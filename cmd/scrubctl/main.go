@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -38,6 +39,9 @@ func main() {
 		if err != nil {
 			exit(err.Error())
 		}
+		if !json.Valid(raw) {
+			exit(fmt.Sprintf("%s does not contain valid JSON", args[1]))
+		}
 		fmt.Println(string(call(token, http.MethodPost, *api+"/v1/policies", raw)))
 	case "deploy":
 		if len(args) < 2 {
@@ -52,7 +56,13 @@ func main() {
 		if err != nil {
 			exit(err.Error())
 		}
-		body, _ := json.Marshal(map[string]json.RawMessage{"node_id": json.RawMessage(fmt.Sprintf("%q", args[1])), "flow": flow})
+		if !json.Valid(flow) {
+			exit(fmt.Sprintf("%s does not contain valid JSON", args[2]))
+		}
+		body, err := json.Marshal(map[string]json.RawMessage{"node_id": json.RawMessage(fmt.Sprintf("%q", args[1])), "flow": flow})
+		if err != nil {
+			exit(err.Error())
+		}
 		fmt.Println(string(call(token, http.MethodPost, *api+"/v1/decide", body)))
 	case "ml-load":
 		if len(args) < 2 {
@@ -62,11 +72,18 @@ func main() {
 		if err != nil {
 			exit(err.Error())
 		}
+		if !json.Valid(raw) {
+			exit(fmt.Sprintf("%s does not contain valid JSON", args[1]))
+		}
 		fmt.Println(string(call(token, http.MethodPost, *api+"/v1/ml/samples", raw)))
 	case "ml-train":
 		body := []byte(`{"epochs":300,"lr":0.2,"threshold":0.65}`)
 		if len(args) > 1 {
-			body, _ = os.ReadFile(args[1])
+			raw, err := os.ReadFile(args[1])
+			if err != nil {
+				exit(err.Error())
+			}
+			body = raw
 		}
 		fmt.Println(string(call(token, http.MethodPost, *api+"/v1/ml/train", body)))
 	case "ml-model":
@@ -88,9 +105,12 @@ func call(token, method, url string, body []byte) []byte {
 		exit(err.Error())
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		exit(fmt.Sprintf("reading %s %s: %v", method, url, err))
+	}
 	if resp.StatusCode >= 300 {
-		exit(string(raw))
+		exit(fmt.Sprintf("%s %s: %s: %s", method, url, resp.Status, strings.TrimSpace(string(raw))))
 	}
 	return raw
 }

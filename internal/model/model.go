@@ -48,6 +48,12 @@ type Policy struct {
 	Version   int       `json:"version"`
 }
 
+// Node liveness states reported by the control plane.
+const (
+	NodeReady = "ready"
+	NodeStale = "stale"
+)
+
 type Node struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
