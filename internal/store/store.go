@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 )
 
@@ -17,6 +18,8 @@ type Store struct {
 	policies    map[string]*model.Policy
 	programs    map[string]*model.Program
 	assignments []model.Assignment
+	samples     []ml.Sample
+	model       ml.Model
 	seq         int
 }
 
@@ -132,6 +135,32 @@ func (s *Store) Fabric() ([]model.Assignment, []model.Program) {
 	}
 	sort.Slice(progs, func(i, j int) bool { return progs[i].NodeID < progs[j].NodeID })
 	return append([]model.Assignment(nil), s.assignments...), progs
+}
+
+func (s *Store) AddSamples(in []ml.Sample) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.samples = append(s.samples, in...)
+	return len(s.samples)
+}
+
+func (s *Store) Samples() []ml.Sample {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ml.Sample(nil), s.samples...)
+}
+
+func (s *Store) Train(epochs int, lr, threshold float64) ml.Model {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.model = ml.Train(s.samples, epochs, lr, threshold)
+	return s.model
+}
+
+func (s *Store) Model() ml.Model {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model
 }
 
 func id(kind, key string) string {
