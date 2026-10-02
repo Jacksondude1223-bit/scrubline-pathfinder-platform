@@ -1,0 +1,10 @@
+# Keep the build context to what the build needs. Without this, "COPY . ."
+# pulls in .git and local build output, so the source layer is invalidated by
+# every commit even when no source changed.
+.git
+bin/
+dist/
+*.exe
+*.test
+.env
+.DS_Store

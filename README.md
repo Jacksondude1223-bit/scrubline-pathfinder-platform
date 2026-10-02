@@ -37,10 +37,20 @@ sh scripts/demo.sh
 go run ./cmd/scrubctl fabric
 ```
 
-Three nodes in Docker:
+Three nodes in Docker. The nodes wait on the API's healthcheck, so they no
+longer race it on startup:
 
 ```sh
 SCRUBLINE_API_TOKEN=dev-scrubline-token docker compose -f deploy/docker-compose.yml up --build
+```
+
+The control API is published on 8080 and the three node dataplanes on 9091,
+9092, and 9093:
+
+```sh
+curl -H "Authorization: Bearer dev-scrubline-token" \
+  -d '{"dst_ip":"203.0.113.10","proto":"tcp","dport":443,"pps":10}' \
+  http://127.0.0.1:9091/decide
 ```
 
 ## API

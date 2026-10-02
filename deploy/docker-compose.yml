@@ -14,6 +14,14 @@ services:
       timeout: 2s
       retries: 15
       start_period: 2s
+
+  # Each node listens on 9091 inside its own container, so the three differ only
+  # in the published host port, matching the single-host example in the README.
+  # /decide on a node takes the same bearer token as the control API; /health is
+  # open so the container healthcheck and any probe can reach it.
+  #
+  # Plain depends_on only waits for the container to start, not for the API to
+  # listen, so the agent raced the control plane on startup.
   node-a:
     build:
       context: ..
@@ -21,12 +29,13 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: dev-scrubline-token
     command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-a", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
-    # Plain depends_on only waits for the container to start, not for the API to
-    # listen, so the agent raced the control plane on startup.
+    ports:
+      - "9091:9091"
     depends_on:
       api:
         condition: service_healthy
     restart: on-failure
+
   node-b:
     build:
       context: ..
@@ -34,10 +43,13 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: dev-scrubline-token
     command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-b", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
+    ports:
+      - "9092:9091"
     depends_on:
       api:
         condition: service_healthy
     restart: on-failure
+
   node-c:
     build:
       context: ..
@@ -45,6 +57,8 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: dev-scrubline-token
     command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-c", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
+    ports:
+      - "9093:9091"
     depends_on:
       api:
         condition: service_healthy

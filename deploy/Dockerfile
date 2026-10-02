@@ -1,6 +1,10 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
+# Resolve dependencies in their own layer so editing source does not re-download
+# them. The previous "COPY go.mod" was immediately followed by "COPY . .", which
+# invalidated the module layer on every source change and cached nothing.
 COPY go.mod ./
+RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o /out/scrub-api ./cmd/scrub-api \
  && CGO_ENABLED=0 go build -o /out/scrub-node ./cmd/scrub-node \
