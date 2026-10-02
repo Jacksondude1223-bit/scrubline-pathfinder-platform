@@ -2,18 +2,32 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 )
+
+const (
+	pollInterval = 2 * time.Second
+	// registerAttempts covers the control plane not being up yet, which is the
+	// normal case under docker compose: depends_on waits for the container to
+	// start, not for the API to listen.
+	registerAttempts = 30
+)
+
+var client = &http.Client{Timeout: 5 * time.Second}
 
 func main() {
 	apiURL := flag.String("api", "http://127.0.0.1:8080", "control API base URL")
@@ -26,94 +40,195 @@ func main() {
 	if token == "" {
 		log.Fatal("SCRUBLINE_API_TOKEN is required")
 	}
+	if *capacity < 0 {
+		log.Fatalf("-capacity must not be negative, got %v", *capacity)
+	}
 
-	node := model.Node{
+	desired := model.Node{
 		Name: *name, Region: *region, CapacityGbps: *capacity, Advertise: *listen,
 		Backends: []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC},
 	}
-	raw, _ := json.Marshal(node)
-	res := call(token, http.MethodPost, *apiURL+"/v1/nodes/register", raw)
-	if err := json.Unmarshal(res, &node); err != nil {
-		log.Fatal(err)
+
+	var node model.Node
+	var err error
+	for attempt := 1; ; attempt++ {
+		node, err = register(*apiURL, token, desired)
+		if err == nil {
+			break
+		}
+		if attempt >= registerAttempts {
+			log.Fatalf("registering with %s failed after %d attempts: %v", *apiURL, attempt, err)
+		}
+		backoff := time.Duration(attempt) * 500 * time.Millisecond
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
+		log.Printf("registering with %s failed (attempt %d/%d): %v; retrying in %s", *apiURL, attempt, registerAttempts, err, backoff)
+		time.Sleep(backoff)
 	}
 	log.Printf("registered %s as %s backends=asic,fpga,zc", node.Name, node.ID)
 
 	pipe := pipeline.New(model.Program{NodeID: node.ID})
-	go poll(*apiURL, token, node.ID, pipe)
+	go poll(*apiURL, token, node.ID, desired, pipe)
+
 	mux := http.NewServeMux()
+	// /health stays open for liveness probes; it carries no policy detail.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]string{"node": node.ID, "name": node.Name, "datapath": "asic-tcam+fpga+pfring-zc"})
+		writeJSON(w, http.StatusOK, map[string]string{"node": node.ID, "name": node.Name, "datapath": "asic-tcam+fpga+pfring-zc"})
 	})
+	// /decide reveals what the policy does with a given flow, so it takes the
+	// same bearer token as the control API.
 	mux.HandleFunc("/decide", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, token) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
 		var f model.Flow
-		if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&f); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := ml.ValidateFlow(f); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 		d := pipe.Decide(f)
 		d.NodeID = node.ID
-		writeJSON(w, d)
+		writeJSON(w, http.StatusOK, d)
 	})
 	log.Printf("node dataplane listening on %s", *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
-func poll(apiURL, token, id string, pipe *pipeline.Pipeline) {
-	client := &http.Client{Timeout: 5 * time.Second}
+func poll(apiURL, token, id string, desired model.Node, pipe *pipeline.Pipeline) {
+	var lastPolicy string
+	var lastVersion int
 	for {
-		req, _ := http.NewRequest(http.MethodPost, apiURL+"/v1/nodes/"+id+"/heartbeat", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		_, _ = client.Do(req)
+		// A control plane that restarted has no record of this node, so its
+		// heartbeat 404s. Re-register instead of polling a program forever.
+		if err := heartbeat(apiURL, token, id); err != nil {
+			log.Printf("heartbeat: %v", err)
+			if errors.Is(err, errUnknownNode) {
+				if _, err := register(apiURL, token, desired); err != nil {
+					log.Printf("re-registering: %v", err)
+				} else {
+					log.Printf("re-registered %s after the control plane lost it", id)
+				}
+			}
+		}
 
-		req, _ = http.NewRequest(http.MethodGet, apiURL+"/v1/nodes/"+id+"/program", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := client.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			var prog model.Program
-			if json.NewDecoder(resp.Body).Decode(&prog) == nil {
-				pipe.Load(prog)
-				log.Printf("programmed node %s version=%d asic=%d fpga=%d zc=%d prefixes=%v", id, prog.Version, len(prog.ASIC), len(prog.FPGA), len(prog.ZC), prog.Prefixes)
+		var prog model.Program
+		if err := get(apiURL+"/v1/nodes/"+id+"/program", token, &prog); err != nil {
+			if !errors.Is(err, errNotFound) {
+				log.Printf("fetching program: %v", err)
 			}
-			resp.Body.Close()
-		} else if resp != nil {
-			resp.Body.Close()
-		}
-		req, _ = http.NewRequest(http.MethodGet, apiURL+"/v1/ml/model", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err = client.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			var trained ml.Model
-			if json.NewDecoder(resp.Body).Decode(&trained) == nil && trained.Ready {
-				pipe.SetModel(trained)
+		} else {
+			pipe.Load(prog)
+			if prog.PolicyID != lastPolicy || prog.Version != lastVersion {
+				lastPolicy, lastVersion = prog.PolicyID, prog.Version
+				log.Printf("programmed node %s policy=%s version=%d asic=%d fpga=%d zc=%d prefixes=%v",
+					id, prog.PolicyID, prog.Version, len(prog.ASIC), len(prog.FPGA), len(prog.ZC), prog.Prefixes)
 			}
-			resp.Body.Close()
-		} else if resp != nil {
-			resp.Body.Close()
 		}
-		time.Sleep(2 * time.Second)
+
+		var trained ml.Model
+		if err := get(apiURL+"/v1/ml/model", token, &trained); err != nil {
+			log.Printf("fetching model: %v", err)
+		} else if trained.Ready {
+			pipe.SetModel(trained)
+		}
+
+		time.Sleep(pollInterval)
 	}
 }
 
-func call(token, method, url string, body []byte) []byte {
-	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+var (
+	errUnknownNode = errors.New("control plane does not know this node")
+	errNotFound    = errors.New("not found")
+)
+
+func register(apiURL, token string, node model.Node) (model.Node, error) {
+	raw, err := json.Marshal(node)
 	if err != nil {
-		log.Fatal(err)
+		return model.Node{}, err
+	}
+	var out model.Node
+	if err := send(http.MethodPost, apiURL+"/v1/nodes/register", token, raw, &out); err != nil {
+		return model.Node{}, err
+	}
+	return out, nil
+}
+
+func heartbeat(apiURL, token, id string) error {
+	err := send(http.MethodPost, apiURL+"/v1/nodes/"+id+"/heartbeat", token, nil, nil)
+	if errors.Is(err, errNotFound) {
+		return errUnknownNode
+	}
+	return err
+}
+
+func get(url, token string, out any) error {
+	return send(http.MethodGet, url, token, nil, out)
+}
+
+// send performs one request and always drains and closes the response body.
+// Leaving the body open leaked a connection on every poll round.
+func send(method, url, token string, body []byte, out any) error {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	if resp.StatusCode == http.StatusNotFound {
+		return errNotFound
+	}
 	if resp.StatusCode >= 300 {
-		log.Fatalf("%s %s: %s", method, url, raw)
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%s %s: %s: %s", method, url, resp.Status, strings.TrimSpace(string(snippet)))
 	}
-	return raw
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(out)
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
+func authorized(r *http.Request, token string) bool {
+	scheme, got, found := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !found || !strings.EqualFold(scheme, "Bearer") {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(v); err != nil {
+		log.Printf("node: encoding %T response failed: %v", v, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"failed to encode response"}` + "\n"))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	w.WriteHeader(code)
+	_, _ = w.Write(buf.Bytes())
 }

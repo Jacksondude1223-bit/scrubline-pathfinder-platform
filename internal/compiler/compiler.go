@@ -3,6 +3,7 @@ package compiler
 import (
 	"fmt"
 	"hash/fnv"
+	"math"
 	"sort"
 	"time"
 
@@ -28,11 +29,25 @@ func Assign(prefixes []string, nodes []model.Node) []model.Assignment {
 	return out
 }
 
+// capacityBias caps how much capacity can tilt the rendezvous hash, so a single
+// very large node cannot win every prefix.
+const capacityBias = 500
+
 func score(prefix string, n model.Node) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(prefix + "|" + n.ID))
-	// Capacity biases the rendezvous pick without pinning every prefix to the largest node.
-	return h.Sum64()%1000 + uint64(n.CapacityGbps)
+	// Capacity biases the rendezvous pick without pinning every prefix to the
+	// largest node. Converting a negative or NaN float to uint64 is undefined in
+	// Go and yielded a near-max value, which let one node with a bogus capacity
+	// capture the whole fabric; clamp into range first.
+	bias := n.CapacityGbps
+	if math.IsNaN(bias) || bias < 0 {
+		bias = 0
+	}
+	if bias > capacityBias {
+		bias = capacityBias
+	}
+	return h.Sum64()%1000 + uint64(bias)
 }
 
 func Compile(policy model.Policy, nodes []model.Node, assigned []model.Assignment) map[string]*model.Program {
@@ -43,11 +58,15 @@ func Compile(policy model.Policy, nodes []model.Node, assigned []model.Assignmen
 	out := map[string]*model.Program{}
 	now := time.Now().UTC()
 	for _, n := range nodes {
+		prefixes := byNode[n.ID]
+		if prefixes == nil {
+			prefixes = []string{}
+		}
 		prog := &model.Program{
 			NodeID:     n.ID,
 			PolicyID:   policy.ID,
 			Version:    policy.Version,
-			Prefixes:   byNode[n.ID],
+			Prefixes:   prefixes,
 			CompiledAt: now,
 		}
 		for _, rule := range policy.Rules {

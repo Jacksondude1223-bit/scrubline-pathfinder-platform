@@ -8,6 +8,12 @@ services:
     ports:
       - "8080:8080"
     command: ["scrub-api", "-addr", "0.0.0.0:8080"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
   node-a:
     build:
       context: ..
@@ -15,7 +21,12 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: dev-scrubline-token
     command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-a", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
-    depends_on: [api]
+    # Plain depends_on only waits for the container to start, not for the API to
+    # listen, so the agent raced the control plane on startup.
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: on-failure
   node-b:
     build:
       context: ..
@@ -23,7 +34,10 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: dev-scrubline-token
     command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-b", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
-    depends_on: [api]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: on-failure
   node-c:
     build:
       context: ..
@@ -31,4 +45,7 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: dev-scrubline-token
     command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-c", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
-    depends_on: [api]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: on-failure

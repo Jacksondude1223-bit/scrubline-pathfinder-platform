@@ -15,6 +15,24 @@ paths:
   /v1/nodes/register:
     post:
       summary: Register a node and its hardware backends
+  /v1/nodes/{id}/heartbeat:
+    post:
+      summary: Keep a node live; a node past its TTL is not assigned prefixes
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+  /v1/nodes/{id}/program:
+    get:
+      summary: Compiled ASIC, FPGA, and ZC program a node agent installs
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
   /v1/policies:
     get:
       summary: List policies
@@ -22,7 +40,13 @@ paths:
       summary: Create or replace a policy
   /v1/policies/{id}/deploy:
     post:
-      summary: Compile policy onto the fabric and assign prefixes to nodes
+      summary: Compile policy onto the fabric and assign prefixes to live nodes
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
   /v1/fabric:
     get:
       summary: Assignments plus compiled ASIC, FPGA, and ZC programs
@@ -30,6 +54,8 @@ paths:
     post:
       summary: Run a flow record through a node's three-stage pipeline
   /v1/ml/samples:
+    get:
+      summary: List the labeled flow samples held for training
     post:
       summary: Add labeled flow samples for the ZC classifier
   /v1/ml/train:
