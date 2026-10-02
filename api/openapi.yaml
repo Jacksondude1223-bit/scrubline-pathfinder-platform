@@ -1,0 +1,38 @@
+openapi: 3.0.3
+info:
+  title: Scrubline Cloud API
+  version: 0.1.0
+  description: Control plane for the distributed scrubbing fabric. Drop path is ASIC/TCAM ACLs, FPGA, and PF_RING ZC. Not XDP.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /health:
+    get:
+      summary: Liveness
+  /v1/nodes:
+    get:
+      summary: List scrubbing nodes
+  /v1/nodes/register:
+    post:
+      summary: Register a node and its hardware backends
+  /v1/policies:
+    get:
+      summary: List policies
+    post:
+      summary: Create or replace a policy
+  /v1/policies/{id}/deploy:
+    post:
+      summary: Compile policy onto the fabric and assign prefixes to nodes
+  /v1/fabric:
+    get:
+      summary: Assignments plus compiled ASIC, FPGA, and ZC programs
+  /v1/decide:
+    post:
+      summary: Run a flow record through a node's three-stage pipeline
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+security:
+  - bearerAuth: []
