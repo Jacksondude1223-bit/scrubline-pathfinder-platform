@@ -1,0 +1,13 @@
+{
+  "epochs": 300,
+  "lr": 0.2,
+  "threshold": 0.65,
+  "samples": [
+    {"label": 0, "flow": {"src_ip": "192.0.2.10", "dst_ip": "203.0.113.10", "proto": "tcp", "sport": 51000, "dport": 443, "pps": 40}},
+    {"label": 0, "flow": {"src_ip": "192.0.2.11", "dst_ip": "203.0.113.10", "proto": "udp", "sport": 52000, "dport": 19132, "pps": 80}},
+    {"label": 0, "flow": {"src_ip": "192.0.2.12", "dst_ip": "203.0.113.10", "proto": "tcp", "sport": 53000, "dport": 443, "pps": 20}},
+    {"label": 1, "flow": {"src_ip": "198.51.100.10", "dst_ip": "203.0.113.10", "proto": "tcp", "sport": 40, "dport": 443, "flags": "syn", "pps": 200000}},
+    {"label": 1, "flow": {"src_ip": "198.51.100.11", "dst_ip": "203.0.113.10", "proto": "tcp", "sport": 41, "dport": 443, "flags": "syn", "pps": 180000}},
+    {"label": 1, "flow": {"src_ip": "198.51.100.12", "dst_ip": "203.0.113.10", "proto": "udp", "sport": 53, "dport": 19132, "pps": 300000}}
+  ]
+}
