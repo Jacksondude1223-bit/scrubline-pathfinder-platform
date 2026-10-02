@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/compiler"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
@@ -20,7 +21,7 @@ type Server struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "product": "scrubline-cloud", "datapath": "asic-tcam+fpga+pfring-zc"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "product": "scrubline-cloud", "datapath": "asic-tcam+fpga+pfring-zc+ml"})
 	})
 	mux.HandleFunc("/v1/", s.route)
 	return mux
@@ -61,7 +62,17 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.deploy(w, id)
 	case r.Method == http.MethodGet && path == "fabric":
 		assignments, programs := s.Store.Fabric()
-		writeJSON(w, http.StatusOK, map[string]any{"assignments": assignments, "programs": programs})
+		writeJSON(w, http.StatusOK, map[string]any{"assignments": assignments, "programs": programs, "ml": s.Store.Model()})
+	case r.Method == http.MethodPost && path == "ml/samples":
+		s.addSamples(w, r)
+	case r.Method == http.MethodGet && path == "ml/samples":
+		writeJSON(w, http.StatusOK, s.Store.Samples())
+	case r.Method == http.MethodPost && path == "ml/train":
+		s.train(w, r)
+	case r.Method == http.MethodGet && path == "ml/model":
+		writeJSON(w, http.StatusOK, s.Store.Model())
+	case r.Method == http.MethodPost && path == "ml/score":
+		s.score(w, r)
 	case r.Method == http.MethodPost && path == "decide":
 		s.decide(w, r)
 	default:
@@ -114,8 +125,48 @@ func (s *Server) deploy(w http.ResponseWriter, id string) {
 		"version":     policy.Version,
 		"assignments": assigned,
 		"nodes":       len(programs),
-		"datapath":    "asic/tcam + fpga + pf_ring zc",
+		"datapath":    "asic/tcam + fpga + pf_ring zc + ml",
+		"ml_ready":    s.Store.Model().Ready,
 	})
+}
+
+func (s *Server) addSamples(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Samples []ml.Sample `json:"samples"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(body.Samples) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "samples required"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"stored": s.Store.AddSamples(body.Samples)})
+}
+
+func (s *Server) train(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Epochs    int     `json:"epochs"`
+		LR        float64 `json:"lr"`
+		Threshold float64 `json:"threshold"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	if len(s.Store.Samples()) < 2 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need at least two labeled samples"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Store.Train(body.Epochs, body.LR, body.Threshold))
+}
+
+func (s *Server) score(w http.ResponseWriter, r *http.Request) {
+	var f model.Flow
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&f); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	m := s.Store.Model()
+	writeJSON(w, http.StatusOK, map[string]any{"score": ml.Score(m, f), "label": ml.Predict(m, f), "ready": m.Ready})
 }
 
 func (s *Server) decide(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +183,9 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "node has no program"})
 		return
 	}
-	d := pipeline.New(prog).Decide(body.Flow)
+	pipe := pipeline.New(prog)
+	pipe.SetModel(s.Store.Model())
+	d := pipe.Decide(body.Flow)
 	d.NodeID = body.NodeID
 	writeJSON(w, http.StatusOK, d)
 }
