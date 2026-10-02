@@ -70,11 +70,12 @@ type Flow struct {
 }
 
 type Decision struct {
-	Action Action `json:"action"`
-	Stage  Stage  `json:"stage"`
-	RuleID string `json:"rule_id,omitempty"`
-	Reason string `json:"reason"`
-	NodeID string `json:"node_id,omitempty"`
+	Action Action  `json:"action"`
+	Stage  Stage   `json:"stage"`
+	RuleID string  `json:"rule_id,omitempty"`
+	Reason string  `json:"reason"`
+	NodeID string  `json:"node_id,omitempty"`
+	Score  float64 `json:"score,omitempty"`
 }
 
 type ACLEntry struct {

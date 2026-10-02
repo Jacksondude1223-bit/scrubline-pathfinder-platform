@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 )
@@ -72,6 +73,18 @@ func poll(apiURL, token, id string, pipe *pipeline.Pipeline) {
 			if json.NewDecoder(resp.Body).Decode(&prog) == nil {
 				pipe.Load(prog)
 				log.Printf("programmed node %s version=%d asic=%d fpga=%d zc=%d prefixes=%v", id, prog.Version, len(prog.ASIC), len(prog.FPGA), len(prog.ZC), prog.Prefixes)
+			}
+			resp.Body.Close()
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+		req, _ = http.NewRequest(http.MethodGet, apiURL+"/v1/ml/model", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err = client.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var trained ml.Model
+			if json.NewDecoder(resp.Body).Decode(&trained) == nil && trained.Ready {
+				pipe.SetModel(trained)
 			}
 			resp.Body.Close()
 		} else if resp != nil {
