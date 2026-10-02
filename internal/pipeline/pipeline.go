@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 )
 
@@ -13,6 +14,7 @@ type Pipeline struct {
 	mu      sync.Mutex
 	program model.Program
 	buckets map[string]int
+	model   ml.Model
 }
 
 func New(p model.Program) *Pipeline {
@@ -24,6 +26,12 @@ func (p *Pipeline) Load(prog model.Program) {
 	defer p.mu.Unlock()
 	p.program = prog
 	p.buckets = map[string]int{}
+}
+
+func (p *Pipeline) SetModel(m ml.Model) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.model = m
 }
 
 func (p *Pipeline) Decide(f model.Flow) model.Decision {
@@ -56,6 +64,13 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 		p.buckets[key] += f.PPS
 		if zc.PPS > 0 && p.buckets[key] > zc.PPS {
 			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.RuleID, Reason: "PF_RING ZC behavioral cap"}
+		}
+		if p.model.Ready {
+			score := ml.Score(p.model, f)
+			if score >= p.model.Threshold {
+				return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.RuleID, Reason: fmt.Sprintf("PF_RING ZC ml score %.2f", score), Score: score}
+			}
+			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.RuleID, Reason: fmt.Sprintf("PF_RING ZC ml pass %.2f", score), Score: score}
 		}
 		return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.RuleID, Reason: "PF_RING ZC inspect pass"}
 	}
