@@ -29,6 +29,18 @@ paths:
   /v1/decide:
     post:
       summary: Run a flow record through a node's three-stage pipeline
+  /v1/ml/samples:
+    post:
+      summary: Add labeled flow samples for the ZC classifier
+  /v1/ml/train:
+    post:
+      summary: Train the logistic flow model used on the PF_RING ZC path
+  /v1/ml/model:
+    get:
+      summary: Current model weights and threshold
+  /v1/ml/score:
+    post:
+      summary: Score one flow without running the hardware stages
 components:
   securitySchemes:
     bearerAuth:

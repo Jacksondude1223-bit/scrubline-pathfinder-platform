@@ -8,7 +8,9 @@ Attack traffic is steered onto scrubbing nodes. Each node drops in hardware firs
 
 1. ASIC / TCAM ACL. Longest-prefix and port ACLs. Terminal drops never leave the chip.
 2. FPGA. Line-rate meters and flag matches for what the TCAM did not already drop.
-3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path.
+3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path. A logistic classifier trained from the control API scores this stage and drops flows over the threshold.
+
+The model is flow-level only: rate, protocol, ports, and TCP flags. It does not inspect payloads. Train it with labeled samples, then nodes pull the weights on the same poll as the hardware program.
 
 Hardware programming is represented as compiled programs the node agent pulls. A node without a switch ASIC, FPGA, or PF_RING license still enforces the same decision order in the software pipeline so the control plane can be tested. On an appliance, the agent writes the TCAM key, FPGA table, and `zc:<node>` cluster from that program.
 
@@ -48,5 +50,13 @@ Bearer token is `SCRUBLINE_API_TOKEN`. Spec is in `api/openapi.yaml`.
 - `GET /v1/fabric` assignments and compiled programs
 - `GET /v1/nodes/{id}/program` what a node agent installs
 - `POST /v1/decide` run a flow record through a node's pipeline
+- `POST /v1/ml/samples` labeled flow records (`label` 0 clean, 1 attack)
+- `POST /v1/ml/train` fit the ZC logistic model
+- `GET /v1/ml/model` weights the node agent installs
 
-Example policy: `configs/policy.example.json`.
+Example policy: `configs/policy.example.json`. Example training set: `configs/ml.samples.json`.
+
+```sh
+go run ./cmd/scrubctl ml-load configs/ml.samples.json
+go run ./cmd/scrubctl ml-train
+```
