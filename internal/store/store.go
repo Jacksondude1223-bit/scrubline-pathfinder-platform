@@ -27,7 +27,10 @@ const (
 var ErrSampleLimit = fmt.Errorf("training set is limited to %d samples", MaxSamples)
 
 type Store struct {
-	mu          sync.Mutex
+	// Reads dominate the control plane: every agent polls its program and the
+	// model each round, while only heartbeats and deploys write. An exclusive
+	// lock made a read-only Program() 3x slower at four cores than at one.
+	mu          sync.RWMutex
 	nodes       map[string]*model.Node
 	policies    map[string]*model.Policy
 	programs    map[string]*model.Program
@@ -86,8 +89,8 @@ func (s *Store) Heartbeat(id string) bool {
 
 // Nodes lists every registered node with its status refreshed against NodeTTL.
 func (s *Store) Nodes() []model.Node {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.snapshot(false)
 }
 
@@ -95,8 +98,8 @@ func (s *Store) Nodes() []model.Node {
 // assignment uses this: handing a prefix to a node that stopped answering
 // blackholes the traffic it was supposed to scrub.
 func (s *Store) LiveNodes() []model.Node {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.snapshot(true)
 }
 
@@ -151,8 +154,8 @@ func (s *Store) SavePolicy(p model.Policy) model.Policy {
 }
 
 func (s *Store) Policies() []model.Policy {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]model.Policy, 0, len(s.policies))
 	for _, p := range s.policies {
 		out = append(out, *p)
@@ -167,8 +170,8 @@ func (s *Store) Policies() []model.Policy {
 }
 
 func (s *Store) Policy(id string) (model.Policy, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	p, ok := s.policies[id]
 	if !ok {
 		return model.Policy{}, false
@@ -189,8 +192,8 @@ func (s *Store) PutDeploy(assignments []model.Assignment, programs map[string]*m
 }
 
 func (s *Store) Program(nodeID string) (model.Program, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	p, ok := s.programs[nodeID]
 	if !ok {
 		return model.Program{}, false
@@ -199,8 +202,8 @@ func (s *Store) Program(nodeID string) (model.Program, bool) {
 }
 
 func (s *Store) Fabric() ([]model.Assignment, []model.Program) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	progs := make([]model.Program, 0, len(s.programs))
 	for _, p := range s.programs {
 		progs = append(progs, *p)
@@ -224,14 +227,14 @@ func (s *Store) AddSamples(in []ml.Sample) (int, error) {
 // Samples() copied the entire set just to check a number: at 10k samples that
 // was ~1MB and 640us per call, on a request path.
 func (s *Store) SampleCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.samples)
 }
 
 func (s *Store) Samples() []ml.Sample {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return append([]ml.Sample(nil), s.samples...)
 }
 
@@ -239,9 +242,9 @@ func (s *Store) Samples() []ml.Sample {
 // store lock: it is O(epochs * samples) and holding the lock across it stalled
 // every other request, heartbeats included, long enough to mark nodes stale.
 func (s *Store) Train(epochs int, lr, threshold float64) (ml.Model, error) {
-	s.mu.Lock()
+	s.mu.RLock()
 	samples := append([]ml.Sample(nil), s.samples...)
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	m, err := ml.Train(samples, epochs, lr, threshold)
 	if err != nil {
@@ -255,8 +258,8 @@ func (s *Store) Train(epochs int, lr, threshold float64) (ml.Model, error) {
 }
 
 func (s *Store) Model() ml.Model {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.model
 }
 

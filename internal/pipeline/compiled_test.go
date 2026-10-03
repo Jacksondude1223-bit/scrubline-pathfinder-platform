@@ -120,7 +120,7 @@ func TestOwnsAgreesWithStringParsing(t *testing.T) {
 			}
 			k := flowKey{}
 			k.dst, k.dstOK = parseAddr(ip)
-			if got := p.owns(k); got != want {
+			if got := owns(p.snapshot(), k); got != want {
 				t.Fatalf("prefixes %v ip %q: reference=%v compiled=%v", list, ip, want, got)
 			}
 		}

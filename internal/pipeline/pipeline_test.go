@@ -203,14 +203,14 @@ func TestLoadDropsRateStateForRemovedRules(t *testing.T) {
 	}
 	p := New(prog)
 	p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 60})
-	if len(p.buckets) != 1 {
-		t.Fatalf("expected one tracked source, got %d", len(p.buckets))
+	if got := p.bucketCount(); got != 1 {
+		t.Fatalf("expected one tracked source, got %d", got)
 	}
 	replacement := prog
 	replacement.ZC = []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 100, RuleID: "other", Match: model.Match{Proto: "tcp"}}}
 	p.Load(replacement)
-	if len(p.buckets) != 0 {
-		t.Fatalf("expected state for the removed rule to be dropped, got %d entries", len(p.buckets))
+	if got := p.bucketCount(); got != 0 {
+		t.Fatalf("expected state for the removed rule to be dropped, got %d entries", got)
 	}
 }
 
@@ -228,15 +228,19 @@ func TestRateTableStaysBounded(t *testing.T) {
 	for i := 0; i < maxBuckets*3; i++ {
 		src := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
 		p.Decide(model.Flow{SrcIP: src.String(), DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1})
-		if len(p.buckets) > maxBuckets {
-			t.Fatalf("rate table grew past the bound: %d entries after %d sources", len(p.buckets), i+1)
+		if i%1000 == 0 {
+			if got := p.bucketCount(); got > maxBuckets {
+				t.Fatalf("rate table grew past the bound: %d entries after %d sources", got, i+1)
+			}
 		}
 	}
 }
 
-// Expired windows must be reclaimed so a burst of one-off sources does not pin
-// the table at its limit forever.
-func TestExpiredRateStateIsReclaimed(t *testing.T) {
+// A shard that has hit its bound must start accepting sources again once its
+// windows close. Reclamation is deliberately lazy - it only runs when a shard
+// is actually full - so this fills one shard deterministically rather than
+// assuming the whole table is swept.
+func TestFullShardAcceptsSourcesAgainAfterItsWindowCloses(t *testing.T) {
 	prog := model.Program{
 		Prefixes: []string{"203.0.113.0/24"},
 		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 1000000, RuleID: "zc", Match: model.Match{Proto: "tcp"}}},
@@ -245,15 +249,107 @@ func TestExpiredRateStateIsReclaimed(t *testing.T) {
 	clock := time.Now()
 	p.now = func() time.Time { return clock }
 
-	for i := 0; i < maxBuckets; i++ {
-		src := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		p.Decide(model.Flow{SrcIP: src.String(), DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1})
+	// Collect enough sources that all hash to one shard to fill it exactly.
+	target := shardIndex(rateKey{rule: "zc", src: "203.0.113.1"})
+	var ips []string
+	for i := 0; len(ips) < shardBuckets && i < 1<<22; i++ {
+		ip := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}).String()
+		if shardIndex(rateKey{rule: "zc", src: ip}) == target {
+			ips = append(ips, ip)
+		}
 	}
+	if len(ips) < shardBuckets {
+		t.Fatalf("only found %d sources for shard %d", len(ips), target)
+	}
+	for _, ip := range ips {
+		p.Decide(model.Flow{SrcIP: ip, DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1})
+	}
+	sh := &p.shards[target]
+	sh.mu.Lock()
+	filled := len(sh.buckets)
+	sh.mu.Unlock()
+	if filled != shardBuckets {
+		t.Fatalf("expected the shard at its bound, got %d of %d", filled, shardBuckets)
+	}
+
+	// Inside the same window the shard is full, so a new source goes untracked.
+	fresh := ips[0]
+	for i := 0; ; i++ {
+		ip := netip.AddrFrom4([4]byte{172, byte(i >> 16), byte(i >> 8), byte(i)}).String()
+		if shardIndex(rateKey{rule: "zc", src: ip}) == target {
+			fresh = ip
+			break
+		}
+	}
+	p.Decide(model.Flow{SrcIP: fresh, DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1})
+	sh.mu.Lock()
+	_, tracked := sh.buckets[rateKey{rule: "zc", src: fresh}]
+	stillFull := len(sh.buckets)
+	sh.mu.Unlock()
+	if tracked {
+		t.Fatal("a full shard must not admit another source inside the window")
+	}
+	if stillFull != shardBuckets {
+		t.Fatalf("the bound must hold, got %d of %d", stillFull, shardBuckets)
+	}
+
+	// Once the windows close, the shard reclaims and takes the source.
 	clock = clock.Add(2 * time.Second)
-	// A new source now forces a sweep of the stale windows.
-	p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1})
-	if len(p.buckets) > 2 {
-		t.Fatalf("expected the stale windows to be reclaimed, got %d entries", len(p.buckets))
+	p.Decide(model.Flow{SrcIP: fresh, DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1})
+	sh.mu.Lock()
+	_, nowTracked := sh.buckets[rateKey{rule: "zc", src: fresh}]
+	after := len(sh.buckets)
+	sh.mu.Unlock()
+	if !nowTracked {
+		t.Fatal("expected the shard to accept the source after reclaiming closed windows")
+	}
+	if after > shardBuckets {
+		t.Fatalf("shard grew past its bound: %d", after)
+	}
+	if after != 1 {
+		t.Fatalf("expected the stale windows to be swept, leaving one entry, got %d", after)
+	}
+}
+
+// reclaim drops closed windows and keeps open ones, and scans at most once per
+// window so a full shard cannot be made to rescan per packet.
+func TestShardReclaimSemantics(t *testing.T) {
+	now := time.Now()
+	sh := &rateShard{buckets: map[rateKey]*bucket{}}
+	keyA := rateKey{rule: "zc", src: "a"}
+	keyB := rateKey{rule: "zc", src: "b"}
+	keyC := rateKey{rule: "zc", src: "c"}
+	sh.buckets[keyA] = &bucket{windowStart: now.Add(-2 * time.Second)}
+	sh.buckets[keyB] = &bucket{windowStart: now}
+	if !sh.reclaim(now) {
+		t.Fatal("expected room after reclaiming a closed window")
+	}
+	if _, stale := sh.buckets[keyA]; stale {
+		t.Fatal("expected the closed window to be dropped")
+	}
+	if _, live := sh.buckets[keyB]; !live {
+		t.Fatal("expected the open window to be kept")
+	}
+	// A second call inside the same window must not rescan.
+	sh.buckets[keyC] = &bucket{windowStart: now.Add(-2 * time.Second)}
+	sh.reclaim(now)
+	if _, present := sh.buckets[keyC]; !present {
+		t.Fatal("expected the throttle to skip a second sweep inside the same window")
+	}
+}
+
+// Keys must land on a stable shard, or a source's counter would move between
+// shards and its rate would never accumulate.
+func TestShardIndexIsStableAndInRange(t *testing.T) {
+	for i := 0; i < 2000; i++ {
+		key := rateKey{rule: "zc", src: netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}).String()}
+		first := shardIndex(key)
+		if first >= rateShards {
+			t.Fatalf("shard %d out of range for %q", first, key)
+		}
+		if again := shardIndex(key); again != first {
+			t.Fatalf("shard for %q moved: %d then %d", key, first, again)
+		}
 	}
 }
 

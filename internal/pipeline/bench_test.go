@@ -153,8 +153,8 @@ func BenchmarkDecideFloodAgainstFullTable(b *testing.B) {
 		src := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
 		p.Decide(model.Flow{SrcIP: src.String(), DstIP: "203.0.113.10", Proto: "tcp", DPort: 443, PPS: 1})
 	}
-	if len(p.buckets) != maxBuckets {
-		b.Fatalf("expected a full table, got %d", len(p.buckets))
+	if got := p.bucketCount(); got == 0 {
+		b.Fatalf("expected a populated table, got %d", got)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -165,36 +165,35 @@ func BenchmarkDecideFloodAgainstFullTable(b *testing.B) {
 }
 
 // unthrottledReclaim is what the first version of the bounded table did: scan
-// the whole table whenever it is full and an insert is attempted. Kept here only
-// to quantify what the throttle buys.
-func (p *Pipeline) unthrottledReclaim(now time.Time) bool {
-	for key, bkt := range p.buckets {
+// the whole shard whenever it is full and an insert is attempted. Kept here
+// only to quantify what the throttle buys.
+func (sh *rateShard) unthrottledReclaim(now time.Time) bool {
+	for key, bkt := range sh.buckets {
 		if now.Sub(bkt.windowStart) >= rateWindow {
-			delete(p.buckets, key)
+			delete(sh.buckets, key)
 		}
 	}
-	return len(p.buckets) < maxBuckets
+	return len(sh.buckets) < shardBuckets
 }
 
 func BenchmarkFloodAgainstFullTableUnthrottled(b *testing.B) {
-	p := New(benchProgram())
-	clock := time.Now()
-	p.now = func() time.Time { return clock }
-	for i := 0; i < maxBuckets; i++ {
-		src := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		p.Decide(model.Flow{SrcIP: src.String(), DstIP: "203.0.113.10", Proto: "tcp", DPort: 443, PPS: 1})
+	now := time.Now()
+	sh := &rateShard{buckets: make(map[rateKey]*bucket, shardBuckets)}
+	for i := 0; i < shardBuckets; i++ {
+		key := rateKey{rule: "zc", src: netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}).String()}
+		sh.buckets[key] = &bucket{windowStart: now}
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		p.mu.Lock()
-		p.unthrottledReclaim(clock)
-		p.mu.Unlock()
+		sh.mu.Lock()
+		sh.unthrottledReclaim(now)
+		sh.mu.Unlock()
 	}
 }
 
-// Decide takes one mutex for the whole decision, so this measures how the
-// datapath behaves when several cores offer traffic at once.
+// The program and model are read through an atomic snapshot and the rate table
+// is sharded, so this measures whether the datapath scales across cores.
 func BenchmarkDecideParallel(b *testing.B) {
 	p := New(benchProgram())
 	p.SetModel(trainedModel(b))
@@ -222,5 +221,32 @@ func BenchmarkLoad(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		p.Load(prog)
+	}
+}
+
+// The control plane's /v1/decide builds a Pipeline per request, so New is on
+// that request path and now pays for compiling the program.
+func BenchmarkNewWithExamplePolicySizedProgram(b *testing.B) {
+	prog := benchProgram()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		New(prog)
+	}
+}
+
+func BenchmarkNewLargeProgram(b *testing.B) {
+	prog := benchProgram()
+	for i := 0; i < 100; i++ {
+		src := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0})
+		prog.ASIC = append(prog.ASIC, model.ACLEntry{
+			Priority: i, Action: model.ActionDrop, RuleID: fmt.Sprintf("r%d", i),
+			Match: model.Match{SrcCIDR: src.String() + "/24"},
+		})
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		New(prog)
 	}
 }

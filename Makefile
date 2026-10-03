@@ -1,13 +1,17 @@
-.PHONY: build test demo
+.PHONY: build test bench demo
 
 build:
 	mkdir -p bin
 	go build -o bin/scrub-api ./cmd/scrub-api
 	go build -o bin/scrub-node ./cmd/scrub-node
 	go build -o bin/scrubctl ./cmd/scrubctl
+	go build -o bin/scrub-loadgen ./cmd/scrub-loadgen
 
 test:
 	go test ./...
+
+bench:
+	go test ./... -run '^$$' -bench . -benchtime 1s
 
 # Each recipe line runs in its own shell, so a backgrounded server started on one
 # line cannot be reached by "kill %1" on the next: the API was left running and
