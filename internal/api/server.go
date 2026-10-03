@@ -204,7 +204,7 @@ func (s *Server) train(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if len(s.Store.Samples()) < 2 {
+	if s.Store.SampleCount() < 2 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need at least two labeled samples"})
 		return
 	}

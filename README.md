@@ -53,6 +53,27 @@ curl -H "Authorization: Bearer dev-scrubline-token" \
   http://127.0.0.1:9091/decide
 ```
 
+## Measuring
+
+Benchmarks cover the datapath, the classifier, the compiler, and the store:
+
+```sh
+make bench
+go test ./internal/pipeline/ -run '^$' -bench Decide -benchtime 2s -cpu 1,2,4
+```
+
+The datapath parses rule CIDRs once per `Load` rather than per packet, reads the
+program and model through an atomic snapshot, and shards the per-source rate
+table, so `Decide` scales across cores instead of serializing on one lock.
+
+`scrub-loadgen` drives the control API and reports throughput with latency
+percentiles. It counts a 200 with an empty body as an error.
+
+```sh
+go run ./cmd/scrub-loadgen -token "$SCRUBLINE_API_TOKEN" -c 32 -d 5s -node <node-id>
+go run ./cmd/scrub-loadgen -token "$SCRUBLINE_API_TOKEN" -only decide -c 32 -d 5s -node <node-id>
+```
+
 ## API
 
 Bearer token is `SCRUBLINE_API_TOKEN`. Spec is in `api/openapi.yaml`. The token is required: an empty one is a misconfiguration, not a way to open the control plane. The node agent's own `/decide` takes the same bearer token; its `/health` is open for liveness probes.

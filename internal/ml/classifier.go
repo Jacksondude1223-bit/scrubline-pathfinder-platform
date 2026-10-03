@@ -95,19 +95,28 @@ func Train(samples []Sample, epochs int, lr, threshold float64) (Model, error) {
 	if threshold <= 0 {
 		threshold = 0.7
 	}
+	// Build the feature vectors once. Calling Features inside the epoch loop
+	// allocated a slice per sample per epoch, which made training
+	// allocation-bound: 10k samples over 300 epochs was 3M allocations.
+	xs := make([][]float64, len(samples))
+	ys := make([]float64, len(samples))
+	for i, s := range samples {
+		xs[i] = Features(s.Flow)
+		ys[i] = float64(s.Label)
+	}
 	w := make([]float64, FeatureCount)
 	bias := 0.0
 	loss := 0.0
 	for ep := 0; ep < epochs; ep++ {
 		loss = 0
-		for _, s := range samples {
-			x := Features(s.Flow)
+		for i := range samples {
+			x := xs[i]
 			p := sigmoid(dot(w, x) + bias)
-			y := float64(s.Label)
+			y := ys[i]
 			err := p - y
 			loss += -(y*math.Log(clamp(p)) + (1-y)*math.Log(clamp(1-p)))
-			for i := range w {
-				w[i] -= lr * err * x[i]
+			for j := range w {
+				w[j] -= lr * err * x[j]
 			}
 			bias -= lr * err
 		}
