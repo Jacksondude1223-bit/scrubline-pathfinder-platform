@@ -8,20 +8,31 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/transport"
 )
 
 func main() {
 	api := flag.String("api", "http://127.0.0.1:8080", "control API")
+	caFile := flag.String("ca", "", "PEM bundle to verify the control plane against; empty uses the system roots")
 	flag.Parse()
+	httpClient, err := transport.Client(transport.ClientConfig{CAFile: *caFile, Timeout: 30 * time.Second})
+	if err != nil {
+		exit(err.Error())
+	}
+	client = httpClient
 	token := os.Getenv("SCRUBLINE_API_TOKEN")
 	if token == "" {
-		fmt.Fprintln(os.Stderr, "SCRUBLINE_API_TOKEN is required")
+		fmt.Fprintln(os.Stderr, "SCRUBLINE_API_TOKEN is required (the operator credential)")
 		os.Exit(1)
 	}
 	args := flag.Args()
 	if len(args) == 0 {
-		fmt.Println("usage: scrubctl nodes | policies | apply <file> | deploy <policy-id> | fabric | decide <node-id> <flow.json> | ml-load <file> | ml-train | ml-model")
+		fmt.Println("usage: scrubctl nodes | policies | apply <file> | deploy <policy-id> | fabric | bgp | decide <node-id> <flow.json> | ml-load <file> | ml-train | ml-model")
 		os.Exit(1)
 	}
 	switch args[0] {
@@ -31,6 +42,8 @@ func main() {
 		fmt.Println(string(call(token, http.MethodGet, *api+"/v1/policies", nil)))
 	case "fabric":
 		fmt.Println(string(call(token, http.MethodGet, *api+"/v1/fabric", nil)))
+	case "bgp":
+		printPlan(call(token, http.MethodGet, *api+"/v1/fabric", nil))
 	case "apply":
 		if len(args) < 2 {
 			exit("apply <file>")
@@ -93,6 +106,50 @@ func main() {
 	}
 }
 
+// printPlan renders the fabric's BGP posture as a table: which node announces
+// which prefix, and how hard each one is padded away from it.
+func printPlan(raw []byte) {
+	var fabric struct {
+		Announcements []struct {
+			Prefix   string `json:"prefix"`
+			NodeName string `json:"node_name"`
+			Region   string `json:"region"`
+			State    string `json:"state"`
+			Prepends int    `json:"prepends"`
+			NextHop  string `json:"next_hop"`
+			Reason   string `json:"reason"`
+		} `json:"announcements"`
+	}
+	if err := json.Unmarshal(raw, &fabric); err != nil {
+		exit(fmt.Sprintf("reading the fabric: %v", err))
+	}
+	if len(fabric.Announcements) == 0 {
+		fmt.Println("no announcements; deploy a policy first")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "PREFIX\tNODE\tREGION\tSTATE\tPREPENDS\tNEXT HOP\tWHY")
+	for _, a := range fabric.Announcements {
+		prepends := strconv.Itoa(a.Prepends)
+		if a.State != "announce" {
+			prepends = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			a.Prefix, a.NodeName, a.Region, a.State, prepends, orDash(a.NextHop), a.Reason)
+	}
+	_ = w.Flush()
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// client reaches the control plane; it is configured in main.
+var client = http.DefaultClient
+
 func call(token, method, url string, body []byte) []byte {
 	req, err := http.NewRequest(method, url, bytes.NewReader(body))
 	if err != nil {
@@ -100,7 +157,7 @@ func call(token, method, url string, body []byte) []byte {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		exit(err.Error())
 	}

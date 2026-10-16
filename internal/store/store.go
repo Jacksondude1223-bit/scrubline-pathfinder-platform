@@ -1,8 +1,10 @@
 package store
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 )
 
 const (
@@ -26,26 +30,67 @@ const (
 // MaxSamples.
 var ErrSampleLimit = fmt.Errorf("training set is limited to %d samples", MaxSamples)
 
+// ErrNodeConflict is returned when a registration would take over the identity
+// of a different node that is still live. Node IDs derive from name and region,
+// so two scrubbers sharing both used to silently overwrite each other.
+var ErrNodeConflict = errors.New("a different live node is already registered under this name and region")
+
 type Store struct {
-	mu          sync.Mutex
-	nodes       map[string]*model.Node
-	policies    map[string]*model.Policy
-	programs    map[string]*model.Program
-	assignments []model.Assignment
-	samples     []ml.Sample
-	model       ml.Model
-	seq         int
+	mu       sync.Mutex
+	nodes    map[string]*model.Node
+	policies map[string]*model.Policy
+	programs map[string]*model.Program
+	plan     []model.Announcement
+	samples  []ml.Sample
+	model    ml.Model
+	seq      int
+	// lastPolicyID is the policy of the most recent deploy. The fabric is
+	// recompiled against it when the live node set changes, so a node that
+	// joins or recovers after a deploy is not left without a program.
+	lastPolicyID string
+	// reports holds the datapath counters each node last sent with its
+	// heartbeat, keyed by node ID so the map stays bounded by the node set.
+	reports map[string]telemetry.Report
+	// nodeTokens maps a node to the hash of its current credential, and
+	// tokenNodes maps back from the hash. Only hashes are kept: a dump of
+	// this store must not hand anyone a working credential.
+	nodeTokens map[string]string
+	tokenNodes map[string]string
+	// path is where durable state is written. Empty keeps everything in
+	// memory, which is what the tests and the single-shot demo use.
+	path string
 	// now is swapped out in tests; production always uses the wall clock.
 	now func() time.Time
 }
 
+// sortNodes and sortPolicies keep a snapshot byte-stable, so an unchanged
+// state does not rewrite the file differently each time.
+func sortNodes(nodes []model.Node) {
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+}
+
+func sortPolicies(policies []model.Policy) {
+	sort.Slice(policies, func(i, j int) bool { return policies[i].ID < policies[j].ID })
+}
+
 func New() *Store {
 	return &Store{
-		nodes:    map[string]*model.Node{},
-		policies: map[string]*model.Policy{},
-		programs: map[string]*model.Program{},
-		now:      func() time.Time { return time.Now().UTC() },
+		nodes:      map[string]*model.Node{},
+		policies:   map[string]*model.Policy{},
+		programs:   map[string]*model.Program{},
+		reports:    map[string]telemetry.Report{},
+		nodeTokens: map[string]string{},
+		tokenNodes: map[string]string{},
+		now:        func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetClock replaces the store's time source. It exists so tests outside this
+// package can age nodes past their TTL without sleeping.
+func (s *Store) SetClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
 }
 
 // clock reads the store's time source, tolerating a zero-value Store.
@@ -56,7 +101,9 @@ func (s *Store) clock() time.Time {
 	return s.now()
 }
 
-func (s *Store) UpsertNode(n model.Node) model.Node {
+// UpsertNode registers or refreshes a node. It reports whether the node is new
+// to the fabric, which is what triggers a recompile.
+func (s *Store) UpsertNode(n model.Node) (model.Node, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if n.ID == "" {
@@ -65,23 +112,49 @@ func (s *Store) UpsertNode(n model.Node) model.Node {
 	if n.Backends == nil {
 		n.Backends = []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC}
 	}
-	n.LastSeen = s.clock()
+	now := s.clock()
+	prev, existed := s.nodes[n.ID]
+	if existed {
+		// Two scrubbers under the same name and region collapse onto one ID.
+		// Refuse while the incumbent is still live rather than merging them;
+		// once it has aged out, a replacement is free to take the identity.
+		stillLive := now.Sub(prev.LastSeen) <= NodeTTL
+		if stillLive && prev.Advertise != "" && n.Advertise != "" && prev.Advertise != n.Advertise {
+			return model.Node{}, false, fmt.Errorf("%w: %s is advertised by %s", ErrNodeConflict, n.ID, prev.Advertise)
+		}
+	}
+	n.LastSeen = now
 	n.Status = model.NodeReady
 	cp := n
 	s.nodes[n.ID] = &cp
-	return cp
+	if err := s.persistLocked(); err != nil {
+		// Roll back rather than report a registration the control plane
+		// cannot remember across a restart.
+		if existed {
+			s.nodes[n.ID] = prev
+		} else {
+			delete(s.nodes, n.ID)
+		}
+		return model.Node{}, false, err
+	}
+	return cp, !existed, nil
 }
 
-func (s *Store) Heartbeat(id string) bool {
+// Heartbeat refreshes a node's liveness. It reports whether the node was known,
+// and whether this heartbeat brought it back from stale, which changes the live
+// set and so has to trigger a recompile.
+func (s *Store) Heartbeat(id string) (ok, revived bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n, ok := s.nodes[id]
-	if !ok {
-		return false
+	n, found := s.nodes[id]
+	if !found {
+		return false, false
 	}
-	n.LastSeen = s.clock()
+	now := s.clock()
+	revived = now.Sub(n.LastSeen) > NodeTTL
+	n.LastSeen = now
 	n.Status = model.NodeReady
-	return true
+	return true, revived
 }
 
 // Nodes lists every registered node with its status refreshed against NodeTTL.
@@ -92,8 +165,8 @@ func (s *Store) Nodes() []model.Node {
 }
 
 // LiveNodes lists only the nodes that have heartbeated within NodeTTL. Prefix
-// assignment uses this: handing a prefix to a node that stopped answering
-// blackholes the traffic it was supposed to scrub.
+// The announcement plan uses this: a node past its TTL is withdrawn from
+// anycast so its share of the traffic moves to the nodes still answering.
 func (s *Store) LiveNodes() []model.Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -125,7 +198,7 @@ func (s *Store) snapshot(liveOnly bool) []model.Node {
 	return out
 }
 
-func (s *Store) SavePolicy(p model.Policy) model.Policy {
+func (s *Store) SavePolicy(p model.Policy) (model.Policy, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if p.ID == "" {
@@ -146,8 +219,17 @@ func (s *Store) SavePolicy(p model.Policy) model.Policy {
 	}
 	p.UpdatedAt = s.clock()
 	cp := p
+	previous, existed := s.policies[p.ID]
 	s.policies[p.ID] = &cp
-	return cp
+	if err := s.persistLocked(); err != nil {
+		if existed {
+			s.policies[p.ID] = previous
+		} else {
+			delete(s.policies, p.ID)
+		}
+		return model.Policy{}, err
+	}
+	return cp, nil
 }
 
 func (s *Store) Policies() []model.Policy {
@@ -176,16 +258,26 @@ func (s *Store) Policy(id string) (model.Policy, bool) {
 	return *p, true
 }
 
-func (s *Store) PutDeploy(assignments []model.Assignment, programs map[string]*model.Program) {
+func (s *Store) PutDeploy(policyID string, plan []model.Announcement, programs map[string]*model.Program) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.assignments = append([]model.Assignment(nil), assignments...)
+	// Only the deployed policy is durable; the plan and the programs are
+	// recompiled from it. A recompile that does not change which policy is
+	// deployed therefore does not touch the disk, which matters because
+	// membership churn recompiles often.
+	changed := s.lastPolicyID != policyID
+	s.lastPolicyID = policyID
+	s.plan = append([]model.Announcement(nil), plan...)
 	// Copy the caller's map so a later mutation of it cannot reach into the store.
 	s.programs = make(map[string]*model.Program, len(programs))
 	for k, v := range programs {
 		cp := *v
 		s.programs[k] = &cp
 	}
+	if !changed {
+		return nil
+	}
+	return s.persistLocked()
 }
 
 func (s *Store) Program(nodeID string) (model.Program, bool) {
@@ -198,7 +290,8 @@ func (s *Store) Program(nodeID string) (model.Program, bool) {
 	return *p, true
 }
 
-func (s *Store) Fabric() ([]model.Assignment, []model.Program) {
+// Fabric returns the BGP announcement plan and the compiled programs.
+func (s *Store) Fabric() ([]model.Announcement, []model.Program) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	progs := make([]model.Program, 0, len(s.programs))
@@ -206,7 +299,7 @@ func (s *Store) Fabric() ([]model.Assignment, []model.Program) {
 		progs = append(progs, *p)
 	}
 	sort.Slice(progs, func(i, j int) bool { return progs[i].NodeID < progs[j].NodeID })
-	return append([]model.Assignment(nil), s.assignments...), progs
+	return append([]model.Announcement(nil), s.plan...), progs
 }
 
 // AddSamples appends a labeled batch and reports the new total.
@@ -216,7 +309,12 @@ func (s *Store) AddSamples(in []ml.Sample) (int, error) {
 	if len(s.samples)+len(in) > MaxSamples {
 		return len(s.samples), ErrSampleLimit
 	}
+	before := len(s.samples)
 	s.samples = append(s.samples, in...)
+	if err := s.persistLocked(); err != nil {
+		s.samples = s.samples[:before]
+		return before, err
+	}
 	return len(s.samples), nil
 }
 
@@ -241,8 +339,153 @@ func (s *Store) Train(epochs int, lr, threshold float64) (ml.Model, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := s.model
 	s.model = m
+	if err := s.persistLocked(); err != nil {
+		s.model = previous
+		return ml.Model{}, err
+	}
 	return m, nil
+}
+
+// PutReport records a node's datapath counters. A report for a node the
+// control plane does not know is dropped: without that the map would grow on
+// anything that can reach the endpoint.
+func (s *Store) PutReport(nodeID string, stats pipeline.Stats) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nodes[nodeID]
+	if !ok {
+		return false
+	}
+	if s.reports == nil {
+		s.reports = map[string]telemetry.Report{}
+	}
+	s.reports[nodeID] = telemetry.Report{
+		NodeID:     nodeID,
+		Name:       n.Name,
+		Region:     n.Region,
+		Stats:      stats,
+		ReportedAt: s.clock(),
+	}
+	return true
+}
+
+// Report returns one node's last reported counters.
+func (s *Store) Report(nodeID string) (telemetry.Report, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.reports[nodeID]
+	return r, ok
+}
+
+// Reports lists the datapath counters collected from the fleet, oldest node ID
+// first so a scrape is stable.
+func (s *Store) Reports() []telemetry.Report {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]telemetry.Report, 0, len(s.reports))
+	for _, r := range s.reports {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// IssueNodeToken mints a fresh credential for a node and returns it. The
+// plaintext is returned exactly once, at enrollment; only its hash is kept.
+//
+// Issuing replaces whatever the node had, so a restart rotates the credential
+// and an old one stops working the moment a new one is handed out.
+func (s *Store) IssueNodeToken(nodeID string) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generating a node credential: %w", err)
+	}
+	token := hex.EncodeToString(raw)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nodeTokens == nil {
+		s.nodeTokens = map[string]string{}
+		s.tokenNodes = map[string]string{}
+	}
+	if previous, ok := s.nodeTokens[nodeID]; ok {
+		delete(s.tokenNodes, previous)
+	}
+	sum := tokenHash(token)
+	s.nodeTokens[nodeID] = sum
+	s.tokenNodes[sum] = nodeID
+	if err := s.persistLocked(); err != nil {
+		// A credential the control plane cannot remember is worse than none:
+		// the agent would hold a key that stops working at the next restart.
+		delete(s.nodeTokens, nodeID)
+		delete(s.tokenNodes, sum)
+		return "", err
+	}
+	return token, nil
+}
+
+// NodeForToken resolves a presented credential to the node that holds it.
+//
+// The lookup is by hash, so the store never compares against a live secret and
+// a timing signal would only reveal something about the hash of a value the
+// caller already knows.
+func (s *Store) NodeForToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	sum := tokenHash(token)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.tokenNodes[sum]
+	return id, ok
+}
+
+// RevokeNodeToken drops a node's credential.
+func (s *Store) RevokeNodeToken(nodeID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sum, ok := s.nodeTokens[nodeID]
+	if !ok {
+		return false, nil
+	}
+	delete(s.nodeTokens, nodeID)
+	delete(s.tokenNodes, sum)
+	if err := s.persistLocked(); err != nil {
+		s.nodeTokens[nodeID] = sum
+		s.tokenNodes[sum] = nodeID
+		return false, err
+	}
+	return true, nil
+}
+
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// LastDeployedPolicy reports the policy the fabric was last compiled from, or
+// "" when nothing has been deployed yet.
+func (s *Store) LastDeployedPolicy() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastPolicyID
+}
+
+// WithdrawModel retires the published model. The zero model means "never
+// trained", which a node cannot tell from "retired", so the withdrawal is
+// explicit and nodes clear their copy when they see it.
+func (s *Store) WithdrawModel() (ml.Model, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.model
+	s.model = ml.Model{Withdrawn: true}
+	if err := s.persistLocked(); err != nil {
+		s.model = previous
+		return ml.Model{}, err
+	}
+	return s.model, nil
 }
 
 func (s *Store) Model() ml.Model {

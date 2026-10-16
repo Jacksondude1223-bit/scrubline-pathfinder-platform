@@ -11,6 +11,14 @@ import (
 
 const FeatureCount = 7
 
+// minHoldout is the smallest sample set worth splitting. Below it a holdout is
+// too small to say anything, so the fit uses every sample and reports its
+// metrics as training metrics.
+const minHoldout = 10
+
+// holdoutFraction is the share of samples reserved for evaluation.
+const holdoutFraction = 5 // one in five
+
 // MaxPort is the largest port number a flow record can carry.
 const MaxPort = 65535
 
@@ -26,8 +34,21 @@ type Model struct {
 	Epochs    int       `json:"epochs"`
 	Loss      float64   `json:"loss"`
 	Accuracy  float64   `json:"accuracy"`
-	Samples   int       `json:"samples"`
-	Ready     bool      `json:"ready"`
+	// Precision and Recall are the ones that matter operationally: a false
+	// positive here is dropped customer traffic. On an imbalanced attack/clean
+	// set, accuracy alone says very little.
+	Precision float64 `json:"precision"`
+	Recall    float64 `json:"recall"`
+	// Validation is the number of samples held out of the fit and scored
+	// against. Zero means the metrics are training metrics on too small a set
+	// to split.
+	Validation int  `json:"validation"`
+	Samples    int  `json:"samples"`
+	Ready      bool `json:"ready"`
+	// Withdrawn marks a model the control plane has explicitly retired. A node
+	// clears its installed copy when it sees this, which the zero model cannot
+	// signal because it is indistinguishable from "never trained".
+	Withdrawn bool `json:"withdrawn,omitempty"`
 }
 
 // ValidateFlow rejects flow records that cannot be turned into finite features.
@@ -77,6 +98,10 @@ func Features(f model.Flow) []float64 {
 // Train fits the logistic model. It returns an error when the sample set cannot
 // produce a usable model so the caller can report that instead of publishing a
 // degenerate one.
+//
+// Samples are split into a fit set and a holdout, and the reported metrics are
+// measured on the holdout. Scoring the fit on its own training data reported an
+// accuracy that said nothing about unseen traffic.
 func Train(samples []Sample, epochs int, lr, threshold float64) (Model, error) {
 	if len(samples) == 0 {
 		return Model{}, errors.New("no samples to train on")
@@ -95,12 +120,14 @@ func Train(samples []Sample, epochs int, lr, threshold float64) (Model, error) {
 	if threshold <= 0 {
 		threshold = 0.7
 	}
+
+	fit, holdout := split(samples)
 	w := make([]float64, FeatureCount)
 	bias := 0.0
 	loss := 0.0
 	for ep := 0; ep < epochs; ep++ {
 		loss = 0
-		for _, s := range samples {
+		for _, s := range fit {
 			x := Features(s.Flow)
 			p := sigmoid(dot(w, x) + bias)
 			y := float64(s.Label)
@@ -111,25 +138,78 @@ func Train(samples []Sample, epochs int, lr, threshold float64) (Model, error) {
 			}
 			bias -= lr * err
 		}
-		loss /= float64(len(samples))
+		loss /= float64(len(fit))
 	}
 	fitted := Model{
 		Weights: w, Bias: bias, Threshold: threshold, Epochs: epochs,
-		Loss: loss, Samples: len(samples), Ready: true,
+		Loss: loss, Samples: len(samples), Validation: len(holdout), Ready: true,
 	}
 	// A divergent learning rate can still push the weights to Inf or NaN. Catch
 	// that here rather than shipping a model that scores every flow as NaN.
 	if err := checkFinite(fitted); err != nil {
 		return Model{}, err
 	}
-	correct := 0
+
+	scored := holdout
+	if len(scored) == 0 {
+		scored = fit
+	}
+	fitted.Accuracy, fitted.Precision, fitted.Recall = evaluate(fitted, scored)
+	return fitted, nil
+}
+
+// split reserves one sample in holdoutFraction for evaluation. The pick is
+// deterministic so the same sample set always reports the same metrics, and
+// it strides rather than cuts so an ordered set does not put every attack
+// sample on one side.
+func split(samples []Sample) (fit, holdout []Sample) {
+	if len(samples) < minHoldout {
+		return samples, nil
+	}
+	fit = make([]Sample, 0, len(samples))
+	holdout = make([]Sample, 0, len(samples)/holdoutFraction+1)
+	for i, s := range samples {
+		if i%holdoutFraction == holdoutFraction-1 {
+			holdout = append(holdout, s)
+			continue
+		}
+		fit = append(fit, s)
+	}
+	if len(holdout) == 0 || len(fit) == 0 {
+		return samples, nil
+	}
+	return fit, holdout
+}
+
+// evaluate scores a fitted model against a sample set. Precision and recall are
+// reported for the attack class.
+func evaluate(m Model, samples []Sample) (accuracy, precision, recall float64) {
+	if len(samples) == 0 {
+		return 0, 0, 0
+	}
+	var correct, truePos, falsePos, falseNeg int
 	for _, s := range samples {
-		if Predict(fitted, s.Flow) == s.Label {
+		predicted := Predict(m, s.Flow)
+		if predicted == s.Label {
 			correct++
 		}
+		switch {
+		case predicted == 1 && s.Label == 1:
+			truePos++
+		case predicted == 1 && s.Label == 0:
+			falsePos++
+		case predicted == 0 && s.Label == 1:
+			falseNeg++
+		}
 	}
-	fitted.Accuracy = float64(correct) / float64(len(samples))
-	return fitted, nil
+	accuracy = float64(correct) / float64(len(samples))
+	if truePos+falsePos > 0 {
+		precision = float64(truePos) / float64(truePos+falsePos)
+	}
+	if truePos+falseNeg > 0 {
+		recall = float64(truePos) / float64(truePos+falseNeg)
+	}
+	return accuracy, precision, recall
 }
 
 func checkFinite(m Model) error {

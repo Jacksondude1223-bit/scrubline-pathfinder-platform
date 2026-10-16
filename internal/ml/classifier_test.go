@@ -131,3 +131,72 @@ func TestScoreRejectsWeightLengthMismatch(t *testing.T) {
 		t.Fatalf("expected 0 for a model whose weight count does not match FeatureCount, got %v", got)
 	}
 }
+
+// Accuracy used to be measured on the samples the model was fitted on, which
+// says nothing about unseen traffic.
+func TestMetricsAreMeasuredOnAHoldout(t *testing.T) {
+	var samples []Sample
+	for i := 0; i < 50; i++ {
+		samples = append(samples, Sample{Flow: model.Flow{Proto: "tcp", DPort: 443, SPort: 40000 + i, PPS: 40}, Label: 0})
+		samples = append(samples, Sample{Flow: model.Flow{Proto: "udp", DPort: 19132, SPort: 1000 + i, PPS: 300000}, Label: 1})
+	}
+	m, err := Train(samples, 300, 0.2, 0.6)
+	if err != nil {
+		t.Fatalf("Train: %v", err)
+	}
+	if m.Validation == 0 {
+		t.Fatal("expected samples to be held out of the fit")
+	}
+	if m.Validation >= m.Samples {
+		t.Fatalf("the holdout cannot be the whole set: %d of %d", m.Validation, m.Samples)
+	}
+	if m.Samples != len(samples) {
+		t.Fatalf("expected Samples to count the whole set, got %d", m.Samples)
+	}
+	// This set is cleanly separable, so holdout metrics should still be strong.
+	if m.Accuracy < 0.9 || m.Precision < 0.9 || m.Recall < 0.9 {
+		t.Fatalf("expected strong holdout metrics, got acc=%.2f prec=%.2f recall=%.2f", m.Accuracy, m.Precision, m.Recall)
+	}
+}
+
+// Below the split threshold there is nothing useful to hold out, so the fit
+// uses every sample and says so by reporting no validation set.
+func TestTinySampleSetsAreNotSplit(t *testing.T) {
+	samples := []Sample{
+		{Flow: model.Flow{Proto: "tcp", PPS: 10}, Label: 0},
+		{Flow: model.Flow{Proto: "udp", Flags: "syn", PPS: 400000}, Label: 1},
+	}
+	m, err := Train(samples, 100, 0.2, 0.6)
+	if err != nil {
+		t.Fatalf("Train: %v", err)
+	}
+	if m.Validation != 0 {
+		t.Fatalf("expected no holdout for %d samples, got %d", len(samples), m.Validation)
+	}
+	if !m.Ready {
+		t.Fatal("expected a usable model")
+	}
+}
+
+// Precision is the one that costs customers: a false positive is dropped
+// legitimate traffic. A model that labels everything an attack must not report
+// a flattering number.
+func TestPrecisionReflectsFalsePositives(t *testing.T) {
+	m := Model{Weights: make([]float64, FeatureCount), Bias: 50, Threshold: 0.5, Ready: true}
+	samples := []Sample{
+		{Flow: model.Flow{Proto: "tcp", PPS: 10}, Label: 0},
+		{Flow: model.Flow{Proto: "tcp", PPS: 20}, Label: 0},
+		{Flow: model.Flow{Proto: "tcp", PPS: 30}, Label: 0},
+		{Flow: model.Flow{Proto: "udp", PPS: 400000}, Label: 1},
+	}
+	accuracy, precision, recall := evaluate(m, samples)
+	if recall != 1 {
+		t.Fatalf("a model that labels everything an attack catches every attack: recall %.2f", recall)
+	}
+	if precision != 0.25 {
+		t.Fatalf("expected precision 0.25 with three false positives, got %.2f", precision)
+	}
+	if accuracy != 0.25 {
+		t.Fatalf("expected accuracy 0.25, got %.2f", accuracy)
+	}
+}

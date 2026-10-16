@@ -1,4 +1,4 @@
-.PHONY: build test demo
+.PHONY: build test bench certs demo
 
 build:
 	mkdir -p bin
@@ -6,8 +6,17 @@ build:
 	go build -o bin/scrub-node ./cmd/scrub-node
 	go build -o bin/scrubctl ./cmd/scrubctl
 
+# -race is the cheap safety net for the Pipeline and Store, both of which are
+# written for concurrent use.
 test:
-	go test ./...
+	go test -race ./...
+
+# Throwaway CA and server certificate for trying TLS locally. Not for deployment.
+certs:
+	go run scripts/gen-dev-certs.go -dir certs -host 127.0.0.1,localhost
+
+bench:
+	go test -run xxx -bench . -benchmem ./internal/pipeline/
 
 # Each recipe line runs in its own shell, so a backgrounded server started on one
 # line cannot be reached by "kill %1" on the next: the API was left running and
@@ -16,8 +25,10 @@ test:
 demo: build
 	@set -e; \
 	SCRUBLINE_API_TOKEN=$${SCRUBLINE_API_TOKEN:-dev-scrubline-token}; \
-	export SCRUBLINE_API_TOKEN; \
-	./bin/scrub-api -addr 127.0.0.1:8080 & \
+	SCRUBLINE_ENROLL_TOKEN=$${SCRUBLINE_ENROLL_TOKEN:-dev-scrubline-enroll}; \
+	export SCRUBLINE_API_TOKEN SCRUBLINE_ENROLL_TOKEN; \
+	state=$$(mktemp -d)/state.json; \
+	./bin/scrub-api -addr 127.0.0.1:8080 -state $$state & \
 	api_pid=$$!; \
 	trap 'kill $$api_pid 2>/dev/null || true; wait $$api_pid 2>/dev/null || true' EXIT INT TERM; \
 	for i in $$(seq 1 50); do \

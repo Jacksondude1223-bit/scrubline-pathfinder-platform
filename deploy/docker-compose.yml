@@ -4,10 +4,16 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
+      SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
+      SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
     ports:
       - "8080:8080"
-    command: ["scrub-api", "-addr", "0.0.0.0:8080"]
+    # -insecure is for this single-host demo only. The compose network is not
+    # loopback, so without it the control plane refuses to serve in the clear.
+    # In a deployment, mount a certificate and pass -tls-cert/-tls-key.
+    command: ["scrub-api", "-addr", "0.0.0.0:8080", "-insecure", "-state", "/var/lib/scrubline/state.json"]
+    volumes:
+      - api-state:/var/lib/scrubline
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 2s
@@ -27,8 +33,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
-    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-a", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
+      SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
+      SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-a", "-advertise", "node-a:9091", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
     ports:
       - "9091:9091"
     depends_on:
@@ -41,8 +48,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
-    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-b", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
+      SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
+      SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-b", "-advertise", "node-b:9091", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
     ports:
       - "9092:9091"
     depends_on:
@@ -55,11 +63,15 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
-    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-c", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
+      SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
+      SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-c", "-advertise", "node-c:9091", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
     ports:
       - "9093:9091"
     depends_on:
       api:
         condition: service_healthy
     restart: on-failure
+
+volumes:
+  api-state:

@@ -2,9 +2,32 @@ openapi: 3.0.3
 info:
   title: Scrubline Cloud API
   version: 0.1.0
-  description: Control plane for the distributed scrubbing fabric. Drop path is ASIC/TCAM ACLs, FPGA, and PF_RING ZC. Not XDP.
+  description: >-
+    Control plane for the distributed scrubbing fabric. Drop path is ASIC/TCAM
+    ACLs, FPGA, and PF_RING ZC. Not XDP.
+
+    Three bearer credentials. The operator token reaches every endpoint. The
+    enrollment token may only POST /v1/nodes/register. A node credential,
+    issued at registration, may heartbeat and read the program for its own
+    node id, and read /v1/ml/model; anything else is 403.
 servers:
-  - url: http://127.0.0.1:8080
+  - url: https://127.0.0.1:8080
+components:
+  securitySchemes:
+    operatorToken:
+      type: http
+      scheme: bearer
+      description: Full control-plane access.
+    enrollToken:
+      type: http
+      scheme: bearer
+      description: Registers a node and collects its credential. Nothing else.
+    nodeToken:
+      type: http
+      scheme: bearer
+      description: Issued at registration, scoped to one node.
+security:
+  - operatorToken: []
 paths:
   /health:
     get:
@@ -14,10 +37,35 @@ paths:
       summary: List scrubbing nodes
   /v1/nodes/register:
     post:
-      summary: Register a node and its hardware backends
+      summary: Register a node, and issue the credential scoped to it
+      security:
+        - enrollToken: []
+        - operatorToken: []
+      description: >-
+        capacity_gbps weights the node's AS-path padding against the rest of
+        the fabric. capacity_pps is the packet-rate ceiling load-driven
+        shedding measures against; a node that declares none is never padded
+        for load.
+  /metrics:
+    get:
+      summary: Prometheus exposition for the control plane and the reporting fleet
+      description: Takes the same bearer token as /v1. Node series are built from the counters each node attached to its heartbeat.
+  /v1/nodes/{id}/stats:
+    get:
+      summary: Datapath counters a node last reported
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
   /v1/nodes/{id}/heartbeat:
     post:
       summary: Keep a node live; a node past its TTL is not assigned prefixes
+      description: >-
+        The body is optional and may carry the node's datapath counters as a
+        "stats" object. The report is keyed to the node the path names, not to
+        anything in the body.
       parameters:
         - name: id
           in: path
@@ -38,6 +86,10 @@ paths:
       summary: List policies
     post:
       summary: Create or replace a policy
+      description: >-
+        Carries protected prefixes, stage rules, and optional per-prefix
+        steering. Steering regions are a hard boundary, and communities are
+        validated here because the agents write them into a routing daemon.
   /v1/policies/{id}/deploy:
     post:
       summary: Compile policy onto the fabric and assign prefixes to live nodes
@@ -47,9 +99,22 @@ paths:
           required: true
           schema:
             type: string
+  /v1/state:
+    get:
+      summary: The durable control-plane state a replica follows
+      description: >-
+        Operator only. Carries every policy and every node credential hash, so
+        it is not reachable with a node or enrollment credential.
+  /v1/promote:
+    post:
+      summary: Turn a replica into the primary
+      description: >-
+        Operator only, and deliberate. Promoting while the old primary still
+        lives gives two control planes compiling conflicting announcement
+        plans, so the old one must be fenced first.
   /v1/fabric:
     get:
-      summary: Assignments plus compiled ASIC, FPGA, and ZC programs
+      summary: The BGP announcement plan plus compiled ASIC, FPGA, and ZC programs
   /v1/decide:
     post:
       summary: Run a flow record through a node's three-stage pipeline
@@ -62,15 +127,10 @@ paths:
     post:
       summary: Train the logistic flow model used on the PF_RING ZC path
   /v1/ml/model:
+    delete:
+      summary: Retire the published model; agents clear their copy on the next poll
     get:
       summary: Current model weights and threshold
   /v1/ml/score:
     post:
       summary: Score one flow without running the hardware stages
-components:
-  securitySchemes:
-    bearerAuth:
-      type: http
-      scheme: bearer
-security:
-  - bearerAuth: []
