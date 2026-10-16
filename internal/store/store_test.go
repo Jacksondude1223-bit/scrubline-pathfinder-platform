@@ -7,6 +7,7 @@ import (
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 )
 
 // Joining the id parts without a separator made ("scrub","ab") and
@@ -282,5 +283,40 @@ func TestWithdrawModelIsDistinguishableFromUntrained(t *testing.T) {
 	}
 	if got := s.Model(); got.Ready || !got.Withdrawn {
 		t.Fatalf("the withdrawal was not published: %+v", got)
+	}
+}
+
+// Reports are keyed to a known node, so the map stays bounded by the node set.
+func TestReportsAreOnlyKeptForKnownNodes(t *testing.T) {
+	s := New()
+	node, _, err := s.UpsertNode(model.Node{Name: "scrub-a", Region: "iad"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if ok := s.PutReport("node-nope", pipeline.Stats{Decisions: 5}); ok {
+		t.Fatal("a report for an unknown node should be dropped")
+	}
+	if got := len(s.Reports()); got != 0 {
+		t.Fatalf("expected no reports, got %d", got)
+	}
+	if ok := s.PutReport(node.ID, pipeline.Stats{Decisions: 5}); !ok {
+		t.Fatal("a report for a known node should be kept")
+	}
+	reports := s.Reports()
+	if len(reports) != 1 {
+		t.Fatalf("expected one report, got %d", len(reports))
+	}
+	// Identity comes from the node record, not from the reporter.
+	if reports[0].NodeID != node.ID || reports[0].Name != "scrub-a" || reports[0].Region != "iad" {
+		t.Fatalf("unexpected report identity %+v", reports[0])
+	}
+	if reports[0].ReportedAt.IsZero() {
+		t.Fatal("expected the report to be stamped")
+	}
+
+	// A later report replaces the previous one rather than accumulating.
+	s.PutReport(node.ID, pipeline.Stats{Decisions: 9})
+	if got := s.Reports(); len(got) != 1 || got[0].Stats.Decisions != 9 {
+		t.Fatalf("expected the report to be replaced, got %+v", got)
 	}
 }

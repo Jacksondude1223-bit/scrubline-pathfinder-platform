@@ -15,9 +15,26 @@ paths:
   /v1/nodes/register:
     post:
       summary: Register a node and its hardware backends
+  /metrics:
+    get:
+      summary: Prometheus exposition for the control plane and the reporting fleet
+      description: Takes the same bearer token as /v1. Node series are built from the counters each node attached to its heartbeat.
+  /v1/nodes/{id}/stats:
+    get:
+      summary: Datapath counters a node last reported
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
   /v1/nodes/{id}/heartbeat:
     post:
       summary: Keep a node live; a node past its TTL is not assigned prefixes
+      description: >-
+        The body is optional and may carry the node's datapath counters as a
+        "stats" object. The report is keyed to the node the path names, not to
+        anything in the body.
       parameters:
         - name: id
           in: path

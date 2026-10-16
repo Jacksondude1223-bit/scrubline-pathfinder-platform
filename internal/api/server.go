@@ -12,15 +12,19 @@ import (
 	"net/http"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/compiler"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/metrics"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 )
 
 // maxBody bounds every request body. Policies and sample batches are the large
@@ -32,9 +36,23 @@ const maxBody = 4 << 20
 // program, and a node that dies would keep its prefixes assigned to it.
 const ReconcileInterval = 5 * time.Second
 
+// requestKey is one bucket of the API request counter. Route names come from
+// the dispatch switch rather than the raw path, so the label set stays bounded.
+type requestKey struct {
+	route  string
+	status int
+}
+
 type Server struct {
 	Token string
 	Store *store.Store
+
+	// requestsMu guards the API request counters.
+	requestsMu sync.Mutex
+	requests   map[requestKey]uint64
+	// recompiles counts fabric recompiles, so an operator can see the control
+	// plane reacting to membership churn.
+	recompiles atomic.Uint64
 
 	// reconcileMu serialises recompiles so two membership changes cannot
 	// compile competing fabrics.
@@ -103,6 +121,7 @@ func (s *Server) applyDeploy(policy model.Policy, nodes []model.Node) ([]model.A
 	s.Store.PutDeploy(policy.ID, assigned, programs)
 	s.lastLive = fingerprint(nodes)
 	s.prunePipelines(programs)
+	s.recompiles.Add(1)
 	return assigned, programs
 }
 
@@ -154,71 +173,280 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "product": "scrubline-cloud", "datapath": "asic-tcam+fpga+pfring-zc+ml"})
 	})
+	mux.HandleFunc("/metrics", s.metrics)
 	mux.HandleFunc("/v1/", s.route)
 	return mux
 }
 
-func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+// metrics exposes the control plane's own view plus the datapath counters the
+// fleet reported on its heartbeats. It takes the same bearer token as the rest
+// of the control plane: rule IDs and traffic volumes are not public.
+func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(r) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
 		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+		return
+	}
+	var buf bytes.Buffer
+	families := append(s.controlFamilies(), telemetry.Families(s.Store.Reports(), time.Now().UTC())...)
+	if err := metrics.Write(&buf, families); err != nil {
+		log.Printf("api: rendering metrics failed: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
+		return
+	}
+	w.Header().Set("Content-Type", metrics.ContentType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+}
+
+// controlFamilies describes the control plane itself: what it knows about the
+// fleet, what it last compiled, and how its own API is answering.
+func (s *Server) controlFamilies() []metrics.Family {
+	nodes := s.Store.Nodes()
+	ready, stale := 0, 0
+	prefixes := metrics.Family{
+		Name: "scrubline_node_prefixes", Type: metrics.Gauge,
+		Help: "Protected prefixes assigned to a node. Zero means the node is enforcing nothing.",
+	}
+	for _, n := range nodes {
+		if n.Status == model.NodeStale {
+			stale++
+		} else {
+			ready++
+		}
+		prog, ok := s.Store.Program(n.ID)
+		if !ok {
+			continue
+		}
+		prefixes.Samples = append(prefixes.Samples, metrics.Sample{
+			Labels: []metrics.Label{{Name: "node", Value: n.ID}, {Name: "name", Value: n.Name}, {Name: "region", Value: n.Region}},
+			Value:  float64(len(prog.Prefixes)),
+		})
+	}
+
+	assignments, programs := s.Store.Fabric()
+	m := s.Store.Model()
+
+	families := []metrics.Family{
+		{
+			Name: "scrubline_nodes", Type: metrics.Gauge,
+			Help: "Registered nodes by liveness. A stale node is skipped by prefix assignment.",
+			Samples: []metrics.Sample{
+				{Labels: []metrics.Label{{Name: "status", Value: model.NodeReady}}, Value: float64(ready)},
+				{Labels: []metrics.Label{{Name: "status", Value: model.NodeStale}}, Value: float64(stale)},
+			},
+		},
+		{
+			Name: "scrubline_policies", Type: metrics.Gauge, Help: "Policies held by the control plane.",
+			Samples: []metrics.Sample{{Value: float64(len(s.Store.Policies()))}},
+		},
+		{
+			Name: "scrubline_assignments", Type: metrics.Gauge, Help: "Prefix-to-node assignments in the current fabric.",
+			Samples: []metrics.Sample{{Value: float64(len(assignments))}},
+		},
+		{
+			Name: "scrubline_programs", Type: metrics.Gauge, Help: "Nodes holding a compiled program.",
+			Samples: []metrics.Sample{{Value: float64(len(programs))}},
+		},
+		{
+			Name: "scrubline_fabric_recompiles_total", Type: metrics.Counter,
+			Help:    "Fabric recompiles, including those triggered by a node joining, recovering, or going stale.",
+			Samples: []metrics.Sample{{Value: float64(s.recompiles.Load())}},
+		},
+		prefixes,
+		{
+			Name: "scrubline_control_ml_model_ready", Type: metrics.Gauge,
+			Help:    "1 when the control plane is publishing a fitted classifier.",
+			Samples: []metrics.Sample{{Value: boolValue(m.Ready)}},
+		},
+		{
+			Name: "scrubline_control_ml_samples", Type: metrics.Gauge, Help: "Labeled samples held for training.",
+			Samples: []metrics.Sample{{Value: float64(m.Samples)}},
+		},
+		{
+			Name: "scrubline_control_ml_validation_samples", Type: metrics.Gauge,
+			Help:    "Samples held out of the fit and scored against. Zero means the set was too small to split.",
+			Samples: []metrics.Sample{{Value: float64(m.Validation)}},
+		},
+		{
+			Name: "scrubline_control_ml_accuracy", Type: metrics.Gauge, Help: "Holdout accuracy of the published model.",
+			Samples: []metrics.Sample{{Value: m.Accuracy}},
+		},
+		{
+			Name: "scrubline_control_ml_precision", Type: metrics.Gauge,
+			Help:    "Holdout precision of the published model. A false positive here is dropped customer traffic.",
+			Samples: []metrics.Sample{{Value: m.Precision}},
+		},
+		{
+			Name: "scrubline_control_ml_recall", Type: metrics.Gauge, Help: "Holdout recall of the published model.",
+			Samples: []metrics.Sample{{Value: m.Recall}},
+		},
+	}
+	return append(families, s.requestFamily())
+}
+
+func (s *Server) requestFamily() metrics.Family {
+	s.requestsMu.Lock()
+	defer s.requestsMu.Unlock()
+	fam := metrics.Family{
+		Name: "scrubline_api_requests_total", Type: metrics.Counter,
+		Help: "Control-plane API requests by route and response status.",
+	}
+	for k, v := range s.requests {
+		fam.Samples = append(fam.Samples, metrics.Sample{
+			Labels: []metrics.Label{
+				{Name: "route", Value: k.route},
+				{Name: "status", Value: strconv.Itoa(k.status)},
+			},
+			Value: float64(v),
+		})
+	}
+	return fam
+}
+
+func boolValue(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// statusRecorder remembers the status a handler wrote, so a request can be
+// counted by outcome.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	route := s.dispatch(rec, r)
+	s.requestsMu.Lock()
+	if s.requests == nil {
+		s.requests = map[requestKey]uint64{}
+	}
+	s.requests[requestKey{route: route, status: rec.status}]++
+	s.requestsMu.Unlock()
+}
+
+// dispatch handles one request and returns the route name it matched, which is
+// what the request counter is labeled by. Returning a name from the switch
+// keeps the label set bounded and in step with the routing.
+func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
+	if !s.auth(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+		return "unauthorized"
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/v1/")
 	switch {
 	case r.Method == http.MethodPost && path == "nodes/register":
 		s.register(w, r)
+		return "nodes/register"
 	case r.Method == http.MethodPost && hasSubpath(path, "nodes", "heartbeat"):
 		id, _ := subpathID(path, "nodes", "heartbeat")
-		known, revived := s.Store.Heartbeat(id)
-		if !known {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown node"})
-			return
-		}
-		if revived {
-			// The node is back in the live set, so it needs a program again.
-			s.reconcile()
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		s.heartbeat(w, r, id)
+		return "nodes/heartbeat"
 	case r.Method == http.MethodGet && path == "nodes":
 		writeJSON(w, http.StatusOK, s.Store.Nodes())
+		return "nodes"
 	case r.Method == http.MethodGet && hasSubpath(path, "nodes", "program"):
 		id, _ := subpathID(path, "nodes", "program")
 		prog, found := s.Store.Program(id)
 		if !found {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no program deployed"})
-			return
+			return "nodes/program"
 		}
 		writeJSON(w, http.StatusOK, prog)
+		return "nodes/program"
+	case r.Method == http.MethodGet && hasSubpath(path, "nodes", "stats"):
+		id, _ := subpathID(path, "nodes", "stats")
+		report, found := s.Store.Report(id)
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no counters reported for this node"})
+			return "nodes/stats"
+		}
+		writeJSON(w, http.StatusOK, report)
+		return "nodes/stats"
 	case r.Method == http.MethodPost && path == "policies":
 		s.savePolicy(w, r)
+		return "policies"
 	case r.Method == http.MethodGet && path == "policies":
 		writeJSON(w, http.StatusOK, s.Store.Policies())
+		return "policies"
 	case r.Method == http.MethodPost && hasSubpath(path, "policies", "deploy"):
 		id, _ := subpathID(path, "policies", "deploy")
 		s.deploy(w, id)
+		return "policies/deploy"
 	case r.Method == http.MethodGet && path == "fabric":
 		assignments, programs := s.Store.Fabric()
 		writeJSON(w, http.StatusOK, map[string]any{"assignments": assignments, "programs": programs, "ml": s.Store.Model()})
+		return "fabric"
 	case r.Method == http.MethodPost && path == "ml/samples":
 		s.addSamples(w, r)
+		return "ml/samples"
 	case r.Method == http.MethodGet && path == "ml/samples":
 		writeJSON(w, http.StatusOK, s.Store.Samples())
+		return "ml/samples"
 	case r.Method == http.MethodPost && path == "ml/train":
 		s.train(w, r)
+		return "ml/train"
 	case r.Method == http.MethodGet && path == "ml/model":
 		writeJSON(w, http.StatusOK, s.Store.Model())
+		return "ml/model"
 	case r.Method == http.MethodDelete && path == "ml/model":
 		// Explicitly retire a model. Nodes clear their installed copy on the
 		// next poll; without this a bad model could only be removed by
 		// restarting every agent in the fleet.
 		writeJSON(w, http.StatusOK, s.Store.WithdrawModel())
+		return "ml/model"
 	case r.Method == http.MethodPost && path == "ml/score":
 		s.score(w, r)
+		return "ml/score"
 	case r.Method == http.MethodPost && path == "decide":
 		s.decide(w, r)
+		return "decide"
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return "unknown"
 	}
+}
+
+// heartbeat keeps a node live and takes the datapath counters it attached. The
+// body is optional: an agent that sends none still heartbeats.
+func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, id string) {
+	var body struct {
+		Stats pipeline.Stats `json:"stats"`
+	}
+	reported := false
+	if err := decode(r, &body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	} else if err == nil {
+		reported = true
+	}
+	known, revived := s.Store.Heartbeat(id)
+	if !known {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown node"})
+		return
+	}
+	// The node's identity comes from the record the control plane already
+	// holds, not from the body, so a report cannot claim to be another node.
+	if reported {
+		s.Store.PutReport(id, body.Stats)
+	}
+	if revived {
+		// The node is back in the live set, so it needs a program again.
+		s.reconcile()
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // hasSubpath reports whether path is exactly "{collection}/{id}/{leaf}".

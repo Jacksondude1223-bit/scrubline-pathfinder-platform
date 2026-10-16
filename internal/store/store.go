@@ -11,6 +11,8 @@ import (
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 )
 
 const (
@@ -45,6 +47,9 @@ type Store struct {
 	// recompiled against it when the live node set changes, so a node that
 	// joins or recovers after a deploy is not left without a program.
 	lastPolicyID string
+	// reports holds the datapath counters each node last sent with its
+	// heartbeat, keyed by node ID so the map stays bounded by the node set.
+	reports map[string]telemetry.Report
 	// now is swapped out in tests; production always uses the wall clock.
 	now func() time.Time
 }
@@ -54,6 +59,7 @@ func New() *Store {
 		nodes:    map[string]*model.Node{},
 		policies: map[string]*model.Policy{},
 		programs: map[string]*model.Program{},
+		reports:  map[string]telemetry.Report{},
 		now:      func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -272,6 +278,50 @@ func (s *Store) Train(epochs int, lr, threshold float64) (ml.Model, error) {
 	defer s.mu.Unlock()
 	s.model = m
 	return m, nil
+}
+
+// PutReport records a node's datapath counters. A report for a node the
+// control plane does not know is dropped: without that the map would grow on
+// anything that can reach the endpoint.
+func (s *Store) PutReport(nodeID string, stats pipeline.Stats) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nodes[nodeID]
+	if !ok {
+		return false
+	}
+	if s.reports == nil {
+		s.reports = map[string]telemetry.Report{}
+	}
+	s.reports[nodeID] = telemetry.Report{
+		NodeID:     nodeID,
+		Name:       n.Name,
+		Region:     n.Region,
+		Stats:      stats,
+		ReportedAt: s.clock(),
+	}
+	return true
+}
+
+// Report returns one node's last reported counters.
+func (s *Store) Report(nodeID string) (telemetry.Report, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.reports[nodeID]
+	return r, ok
+}
+
+// Reports lists the datapath counters collected from the fleet, oldest node ID
+// first so a scrape is stable.
+func (s *Store) Reports() []telemetry.Report {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]telemetry.Report, 0, len(s.reports))
+	for _, r := range s.reports {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
 }
 
 // LastDeployedPolicy reports the policy the fabric was last compiled from, or

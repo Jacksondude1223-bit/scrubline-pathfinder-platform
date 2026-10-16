@@ -64,6 +64,44 @@ curl -H "Authorization: Bearer dev-scrubline-token" \
   http://127.0.0.1:9091/decide
 ```
 
+## Observability
+
+Both binaries expose Prometheus metrics at `/metrics`. The exposition carries
+rule IDs and traffic volumes, so it takes the same bearer token as the rest of
+the control plane — configure the scraper with it. `/health` stays open for
+liveness probes.
+
+A node counts what its datapath did and attaches those counters to the
+heartbeat it already sends every couple of seconds, so the control plane has a
+fleet view without a second round trip. Both ends render the same metric names,
+one series per node, so a dashboard written against a node works against the
+control plane.
+
+The counters that answer "is mitigation working, and which rule is doing the
+work":
+
+- `scrubline_rule_matches_total{node,stage,rule}` and `scrubline_rule_drops_total{...}` — per rule. A rule with matches and no drops is seeing traffic it is not acting on; a rule with neither is dead weight in the policy.
+- `scrubline_stage_dropped_total{node,stage}` and `scrubline_stage_permitted_total{...}` — where in the pipeline traffic is being decided. Work moving from `asic` toward `zc` means the cheap stages are missing it.
+- `scrubline_*_pps_total` — the same counts weighted by the per-flow rate reported on each decision. A volume indicator, not a packet counter.
+- `scrubline_unowned_flows_total{node}` — flows for a prefix the node was not assigned. A rising value means the steering layer and the fabric disagree about who scrubs what.
+- `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
+- `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
+
+Counters survive a reprogram for rules that stay in the policy, so a poll every
+two seconds does not reset the series. A rule that is removed, or moved to
+another stage, takes its series with it.
+
+The control plane also reports its own view: `scrubline_nodes{status}`,
+`scrubline_assignments`, `scrubline_programs`, `scrubline_node_prefixes{node}`
+(zero means the node is enforcing nothing), `scrubline_fabric_recompiles_total`,
+the published model's holdout metrics, and
+`scrubline_api_requests_total{route,status}`.
+
+```sh
+curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN" http://127.0.0.1:8080/metrics
+curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN" http://127.0.0.1:9091/metrics
+```
+
 ## API
 
 Bearer token is `SCRUBLINE_API_TOKEN`. Spec is in `api/openapi.yaml`. The token is required: an empty one is a misconfiguration, not a way to open the control plane. The node agent's own `/decide` takes the same bearer token; its `/health` is open for liveness probes.
@@ -74,8 +112,10 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `GET /v1/nodes`
 - `POST /v1/policies` protected prefixes and stage rules
 - `POST /v1/policies/{id}/deploy` assign prefixes across live nodes and compile ASIC, FPGA, ZC programs
-- `POST /v1/nodes/{id}/heartbeat` keep a node live
+- `POST /v1/nodes/{id}/heartbeat` keep a node live; the body optionally carries the node's datapath counters
+- `GET /v1/nodes/{id}/stats` the counters a node last reported
 - `GET /v1/fabric` assignments and compiled programs
+- `GET /metrics` Prometheus exposition for the control plane and the fleet
 - `GET /v1/nodes/{id}/program` what a node agent installs
 - `POST /v1/decide` run a flow record through a node's pipeline
 - `POST /v1/ml/samples` labeled flow records (`label` 0 clean, 1 attack)

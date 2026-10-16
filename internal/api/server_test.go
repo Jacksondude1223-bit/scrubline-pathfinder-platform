@@ -472,3 +472,142 @@ func TestModelCanBeWithdrawn(t *testing.T) {
 		t.Fatalf("the withdrawal was not published to agents: %v", after)
 	}
 }
+
+func scrape(t *testing.T, h http.Handler) string {
+	t.Helper()
+	rec := do(t, h, http.MethodGet, "/metrics", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("unexpected content type %q", ct)
+	}
+	return rec.Body.String()
+}
+
+// Rule IDs and traffic volumes are not public.
+func TestMetricsRequiresTheToken(t *testing.T) {
+	_, h := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for an unauthenticated scrape, got %d", rec.Code)
+	}
+}
+
+func TestMetricsDescribeTheControlPlane(t *testing.T) {
+	_, h := newTestAPI()
+	registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	out := scrape(t, h)
+	for _, want := range []string{
+		`scrubline_nodes{status="ready"} 1`,
+		`scrubline_nodes{status="stale"} 0`,
+		"scrubline_policies 1",
+		"scrubline_assignments 1",
+		"scrubline_programs 1",
+		`scrubline_node_prefixes{node=`,
+		"scrubline_fabric_recompiles_total 1",
+		"scrubline_control_ml_model_ready 0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in scrape:\n%s", want, out)
+		}
+	}
+}
+
+// The control plane can only answer "is mitigation working" if nodes tell it
+// what their datapath did.
+func TestHeartbeatCarriesDatapathCounters(t *testing.T) {
+	_, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	body := `{"stats":{"decisions":40,"unowned":2,
+	  "stages":[{"stage":"asic","dropped":10,"permitted":0,"pps_dropped":5000,"pps_permitted":0}],
+	  "rules":[{"rule_id":"zc-cap","stage":"zc","matches":9,"drops":4,"pps_seen":900,"pps_dropped":400}],
+	  "ml":{"ready":false,"scored":0,"drops":0,"passes":0},
+	  "rate_buckets":7,"rate_buckets_max":65536}}`
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", body), http.StatusOK)
+
+	reported := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+node+"/stats", ""), http.StatusOK)
+	if reported["node_id"] != node {
+		t.Fatalf("expected the report keyed to the node, got %v", reported)
+	}
+
+	out := scrape(t, h)
+	for _, want := range []string{
+		`scrubline_decisions_total{node="` + node + `",name="scrub-a",region="iad"} 40`,
+		`scrubline_rule_drops_total{node="` + node + `",name="scrub-a",region="iad",stage="zc",rule="zc-cap"} 4`,
+		`scrubline_stage_dropped_pps_total{node="` + node + `",name="scrub-a",region="iad",stage="asic"} 5000`,
+		"scrubline_report_age_seconds{node=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in scrape:\n%s", want, out)
+		}
+	}
+}
+
+// An agent that sends no counters still heartbeats.
+func TestHeartbeatWithoutCountersStillWorks(t *testing.T) {
+	_, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", ""), http.StatusOK)
+	if rec := do(t, h, http.MethodGet, "/v1/nodes/"+node+"/stats", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("expected no report to be recorded, got %d", rec.Code)
+	}
+}
+
+func TestHeartbeatRejectsAMalformedReport(t *testing.T) {
+	_, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	rec := do(t, h, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", `{"stats":`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed body, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A report for a node the control plane does not know must not be recorded;
+// otherwise the map grows on anything that can reach the endpoint.
+func TestReportForAnUnknownNodeIsNotRecorded(t *testing.T) {
+	s, h := newTestAPI()
+	rec := do(t, h, http.MethodPost, "/v1/nodes/node-nope/heartbeat", `{"stats":{"decisions":1}}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown node, got %d", rec.Code)
+	}
+	if got := len(s.Store.Reports()); got != 0 {
+		t.Fatalf("expected no reports to be stored, got %d", got)
+	}
+}
+
+func TestAPIRequestsAreCountedByRouteAndStatus(t *testing.T) {
+	_, h := newTestAPI()
+	do(t, h, http.MethodGet, "/v1/nodes", "")
+	do(t, h, http.MethodGet, "/v1/nodes", "")
+	do(t, h, http.MethodGet, "/v1/nodes/node-nope/program", "")
+
+	out := scrape(t, h)
+	for _, want := range []string{
+		`scrubline_api_requests_total{route="nodes",status="200"} 2`,
+		`scrubline_api_requests_total{route="nodes/program",status="404"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in scrape:\n%s", want, out)
+		}
+	}
+}
+
+// An unauthenticated request is counted too: a spike of them is the signal
+// that something is probing the control plane.
+func TestUnauthenticatedRequestsAreCounted(t *testing.T) {
+	_, h := newTestAPI()
+	req := httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if out := scrape(t, h); !strings.Contains(out, `scrubline_api_requests_total{route="unauthorized",status="401"} 1`) {
+		t.Fatalf("expected the rejected request to be counted:\n%s", out)
+	}
+}

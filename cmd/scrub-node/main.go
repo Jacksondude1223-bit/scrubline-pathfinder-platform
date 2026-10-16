@@ -15,9 +15,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/metrics"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 )
 
 const (
@@ -78,12 +80,33 @@ func main() {
 	log.Printf("registered %s as %s backends=asic,fpga,zc", node.Name, node.ID)
 
 	pipe := pipeline.New(model.Program{NodeID: node.ID})
-	go poll(*apiURL, token, node.ID, desired, pipe)
+	go poll(*apiURL, token, node, desired, pipe)
 
 	mux := http.NewServeMux()
 	// /health stays open for liveness probes; it carries no policy detail.
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"node": node.ID, "name": node.Name, "datapath": "asic-tcam+fpga+pfring-zc"})
+	})
+	// /metrics carries rule IDs and traffic volumes, so it takes the same
+	// bearer token as /decide. Point the scraper at it with that token.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, token) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+			return
+		}
+		var buf bytes.Buffer
+		if err := metrics.Write(&buf, telemetry.Families([]telemetry.Report{report(node, pipe)}, time.Time{})); err != nil {
+			log.Printf("rendering metrics: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
+			return
+		}
+		w.Header().Set("Content-Type", metrics.ContentType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(buf.Bytes())
 	})
 	// /decide reveals what the policy does with a given flow, so it takes the
 	// same bearer token as the control API.
@@ -133,7 +156,17 @@ func advertiseAddr(explicit, listen string) (string, bool) {
 	return listen, true
 }
 
-func poll(apiURL, token, id string, desired model.Node, pipe *pipeline.Pipeline) {
+// report snapshots this node's datapath counters for the control plane and
+// for its own /metrics.
+func report(node model.Node, pipe *pipeline.Pipeline) telemetry.Report {
+	return telemetry.Report{
+		NodeID: node.ID, Name: node.Name, Region: node.Region,
+		Stats: pipe.Stats(), ReportedAt: time.Now().UTC(),
+	}
+}
+
+func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipeline.Pipeline) {
+	id := node.ID
 	var lastPolicy string
 	var lastVersion int
 	var lastCompiled time.Time
@@ -141,7 +174,10 @@ func poll(apiURL, token, id string, desired model.Node, pipe *pipeline.Pipeline)
 	for {
 		// A control plane that restarted has no record of this node, so its
 		// heartbeat 404s. Re-register instead of polling a program forever.
-		if err := heartbeat(apiURL, token, id); err != nil {
+		// The heartbeat carries this node's counters. It is the one call the
+		// agent already makes every poll, so the control plane gets a fleet
+		// view without a second round trip.
+		if err := heartbeat(apiURL, token, id, pipe.Stats()); err != nil {
 			log.Printf("heartbeat: %v", err)
 			if errors.Is(err, errUnknownNode) {
 				if _, err := register(apiURL, token, desired); err != nil {
@@ -201,8 +237,14 @@ func register(apiURL, token string, node model.Node) (model.Node, error) {
 	return out, nil
 }
 
-func heartbeat(apiURL, token, id string) error {
-	err := send(http.MethodPost, apiURL+"/v1/nodes/"+id+"/heartbeat", token, nil, nil)
+func heartbeat(apiURL, token, id string, stats pipeline.Stats) error {
+	body, err := json.Marshal(struct {
+		Stats pipeline.Stats `json:"stats"`
+	}{Stats: stats})
+	if err != nil {
+		return err
+	}
+	err = send(http.MethodPost, apiURL+"/v1/nodes/"+id+"/heartbeat", token, body, nil)
 	if errors.Is(err, errNotFound) {
 		return errUnknownNode
 	}
