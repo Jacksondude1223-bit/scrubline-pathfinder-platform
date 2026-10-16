@@ -3,8 +3,10 @@ package pipeline
 import (
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
@@ -91,12 +93,61 @@ func (c compiledMatch) matches(f parsedFlow) bool {
 }
 
 // compiledRule is one row of any stage. limit carries the FPGA meter or the ZC
-// behavioral cap; it is zero on stages and actions that do not meter.
+// behavioral cap; it is zero on stages and actions that do not meter. stats is
+// resolved once at Load so counting a match costs a pointer hop, not a lookup.
 type compiledRule struct {
 	match  compiledMatch
 	action model.Action
 	ruleID string
 	limit  int
+	stats  *ruleStats
+}
+
+// ruleStats counts what one rule did. Counters survive a reprogram for rules
+// that remain in the policy: a node re-polls every couple of seconds, and
+// resetting on every poll would make the series useless.
+type ruleStats struct {
+	ruleID     string
+	stage      model.Stage
+	matches    atomic.Uint64
+	drops      atomic.Uint64
+	ppsSeen    atomic.Uint64
+	ppsDropped atomic.Uint64
+}
+
+// stageIndex orders the per-stage counters.
+const (
+	idxASIC = iota
+	idxFPGA
+	idxZC
+	stageCount
+)
+
+var stagesInOrder = [stageCount]model.Stage{model.StageASIC, model.StageFPGA, model.StageZC}
+
+func stageIndex(s model.Stage) int {
+	switch s {
+	case model.StageFPGA:
+		return idxFPGA
+	case model.StageZC:
+		return idxZC
+	default:
+		return idxASIC
+	}
+}
+
+// counters are the node-level totals behind /metrics. They are atomics so a
+// scrape never has to wait on the datapath.
+type counters struct {
+	decisions    atomic.Uint64
+	unowned      atomic.Uint64
+	dropped      [stageCount]atomic.Uint64
+	permitted    [stageCount]atomic.Uint64
+	ppsDropped   [stageCount]atomic.Uint64
+	ppsPermitted [stageCount]atomic.Uint64
+	mlScored     atomic.Uint64
+	mlDrops      atomic.Uint64
+	mlPasses     atomic.Uint64
 }
 
 // compiledProgram is the per-flow form of a model.Program.
@@ -163,6 +214,10 @@ type Pipeline struct {
 	compiled *compiledProgram
 	buckets  map[string]*bucket
 	model    ml.Model
+	// stats is keyed by rule ID, which a policy guarantees unique. It is the
+	// handle that lets counters outlive a reprogram.
+	stats    map[string]*ruleStats
+	counters counters
 	// lastSweep throttles reclaiming the rate table to once per window, so a
 	// flood of fresh source addresses cannot make every packet pay for a full
 	// scan of the table.
@@ -172,7 +227,39 @@ type Pipeline struct {
 }
 
 func New(p model.Program) *Pipeline {
-	return &Pipeline{program: p, compiled: compileProgram(p), buckets: map[string]*bucket{}, now: time.Now}
+	pipe := &Pipeline{program: p, buckets: map[string]*bucket{}, now: time.Now}
+	compiled := compileProgram(p)
+	pipe.attachStats(compiled)
+	pipe.compiled = compiled
+	return pipe
+}
+
+// attachStats points every compiled rule at its counters, carrying over the
+// counters of rules that survived the reprogram. Callers hold p.mu.
+func (p *Pipeline) attachStats(cp *compiledProgram) {
+	next := make(map[string]*ruleStats, len(cp.asic)+len(cp.fpga)+len(cp.zc))
+	wire := func(rules []compiledRule, stage model.Stage) {
+		for i := range rules {
+			id := rules[i].ruleID
+			rs, ok := next[id]
+			if !ok {
+				// A rule that kept its ID and stage keeps its counters; one
+				// that moved stage starts over, because the series changed
+				// meaning.
+				if prev := p.stats[id]; prev != nil && prev.stage == stage {
+					rs = prev
+				} else {
+					rs = &ruleStats{ruleID: id, stage: stage}
+				}
+				next[id] = rs
+			}
+			rules[i].stats = rs
+		}
+	}
+	wire(cp.asic, model.StageASIC)
+	wire(cp.fpga, model.StageFPGA)
+	wire(cp.zc, model.StageZC)
+	p.stats = next
 }
 
 // clock reads the pipeline's time source, tolerating a zero-value Pipeline.
@@ -199,6 +286,7 @@ func (p *Pipeline) Load(prog model.Program) {
 			delete(p.buckets, key)
 		}
 	}
+	p.attachStats(compiled)
 	p.program = prog
 	p.compiled = compiled
 }
@@ -225,70 +313,213 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	cp := p.compiled
 	if cp == nil {
 		cp = compileProgram(p.program)
+		p.attachStats(cp)
 		p.compiled = cp
 	}
+
+	p.counters.decisions.Add(1)
 	if !cp.owns(pf) {
+		// Traffic for a prefix this node was not assigned. Counted separately:
+		// a rising number here means the steering layer and the fabric
+		// disagree about who scrubs what.
+		p.counters.unowned.Add(1)
 		return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, Reason: "prefix not assigned to this node"}
 	}
-	for _, acl := range cp.asic {
+
+	d, decidedBy := p.evaluate(cp, pf, f)
+	// Every outcome is recorded in one place, so no return path can forget a
+	// counter.
+	p.record(d, decidedBy, pf)
+	return d
+}
+
+// evaluate walks the three stages and returns the decision together with the
+// rule that produced it, which is nil when no rule did. Callers hold p.mu.
+func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow) (model.Decision, *ruleStats) {
+	for i := range cp.asic {
+		acl := &cp.asic[i]
 		if !acl.match.matches(pf) {
 			continue
 		}
+		p.seen(acl.stats, pf)
 		switch acl.action {
 		case model.ActionDrop:
-			return model.Decision{Action: model.ActionDrop, Stage: model.StageASIC, RuleID: acl.ruleID, Reason: "TCAM ACL drop"}
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageASIC, RuleID: acl.ruleID, Reason: "TCAM ACL drop"}, acl.stats
 		case model.ActionPermit:
 			// An explicit TCAM permit is terminal: it is how an allow-list
 			// exempts a source from the stages behind it.
-			return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, RuleID: acl.ruleID, Reason: "TCAM ACL permit"}
+			return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, RuleID: acl.ruleID, Reason: "TCAM ACL permit"}, acl.stats
 		}
 		// count and inspect carry no TCAM verdict; fall through to the next row.
 	}
-	for _, row := range cp.fpga {
+	for i := range cp.fpga {
+		row := &cp.fpga[i]
 		if !row.match.matches(pf) {
 			continue
 		}
+		p.seen(row.stats, pf)
 		switch row.action {
 		case model.ActionPermit:
-			return model.Decision{Action: model.ActionPermit, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: "FPGA permit"}
+			return model.Decision{Action: model.ActionPermit, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: "FPGA permit"}, row.stats
 		case model.ActionDrop:
-			return model.Decision{Action: model.ActionDrop, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: "FPGA drop"}
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: "FPGA drop"}, row.stats
 		case model.ActionLimit:
 			// Only a rate_limit row consults the meter. A count row used to drop
 			// here too, which turned an observe-only rule into a drop rule.
 			if row.limit > 0 && pf.pps > row.limit {
-				return model.Decision{Action: model.ActionDrop, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: fmt.Sprintf("FPGA meter %d pps exceeded", row.limit)}
+				return model.Decision{Action: model.ActionDrop, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: fmt.Sprintf("FPGA meter %d pps exceeded", row.limit)}, row.stats
 			}
 		}
 	}
-	for _, zc := range cp.zc {
+	for i := range cp.zc {
+		zc := &cp.zc[i]
 		if !zc.match.matches(pf) {
 			continue
 		}
+		p.seen(zc.stats, pf)
 		switch zc.action {
 		case model.ActionPermit:
-			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC permit"}
+			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC permit"}, zc.stats
 		case model.ActionDrop:
-			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC drop"}
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC drop"}, zc.stats
 		case model.ActionCount:
-			// Observe-only: record nothing and leave the verdict to a later row.
+			// Observe-only: the match is counted, the verdict is left to a
+			// later row.
 			continue
 		}
 		// rate_limit and inspect both reach the ZC inspect path: the behavioral
 		// cap first, then the classifier.
 		if zc.limit > 0 && p.overRate(zc.ruleID, zc.limit, pf) {
-			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC behavioral cap %d pps exceeded", zc.limit)}
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC behavioral cap %d pps exceeded", zc.limit)}, zc.stats
 		}
 		if p.model.Ready {
 			score := ml.Score(p.model, f)
+			p.counters.mlScored.Add(1)
 			if score >= p.model.Threshold {
-				return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC ml score %.2f", score), Score: score}
+				p.counters.mlDrops.Add(1)
+				return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC ml score %.2f", score), Score: score}, zc.stats
 			}
-			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC ml pass %.2f", score), Score: score}
+			p.counters.mlPasses.Add(1)
+			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC ml pass %.2f", score), Score: score}, zc.stats
 		}
-		return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC inspect pass"}
+		return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC inspect pass"}, zc.stats
 	}
-	return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, Reason: "no matching drop rule"}
+	return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, Reason: "no matching drop rule"}, nil
+}
+
+// seen counts a rule match. A rule that matched but left the verdict to a
+// later row still matched, which is the point of an observe-only rule.
+func (p *Pipeline) seen(rs *ruleStats, pf parsedFlow) {
+	if rs == nil {
+		return
+	}
+	rs.matches.Add(1)
+	rs.ppsSeen.Add(nonNegative(pf.pps))
+}
+
+// record books the outcome against the node totals and the deciding rule.
+func (p *Pipeline) record(d model.Decision, rs *ruleStats, pf parsedFlow) {
+	idx := stageIndex(d.Stage)
+	pps := nonNegative(pf.pps)
+	if d.Action == model.ActionDrop {
+		p.counters.dropped[idx].Add(1)
+		p.counters.ppsDropped[idx].Add(pps)
+		if rs != nil {
+			rs.drops.Add(1)
+			rs.ppsDropped.Add(pps)
+		}
+		return
+	}
+	p.counters.permitted[idx].Add(1)
+	p.counters.ppsPermitted[idx].Add(pps)
+}
+
+// nonNegative keeps a hand-built flow record from wrapping a counter. The API
+// and the agent both reject a negative rate, but Decide is callable directly.
+func nonNegative(pps int) uint64 {
+	if pps <= 0 {
+		return 0
+	}
+	return uint64(pps)
+}
+
+// Stats is a point-in-time copy of a node's datapath counters.
+type Stats struct {
+	Decisions uint64       `json:"decisions"`
+	Unowned   uint64       `json:"unowned"`
+	Stages    []StageStats `json:"stages"`
+	Rules     []RuleStats  `json:"rules"`
+	ML        MLStats      `json:"ml"`
+	// RateBuckets is the size of the per-source rate table. It is bounded, and
+	// sitting at the bound means the behavioral cap is no longer tracking
+	// every source.
+	RateBuckets    int `json:"rate_buckets"`
+	RateBucketsMax int `json:"rate_buckets_max"`
+}
+
+type StageStats struct {
+	Stage        model.Stage `json:"stage"`
+	Dropped      uint64      `json:"dropped"`
+	Permitted    uint64      `json:"permitted"`
+	PPSDropped   uint64      `json:"pps_dropped"`
+	PPSPermitted uint64      `json:"pps_permitted"`
+}
+
+type RuleStats struct {
+	RuleID     string      `json:"rule_id"`
+	Stage      model.Stage `json:"stage"`
+	Matches    uint64      `json:"matches"`
+	Drops      uint64      `json:"drops"`
+	PPSSeen    uint64      `json:"pps_seen"`
+	PPSDropped uint64      `json:"pps_dropped"`
+}
+
+type MLStats struct {
+	Ready  bool   `json:"ready"`
+	Scored uint64 `json:"scored"`
+	Drops  uint64 `json:"drops"`
+	Passes uint64 `json:"passes"`
+}
+
+// Stats copies the counters out. Rules are sorted by ID so a scrape is stable.
+func (p *Pipeline) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := Stats{
+		Decisions:      p.counters.decisions.Load(),
+		Unowned:        p.counters.unowned.Load(),
+		Stages:         make([]StageStats, 0, stageCount),
+		Rules:          make([]RuleStats, 0, len(p.stats)),
+		RateBuckets:    len(p.buckets),
+		RateBucketsMax: maxBuckets,
+		ML: MLStats{
+			Ready:  p.model.Ready,
+			Scored: p.counters.mlScored.Load(),
+			Drops:  p.counters.mlDrops.Load(),
+			Passes: p.counters.mlPasses.Load(),
+		},
+	}
+	for i, stage := range stagesInOrder {
+		out.Stages = append(out.Stages, StageStats{
+			Stage:        stage,
+			Dropped:      p.counters.dropped[i].Load(),
+			Permitted:    p.counters.permitted[i].Load(),
+			PPSDropped:   p.counters.ppsDropped[i].Load(),
+			PPSPermitted: p.counters.ppsPermitted[i].Load(),
+		})
+	}
+	for _, rs := range p.stats {
+		out.Rules = append(out.Rules, RuleStats{
+			RuleID:     rs.ruleID,
+			Stage:      rs.stage,
+			Matches:    rs.matches.Load(),
+			Drops:      rs.drops.Load(),
+			PPSSeen:    rs.ppsSeen.Load(),
+			PPSDropped: rs.ppsDropped.Load(),
+		})
+	}
+	sort.Slice(out.Rules, func(i, j int) bool { return out.Rules[i].RuleID < out.Rules[j].RuleID })
+	return out
 }
 
 // overRate accumulates the source's packet rate inside the current one-second

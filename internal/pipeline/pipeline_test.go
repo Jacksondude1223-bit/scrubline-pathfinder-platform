@@ -434,3 +434,192 @@ func BenchmarkDecide(b *testing.B) {
 		_ = p.Decide(f)
 	}
 }
+
+func statsForRule(t *testing.T, s Stats, ruleID string) RuleStats {
+	t.Helper()
+	for _, r := range s.Rules {
+		if r.RuleID == ruleID {
+			return r
+		}
+	}
+	t.Fatalf("no stats for rule %q in %+v", ruleID, s.Rules)
+	return RuleStats{}
+}
+
+func stageOf(t *testing.T, s Stats, stage model.Stage) StageStats {
+	t.Helper()
+	for _, st := range s.Stages {
+		if st.Stage == stage {
+			return st
+		}
+	}
+	t.Fatalf("no stats for stage %q", stage)
+	return StageStats{}
+}
+
+// Counters are what tell an operator whether mitigation is working and which
+// rule is doing the work.
+func TestCountersAttributeDropsToTheDecidingRule(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "tcam", Match: model.Match{Proto: "udp"}}},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, RuleID: "zc", Match: model.Match{Proto: "tcp"}}},
+	}
+	p := New(prog)
+	for i := 0; i < 3; i++ {
+		p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "udp", PPS: 1000})
+	}
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 20})
+	// Traffic for a prefix this node does not hold.
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "198.18.0.1", Proto: "tcp", PPS: 7})
+
+	s := p.Stats()
+	if s.Decisions != 5 {
+		t.Fatalf("expected 5 decisions, got %d", s.Decisions)
+	}
+	if s.Unowned != 1 {
+		t.Fatalf("expected 1 unowned flow, got %d", s.Unowned)
+	}
+	tcam := statsForRule(t, s, "tcam")
+	if tcam.Matches != 3 || tcam.Drops != 3 {
+		t.Fatalf("expected 3 matches and 3 drops on the TCAM rule, got %+v", tcam)
+	}
+	if tcam.PPSDropped != 3000 {
+		t.Fatalf("expected 3000 pps dropped, got %d", tcam.PPSDropped)
+	}
+	if tcam.Stage != model.StageASIC {
+		t.Fatalf("expected the TCAM rule on the asic stage, got %q", tcam.Stage)
+	}
+	asic := stageOf(t, s, model.StageASIC)
+	if asic.Dropped != 3 || asic.PPSDropped != 3000 {
+		t.Fatalf("unexpected asic stage counters %+v", asic)
+	}
+	zc := statsForRule(t, s, "zc")
+	if zc.Matches != 1 || zc.Drops != 0 || zc.PPSSeen != 20 {
+		t.Fatalf("unexpected zc rule counters %+v", zc)
+	}
+	// The unowned flow is counted but attributed to no stage verdict.
+	if got := stageOf(t, s, model.StageASIC).Permitted; got != 0 {
+		t.Fatalf("an unowned flow must not count as a stage permit, got %d", got)
+	}
+}
+
+// An observe-only rule still has to show what it saw; that is the whole point
+// of adding one during an incident.
+func TestCountRuleRecordsMatchesWithoutDrops(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC: []model.ZCEntry{
+			{Cluster: "zc:a", Action: model.ActionCount, RuleID: "watch", Match: model.Match{Proto: "tcp"}},
+			{Cluster: "zc:a", Action: model.ActionDrop, RuleID: "block", Match: model.Match{Proto: "tcp", DPort: 443}},
+		},
+	}
+	p := New(prog)
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 100})
+
+	s := p.Stats()
+	watch := statsForRule(t, s, "watch")
+	if watch.Matches != 1 {
+		t.Fatalf("the count rule saw the flow and must say so: %+v", watch)
+	}
+	if watch.Drops != 0 || watch.PPSDropped != 0 {
+		t.Fatalf("an observe-only rule must not be credited with drops: %+v", watch)
+	}
+	block := statsForRule(t, s, "block")
+	if block.Drops != 1 || block.PPSDropped != 100 {
+		t.Fatalf("the drop must be attributed to the rule that decided: %+v", block)
+	}
+}
+
+// The agent re-polls every couple of seconds. Resetting counters on every
+// reprogram would make the series useless.
+func TestCountersSurviveAReprogram(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "tcam", Match: model.Match{Proto: "udp"}}},
+	}
+	p := New(prog)
+	p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "udp", PPS: 10})
+
+	// Same rule, recompiled with a different prefix set.
+	next := prog
+	next.Prefixes = []string{"203.0.113.0/24", "198.51.0.0/16"}
+	p.Load(next)
+	p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "udp", PPS: 10})
+
+	if got := statsForRule(t, p.Stats(), "tcam"); got.Drops != 2 {
+		t.Fatalf("expected the counter to carry across the reprogram, got %+v", got)
+	}
+
+	// A rule that is gone takes its series with it.
+	p.Load(model.Program{Prefixes: []string{"203.0.113.0/24"},
+		ASIC: []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "other", Match: model.Match{Proto: "udp"}}}})
+	for _, r := range p.Stats().Rules {
+		if r.RuleID == "tcam" {
+			t.Fatalf("a removed rule kept reporting: %+v", r)
+		}
+	}
+}
+
+// A rule ID reused on a different stage is a different series.
+func TestMovingARuleToAnotherStageResetsItsCounters(t *testing.T) {
+	p := New(model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "r", Match: model.Match{Proto: "udp"}}},
+	})
+	p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "udp", PPS: 10})
+	p.Load(model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionDrop, RuleID: "r", Match: model.Match{Proto: "udp"}}},
+	})
+	got := statsForRule(t, p.Stats(), "r")
+	if got.Stage != model.StageZC || got.Drops != 0 {
+		t.Fatalf("expected a fresh series on the new stage, got %+v", got)
+	}
+}
+
+func TestMLCountersTrackTheClassifier(t *testing.T) {
+	p := New(model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, RuleID: "zc", Match: model.Match{Proto: "tcp"}}},
+	})
+	// Weights are zero and the bias is high, so every scored flow is an attack.
+	p.SetModel(ml.Model{Weights: make([]float64, ml.FeatureCount), Bias: 50, Threshold: 0.5, Ready: true})
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 10})
+
+	s := p.Stats()
+	if !s.ML.Ready || s.ML.Scored != 1 || s.ML.Drops != 1 || s.ML.Passes != 0 {
+		t.Fatalf("unexpected ml counters %+v", s.ML)
+	}
+	if got := statsForRule(t, s, "zc"); got.Drops != 1 {
+		t.Fatalf("an ml drop is still the zc rule's drop: %+v", got)
+	}
+}
+
+// A hand-built flow with a negative rate must not wrap a counter.
+func TestNegativeRateDoesNotWrapCounters(t *testing.T) {
+	p := New(model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "tcam", Match: model.Match{Proto: "udp"}}},
+	})
+	p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "udp", PPS: -5})
+	if got := statsForRule(t, p.Stats(), "tcam"); got.PPSDropped != 0 {
+		t.Fatalf("a negative rate wrapped the counter: %d", got.PPSDropped)
+	}
+}
+
+// The rate table is bounded; sitting at the bound means the cap has stopped
+// tracking every source, which an operator needs to see.
+func TestStatsReportRateTableOccupancy(t *testing.T) {
+	p := New(model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 1000000, RuleID: "zc", Match: model.Match{Proto: "tcp"}}},
+	})
+	if got := p.Stats(); got.RateBuckets != 0 || got.RateBucketsMax != maxBuckets {
+		t.Fatalf("unexpected initial occupancy %+v", got)
+	}
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1})
+	if got := p.Stats().RateBuckets; got != 1 {
+		t.Fatalf("expected one tracked source, got %d", got)
+	}
+}
