@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
 )
@@ -305,6 +307,25 @@ func newTestAPI() (*Server, http.Handler) {
 	return s, s.Handler()
 }
 
+// newTestAPIWithClock returns a server whose node liveness can be aged without
+// sleeping. advance moves the clock the store stamps heartbeats against.
+func newTestAPIWithClock() (s *Server, h http.Handler, advance func(time.Duration)) {
+	st := store.New()
+	var mu sync.Mutex
+	now := time.Now().UTC()
+	st.SetClock(func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	})
+	s = &Server{Token: testToken, Store: st}
+	return s, s.Handler(), func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		now = now.Add(d)
+	}
+}
+
 func registerNode(t *testing.T, h http.Handler, name, region string, capacity int) string {
 	t.Helper()
 	body := fmt.Sprintf(`{"name":%q,"region":%q,"capacity_gbps":%d,"advertise":"%s:9091"}`, name, region, capacity, name)
@@ -506,7 +527,8 @@ func TestMetricsDescribeTheControlPlane(t *testing.T) {
 		`scrubline_nodes{status="ready"} 1`,
 		`scrubline_nodes{status="stale"} 0`,
 		"scrubline_policies 1",
-		"scrubline_assignments 1",
+		"scrubline_announcements 1",
+		`scrubline_bgp_announced{node=`,
 		"scrubline_programs 1",
 		`scrubline_node_prefixes{node=`,
 		"scrubline_fabric_recompiles_total 1",
@@ -609,5 +631,196 @@ func TestUnauthenticatedRequestsAreCounted(t *testing.T) {
 
 	if out := scrape(t, h); !strings.Contains(out, `scrubline_api_requests_total{route="unauthorized",status="401"} 1`) {
 		t.Fatalf("expected the rejected request to be counted:\n%s", out)
+	}
+}
+
+const twoPrefixPolicy = `{
+  "name": "anycast",
+  "protected": ["203.0.113.0/24", "198.51.100.0/24"],
+  "rules": [{"id":"zc-cap","stage":"zc","action":"rate_limit","pps":100,"match":{"proto":"tcp"}}]
+}`
+
+func fabricPlan(t *testing.T, h http.Handler) []map[string]any {
+	t.Helper()
+	fabric := requireJSON(t, do(t, h, http.MethodGet, "/v1/fabric", ""), http.StatusOK)
+	raw, ok := fabric["announcements"].([]any)
+	if !ok {
+		t.Fatalf("fabric carries no announcement plan: %v", fabric)
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, r.(map[string]any))
+	}
+	return out
+}
+
+// Under anycast nothing is exclusively owned: every live node announces and
+// enforces every protected prefix, so a flood on one prefix is absorbed by
+// the whole fabric.
+func TestDeployAnnouncesEveryPrefixFromEveryNode(t *testing.T) {
+	_, h := newTestAPI()
+	a := registerNode(t, h, "scrub-a", "iad", 100)
+	b := registerNode(t, h, "scrub-b", "fra", 100)
+	savePolicyAndDeploy(t, h, twoPrefixPolicy)
+
+	if got := len(fabricPlan(t, h)); got != 4 {
+		t.Fatalf("expected 2 prefixes across 2 nodes, got %d announcement rows", got)
+	}
+	for _, node := range []string{a, b} {
+		prog := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+node+"/program", ""), http.StatusOK)
+		prefixes, _ := prog["prefixes"].([]any)
+		if len(prefixes) != 2 {
+			t.Fatalf("node %s enforces %v, expected both prefixes", node, prefixes)
+		}
+		announcements, _ := prog["announcements"].([]any)
+		if len(announcements) != 2 {
+			t.Fatalf("node %s carries %d announcements, expected 2", node, len(announcements))
+		}
+	}
+}
+
+// Capacity is weighted by prepending, not by picking a winner.
+func TestSmallerNodesAreMorePrepended(t *testing.T) {
+	_, h := newTestAPI()
+	registerNode(t, h, "scrub-big", "iad", 400)
+	registerNode(t, h, "scrub-small", "sin", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	prepends := map[string]float64{}
+	for _, row := range fabricPlan(t, h) {
+		prepends[row["node_name"].(string)] = row["prepends"].(float64)
+	}
+	if prepends["scrub-big"] != 0 {
+		t.Fatalf("the largest node should announce unpadded, got %v", prepends["scrub-big"])
+	}
+	if prepends["scrub-small"] != 2 {
+		t.Fatalf("a quarter-capacity node should carry 2 prepends, got %v", prepends["scrub-small"])
+	}
+}
+
+// A node going stale is withdrawn from anycast, and its traffic moves to the
+// nodes still answering. That is the failover path.
+func TestStaleNodeIsWithdrawnFromTheFabric(t *testing.T) {
+	s, h, advance := newTestAPIWithClock()
+	registerNode(t, h, "scrub-a", "iad", 100)
+	dead := registerNode(t, h, "scrub-dead", "sin", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	for _, row := range fabricPlan(t, h) {
+		if row["state"] != "announce" {
+			t.Fatalf("expected both nodes announcing to begin with, got %v", row)
+		}
+	}
+
+	// Age the fleet past the TTL, leaving one node heartbeating.
+	advance(store.NodeTTL + time.Second)
+	if ok, _ := s.Store.Heartbeat(dead); !ok {
+		t.Fatal("heartbeat for a known node should succeed")
+	}
+	s.reconcile()
+
+	states := map[string]string{}
+	for _, row := range fabricPlan(t, h) {
+		states[row["node_name"].(string)] = row["state"].(string)
+	}
+	if states["scrub-a"] != "withdraw" {
+		t.Fatalf("expected the silent node withdrawn, got %q", states["scrub-a"])
+	}
+	if states["scrub-dead"] != "announce" {
+		t.Fatalf("expected the heartbeating node still announcing, got %q", states["scrub-dead"])
+	}
+}
+
+// Convergence is not instant, so a withdrawing node keeps scrubbing whatever
+// still arrives for the prefix.
+func TestWithdrawnNodeKeepsEnforcing(t *testing.T) {
+	s, h, advance := newTestAPIWithClock()
+	quiet := registerNode(t, h, "scrub-a", "iad", 100)
+	alive := registerNode(t, h, "scrub-b", "fra", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	advance(store.NodeTTL + time.Second)
+	s.Store.Heartbeat(alive)
+	s.reconcile()
+
+	prog := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+quiet+"/program", ""), http.StatusOK)
+	prefixes, _ := prog["prefixes"].([]any)
+	if len(prefixes) != 1 {
+		t.Fatalf("a withdrawing node must keep enforcing during convergence, got %v", prefixes)
+	}
+}
+
+// Region pinning keeps a prefix inside a jurisdiction: an out-of-region node
+// neither announces it nor inspects traffic for it.
+func TestRegionPinnedPrefixStaysInItsRegion(t *testing.T) {
+	_, h := newTestAPI()
+	registerNode(t, h, "scrub-eu", "fra", 100)
+	us := registerNode(t, h, "scrub-us", "iad", 100)
+	savePolicyAndDeploy(t, h, `{
+	  "name": "pinned",
+	  "protected": ["203.0.113.0/24", "198.51.100.0/24"],
+	  "steering": [{"prefix":"203.0.113.0/24","regions":["fra"],"communities":["65000:100"]}],
+	  "rules": []
+	}`)
+
+	for _, row := range fabricPlan(t, h) {
+		if row["prefix"] == "203.0.113.0/24" && row["node_name"] == "scrub-us" {
+			t.Fatalf("a pinned prefix was announced out of region: %v", row)
+		}
+	}
+	prog := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+us+"/program", ""), http.StatusOK)
+	prefixes, _ := prog["prefixes"].([]any)
+	if len(prefixes) != 1 || prefixes[0] != "198.51.100.0/24" {
+		t.Fatalf("the out-of-region node must not enforce the pinned prefix, got %v", prefixes)
+	}
+}
+
+// Communities are written into a routing daemon's control pipe on every node,
+// so they are checked when the policy is saved, not at the pipe.
+func TestPolicyRejectsUnsafeSteering(t *testing.T) {
+	_, h := newTestAPI()
+	for _, tc := range []struct{ name, steering, want string }{
+		{"injection", `{"prefix":"203.0.113.0/24","communities":["65000:1\nannounce route 0.0.0.0/0"]}`, "community"},
+		{"bad community", `{"prefix":"203.0.113.0/24","communities":["nope"]}`, "community"},
+		{"unprotected prefix", `{"prefix":"192.0.2.0/24"}`, "not in this policy's protected list"},
+		{"empty prefix", `{"prefix":""}`, "prefix required"},
+		{"empty region", `{"prefix":"203.0.113.0/24","regions":["  "]}`, "region must not be empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"name":"p","protected":["203.0.113.0/24"],"steering":[%s],"rules":[]}`, tc.steering)
+			out := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusBadRequest)
+			if msg, _ := out["error"].(string); !strings.Contains(msg, tc.want) {
+				t.Fatalf("expected an error mentioning %q, got %q", tc.want, msg)
+			}
+		})
+	}
+}
+
+func TestPolicyRejectsDuplicateSteering(t *testing.T) {
+	_, h := newTestAPI()
+	body := `{"name":"p","protected":["203.0.113.0/24"],"rules":[],"steering":[
+	  {"prefix":"203.0.113.0/24","regions":["iad"]},
+	  {"prefix":"203.0.113.0/24","regions":["fra"]}
+	]}`
+	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusBadRequest)
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "duplicate steering") {
+		t.Fatalf("expected a duplicate-steering error, got %q", msg)
+	}
+}
+
+// A capacity that cannot be compared would decide prepends for the whole
+// fabric.
+func TestRegisterRejectsNonFiniteCapacity(t *testing.T) {
+	_, h := newTestAPI()
+	// JSON has no NaN literal, so this arrives as a string the decoder rejects,
+	// and an overflowing number is rejected too.
+	for _, body := range []string{
+		`{"name":"n","region":"iad","capacity_gbps":"NaN"}`,
+		`{"name":"n","region":"iad","capacity_gbps":1e999}`,
+		`{"name":"n","region":"iad","capacity_gbps":-1}`,
+	} {
+		if rec := do(t, h, http.MethodPost, "/v1/nodes/register", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %s: expected 400, got %d: %s", body, rec.Code, rec.Body.String())
+		}
 	}
 }

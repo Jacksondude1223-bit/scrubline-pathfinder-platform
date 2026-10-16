@@ -11,10 +11,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/bgp"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/metrics"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
@@ -39,6 +42,8 @@ func main() {
 	capacity := flag.Float64("capacity", 40, "scrub capacity in Gbps")
 	listen := flag.String("listen", "127.0.0.1:9091", "local decide/metrics address")
 	advertise := flag.String("advertise", "", "address other components use to reach this node (default: -listen, or hostname:port when -listen is a wildcard)")
+	localAS := flag.Int("local-as", 0, "AS this node's BGP speaker announces from; required for AS-path prepends")
+	bgpNextHop := flag.String("bgp-next-hop", "", "next hop to advertise with, when it differs from the address peers reach this node on")
 	flag.Parse()
 	token := os.Getenv("SCRUBLINE_API_TOKEN")
 	if token == "" {
@@ -46,6 +51,14 @@ func main() {
 	}
 	if *capacity < 0 {
 		log.Fatalf("-capacity must not be negative, got %v", *capacity)
+	}
+	if *localAS < 0 || *localAS > 4294967295 {
+		log.Fatalf("-local-as %d is out of range", *localAS)
+	}
+	if *bgpNextHop != "" {
+		if _, err := netip.ParseAddr(*bgpNextHop); err != nil {
+			log.Fatalf("-bgp-next-hop %q is not an IP address: %v", *bgpNextHop, err)
+		}
 	}
 
 	// Registering the listen address advertised "0.0.0.0:9091" to the control
@@ -80,7 +93,11 @@ func main() {
 	log.Printf("registered %s as %s backends=asic,fpga,zc", node.Name, node.ID)
 
 	pipe := pipeline.New(model.Program{NodeID: node.ID})
-	go poll(*apiURL, token, node, desired, pipe)
+	// The steering plan is held separately from the datapath: /bgp and
+	// /metrics serve it, and the speaker beside this agent consumes it.
+	var steering atomic.Pointer[steeringPlan]
+	steering.Store(&steeringPlan{})
+	go poll(*apiURL, token, node, desired, pipe, &steering, *localAS, *bgpNextHop)
 
 	mux := http.NewServeMux()
 	// /health stays open for liveness probes; it carries no policy detail.
@@ -99,7 +116,9 @@ func main() {
 			return
 		}
 		var buf bytes.Buffer
-		if err := metrics.Write(&buf, telemetry.Families([]telemetry.Report{report(node, pipe)}, time.Time{})); err != nil {
+		families := telemetry.Families([]telemetry.Report{report(node, pipe)}, time.Time{})
+		families = append(families, telemetry.AnnouncementFamilies(steering.Load().Announcements)...)
+		if err := metrics.Write(&buf, families); err != nil {
 			log.Printf("rendering metrics: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
 			return
@@ -107,6 +126,35 @@ func main() {
 		w.Header().Set("Content-Type", metrics.ContentType)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(buf.Bytes())
+	})
+	// /bgp is where a BGP speaker picks up what this node should advertise.
+	// Scrubline does not speak BGP itself: it compiles the plan and serves it,
+	// the way it serves the TCAM, FPGA, and ZC programs.
+	mux.HandleFunc("/bgp", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, token) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+			return
+		}
+		plan := steering.Load()
+		if r.URL.Query().Get("format") == "exabgp" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			for _, line := range plan.Commands {
+				_, _ = io.WriteString(w, line+"\n")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"node":          node.ID,
+			"local_as":      *localAS,
+			"announcements": plan.Announcements,
+			"exabgp":        plan.Commands,
+			"error":         plan.Err,
+		})
 	})
 	// /decide reveals what the policy does with a given flow, so it takes the
 	// same bearer token as the control API.
@@ -165,7 +213,37 @@ func report(node model.Node, pipe *pipeline.Pipeline) telemetry.Report {
 	}
 }
 
-func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipeline.Pipeline) {
+// steeringPlan is the BGP posture this node currently holds, together with
+// its rendered form. Err is set when the plan could not be rendered, which is
+// surfaced rather than swallowed: a plan that cannot be pushed means this node
+// is advertising something other than what the control plane decided.
+type steeringPlan struct {
+	Announcements []model.Announcement `json:"announcements"`
+	Commands      []string             `json:"exabgp"`
+	Err           string               `json:"error,omitempty"`
+}
+
+// renderSteering turns the program's announcements into speaker commands,
+// substituting the operator's next hop when one was given.
+func renderSteering(prog model.Program, localAS int, nextHop string) *steeringPlan {
+	rows := make([]model.Announcement, len(prog.Announcements))
+	copy(rows, prog.Announcements)
+	if nextHop != "" {
+		for i := range rows {
+			rows[i].NextHop = nextHop
+		}
+	}
+	plan := &steeringPlan{Announcements: rows}
+	commands, err := bgp.Commands(rows, localAS)
+	if err != nil {
+		plan.Err = err.Error()
+		return plan
+	}
+	plan.Commands = commands
+	return plan
+}
+
+func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipeline.Pipeline, steering *atomic.Pointer[steeringPlan], localAS int, nextHop string) {
 	id := node.ID
 	var lastPolicy string
 	var lastVersion int
@@ -200,6 +278,18 @@ func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipel
 			lastPolicy, lastVersion, lastCompiled = prog.PolicyID, prog.Version, prog.CompiledAt
 			log.Printf("programmed node %s policy=%s version=%d asic=%d fpga=%d zc=%d prefixes=%v",
 				id, prog.PolicyID, prog.Version, len(prog.ASIC), len(prog.FPGA), len(prog.ZC), prog.Prefixes)
+
+			plan := renderSteering(prog, localAS, nextHop)
+			steering.Store(plan)
+			if plan.Err != "" {
+				// Keep serving the datapath, but say loudly that this node's
+				// advertisements are not what the control plane asked for.
+				log.Printf("steering plan for %s could not be rendered: %s", id, plan.Err)
+			} else {
+				for _, line := range plan.Commands {
+					log.Printf("bgp: %s", line)
+				}
+			}
 		}
 
 		var trained ml.Model

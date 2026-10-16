@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/netip"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/bgp"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/compiler"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/metrics"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
@@ -94,11 +96,11 @@ func (s *Server) reconcile() {
 	if policyID == "" {
 		return
 	}
-	nodes := s.Store.LiveNodes()
-	if fingerprint(nodes) == s.lastLive {
+	live := s.Store.LiveNodes()
+	if fingerprint(live) == s.lastLive {
 		return
 	}
-	if len(nodes) == 0 {
+	if len(live) == 0 {
 		// Every node is stale. Recompiling would blank the fabric; leaving the
 		// last programs in place keeps whatever is still enforcing them.
 		log.Printf("api: no live nodes, keeping the fabric compiled for policy %s", policyID)
@@ -108,21 +110,26 @@ func (s *Server) reconcile() {
 	if !ok {
 		return
 	}
-	assigned, programs := s.applyDeploy(policy, nodes)
-	log.Printf("api: live node set changed, recompiled policy %s v%d across %d nodes (%d assignments)",
-		policy.ID, policy.Version, len(programs), len(assigned))
+	plan, programs := s.applyDeploy(policy, s.Store.Nodes(), live)
+	log.Printf("api: live node set changed, recompiled policy %s v%d across %d nodes (%d announcements)",
+		policy.ID, policy.Version, len(programs), len(plan))
 }
 
 // applyDeploy compiles and stores the fabric for a policy. Callers hold
 // reconcileMu.
-func (s *Server) applyDeploy(policy model.Policy, nodes []model.Node) ([]model.Assignment, map[string]*model.Program) {
-	assigned := compiler.Assign(policy.Protected, nodes)
-	programs := compiler.Compile(policy, nodes, assigned)
-	s.Store.PutDeploy(policy.ID, assigned, programs)
-	s.lastLive = fingerprint(nodes)
+//
+// The plan covers every registered node, not only the live ones: the fabric is
+// anycast, so a node that stopped answering needs an explicit withdrawal
+// rather than to be left out, and a node that comes back finds its program
+// already compiled. live is the set membership is tracked against.
+func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node) ([]model.Announcement, map[string]*model.Program) {
+	plan := compiler.Plan(policy, all)
+	programs := compiler.Compile(policy, all, plan)
+	s.Store.PutDeploy(policy.ID, plan, programs)
+	s.lastLive = fingerprint(live)
 	s.prunePipelines(programs)
 	s.recompiles.Add(1)
-	return assigned, programs
+	return plan, programs
 }
 
 // fingerprint identifies a live node set, so a recompile only runs when
@@ -209,7 +216,7 @@ func (s *Server) controlFamilies() []metrics.Family {
 	ready, stale := 0, 0
 	prefixes := metrics.Family{
 		Name: "scrubline_node_prefixes", Type: metrics.Gauge,
-		Help: "Protected prefixes assigned to a node. Zero means the node is enforcing nothing.",
+		Help: "Protected prefixes a node enforces policy on. Zero means the node is enforcing nothing.",
 	}
 	for _, n := range nodes {
 		if n.Status == model.NodeStale {
@@ -227,13 +234,13 @@ func (s *Server) controlFamilies() []metrics.Family {
 		})
 	}
 
-	assignments, programs := s.Store.Fabric()
+	plan, programs := s.Store.Fabric()
 	m := s.Store.Model()
 
 	families := []metrics.Family{
 		{
 			Name: "scrubline_nodes", Type: metrics.Gauge,
-			Help: "Registered nodes by liveness. A stale node is skipped by prefix assignment.",
+			Help: "Registered nodes by liveness. A stale node is withdrawn from anycast.",
 			Samples: []metrics.Sample{
 				{Labels: []metrics.Label{{Name: "status", Value: model.NodeReady}}, Value: float64(ready)},
 				{Labels: []metrics.Label{{Name: "status", Value: model.NodeStale}}, Value: float64(stale)},
@@ -244,8 +251,8 @@ func (s *Server) controlFamilies() []metrics.Family {
 			Samples: []metrics.Sample{{Value: float64(len(s.Store.Policies()))}},
 		},
 		{
-			Name: "scrubline_assignments", Type: metrics.Gauge, Help: "Prefix-to-node assignments in the current fabric.",
-			Samples: []metrics.Sample{{Value: float64(len(assignments))}},
+			Name: "scrubline_announcements", Type: metrics.Gauge, Help: "Rows in the fabric's BGP announcement plan.",
+			Samples: []metrics.Sample{{Value: float64(len(plan))}},
 		},
 		{
 			Name: "scrubline_programs", Type: metrics.Gauge, Help: "Nodes holding a compiled program.",
@@ -285,6 +292,7 @@ func (s *Server) controlFamilies() []metrics.Family {
 			Samples: []metrics.Sample{{Value: m.Recall}},
 		},
 	}
+	families = append(families, telemetry.AnnouncementFamilies(plan)...)
 	return append(families, s.requestFamily())
 }
 
@@ -386,8 +394,8 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		s.deploy(w, id)
 		return "policies/deploy"
 	case r.Method == http.MethodGet && path == "fabric":
-		assignments, programs := s.Store.Fabric()
-		writeJSON(w, http.StatusOK, map[string]any{"assignments": assignments, "programs": programs, "ml": s.Store.Model()})
+		plan, programs := s.Store.Fabric()
+		writeJSON(w, http.StatusOK, map[string]any{"announcements": plan, "programs": programs, "ml": s.Store.Model()})
 		return "fabric"
 	case r.Method == http.MethodPost && path == "ml/samples":
 		s.addSamples(w, r)
@@ -523,21 +531,21 @@ func (s *Server) deploy(w http.ResponseWriter, id string) {
 	// fingerprint recorded for this fabric is the set it was actually built
 	// from.
 	s.reconcileMu.Lock()
-	nodes := s.Store.LiveNodes()
-	if len(nodes) == 0 {
+	live := s.Store.LiveNodes()
+	if len(live) == 0 {
 		s.reconcileMu.Unlock()
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "no live nodes registered"})
 		return
 	}
-	assigned, programs := s.applyDeploy(policy, nodes)
+	plan, programs := s.applyDeploy(policy, s.Store.Nodes(), live)
 	s.reconcileMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"policy_id":   policy.ID,
-		"version":     policy.Version,
-		"assignments": assigned,
-		"nodes":       len(programs),
-		"datapath":    "asic/tcam + fpga + pf_ring zc + ml",
-		"ml_ready":    s.Store.Model().Ready,
+		"policy_id":     policy.ID,
+		"version":       policy.Version,
+		"announcements": plan,
+		"nodes":         len(programs),
+		"datapath":      "asic/tcam + fpga + pf_ring zc + ml",
+		"ml_ready":      s.Store.Model().Ready,
 	})
 }
 
@@ -636,8 +644,12 @@ func validateNode(n model.Node) error {
 	if strings.ContainsAny(n.Name, "/|") {
 		return errors.New("name must not contain '/' or '|'")
 	}
-	// A negative or absurd capacity skews prefix assignment; reject it at the
-	// edge rather than clamping it silently.
+	// Capacity decides how hard a node is prepended against the rest of the
+	// fabric, so a value that cannot be compared would quietly make this node
+	// the most attractive path everywhere. Reject it at the edge.
+	if math.IsNaN(n.CapacityGbps) || math.IsInf(n.CapacityGbps, 0) {
+		return fmt.Errorf("capacity_gbps must be a finite number, got %v", n.CapacityGbps)
+	}
 	if n.CapacityGbps < 0 {
 		return fmt.Errorf("capacity_gbps must not be negative, got %v", n.CapacityGbps)
 	}
@@ -652,10 +664,15 @@ func validateNode(n model.Node) error {
 }
 
 func validatePolicy(p model.Policy) error {
+	protected := map[string]bool{}
 	for _, prefix := range p.Protected {
 		if _, err := netip.ParsePrefix(prefix); err != nil {
 			return fmt.Errorf("protected prefix %q: %v", prefix, err)
 		}
+		protected[prefix] = true
+	}
+	if err := validateSteering(p, protected); err != nil {
+		return err
 	}
 	seen := map[string]bool{}
 	for i, rule := range p.Rules {
@@ -672,6 +689,38 @@ func validatePolicy(p model.Policy) error {
 		seen[rule.ID] = true
 		if err := validateRule(rule); err != nil {
 			return fmt.Errorf("rules[%d] (%s): %v", i, rule.ID, err)
+		}
+	}
+	return nil
+}
+
+// validateSteering checks the per-prefix BGP overrides. A steering row that
+// names a prefix the policy does not protect is a typo that would otherwise
+// sit in the policy doing nothing.
+func validateSteering(p model.Policy, protected map[string]bool) error {
+	seen := map[string]bool{}
+	for i, st := range p.Steering {
+		if st.Prefix == "" {
+			return fmt.Errorf("steering[%d]: prefix required", i)
+		}
+		if !protected[st.Prefix] {
+			return fmt.Errorf("steering[%d]: prefix %q is not in this policy's protected list", i, st.Prefix)
+		}
+		if seen[st.Prefix] {
+			return fmt.Errorf("steering[%d]: duplicate steering for prefix %q", i, st.Prefix)
+		}
+		seen[st.Prefix] = true
+		for j, region := range st.Regions {
+			if strings.TrimSpace(region) == "" {
+				return fmt.Errorf("steering[%d].regions[%d]: region must not be empty", i, j)
+			}
+		}
+		// Communities are written into a routing daemon's control pipe on
+		// every node, so they are checked here rather than at the pipe.
+		for j, c := range st.Communities {
+			if err := bgp.ValidateCommunity(c); err != nil {
+				return fmt.Errorf("steering[%d].communities[%d]: %v", i, j, err)
+			}
 		}
 	}
 	return nil

@@ -1,13 +1,31 @@
 {
   "name": "game-edge",
-  "protected": ["203.0.113.0/24", "203.0.114.10/32"],
+  "protected": [
+    "203.0.113.0/24",
+    "203.0.114.10/32"
+  ],
+  "steering": [
+    {
+      "prefix": "203.0.114.10/32",
+      "regions": [
+        "iad",
+        "fra"
+      ],
+      "communities": [
+        "65000:100"
+      ]
+    }
+  ],
   "rules": [
     {
       "id": "tcam-bogon",
       "stage": "asic",
       "action": "drop",
       "priority": 100,
-      "match": {"src_cidr": "0.0.0.0/8", "dst_cidr": "203.0.113.0/24"},
+      "match": {
+        "src_cidr": "0.0.0.0/8",
+        "dst_cidr": "203.0.113.0/24"
+      },
       "comment": "TCAM ACL: drop bogon sources before they leave the ASIC"
     },
     {
@@ -15,7 +33,12 @@
       "stage": "asic",
       "action": "drop",
       "priority": 200,
-      "match": {"src_cidr": "198.51.100.0/24", "dst_cidr": "203.0.113.0/24", "proto": "udp", "dport": 19132},
+      "match": {
+        "src_cidr": "198.51.100.0/24",
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "udp",
+        "dport": 19132
+      },
       "comment": "TCAM ACL: drop a known UDP flood source toward the game port"
     },
     {
@@ -24,7 +47,10 @@
       "action": "rate_limit",
       "priority": 300,
       "pps": 50000,
-      "match": {"dst_cidr": "203.0.113.0/24", "proto": "udp"},
+      "match": {
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "udp"
+      },
       "comment": "FPGA meter: line-rate UDP cap on the protected prefix"
     },
     {
@@ -33,7 +59,11 @@
       "action": "rate_limit",
       "priority": 310,
       "pps": 20000,
-      "match": {"dst_cidr": "203.0.113.0/24", "proto": "tcp", "tcp_flags": "syn"},
+      "match": {
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "tcp",
+        "tcp_flags": "syn"
+      },
       "comment": "FPGA meter: SYN rate limit"
     },
     {
@@ -42,7 +72,10 @@
       "action": "inspect",
       "priority": 400,
       "pps": 100000,
-      "match": {"dst_cidr": "203.0.113.0/24", "proto": "tcp"},
+      "match": {
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "tcp"
+      },
       "comment": "PF_RING ZC: zero-copy userspace inspect for residual TCP"
     }
   ]

@@ -22,9 +22,8 @@ func TestThreeStageDropPath(t *testing.T) {
 			{ID: "zc", Stage: model.StageZC, Action: model.ActionInspect, Priority: 30, PPS: 50, Match: model.Match{DstCIDR: "203.0.113.0/24", Proto: "tcp"}},
 		},
 	}
-	nodes := []model.Node{{ID: "node-a", Name: "scrub-a", CapacityGbps: 100}}
-	assigned := compiler.Assign(policy.Protected, nodes)
-	progs := compiler.Compile(policy, nodes, assigned)
+	nodes := []model.Node{{ID: "node-a", Name: "scrub-a", CapacityGbps: 100, Status: model.NodeReady}}
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes))
 	pipe := New(*progs["node-a"])
 
 	acl := pipe.Decide(model.Flow{SrcIP: "198.51.100.9", DstIP: "203.0.113.10", Proto: "udp", DPort: 19132, PPS: 10})
@@ -41,20 +40,29 @@ func TestThreeStageDropPath(t *testing.T) {
 	}
 }
 
-func TestAssignmentSpreads(t *testing.T) {
+// Anycast means every node carries every protected prefix, so a flood on one
+// prefix is absorbed by the whole fabric rather than by one scrubber.
+func TestEveryNodeEnforcesEveryPrefix(t *testing.T) {
 	nodes := []model.Node{
-		{ID: "a", CapacityGbps: 10},
-		{ID: "b", CapacityGbps: 10},
-		{ID: "c", CapacityGbps: 10},
+		{ID: "a", Name: "a", CapacityGbps: 10, Status: model.NodeReady},
+		{ID: "b", Name: "b", CapacityGbps: 10, Status: model.NodeReady},
+		{ID: "c", Name: "c", CapacityGbps: 10, Status: model.NodeReady},
 	}
-	prefixes := []string{"203.0.113.0/24", "203.0.114.0/24", "203.0.115.0/24", "203.0.116.0/24", "198.51.100.0/24", "192.0.2.0/24"}
-	got := compiler.Assign(prefixes, nodes)
-	seen := map[string]bool{}
-	for _, a := range got {
-		seen[a.NodeID] = true
-	}
-	if len(seen) < 2 {
-		t.Fatalf("expected prefixes across nodes, got %+v", got)
+	policy := model.Policy{ID: "pol-1", Version: 1, Protected: []string{
+		"203.0.113.0/24", "203.0.114.0/24", "203.0.115.0/24",
+	}}
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes))
+
+	flow := model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.114.9", Proto: "udp", PPS: 10}
+	for _, n := range nodes {
+		prog := progs[n.ID]
+		if len(prog.Prefixes) != len(policy.Protected) {
+			t.Fatalf("node %s enforces %v, expected all of %v", n.ID, prog.Prefixes, policy.Protected)
+		}
+		// Whichever node BGP steers the traffic to must recognise it as its own.
+		if d := New(*prog).Decide(flow); d.Reason == "prefix not assigned to this node" {
+			t.Fatalf("node %s would wave through traffic anycast sent it: %+v", n.ID, d)
+		}
 	}
 }
 

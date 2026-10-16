@@ -2,13 +2,74 @@
 
 Distributed denial-of-service scrubbing for SecNov. Multi-node, API-controlled, and built on ASIC/TCAM ACLs, FPGA meters, and PF_RING ZC. This is the cloud fabric, not the XDP host filter.
 
-Attack traffic is steered onto scrubbing nodes. Each node drops in hardware first, then meters in the FPGA, then hands residual flows to a PF_RING ZC userspace inspect path. The control API compiles one policy into all three programs and assigns protected prefixes across the live nodes.
+Attack traffic is steered onto scrubbing nodes by anycast. Each node drops in hardware first, then meters in the FPGA, then hands residual flows to a PF_RING ZC userspace inspect path. The control API compiles one policy into all three programs and into the fabric's BGP posture.
 
-A node counts as live while it has heartbeated within the last 30 seconds. A node past that window is reported `stale` and is skipped by prefix assignment, so a prefix is never handed to a scrubber that stopped answering. A node that holds no prefix assignment enforces nothing.
+A node counts as live while it has heartbeated within the last 30 seconds. A node past that window is reported `stale` and is withdrawn from anycast, so traffic moves to the nodes still answering.
 
-The fabric is kept compiled against the live set rather than against whoever happened to be up at the last deploy. A node that registers or recovers after a deploy is compiled into the standing policy immediately, and the control plane re-checks membership every few seconds so a node that dies has its prefixes reassigned. If every node goes stale the last programs are kept rather than blanked, so whatever is still enforcing them keeps doing so.
+The fabric is kept compiled against the live set rather than against whoever happened to be up at the last deploy. A node that registers or recovers after a deploy is compiled into the standing policy immediately, and the control plane re-checks membership every few seconds. If every node goes stale the last programs are kept rather than blanked, so whatever is still enforcing them keeps doing so.
 
 Node IDs derive from name and region, so two scrubbers sharing both collapse onto one identity. A registration that would take over a node that is still live is refused with `409`; once the incumbent has aged out, a replacement is free to take the identity. Each agent advertises the address peers should dial with `-advertise` — it defaults to `-listen`, or to `hostname:port` when `-listen` is a wildcard.
+
+## Steering
+
+The fabric is anycast. Every eligible node announces every protected prefix, so
+nothing is owned by one scrubber and an attack on a single prefix is absorbed by
+the whole fabric instead of landing on whichever node won a hash. Traffic lands
+wherever BGP decides is closest to the source, which also puts scrubbing near
+the attack rather than hauling it across the backbone.
+
+Two things shape the plan:
+
+- **Capacity, as AS-path prepends.** The largest announcing node advertises
+  unpadded; each halving of capacity relative to it costs one prepend, up to
+  five. A prepend makes a node a less attractive path for sources that have a
+  choice, which weights the split without pinning a prefix anywhere. A node
+  whose capacity cannot be compared is padded to the maximum, so a bad
+  registration sheds traffic rather than attracting it.
+- **Liveness.** A node past its TTL is withdrawn, and the survivors re-weight
+  against each other. That withdrawal *is* the failover — nothing is
+  reassigned, and the prefix is still announced from everywhere else.
+
+A policy can override the default posture per prefix:
+
+```json
+"steering": [
+  {"prefix": "203.0.114.10/32", "regions": ["iad", "fra"], "communities": ["65000:100"]}
+]
+```
+
+`regions` is a hard boundary, not a preference: a node outside them neither
+announces the prefix nor inspects traffic for it, which is how a prefix is kept
+inside a jurisdiction. Everything else is softer — a node that is *withdrawing*
+still enforces policy on the prefix, because BGP takes time to converge and
+traffic still arriving should be scrubbed rather than waved through.
+
+Scrubline does not speak BGP itself. It compiles the plan, the same way it
+compiles TCAM, FPGA, and ZC programs, and the agent serves it for the speaker
+running beside it. `GET /bgp` on a node returns the plan as JSON;
+`GET /bgp?format=exabgp` returns it as ExaBGP commands:
+
+```
+announce route 203.0.113.0/24 next-hop 198.51.100.3 as-path [ 65001 65001 65001 ]
+announce route 203.0.114.10/32 next-hop 198.51.100.1 community [ 65000:100 ]
+withdraw route 203.0.113.0/24 next-hop 198.51.100.1
+```
+
+Give the agent `-local-as` so it can pad the path, and `-bgp-next-hop` when the
+address upstreams should route to differs from the one peers reach the node on.
+Communities are validated when the policy is saved, not at the speaker: these
+lines are written into a routing daemon's control pipe, so an unchecked value
+would be a command injection into the thing that decides where the internet
+sends traffic.
+
+`scrubctl bgp` prints the fabric's current posture:
+
+```
+PREFIX           NODE     REGION  STATE     PREPENDS  NEXT HOP      WHY
+203.0.113.0/24   scrub-a  iad     announce  0         198.51.100.1  anycast member at full preference
+203.0.113.0/24   scrub-b  fra     announce  1         198.51.100.2  anycast member padded 1 to weight for capacity
+203.0.113.0/24   scrub-c  sin     withdraw  -         198.51.100.3  node has not heartbeated within its TTL
+```
 
 ## Datapath
 
@@ -83,7 +144,8 @@ work":
 - `scrubline_rule_matches_total{node,stage,rule}` and `scrubline_rule_drops_total{...}` — per rule. A rule with matches and no drops is seeing traffic it is not acting on; a rule with neither is dead weight in the policy.
 - `scrubline_stage_dropped_total{node,stage}` and `scrubline_stage_permitted_total{...}` — where in the pipeline traffic is being decided. Work moving from `asic` toward `zc` means the cheap stages are missing it.
 - `scrubline_*_pps_total` — the same counts weighted by the per-flow rate reported on each decision. A volume indicator, not a packet counter.
-- `scrubline_unowned_flows_total{node}` — flows for a prefix the node was not assigned. A rising value means the steering layer and the fabric disagree about who scrubs what.
+- `scrubline_unowned_flows_total{node}` — flows for a prefix the node does not carry. A rising value means the steering layer and the fabric disagree about who scrubs what.
+- `scrubline_bgp_announced{node,prefix}` and `scrubline_bgp_prepends{node,prefix}` — the steering posture. A prefix with no node at 1 is attracting no traffic to the fabric at all.
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
 - `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
 
@@ -92,7 +154,7 @@ two seconds does not reset the series. A rule that is removed, or moved to
 another stage, takes its series with it.
 
 The control plane also reports its own view: `scrubline_nodes{status}`,
-`scrubline_assignments`, `scrubline_programs`, `scrubline_node_prefixes{node}`
+`scrubline_announcements`, `scrubline_programs`, `scrubline_node_prefixes{node}`
 (zero means the node is enforcing nothing), `scrubline_fabric_recompiles_total`,
 the published model's holdout metrics, and
 `scrubline_api_requests_total{route,status}`.
@@ -110,11 +172,11 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 
 - `POST /v1/nodes/register` node name, region, capacity, backends
 - `GET /v1/nodes`
-- `POST /v1/policies` protected prefixes and stage rules
-- `POST /v1/policies/{id}/deploy` assign prefixes across live nodes and compile ASIC, FPGA, ZC programs
+- `POST /v1/policies` protected prefixes, stage rules, and per-prefix steering
+- `POST /v1/policies/{id}/deploy` compile the ASIC, FPGA, and ZC programs and the fabric's BGP plan
 - `POST /v1/nodes/{id}/heartbeat` keep a node live; the body optionally carries the node's datapath counters
 - `GET /v1/nodes/{id}/stats` the counters a node last reported
-- `GET /v1/fabric` assignments and compiled programs
+- `GET /v1/fabric` the BGP announcement plan and the compiled programs
 - `GET /metrics` Prometheus exposition for the control plane and the fleet
 - `GET /v1/nodes/{id}/program` what a node agent installs
 - `POST /v1/decide` run a flow record through a node's pipeline
@@ -129,3 +191,6 @@ Example policy: `configs/policy.example.json`. Example training set: `configs/ml
 go run ./cmd/scrubctl ml-load configs/ml.samples.json
 go run ./cmd/scrubctl ml-train
 ```
+
+The node agent also takes `-local-as` and `-bgp-next-hop` for steering; see
+[Steering](#steering).

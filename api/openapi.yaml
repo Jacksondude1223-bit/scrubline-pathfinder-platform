@@ -55,6 +55,10 @@ paths:
       summary: List policies
     post:
       summary: Create or replace a policy
+      description: >-
+        Carries protected prefixes, stage rules, and optional per-prefix
+        steering. Steering regions are a hard boundary, and communities are
+        validated here because the agents write them into a routing daemon.
   /v1/policies/{id}/deploy:
     post:
       summary: Compile policy onto the fabric and assign prefixes to live nodes
@@ -66,7 +70,7 @@ paths:
             type: string
   /v1/fabric:
     get:
-      summary: Assignments plus compiled ASIC, FPGA, and ZC programs
+      summary: The BGP announcement plan plus compiled ASIC, FPGA, and ZC programs
   /v1/decide:
     post:
       summary: Run a flow record through a node's three-stage pipeline

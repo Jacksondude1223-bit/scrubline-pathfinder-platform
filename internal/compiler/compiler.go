@@ -2,73 +2,197 @@ package compiler
 
 import (
 	"fmt"
-	"hash/fnv"
 	"math"
+	"net"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 )
 
-func Assign(prefixes []string, nodes []model.Node) []model.Assignment {
-	if len(nodes) == 0 {
-		return nil
-	}
-	out := make([]model.Assignment, 0, len(prefixes))
-	for _, p := range prefixes {
-		best := nodes[0]
-		bestScore := score(p, nodes[0])
-		for _, n := range nodes[1:] {
-			if s := score(p, n); s > bestScore {
-				best, bestScore = n, s
-			}
+// MaxPrepends bounds AS-path padding. Past a handful of prepends upstreams
+// stop distinguishing paths, and a very long path invites filtering.
+const MaxPrepends = 5
+
+// Plan computes the fabric's BGP posture: for every protected prefix, what
+// each node advertises.
+//
+// The fabric is anycast, so every eligible node announces every prefix and no
+// prefix is owned by one scrubber. Two things shape the plan:
+//
+//   - Capacity, as AS-path prepends. The largest node announces unpadded; each
+//     halving of capacity relative to it costs one prepend, which makes a node
+//     a less attractive path for sources that have a choice. This weights the
+//     split without pinning a prefix anywhere.
+//   - Liveness. A node past its heartbeat TTL is withdrawn, so its share of
+//     the traffic moves to the nodes still answering. That withdrawal is the
+//     failover: nothing has to be reassigned.
+func Plan(policy model.Policy, nodes []model.Node) []model.Announcement {
+	steering := steeringByPrefix(policy)
+	// Padding is relative to the largest node that is actually announcing. A
+	// node that has gone stale is not attracting traffic, so weighting the
+	// survivors against it would leave the whole live fabric padded against
+	// something that is not there.
+	maxCapacity := 0.0
+	for _, n := range nodes {
+		if n.Status == model.NodeStale {
+			continue
 		}
-		out = append(out, model.Assignment{Prefix: p, NodeID: best.ID, Weight: best.CapacityGbps})
+		if c := capacityOf(n); c > maxCapacity {
+			maxCapacity = c
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Prefix < out[j].Prefix })
+
+	out := make([]model.Announcement, 0, len(policy.Protected)*len(nodes))
+	for _, prefix := range policy.Protected {
+		st := steering[prefix]
+		for _, n := range nodes {
+			if !eligible(n, st) {
+				continue
+			}
+			a := model.Announcement{
+				Prefix:      prefix,
+				NodeID:      n.ID,
+				NodeName:    n.Name,
+				Region:      n.Region,
+				Communities: append([]string(nil), st.Communities...),
+				NextHop:     nextHop(n),
+			}
+			if n.Status == model.NodeStale {
+				a.State = model.StateWithdraw
+				a.Reason = "node has not heartbeated within its TTL"
+			} else {
+				a.State = model.StateAnnounce
+				a.Prepends = prependsFor(n, maxCapacity)
+				a.Reason = prependReason(a.Prepends)
+			}
+			out = append(out, a)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Prefix != out[j].Prefix {
+			return out[i].Prefix < out[j].Prefix
+		}
+		return out[i].NodeID < out[j].NodeID
+	})
 	return out
 }
 
-// capacityBias caps how much capacity can tilt the rendezvous hash, so a single
-// very large node cannot win every prefix.
-const capacityBias = 500
-
-func score(prefix string, n model.Node) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(prefix + "|" + n.ID))
-	// Capacity biases the rendezvous pick without pinning every prefix to the
-	// largest node. Converting a negative or NaN float to uint64 is undefined in
-	// Go and yielded a near-max value, which let one node with a bogus capacity
-	// capture the whole fabric; clamp into range first.
-	bias := n.CapacityGbps
-	if math.IsNaN(bias) || bias < 0 {
-		bias = 0
+func prependReason(prepends int) string {
+	if prepends == 0 {
+		return "anycast member at full preference"
 	}
-	if bias > capacityBias {
-		bias = capacityBias
-	}
-	return h.Sum64()%1000 + uint64(bias)
+	return fmt.Sprintf("anycast member padded %d to weight for capacity", prepends)
 }
 
-func Compile(policy model.Policy, nodes []model.Node, assigned []model.Assignment) map[string]*model.Program {
-	byNode := map[string][]string{}
-	for _, a := range assigned {
-		byNode[a.NodeID] = append(byNode[a.NodeID], a.Prefix)
+// steeringByPrefix indexes a policy's steering overrides. A prefix with no
+// override takes the default anycast posture.
+func steeringByPrefix(policy model.Policy) map[string]model.Steering {
+	out := make(map[string]model.Steering, len(policy.Steering))
+	for _, st := range policy.Steering {
+		out[st.Prefix] = st
+	}
+	return out
+}
+
+// eligible reports whether a node may carry a prefix at all. Region pinning is
+// a hard boundary, not a preference: a node outside the listed regions neither
+// announces the prefix nor enforces policy on it.
+func eligible(n model.Node, st model.Steering) bool {
+	if len(st.Regions) == 0 {
+		return true
+	}
+	for _, r := range st.Regions {
+		if strings.EqualFold(r, n.Region) {
+			return true
+		}
+	}
+	return false
+}
+
+// capacityOf reads a node's capacity defensively. A NaN or negative value must
+// not reach the prepend arithmetic, where it would silently make one node the
+// most attractive path in the fabric.
+func capacityOf(n model.Node) float64 {
+	c := n.CapacityGbps
+	if math.IsNaN(c) || math.IsInf(c, 0) || c < 0 {
+		return 0
+	}
+	return c
+}
+
+// prependsFor weights a node against the largest one in the fabric. A node
+// with no usable capacity is padded to the maximum rather than treated as
+// infinite, so a bad registration sheds traffic instead of attracting it.
+func prependsFor(n model.Node, maxCapacity float64) int {
+	c := capacityOf(n)
+	if c <= 0 {
+		return MaxPrepends
+	}
+	if maxCapacity <= 0 || c >= maxCapacity {
+		return 0
+	}
+	p := int(math.Round(math.Log2(maxCapacity / c)))
+	if p < 0 {
+		return 0
+	}
+	if p > MaxPrepends {
+		return MaxPrepends
+	}
+	return p
+}
+
+// nextHop is the address upstreams route the prefix to. The agent advertises
+// it at registration; a node that did not gets an empty next hop and the
+// speaker falls back to its own session address.
+func nextHop(n model.Node) string {
+	if n.Advertise == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(n.Advertise); err == nil {
+		return host
+	}
+	return n.Advertise
+}
+
+// EnforcedPrefixes lists the prefixes a node applies policy to. That is every
+// prefix it is eligible for, including ones it is currently withdrawing: BGP
+// takes time to converge, and traffic still arriving for a withdrawn prefix
+// should be scrubbed rather than waved through. Only a region boundary keeps a
+// prefix off a node entirely.
+func EnforcedPrefixes(policy model.Policy, n model.Node) []string {
+	steering := steeringByPrefix(policy)
+	out := []string{}
+	for _, prefix := range policy.Protected {
+		if eligible(n, steering[prefix]) {
+			out = append(out, prefix)
+		}
+	}
+	return out
+}
+
+func Compile(policy model.Policy, nodes []model.Node, plan []model.Announcement) map[string]*model.Program {
+	byNode := map[string][]model.Announcement{}
+	for _, a := range plan {
+		byNode[a.NodeID] = append(byNode[a.NodeID], a)
 	}
 	out := map[string]*model.Program{}
 	now := time.Now().UTC()
 	for _, n := range nodes {
-		prefixes := byNode[n.ID]
-		if prefixes == nil {
-			prefixes = []string{}
+		prefixes := EnforcedPrefixes(policy, n)
+		announcements := byNode[n.ID]
+		if announcements == nil {
+			announcements = []model.Announcement{}
 		}
 		stages := backendSet(n)
 		prog := &model.Program{
-			NodeID:     n.ID,
-			PolicyID:   policy.ID,
-			Version:    policy.Version,
-			Prefixes:   prefixes,
-			CompiledAt: now,
+			NodeID:        n.ID,
+			PolicyID:      policy.ID,
+			Version:       policy.Version,
+			Prefixes:      prefixes,
+			Announcements: announcements,
+			CompiledAt:    now,
 		}
 		for _, rule := range policy.Rules {
 			// A node only gets entries for the backends it advertised. Handing

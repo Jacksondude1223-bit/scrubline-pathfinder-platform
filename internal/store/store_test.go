@@ -43,7 +43,8 @@ func TestNodeIDIsStableAcrossReRegistration(t *testing.T) {
 	}
 }
 
-// Assignment must not hand prefixes to a node that stopped answering.
+// A node that stopped answering must drop out of the live set, which is
+// what withdraws it from anycast.
 func TestLiveNodesExcludesStaleNodes(t *testing.T) {
 	s := New()
 	clock := time.Now().UTC()
@@ -146,7 +147,7 @@ func TestPutDeployCopiesPrograms(t *testing.T) {
 	progs := map[string]*model.Program{
 		"node-a": {NodeID: "node-a", PolicyID: "pol-1", Version: 1, Prefixes: []string{"203.0.113.0/24"}},
 	}
-	s.PutDeploy("pol-1", []model.Assignment{{Prefix: "203.0.113.0/24", NodeID: "node-a"}}, progs)
+	s.PutDeploy("pol-1", []model.Announcement{{Prefix: "203.0.113.0/24", NodeID: "node-a", State: model.StateAnnounce}}, progs)
 	progs["node-a"].Version = 99
 	got, ok := s.Program("node-a")
 	if !ok {

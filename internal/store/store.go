@@ -35,14 +35,14 @@ var ErrSampleLimit = fmt.Errorf("training set is limited to %d samples", MaxSamp
 var ErrNodeConflict = errors.New("a different live node is already registered under this name and region")
 
 type Store struct {
-	mu          sync.Mutex
-	nodes       map[string]*model.Node
-	policies    map[string]*model.Policy
-	programs    map[string]*model.Program
-	assignments []model.Assignment
-	samples     []ml.Sample
-	model       ml.Model
-	seq         int
+	mu       sync.Mutex
+	nodes    map[string]*model.Node
+	policies map[string]*model.Policy
+	programs map[string]*model.Program
+	plan     []model.Announcement
+	samples  []ml.Sample
+	model    ml.Model
+	seq      int
 	// lastPolicyID is the policy of the most recent deploy. The fabric is
 	// recompiled against it when the live node set changes, so a node that
 	// joins or recovers after a deploy is not left without a program.
@@ -62,6 +62,14 @@ func New() *Store {
 		reports:  map[string]telemetry.Report{},
 		now:      func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetClock replaces the store's time source. It exists so tests outside this
+// package can age nodes past their TTL without sleeping.
+func (s *Store) SetClock(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
 }
 
 // clock reads the store's time source, tolerating a zero-value Store.
@@ -126,8 +134,8 @@ func (s *Store) Nodes() []model.Node {
 }
 
 // LiveNodes lists only the nodes that have heartbeated within NodeTTL. Prefix
-// assignment uses this: handing a prefix to a node that stopped answering
-// blackholes the traffic it was supposed to scrub.
+// The announcement plan uses this: a node past its TTL is withdrawn from
+// anycast so its share of the traffic moves to the nodes still answering.
 func (s *Store) LiveNodes() []model.Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -210,11 +218,11 @@ func (s *Store) Policy(id string) (model.Policy, bool) {
 	return *p, true
 }
 
-func (s *Store) PutDeploy(policyID string, assignments []model.Assignment, programs map[string]*model.Program) {
+func (s *Store) PutDeploy(policyID string, plan []model.Announcement, programs map[string]*model.Program) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastPolicyID = policyID
-	s.assignments = append([]model.Assignment(nil), assignments...)
+	s.plan = append([]model.Announcement(nil), plan...)
 	// Copy the caller's map so a later mutation of it cannot reach into the store.
 	s.programs = make(map[string]*model.Program, len(programs))
 	for k, v := range programs {
@@ -233,7 +241,8 @@ func (s *Store) Program(nodeID string) (model.Program, bool) {
 	return *p, true
 }
 
-func (s *Store) Fabric() ([]model.Assignment, []model.Program) {
+// Fabric returns the BGP announcement plan and the compiled programs.
+func (s *Store) Fabric() ([]model.Announcement, []model.Program) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	progs := make([]model.Program, 0, len(s.programs))
@@ -241,7 +250,7 @@ func (s *Store) Fabric() ([]model.Assignment, []model.Program) {
 		progs = append(progs, *p)
 	}
 	sort.Slice(progs, func(i, j int) bool { return progs[i].NodeID < progs[j].NodeID })
-	return append([]model.Assignment(nil), s.assignments...), progs
+	return append([]model.Announcement(nil), s.plan...), progs
 }
 
 // AddSamples appends a labeled batch and reports the new total.

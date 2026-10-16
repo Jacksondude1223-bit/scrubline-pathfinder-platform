@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/metrics"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 )
 
@@ -161,4 +162,33 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		mlScored, mlDrops, mlPasses, mlReady,
 		buckets, bucketsMax, age,
 	}
+}
+
+// AnnouncementFamilies renders a BGP announcement plan as metrics. A node
+// passes its own rows and the control plane passes the whole fabric's, so the
+// same series answer "where is this prefix being announced from, and how hard
+// is each node leaning away from it".
+func AnnouncementFamilies(plan []model.Announcement) []metrics.Family {
+	announced := metrics.Family{
+		Name: "scrubline_bgp_announced", Type: metrics.Gauge,
+		Help: "1 when a node is advertising a protected prefix, 0 when it is withdrawn. A prefix with no node at 1 is attracting no traffic to the fabric.",
+	}
+	prepends := metrics.Family{
+		Name: "scrubline_bgp_prepends", Type: metrics.Gauge,
+		Help: "AS-path padding on a node's announcement. Higher means the node is a less attractive path and takes less of the prefix's traffic.",
+	}
+	for _, a := range plan {
+		labels := []metrics.Label{
+			{Name: "node", Value: a.NodeID},
+			{Name: "name", Value: a.NodeName},
+			{Name: "region", Value: a.Region},
+			{Name: "prefix", Value: a.Prefix},
+		}
+		up := a.State == model.StateAnnounce
+		announced.Samples = append(announced.Samples, metrics.Sample{Labels: labels, Value: boolValue(up)})
+		if up {
+			prepends.Samples = append(prepends.Samples, metrics.Sample{Labels: labels, Value: float64(a.Prepends)})
+		}
+	}
+	return []metrics.Family{announced, prepends}
 }
