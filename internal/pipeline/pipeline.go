@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"log"
 	"net/netip"
 	"sort"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/gamefilter"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 )
@@ -31,6 +33,14 @@ const (
 type bucket struct {
 	windowStart time.Time
 	pps         int
+}
+
+// bucketID keys the per-source rate table. A struct key costs no allocation,
+// where joining the two into a string cost one on every packet that reached
+// a ZC rate rule.
+type bucketID struct {
+	rule string
+	src  string
 }
 
 // loadBucket is one second of the rolling load window. second identifies which
@@ -150,6 +160,17 @@ func stageIndex(s model.Stage) int {
 	}
 }
 
+// filterStats counts what one game filter did.
+type filterStats struct {
+	id            string
+	profile       string
+	inspected     atomic.Uint64
+	dropped       atomic.Uint64
+	challenged    atomic.Uint64
+	uninspectable atomic.Uint64
+	ppsDropped    atomic.Uint64
+}
+
 // counters are the node-level totals behind /metrics. They are atomics so a
 // scrape never has to wait on the datapath.
 type counters struct {
@@ -226,12 +247,22 @@ type Pipeline struct {
 	mu       sync.Mutex
 	program  model.Program
 	compiled *compiledProgram
-	buckets  map[string]*bucket
+	buckets  map[bucketID]*bucket
 	model    ml.Model
 	// stats is keyed by rule ID, which a policy guarantees unique. It is the
 	// handle that lets counters outlive a reprogram.
 	stats    map[string]*ruleStats
 	counters counters
+	// games admits traffic to a game port only if it looks like that game.
+	// It runs in front of the ZC rules, so a packet that is not the protocol
+	// dies before it reaches the behavioral cap or the classifier.
+	games *gamefilter.Engine
+	// gameStats is keyed by filter ID and, like the rule counters, outlives
+	// a reprogram.
+	gameStats map[string]*filterStats
+	// gameBindings is how many filters are installed, cached here so a
+	// policy with none does not pay for the engine's lock on every packet.
+	gameBindings int
 	// load is the rolling per-second window behind the offered-load average.
 	load [loadWindowSeconds]loadBucket
 	// lastSweep throttles reclaiming the rate table to once per window, so a
@@ -243,11 +274,45 @@ type Pipeline struct {
 }
 
 func New(p model.Program) *Pipeline {
-	pipe := &Pipeline{program: p, buckets: map[string]*bucket{}, now: time.Now}
+	pipe := &Pipeline{program: p, buckets: map[bucketID]*bucket{}, now: time.Now}
 	compiled := compileProgram(p)
 	pipe.attachStats(compiled)
 	pipe.compiled = compiled
+	pipe.loadGames(p)
 	return pipe
+}
+
+// loadGames installs the program's game filters. A filter that does not
+// compile is dropped with a log line rather than taking the datapath down:
+// the control plane validates these on save, so reaching here means
+// something got past it, and a node that refuses to program at all is worse
+// than one missing a filter. Callers hold p.mu, or hold the pipeline alone.
+func (p *Pipeline) loadGames(prog model.Program) {
+	bindings, err := gamefilter.Compile(prog.Games)
+	if err != nil {
+		log.Printf("pipeline: game filters in policy %s could not be compiled, running without them: %v", prog.PolicyID, err)
+		bindings = nil
+	}
+	secret := []byte(prog.ChallengeSecret)
+	if p.games == nil {
+		p.games = gamefilter.New(bindings, secret)
+		if p.now != nil {
+			p.games.SetClock(p.clock)
+		}
+	} else {
+		p.games.Load(bindings, secret)
+	}
+
+	p.gameBindings = len(bindings)
+	next := make(map[string]*filterStats, len(bindings))
+	for _, b := range bindings {
+		if prev := p.gameStats[b.ID]; prev != nil && prev.profile == b.Profile.Name {
+			next[b.ID] = prev
+			continue
+		}
+		next[b.ID] = &filterStats{id: b.ID, profile: b.Profile.Name}
+	}
+	p.gameStats = next
 }
 
 // attachStats points every compiled rule at its counters, carrying over the
@@ -298,11 +363,12 @@ func (p *Pipeline) Load(prog model.Program) {
 		live[zc.RuleID] = struct{}{}
 	}
 	for key := range p.buckets {
-		if _, ok := live[ruleOf(key)]; !ok {
+		if _, ok := live[key.rule]; !ok {
 			delete(p.buckets, key)
 		}
 	}
 	p.attachStats(compiled)
+	p.loadGames(prog)
 	p.program = prog
 	p.compiled = compiled
 }
@@ -352,7 +418,7 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	// Every outcome is recorded in one place, so no return path can forget a
 	// counter.
 	p.record(d, decidedBy, pf)
-	p.observeLoad(now, pps, d.Action == model.ActionDrop)
+	p.observeLoad(now, pps, d.Action == model.ActionDrop || d.Action == model.ActionChallenge)
 	return d
 }
 
@@ -431,6 +497,14 @@ func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow, no
 			}
 		}
 	}
+	// The game filter is an admission check in front of the ZC path: a
+	// packet that is not the protocol its port speaks dies here, before it
+	// can reach the behavioral cap or the classifier and before it counts
+	// as a flow either of them has to reason about.
+	if d, decided := p.inspectGame(pf, f); decided {
+		return d, nil
+	}
+
 	for i := range cp.zc {
 		zc := &cp.zc[i]
 		if !zc.match.matches(pf) {
@@ -467,6 +541,58 @@ func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow, no
 	return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, Reason: "no matching drop rule"}, nil
 }
 
+// inspectGame runs the game filter and reports whether it decided the
+// packet. A pass, or traffic no binding covers, leaves the verdict to the ZC
+// rules behind it. Callers hold p.mu.
+func (p *Pipeline) inspectGame(pf parsedFlow, f model.Flow) (model.Decision, bool) {
+	// Most policies bind no game filter at all; those must not pay for the
+	// engine on every packet.
+	if p.games == nil || p.gameBindings == 0 {
+		return model.Decision{}, false
+	}
+	res := p.games.Inspect(gamefilter.Flow{
+		SrcIP: pf.srcIP, DstIP: f.DstIP, Proto: pf.proto, DPort: pf.dport,
+		Payload: f.Payload, HasPayload: f.Payload != nil,
+	})
+	if res.FilterID == "" {
+		// No binding covers this traffic.
+		return model.Decision{}, false
+	}
+	fs := p.gameStats[res.FilterID]
+	if fs != nil {
+		fs.inspected.Add(1)
+	}
+
+	switch res.Verdict {
+	case gamefilter.VerdictDrop:
+		if fs != nil {
+			fs.dropped.Add(1)
+			fs.ppsDropped.Add(nonNegative(pf.pps))
+		}
+		return model.Decision{
+			Action: model.ActionDrop, Stage: model.StageZC, Filter: res.FilterID,
+			Reason: fmt.Sprintf("game filter %s: %s", res.Profile, res.Reason),
+		}, true
+	case gamefilter.VerdictChallenge:
+		if fs != nil {
+			fs.challenged.Add(1)
+		}
+		return model.Decision{
+			Action: model.ActionChallenge, Stage: model.StageZC, Filter: res.FilterID,
+			Reason: fmt.Sprintf("game filter %s: %s", res.Profile, res.Reason),
+			Reply:  res.Reply,
+		}, true
+	case gamefilter.VerdictUninspectable:
+		// Counted, never acted on: the filter cannot judge what it was not
+		// given, and a datapath that supplies no payload must not blackhole
+		// a customer.
+		if fs != nil {
+			fs.uninspectable.Add(1)
+		}
+	}
+	return model.Decision{}, false
+}
+
 // seen counts a rule match. A rule that matched but left the verdict to a
 // later row still matched, which is the point of an observe-only rule.
 func (p *Pipeline) seen(rs *ruleStats, pf parsedFlow) {
@@ -481,7 +607,7 @@ func (p *Pipeline) seen(rs *ruleStats, pf parsedFlow) {
 func (p *Pipeline) record(d model.Decision, rs *ruleStats, pf parsedFlow) {
 	idx := stageIndex(d.Stage)
 	pps := nonNegative(pf.pps)
-	if d.Action == model.ActionDrop {
+	if d.Action == model.ActionDrop || d.Action == model.ActionChallenge {
 		p.counters.dropped[idx].Add(1)
 		p.counters.ppsDropped[idx].Add(pps)
 		if rs != nil {
@@ -509,7 +635,12 @@ type Stats struct {
 	Unowned   uint64       `json:"unowned"`
 	Stages    []StageStats `json:"stages"`
 	Rules     []RuleStats  `json:"rules"`
+	Games     []GameStats  `json:"games"`
 	ML        MLStats      `json:"ml"`
+	// GameSessions is how many sources the game filter is tracking, against
+	// its bound. At the bound it is admitting without tracking.
+	GameSessions    int `json:"game_sessions"`
+	GameSessionsMax int `json:"game_sessions_max"`
 	// RateBuckets is the size of the per-source rate table. It is bounded, and
 	// sitting at the bound means the behavioral cap is no longer tracking
 	// every source.
@@ -538,6 +669,17 @@ type RuleStats struct {
 	Drops      uint64      `json:"drops"`
 	PPSSeen    uint64      `json:"pps_seen"`
 	PPSDropped uint64      `json:"pps_dropped"`
+}
+
+// GameStats is one game filter's counters.
+type GameStats struct {
+	FilterID      string `json:"filter_id"`
+	Profile       string `json:"profile"`
+	Inspected     uint64 `json:"inspected"`
+	Dropped       uint64 `json:"dropped"`
+	Challenged    uint64 `json:"challenged"`
+	Uninspectable uint64 `json:"uninspectable"`
+	PPSDropped    uint64 `json:"pps_dropped"`
 }
 
 type MLStats struct {
@@ -588,7 +730,22 @@ func (p *Pipeline) Stats() Stats {
 			PPSDropped: rs.ppsDropped.Load(),
 		})
 	}
+	for _, gs := range p.gameStats {
+		out.Games = append(out.Games, GameStats{
+			FilterID:      gs.id,
+			Profile:       gs.profile,
+			Inspected:     gs.inspected.Load(),
+			Dropped:       gs.dropped.Load(),
+			Challenged:    gs.challenged.Load(),
+			Uninspectable: gs.uninspectable.Load(),
+			PPSDropped:    gs.ppsDropped.Load(),
+		})
+	}
+	if p.games != nil {
+		out.GameSessions, out.GameSessionsMax = p.games.Sessions()
+	}
 	sort.Slice(out.Rules, func(i, j int) bool { return out.Rules[i].RuleID < out.Rules[j].RuleID })
+	sort.Slice(out.Games, func(i, j int) bool { return out.Games[i].FilterID < out.Games[j].FilterID })
 	return out
 }
 
@@ -599,9 +756,9 @@ func (p *Pipeline) overRate(now time.Time, ruleID string, limit int, f parsedFlo
 		return false
 	}
 	if p.buckets == nil {
-		p.buckets = map[string]*bucket{}
+		p.buckets = map[bucketID]*bucket{}
 	}
-	key := ruleID + "|" + f.srcIP
+	key := bucketID{rule: ruleID, src: f.srcIP}
 	b, ok := p.buckets[key]
 	if !ok {
 		if len(p.buckets) >= maxBuckets && !p.reclaim(now) {

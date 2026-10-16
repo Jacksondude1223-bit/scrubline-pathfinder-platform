@@ -10,6 +10,9 @@ const (
 	ActionLimit   Action = "rate_limit"
 	ActionInspect Action = "inspect"
 	ActionCount   Action = "count"
+	// ActionChallenge drops this packet and emits the protocol's own
+	// challenge back to the source. The source is admitted once it answers.
+	ActionChallenge Action = "challenge"
 )
 
 type Stage string
@@ -45,8 +48,14 @@ type Policy struct {
 	Protected []string   `json:"protected"`
 	Rules     []Rule     `json:"rules"`
 	Steering  []Steering `json:"steering,omitempty"`
-	UpdatedAt time.Time  `json:"updated_at"`
-	Version   int        `json:"version"`
+	// Games binds protocol filters to ports on protected addresses.
+	Games []GameFilter `json:"games,omitempty"`
+	// ChallengeSecret keys the cookies the challenge gate mints. The control
+	// plane generates it and ships it to every node, because under anycast a
+	// cookie minted by one scrubber has to verify on another.
+	ChallengeSecret string    `json:"challenge_secret,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	Version         int       `json:"version"`
 }
 
 // Steering overrides the default anycast posture for one protected prefix.
@@ -91,6 +100,11 @@ type Flow struct {
 	DPort int    `json:"dport"`
 	Flags string `json:"flags,omitempty"`
 	PPS   int    `json:"pps"`
+	// Payload is the packet bytes, base64 in JSON. Only the ZC stage sees
+	// it: neither the TCAM nor the FPGA matches on payload. A record without
+	// one is still decided, just not by the game filter, which refuses to
+	// judge what it was not given.
+	Payload []byte `json:"payload,omitempty"`
 }
 
 type Decision struct {
@@ -100,6 +114,11 @@ type Decision struct {
 	Reason string  `json:"reason"`
 	NodeID string  `json:"node_id,omitempty"`
 	Score  float64 `json:"score,omitempty"`
+	// Filter names the game filter that decided, when one did.
+	Filter string `json:"filter,omitempty"`
+	// Reply is what the datapath should send back to the source. It is set
+	// only on a challenge.
+	Reply []byte `json:"reply,omitempty"`
 }
 
 type ACLEntry struct {
@@ -139,7 +158,57 @@ type Program struct {
 	// Announcements is this node's share of the fabric's BGP plan: what it
 	// advertises, and how hard it leans away from traffic it should not take.
 	Announcements []Announcement `json:"announcements"`
-	CompiledAt    time.Time      `json:"compiled_at"`
+	// Games are the protocol filters this node applies on its ZC stage, and
+	// the secret their challenge cookies are keyed with.
+	Games           []GameFilter `json:"games,omitempty"`
+	ChallengeSecret string       `json:"challenge_secret,omitempty"`
+	CompiledAt      time.Time    `json:"compiled_at"`
+}
+
+// GameFilter admits traffic to a game port only if it looks like that game.
+//
+// It is bound to a port on a protected address rather than to a game the
+// platform knows about: an operator says what runs where, and a protocol the
+// platform has never heard of is described in Custom rather than waiting for
+// a release.
+type GameFilter struct {
+	ID      string `json:"id"`
+	DstCIDR string `json:"dst_cidr,omitempty"`
+	Proto   string `json:"proto,omitempty"`
+	DPort   int    `json:"dport,omitempty"`
+	// Profile names a built-in protocol, or is empty when Custom describes
+	// one inline.
+	Profile string         `json:"profile,omitempty"`
+	Custom  *GameSignature `json:"custom,omitempty"`
+	// Observe records what the filter would have done without acting on it,
+	// which is how a binding is rolled out.
+	Observe bool   `json:"observe,omitempty"`
+	Comment string `json:"comment,omitempty"`
+}
+
+// GameSignature describes a protocol in the policy, for a game the platform
+// does not ship a profile for.
+//
+// It can validate framing and gate on the protocol's own opening sequence.
+// It cannot configure a challenge gate: answering a challenge means emitting
+// protocol-correct bytes, and a wrong guess at that framing breaks every
+// client rather than failing closed.
+type GameSignature struct {
+	MinLen    int         `json:"min_len,omitempty"`
+	MaxLen    int         `json:"max_len,omitempty"`
+	PacketIDs []int       `json:"packet_ids,omitempty"`
+	Magic     []GameMagic `json:"magic,omitempty"`
+	// Gate is "none" or "handshake".
+	Gate        string `json:"gate,omitempty"`
+	OpenerIDs   []int  `json:"opener_ids,omitempty"`
+	CompleteIDs []int  `json:"complete_ids,omitempty"`
+}
+
+// GameMagic is a byte sequence that must appear at a fixed offset, written
+// as hex in the policy.
+type GameMagic struct {
+	Offset int    `json:"offset"`
+	Hex    string `json:"hex"`
 }
 
 // AnnounceState is whether a node offers a prefix to its upstreams.

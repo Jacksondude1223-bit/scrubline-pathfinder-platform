@@ -121,6 +121,34 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		Name: "scrubline_dropped_pps", Type: metrics.Gauge,
 		Help: "Packet rate a node is currently dropping, averaged over its load window.",
 	}
+	gameInspected := metrics.Family{
+		Name: "scrubline_game_inspected_total", Type: metrics.Counter,
+		Help: "Packets a game filter looked at.",
+	}
+	gameDropped := metrics.Family{
+		Name: "scrubline_game_dropped_total", Type: metrics.Counter,
+		Help: "Packets dropped because they are not the protocol their port speaks.",
+	}
+	gameChallenged := metrics.Family{
+		Name: "scrubline_game_challenged_total", Type: metrics.Counter,
+		Help: "Sources sent the protocol's own challenge because they had not cleared the gate.",
+	}
+	gameUninspectable := metrics.Family{
+		Name: "scrubline_game_uninspectable_total", Type: metrics.Counter,
+		Help: "Packets a game filter was given no payload for. The filter never drops on these, so a rising value means the datapath is not supplying payloads and the filter is doing nothing.",
+	}
+	gameDroppedPPS := metrics.Family{
+		Name: "scrubline_game_dropped_pps_total", Type: metrics.Counter,
+		Help: "Sum of the per-flow rates reported on packets a game filter dropped.",
+	}
+	gameSessions := metrics.Family{
+		Name: "scrubline_game_sessions", Type: metrics.Gauge,
+		Help: "Sources the game filter is tracking through a gate.",
+	}
+	gameSessionsMax := metrics.Family{
+		Name: "scrubline_game_sessions_max", Type: metrics.Gauge,
+		Help: "Bound on the game filter's session table. At the bound it admits without tracking rather than evicting connected players.",
+	}
 	age := metrics.Family{
 		Name: "scrubline_report_age_seconds", Type: metrics.Gauge,
 		Help: "Seconds since this node last reported its counters.",
@@ -147,6 +175,18 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 			stageDroppedPPS.Samples = append(stageDroppedPPS.Samples, metrics.Sample{Labels: labels, Value: float64(st.PPSDropped)})
 			stagePermittedPPS.Samples = append(stagePermittedPPS.Samples, metrics.Sample{Labels: labels, Value: float64(st.PPSPermitted)})
 		}
+		gameSessions.Samples = append(gameSessions.Samples, metrics.Sample{Labels: id, Value: float64(s.GameSessions)})
+		gameSessionsMax.Samples = append(gameSessionsMax.Samples, metrics.Sample{Labels: id, Value: float64(s.GameSessionsMax)})
+		for _, g := range s.Games {
+			labels := with(id,
+				metrics.Label{Name: "filter", Value: g.FilterID},
+				metrics.Label{Name: "profile", Value: g.Profile})
+			gameInspected.Samples = append(gameInspected.Samples, metrics.Sample{Labels: labels, Value: float64(g.Inspected)})
+			gameDropped.Samples = append(gameDropped.Samples, metrics.Sample{Labels: labels, Value: float64(g.Dropped)})
+			gameChallenged.Samples = append(gameChallenged.Samples, metrics.Sample{Labels: labels, Value: float64(g.Challenged)})
+			gameUninspectable.Samples = append(gameUninspectable.Samples, metrics.Sample{Labels: labels, Value: float64(g.Uninspectable)})
+			gameDroppedPPS.Samples = append(gameDroppedPPS.Samples, metrics.Sample{Labels: labels, Value: float64(g.PPSDropped)})
+		}
 		for _, rule := range s.Rules {
 			labels := with(id,
 				metrics.Label{Name: "stage", Value: string(rule.Stage)},
@@ -170,7 +210,9 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		stageDropped, stagePermitted, stageDroppedPPS, stagePermittedPPS,
 		ruleMatches, ruleDrops, ruleSeenPPS, ruleDroppedPPS,
 		mlScored, mlDrops, mlPasses, mlReady,
-		buckets, bucketsMax, offeredPPS, droppedPPSRate, age,
+		buckets, bucketsMax, offeredPPS, droppedPPSRate,
+		gameInspected, gameDropped, gameChallenged, gameUninspectable, gameDroppedPPS,
+		gameSessions, gameSessionsMax, age,
 	}
 }
 

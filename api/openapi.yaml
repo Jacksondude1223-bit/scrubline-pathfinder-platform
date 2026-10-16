@@ -87,9 +87,13 @@ paths:
     post:
       summary: Create or replace a policy
       description: >-
-        Carries protected prefixes, stage rules, and optional per-prefix
-        steering. Steering regions are a hard boundary, and communities are
-        validated here because the agents write them into a routing daemon.
+        Carries protected prefixes, stage rules, optional per-prefix
+        steering, and game filters. Steering regions are a hard boundary, and
+        communities are validated here because the agents write them into a
+        routing daemon. Game filters are compiled here too, so a filter that
+        cannot be compiled is refused at save rather than logged on every
+        node. A policy carrying game filters is issued a challenge secret,
+        shared across the fabric so an anycast cookie verifies on any node.
   /v1/policies/{id}/deploy:
     post:
       summary: Compile policy onto the fabric and assign prefixes to live nodes

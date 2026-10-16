@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -217,7 +218,13 @@ func Compile(policy model.Policy, nodes []model.Node, plan []model.Announcement)
 			Version:       policy.Version,
 			Prefixes:      prefixes,
 			Announcements: announcements,
-			CompiledAt:    now,
+			// Only filters for addresses this node actually carries, and
+			// only when it has a ZC stage to run them on: payload
+			// inspection is a userspace job, the TCAM and the FPGA cannot
+			// do it.
+			Games:           gamesFor(policy, prefixes, stages[model.StageZC]),
+			ChallengeSecret: policy.ChallengeSecret,
+			CompiledAt:      now,
 		}
 		for _, rule := range policy.Rules {
 			// A node only gets entries for the backends it advertised. Handing
@@ -262,6 +269,42 @@ func Compile(policy model.Policy, nodes []model.Node, plan []model.Announcement)
 		sort.SliceStable(prog.FPGA, func(i, j int) bool { return prog.FPGA[i].Priority < prog.FPGA[j].Priority })
 		sort.SliceStable(prog.ZC, func(i, j int) bool { return prog.ZC[i].Priority < prog.ZC[j].Priority })
 		out[n.ID] = prog
+	}
+	return out
+}
+
+// gamesFor picks the game filters that belong on a node: those whose
+// address falls inside a prefix the node enforces. A filter with no address
+// applies wherever the policy does.
+func gamesFor(policy model.Policy, prefixes []string, hasZC bool) []model.GameFilter {
+	if !hasZC || len(policy.Games) == 0 {
+		return nil
+	}
+	enforced := make([]netip.Prefix, 0, len(prefixes))
+	for _, cidr := range prefixes {
+		if p, err := netip.ParsePrefix(cidr); err == nil {
+			enforced = append(enforced, p)
+		}
+	}
+	out := make([]model.GameFilter, 0, len(policy.Games))
+	for _, g := range policy.Games {
+		if g.DstCIDR == "" {
+			out = append(out, g)
+			continue
+		}
+		target, err := netip.ParsePrefix(g.DstCIDR)
+		if err != nil {
+			continue
+		}
+		for _, p := range enforced {
+			if p.Overlaps(target) {
+				out = append(out, g)
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

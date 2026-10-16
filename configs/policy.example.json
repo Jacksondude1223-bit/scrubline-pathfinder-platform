@@ -16,6 +16,50 @@
       ]
     }
   ],
+  "games": [
+    {
+      "id": "bedrock-19132",
+      "dst_cidr": "203.0.113.10/32",
+      "proto": "udp",
+      "dport": 19132,
+      "profile": "raknet",
+      "comment": "Bedrock on the customer's assigned address: junk on the port dies, and a source must finish the RakNet handshake before it can send gameplay"
+    },
+    {
+      "id": "queries-27015",
+      "dst_cidr": "203.0.113.10/32",
+      "proto": "udp",
+      "dport": 27015,
+      "profile": "a2s",
+      "comment": "Source query port: the filter answers A2S's own challenge and admits a source once it echoes the number back"
+    },
+    {
+      "id": "inhouse-30120",
+      "dst_cidr": "203.0.114.10/32",
+      "proto": "udp",
+      "dport": 30120,
+      "custom": {
+        "min_len": 8,
+        "max_len": 1400,
+        "magic": [
+          {
+            "offset": 0,
+            "hex": "deadbeef"
+          }
+        ],
+        "gate": "handshake",
+        "opener_ids": [
+          1,
+          2
+        ],
+        "complete_ids": [
+          2
+        ]
+      },
+      "observe": true,
+      "comment": "a protocol the platform ships no profile for, described here instead; observe only until the counters look right"
+    }
+  ],
   "rules": [
     {
       "id": "tcam-bogon",

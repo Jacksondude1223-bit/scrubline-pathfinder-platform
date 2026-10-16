@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1311,5 +1312,168 @@ func TestHealthReportsTheMode(t *testing.T) {
 	rec = do(t, h, http.MethodGet, "/health", "")
 	if !strings.Contains(rec.Body.String(), `"mode":"replica"`) {
 		t.Fatalf("expected the replica mode on /health, got %s", rec.Body.String())
+	}
+}
+
+const gamePolicy = `{
+  "name": "game-edge",
+  "protected": ["203.0.113.0/24"],
+  "rules": [],
+  "games": [
+    {"id":"bedrock","dst_cidr":"203.0.113.0/24","proto":"udp","dport":19132,"profile":"raknet"},
+    {"id":"queries","dst_cidr":"203.0.113.0/24","proto":"udp","dport":27015,"profile":"a2s"}
+  ]
+}`
+
+// A policy with game filters gets a challenge secret, and it reaches every
+// node: under anycast a cookie minted by one scrubber has to verify on
+// another.
+func TestGameFiltersShipWithASharedChallengeSecret(t *testing.T) {
+	_, h := newTestAPI()
+	a := registerNode(t, h, "scrub-a", "iad", 100)
+	b := registerNode(t, h, "scrub-b", "fra", 100)
+	savePolicyAndDeploy(t, h, gamePolicy)
+
+	secrets := map[string]string{}
+	for _, node := range []string{a, b} {
+		prog := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+node+"/program", ""), http.StatusOK)
+		games, _ := prog["games"].([]any)
+		if len(games) != 2 {
+			t.Fatalf("node %s got %d game filters, expected 2", node, len(games))
+		}
+		secret, _ := prog["challenge_secret"].(string)
+		if secret == "" {
+			t.Fatalf("node %s got no challenge secret", node)
+		}
+		secrets[node] = secret
+	}
+	if secrets[a] != secrets[b] {
+		t.Fatal("nodes were given different challenge secrets; a cookie minted by one would not verify on the other")
+	}
+	if len(secrets[a]) != 64 {
+		t.Fatalf("expected a 256-bit secret, got %d characters", len(secrets[a]))
+	}
+}
+
+// A filter only reaches nodes that carry the address it protects.
+func TestGameFiltersOnlyReachNodesCarryingTheAddress(t *testing.T) {
+	_, h := newTestAPI()
+	eu := registerNode(t, h, "scrub-eu", "fra", 100)
+	us := registerNode(t, h, "scrub-us", "iad", 100)
+	savePolicyAndDeploy(t, h, `{
+	  "name":"pinned","protected":["203.0.113.0/24","198.51.100.0/24"],"rules":[],
+	  "steering":[{"prefix":"203.0.113.0/24","regions":["fra"]}],
+	  "games":[{"id":"bedrock","dst_cidr":"203.0.113.0/24","proto":"udp","dport":19132,"profile":"raknet"}]
+	}`)
+
+	euProg := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+eu+"/program", ""), http.StatusOK)
+	if games, _ := euProg["games"].([]any); len(games) != 1 {
+		t.Fatalf("the node carrying the address should hold the filter, got %v", euProg["games"])
+	}
+	usProg := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+us+"/program", ""), http.StatusOK)
+	if games, _ := usProg["games"].([]any); len(games) != 0 {
+		t.Fatalf("a node that does not carry the address must not hold the filter, got %v", usProg["games"])
+	}
+}
+
+// These compile on every node, so a filter that cannot be compiled is
+// refused at save rather than logged on fifty scrubbers.
+func TestPolicyRejectsUnusableGameFilters(t *testing.T) {
+	_, h := newTestAPI()
+	for _, tc := range []struct{ name, games, want string }{
+		{"no id", `{"dst_cidr":"203.0.113.0/24","dport":19132,"profile":"raknet"}`, "id required"},
+		{"pipe in id", `{"id":"a|b","dport":19132,"profile":"raknet"}`, "must not contain"},
+		{"unknown profile", `{"id":"g","dport":19132,"profile":"halo-3"}`, "unknown profile"},
+		{"no profile at all", `{"id":"g","dport":19132}`, "profile or a custom signature"},
+		{"both profile and custom", `{"id":"g","dport":19132,"profile":"raknet","custom":{"min_len":1}}`, "not both"},
+		{"nothing to bind to", `{"id":"g","profile":"raknet"}`, "would inspect everything"},
+		{"bad cidr", `{"id":"g","dst_cidr":"nope","dport":19132,"profile":"raknet"}`, "dst_cidr"},
+		{"bad port", `{"id":"g","dport":70000,"profile":"raknet"}`, "dport"},
+		{"bad proto", `{"id":"g","dport":19132,"proto":"sctp","profile":"raknet"}`, "unknown proto"},
+		{"bad magic hex", `{"id":"g","dport":19132,"custom":{"magic":[{"offset":0,"hex":"zz"}]}}`, "not hex"},
+		{"packet id out of range", `{"id":"g","dport":19132,"custom":{"packet_ids":[300]}}`, "not a byte"},
+		{"handshake with no completion", `{"id":"g","dport":19132,"custom":{"gate":"handshake","opener_ids":[1]}}`, "complete_ids"},
+		{"challenge gate in a policy", `{"id":"g","dport":19132,"custom":{"gate":"challenge"}}`, "cannot be described in a policy"},
+		{"min above max", `{"id":"g","dport":19132,"custom":{"min_len":100,"max_len":10}}`, "above max_len"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"name":"p","protected":["203.0.113.0/24"],"rules":[],"games":[%s]}`, tc.games)
+			out := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusBadRequest)
+			if msg, _ := out["error"].(string); !strings.Contains(msg, tc.want) {
+				t.Fatalf("expected an error mentioning %q, got %q", tc.want, msg)
+			}
+		})
+	}
+}
+
+func TestPolicyRejectsDuplicateGameFilterIDs(t *testing.T) {
+	_, h := newTestAPI()
+	body := `{"name":"p","protected":["203.0.113.0/24"],"rules":[],"games":[
+	  {"id":"g","dport":19132,"profile":"raknet"},
+	  {"id":"g","dport":27015,"profile":"a2s"}
+	]}`
+	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusBadRequest)
+	if msg, _ := out["error"].(string); !strings.Contains(msg, "duplicate filter id") {
+		t.Fatalf("expected a duplicate-id error, got %q", msg)
+	}
+}
+
+// A game nobody shipped a profile for is configured, not waited for.
+func TestCustomGameSignatureIsAccepted(t *testing.T) {
+	_, h := newTestAPI()
+	body := `{"name":"p","protected":["203.0.113.0/24"],"rules":[],"games":[{
+	  "id":"inhouse","dst_cidr":"203.0.113.0/24","proto":"udp","dport":30120,
+	  "custom":{"min_len":8,"max_len":1400,"magic":[{"offset":0,"hex":"deadbeef"}],
+	            "gate":"handshake","opener_ids":[1,2],"complete_ids":[2]}
+	}]}`
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusOK)
+}
+
+// The filter runs end to end through /v1/decide, payload and all.
+func TestDecideRunsTheGameFilter(t *testing.T) {
+	_, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, gamePolicy)
+
+	// base64 of 1200 bytes of 0x41 would be long; a short junk packet is
+	// enough, since RakNet's opening packets are the only thing an
+	// unconnected source may send.
+	junk := base64.StdEncoding.EncodeToString([]byte{0x84, 0x01, 0x02, 0x03})
+	body := fmt.Sprintf(`{"node_id":%q,"flow":{"src_ip":"192.0.2.9","dst_ip":"203.0.113.10","proto":"udp","dport":19132,"pps":100,"payload":%q}}`, node, junk)
+	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/decide", body), http.StatusOK)
+	if out["action"] != "drop" || out["filter"] != "bedrock" {
+		t.Fatalf("expected the game filter to drop an unconnected source, got %v", out)
+	}
+
+	// The protocol's own opening packet passes.
+	magic := []byte{0x07, 0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78}
+	body = fmt.Sprintf(`{"node_id":%q,"flow":{"src_ip":"192.0.2.9","dst_ip":"203.0.113.10","proto":"udp","dport":19132,"pps":100,"payload":%q}}`,
+		node, base64.StdEncoding.EncodeToString(magic))
+	out = requireJSON(t, do(t, h, http.MethodPost, "/v1/decide", body), http.StatusOK)
+	if out["action"] != "permit" {
+		t.Fatalf("expected the handshake to pass, got %v", out)
+	}
+}
+
+func TestGameFilterMetricsAreExposed(t *testing.T) {
+	s, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, gamePolicy)
+
+	body := `{"stats":{"games":[{"filter_id":"bedrock","profile":"raknet","inspected":90,"dropped":80,"challenged":5,"uninspectable":1,"pps_dropped":4000}],
+	          "game_sessions":12,"game_sessions_max":65536}}`
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", body), http.StatusOK)
+	s.reconcile()
+
+	out := scrape(t, h)
+	for _, want := range []string{
+		`scrubline_game_dropped_total{node="` + node + `",name="scrub-a",region="iad",filter="bedrock",profile="raknet"} 80`,
+		`scrubline_game_challenged_total{node="` + node + `",name="scrub-a",region="iad",filter="bedrock",profile="raknet"} 5`,
+		`scrubline_game_uninspectable_total{node="` + node + `",name="scrub-a",region="iad",filter="bedrock",profile="raknet"} 1`,
+		`scrubline_game_sessions{node="` + node + `",name="scrub-a",region="iad"} 12`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in scrape:\n%s", want, out)
+		}
 	}
 }
