@@ -3,7 +3,9 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/bgp"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/compiler"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/gamefilter"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/metrics"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
@@ -783,6 +786,15 @@ func operatorOnly(w http.ResponseWriter, who principal) bool {
 	return false
 }
 
+// newChallengeSecret mints the key the challenge cookies are derived from.
+func newChallengeSecret() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
+}
+
 // storeFailure reports that durable state could not be written. The change
 // has been rolled back, so the caller is told it did not take rather than
 // being left to assume it did.
@@ -870,6 +882,17 @@ func (s *Server) savePolicy(w http.ResponseWriter, r *http.Request) {
 	if err := validatePolicy(p); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
+	}
+	// Filters with a challenge gate mint cookies keyed with this. It is
+	// generated once per policy and shipped to every node, because under
+	// anycast a cookie minted by one scrubber has to verify on another.
+	if p.ChallengeSecret == "" && len(p.Games) > 0 {
+		secret, err := newChallengeSecret()
+		if err != nil {
+			storeFailure(w, "generating a challenge secret", err)
+			return
+		}
+		p.ChallengeSecret = secret
 	}
 	saved, err := s.Store.SavePolicy(p)
 	if err != nil {
@@ -1040,6 +1063,9 @@ func validatePolicy(p model.Policy) error {
 	if err := validateSteering(p, protected); err != nil {
 		return err
 	}
+	if err := validateGames(p); err != nil {
+		return err
+	}
 	seen := map[string]bool{}
 	for i, rule := range p.Rules {
 		if rule.ID == "" {
@@ -1088,6 +1114,45 @@ func validateSteering(p model.Policy, protected map[string]bool) error {
 				return fmt.Errorf("steering[%d].communities[%d]: %v", i, j, err)
 			}
 		}
+	}
+	return nil
+}
+
+// validateGames checks the game filters a policy binds to its ports. They
+// compile on every node, so a filter that cannot be compiled is refused here
+// rather than being logged on fifty scrubbers.
+func validateGames(p model.Policy) error {
+	seen := map[string]bool{}
+	for i, g := range p.Games {
+		if g.ID == "" {
+			return fmt.Errorf("games[%d]: id required", i)
+		}
+		// Filter IDs key the session table as "<filter>|<source>".
+		if strings.Contains(g.ID, "|") {
+			return fmt.Errorf("games[%d]: id must not contain '|'", i)
+		}
+		if seen[g.ID] {
+			return fmt.Errorf("games[%d]: duplicate filter id %q", i, g.ID)
+		}
+		seen[g.ID] = true
+		if g.DPort < 0 || g.DPort > ml.MaxPort {
+			return fmt.Errorf("games[%d] (%s): dport must be within 0..%d, got %d", i, g.ID, ml.MaxPort, g.DPort)
+		}
+		switch strings.ToLower(g.Proto) {
+		case "", "any", "udp", "tcp":
+		default:
+			return fmt.Errorf("games[%d] (%s): unknown proto %q", i, g.ID, g.Proto)
+		}
+		// A binding with no address, port or protocol would inspect every
+		// packet the node sees against one game's grammar.
+		if g.DstCIDR == "" && g.DPort == 0 {
+			return fmt.Errorf("games[%d] (%s): needs a dst_cidr or a dport, or it would inspect everything", i, g.ID)
+		}
+	}
+	// Compiling is the real check: it parses the CIDRs, the magic hex and
+	// the gate, and rejects a profile nobody ships.
+	if _, err := gamefilter.Compile(p.Games); err != nil {
+		return err
 	}
 	return nil
 }

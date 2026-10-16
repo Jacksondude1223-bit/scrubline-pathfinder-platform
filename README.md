@@ -118,13 +118,91 @@ PREFIX           NODE     REGION  STATE     PREPENDS  NEXT HOP      WHY
 203.0.113.0/24   scrub-c  sin     withdraw  -         198.51.100.3  node has not heartbeated within its TTL
 ```
 
+## Game filtering
+
+A UDP flood aimed at a game server is trivially distinguishable from play:
+the flood has the right destination port and nothing else right. The ASIC and
+the FPGA cannot see that, because neither matches on payload, so the game
+filter runs on the ZC stage where the packet is already in userspace. It sits
+in front of the ZC rules, so a packet that is not the protocol its port
+speaks dies before it reaches the behavioral cap or the classifier.
+
+Nothing here is bound to a list of games the platform knows about. A filter
+is bound to **a port on a protected address**, and the profile is either a
+built-in or a signature written in the policy:
+
+```json
+"games": [
+  {"id": "bedrock-19132", "dst_cidr": "203.0.113.10/32", "proto": "udp", "dport": 19132,
+   "profile": "raknet"},
+  {"id": "queries-27015", "dst_cidr": "203.0.113.10/32", "proto": "udp", "dport": 27015,
+   "profile": "a2s"},
+  {"id": "inhouse-30120", "dst_cidr": "203.0.114.10/32", "proto": "udp", "dport": 30120,
+   "observe": true,
+   "custom": {"min_len": 8, "max_len": 1400,
+              "magic": [{"offset": 0, "hex": "deadbeef"}],
+              "gate": "handshake", "opener_ids": [1, 2], "complete_ids": [2]}}
+]
+```
+
+A filter only reaches nodes that carry the address it protects, and only
+nodes that advertised a `zc` backend. `observe` records what a filter would
+have done without acting on it, which is how a binding is rolled out.
+
+### Gates
+
+Validating framing stops junk. It does not stop a flood of *well-formed*
+packets from sources that never connected, so a profile can also gate on
+the protocol's own handshake:
+
+- **`raknet`** (Minecraft Bedrock and other RakNet engines). Offline messages
+  carry a fixed 16-byte magic, and a source must complete the RakNet opening
+  sequence before it may send connected datagrams. RakNet's connected framing
+  is deliberately permissive — encapsulated payloads can be arbitrary bytes —
+  so the gate, not the signature, is what protects an established port.
+- **`a2s`** (the Valve query protocol). Every query is prefixed `0xFFFFFFFF`,
+  and the protocol has a real challenge: the server answers with a four-byte
+  number the client must repeat. The filter answers it and admits a source
+  once it echoes back.
+
+The cookie is a keyed hash of the source, the destination and a rotating
+epoch, so no state is needed to mint one and a spoofed source cannot guess
+it. The key is generated per policy and shipped to **every** node, because
+under anycast a source's packets land on different scrubbers and a cookie
+minted by one has to verify on another. The previous epoch is also accepted,
+so a client answering a moment late is not refused.
+
+A custom signature can gate on a handshake but cannot configure a challenge:
+answering one means emitting protocol-correct bytes, and a wrong guess at
+that framing breaks every client rather than failing closed. Challenge gates
+come from built-in profiles only.
+
+### What it will not do
+
+The filter never drops a packet it was given no payload for. A datapath that
+is not supplying payloads would otherwise blackhole a customer silently;
+instead it passes and `scrubline_game_uninspectable_total` climbs, which is
+the signal that the filter is doing nothing. The control plane's own
+`/v1/decide` sends no payload unless you put one in the flow record, so it
+reports `uninspectable` rather than pretending to judge.
+
+A bound filter costs roughly 380ns a packet on top of the rest of the
+pipeline, with no allocations; a policy that binds none pays nothing, which
+`make bench` guards with a case either way.
+
+Per-filter counters —`scrubline_game_dropped_total{filter,profile}`,
+`_challenged_total`, `_inspected_total` — say which binding is doing the work.
+`scrubline_game_sessions` against `_max` shows the gate's source table; at the
+bound it admits without tracking rather than evicting connected players.
+
 ## Datapath
 
 Within a stage the first matching rule decides: `drop` and `permit` are both terminal, so a `permit` rule acts as an allow-list that exempts a source from the stages behind it. A TCAM entry carries no meter, so `rate_limit` is rejected on the `asic` stage.
 
 Rules are ordered by `priority` on every stage, not just the ASIC, and the ordering is stable, so rules sharing a priority keep policy order and compile identically on every node. A node is only given entries for the backends it advertised at registration.
 
-`count` is observe-only and never drops: it records the match and leaves the verdict to a later rule. Only two stage/action pairs consume `pps` — an `fpga` `rate_limit` meter, and the `zc` behavioral cap on `rate_limit` or `inspect`. A policy carrying `pps` anywhere else is rejected rather than accepted and ignored.
+Payload inspection belongs to the ZC stage alone; see
+[Game filtering](#game-filtering). `count` is observe-only and never drops: it records the match and leaves the verdict to a later rule. Only two stage/action pairs consume `pps` — an `fpga` `rate_limit` meter, and the `zc` behavioral cap on `rate_limit` or `inspect`. A policy carrying `pps` anywhere else is rejected rather than accepted and ignored.
 
 1. ASIC / TCAM ACL. Longest-prefix and port ACLs. Terminal drops never leave the chip.
 2. FPGA. Line-rate meters and flag matches for what the TCAM did not already drop.
@@ -364,7 +442,7 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 
 - `POST /v1/nodes/register` node name, region, capacity (`capacity_gbps` and `capacity_pps`), backends; returns the node and the credential issued to it
 - `GET /v1/nodes`
-- `POST /v1/policies` protected prefixes, stage rules, and per-prefix steering
+- `POST /v1/policies` protected prefixes, stage rules, per-prefix steering, and game filters
 - `POST /v1/policies/{id}/deploy` compile the ASIC, FPGA, and ZC programs and the fabric's BGP plan
 - `POST /v1/nodes/{id}/heartbeat` keep a node live; the body optionally carries the node's datapath counters
 - `GET /v1/nodes/{id}/stats` the counters a node last reported

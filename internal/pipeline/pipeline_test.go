@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 	"sync"
@@ -705,5 +706,207 @@ func TestStaleWindowBucketsAreNotRecounted(t *testing.T) {
 	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1000})
 	if got := p.Stats().OfferedPPS; got != 100 {
 		t.Fatalf("a stale bucket was counted again: got %d, expected only the fresh 1000 pps", got)
+	}
+}
+
+var bedrockMagic = []byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78}
+
+func gameProgram(observe bool) model.Program {
+	return model.Program{
+		PolicyID: "pol-1", Version: 1,
+		Prefixes: []string{"203.0.113.0/24"},
+		Games: []model.GameFilter{{
+			ID: "bedrock", DstCIDR: "203.0.113.0/24", Proto: "udp", DPort: 19132,
+			Profile: "raknet", Observe: observe,
+		}},
+		ChallengeSecret: "0011223344556677",
+		ZC: []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 1000000,
+			RuleID: "zc", Match: model.Match{Proto: "udp"}}},
+	}
+}
+
+func gameFlow(payload []byte) model.Flow {
+	return model.Flow{
+		SrcIP: "192.0.2.50", DstIP: "203.0.113.10", Proto: "udp", DPort: 19132,
+		PPS: 500, Payload: payload,
+	}
+}
+
+// A flood with the right port and nothing else right dies at the ZC stage,
+// before it reaches the behavioural cap or the classifier.
+func TestGameFilterDropsJunkOnTheGamePort(t *testing.T) {
+	p := New(gameProgram(false))
+	d := p.Decide(gameFlow(bytes.Repeat([]byte{0x41}, 1200)))
+	if d.Action != model.ActionDrop || d.Stage != model.StageZC {
+		t.Fatalf("expected a ZC drop, got %+v", d)
+	}
+	if d.Filter != "bedrock" {
+		t.Fatalf("the decision should name the filter, got %+v", d)
+	}
+
+	s := p.Stats()
+	if len(s.Games) != 1 || s.Games[0].Dropped != 1 || s.Games[0].Inspected != 1 {
+		t.Fatalf("unexpected filter counters %+v", s.Games)
+	}
+	if s.Games[0].PPSDropped != 500 {
+		t.Fatalf("expected the dropped rate counted, got %d", s.Games[0].PPSDropped)
+	}
+}
+
+// Real protocol traffic gets through the filter and on to the normal ZC path.
+func TestGameFilterAdmitsRealTraffic(t *testing.T) {
+	p := New(gameProgram(false))
+	if d := p.Decide(gameFlow(append([]byte{0x07}, bedrockMagic...))); d.Action != model.ActionPermit {
+		t.Fatalf("expected the handshake to pass, got %+v", d)
+	}
+	d := p.Decide(gameFlow([]byte{0x84, 0x01, 0x02}))
+	if d.Action != model.ActionPermit {
+		t.Fatalf("expected a connected source to pass, got %+v", d)
+	}
+	// Having cleared the filter, the verdict came from the ZC rule behind it.
+	if d.RuleID != "zc" {
+		t.Fatalf("expected the ZC rule to decide once the filter passed, got %+v", d)
+	}
+}
+
+// The filter only looks at the port it was bound to.
+func TestGameFilterLeavesOtherPortsAlone(t *testing.T) {
+	p := New(gameProgram(false))
+	f := gameFlow(bytes.Repeat([]byte{0x41}, 1200))
+	f.DPort = 443
+	if d := p.Decide(f); d.Action != model.ActionPermit || d.Filter != "" {
+		t.Fatalf("traffic on another port was judged by the game filter: %+v", d)
+	}
+}
+
+// A record with no payload must not be dropped: the filter cannot judge what
+// it was not given, and the control plane's own /decide sends none.
+func TestGameFilterPassesRecordsWithNoPayload(t *testing.T) {
+	p := New(gameProgram(false))
+	d := p.Decide(model.Flow{SrcIP: "192.0.2.50", DstIP: "203.0.113.10", Proto: "udp", DPort: 19132, PPS: 10})
+	if d.Action != model.ActionPermit {
+		t.Fatalf("a payload-less record must not be dropped, got %+v", d)
+	}
+	if got := p.Stats().Games[0].Uninspectable; got != 1 {
+		t.Fatalf("expected the uninspectable packet counted, got %d", got)
+	}
+}
+
+func TestGameFilterObserveModeDoesNotDrop(t *testing.T) {
+	p := New(gameProgram(true))
+	if d := p.Decide(gameFlow(bytes.Repeat([]byte{0x41}, 1200))); d.Action == model.ActionDrop {
+		t.Fatalf("observe mode must not drop, got %+v", d)
+	}
+}
+
+// A challenged packet is dropped and carries the reply the datapath emits.
+func TestGameFilterChallengeCarriesAReply(t *testing.T) {
+	prog := gameProgram(false)
+	prog.Games[0] = model.GameFilter{
+		ID: "a2s", DstCIDR: "203.0.113.0/24", Proto: "udp", DPort: 27015, Profile: "a2s",
+	}
+	p := New(prog)
+	f := gameFlow([]byte{0xFF, 0xFF, 0xFF, 0xFF, 'U'})
+	f.DPort = 27015
+	d := p.Decide(f)
+	if d.Action != model.ActionChallenge {
+		t.Fatalf("expected a challenge, got %+v", d)
+	}
+	if len(d.Reply) == 0 {
+		t.Fatal("a challenge must carry the reply to emit")
+	}
+	if got := p.Stats().Games[0].Challenged; got != 1 {
+		t.Fatalf("expected the challenge counted, got %d", got)
+	}
+	// A challenged packet never reaches the server, so it counts as dropped
+	// at the stage that decided.
+	if got := stageOf(t, p.Stats(), model.StageZC).Dropped; got != 1 {
+		t.Fatalf("expected the challenge booked as a stage drop, got %d", got)
+	}
+}
+
+// Counters and sessions survive a reprogram, which arrives every couple of
+// seconds.
+func TestGameFilterStateSurvivesAReprogram(t *testing.T) {
+	prog := gameProgram(false)
+	p := New(prog)
+	p.Decide(gameFlow(append([]byte{0x07}, bedrockMagic...))) // this source completes the handshake
+	// A different source that never connected: RakNet's framing is
+	// permissive once connected, so the gate is what stops this, not the
+	// signature.
+	junk := gameFlow([]byte{0x84, 0x01, 0x02})
+	junk.SrcIP = "198.51.100.9"
+	if d := p.Decide(junk); d.Action != model.ActionDrop {
+		t.Fatalf("expected an unconnected source to be dropped, got %+v", d)
+	}
+
+	next := prog
+	next.CompiledAt = prog.CompiledAt.Add(time.Second)
+	p.Load(next)
+
+	if got := p.Stats().Games[0].Dropped; got != 1 {
+		t.Fatalf("expected the filter counter to carry across a reprogram, got %d", got)
+	}
+	if d := p.Decide(gameFlow([]byte{0x84, 0x01})); d.Action != model.ActionPermit {
+		t.Fatalf("a reprogram re-challenged a connected player: %+v", d)
+	}
+}
+
+// A filter that cannot be compiled must not take the datapath down.
+func TestUncompilableGameFilterLeavesTheDatapathRunning(t *testing.T) {
+	prog := gameProgram(false)
+	prog.Games[0].Profile = "no-such-game"
+	p := New(prog)
+	if d := p.Decide(gameFlow(bytes.Repeat([]byte{0x41}, 1200))); d.Action != model.ActionPermit {
+		t.Fatalf("expected the datapath to keep running without the filter, got %+v", d)
+	}
+	if got := len(p.Stats().Games); got != 0 {
+		t.Fatalf("expected no filter counters, got %d", got)
+	}
+}
+
+// A custom signature covers a game the platform ships no profile for.
+func TestCustomGameSignature(t *testing.T) {
+	prog := gameProgram(false)
+	prog.Games[0] = model.GameFilter{
+		ID: "inhouse", DstCIDR: "203.0.113.0/24", Proto: "udp", DPort: 19132,
+		Custom: &model.GameSignature{
+			MinLen: 8, MaxLen: 512,
+			Magic: []model.GameMagic{{Offset: 0, Hex: "deadbeef"}},
+		},
+	}
+	p := New(prog)
+	if d := p.Decide(gameFlow(append([]byte{0xde, 0xad, 0xbe, 0xef}, bytes.Repeat([]byte{0x01}, 8)...))); d.Action != model.ActionPermit {
+		t.Fatalf("expected the custom protocol to pass, got %+v", d)
+	}
+	if d := p.Decide(gameFlow(bytes.Repeat([]byte{0x41}, 64))); d.Action != model.ActionDrop {
+		t.Fatalf("expected junk to be dropped by the custom signature, got %+v", d)
+	}
+}
+
+// BenchmarkDecideGameFiltered guards the cost of the game filter on the hot
+// path, for a policy that binds one. BenchmarkDecide covers the common case
+// of a policy that binds none.
+func BenchmarkDecideGameFiltered(b *testing.B) {
+	prog := gameProgram(false)
+	// No behavioural cap: this measures the path an admitted player takes,
+	// not the rate limiter's drop path, which formats a reason and is not
+	// what the game filter costs.
+	prog.ZC[0].PPS = 0
+	for i := 0; i < 20; i++ {
+		prog.ASIC = append(prog.ASIC, model.ACLEntry{
+			Action: model.ActionDrop,
+			RuleID: fmt.Sprintf("acl-%d", i),
+			Match:  model.Match{SrcCIDR: "198.51.100.0/24", DstCIDR: "203.0.113.0/24", Proto: "tcp", DPort: 53},
+		})
+	}
+	p := New(prog)
+	// An admitted source sending gameplay: the path a real player takes.
+	p.Decide(gameFlow(append([]byte{0x07}, bedrockMagic...)))
+	f := gameFlow([]byte{0x84, 0x01, 0x02, 0x03})
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = p.Decide(f)
 	}
 }
