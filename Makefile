@@ -1,4 +1,4 @@
-.PHONY: build test demo
+.PHONY: build test bench demo
 
 build:
 	mkdir -p bin
@@ -6,8 +6,13 @@ build:
 	go build -o bin/scrub-node ./cmd/scrub-node
 	go build -o bin/scrubctl ./cmd/scrubctl
 
+# -race is the cheap safety net for the Pipeline and Store, both of which are
+# written for concurrent use.
 test:
-	go test ./...
+	go test -race ./...
+
+bench:
+	go test -run xxx -bench . -benchmem ./internal/pipeline/
 
 # Each recipe line runs in its own shell, so a backgrounded server started on one
 # line cannot be reached by "kill %1" on the next: the API was left running and

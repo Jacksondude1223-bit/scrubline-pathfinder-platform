@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
+      SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
     ports:
       - "8080:8080"
     command: ["scrub-api", "-addr", "0.0.0.0:8080"]
@@ -27,8 +27,8 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
-    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-a", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
+      SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
+    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-a", "-advertise", "node-a:9091", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
     ports:
       - "9091:9091"
     depends_on:
@@ -41,8 +41,8 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
-    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-b", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
+      SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
+    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-b", "-advertise", "node-b:9091", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
     ports:
       - "9092:9091"
     depends_on:
@@ -55,8 +55,8 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     environment:
-      SCRUBLINE_API_TOKEN: dev-scrubline-token
-    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-c", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
+      SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
+    command: ["scrub-node", "-api", "http://api:8080", "-name", "scrub-c", "-advertise", "node-c:9091", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
     ports:
       - "9093:9091"
     depends_on:

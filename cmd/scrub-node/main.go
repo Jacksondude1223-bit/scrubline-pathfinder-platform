@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -35,6 +36,7 @@ func main() {
 	region := flag.String("region", "iad", "node region")
 	capacity := flag.Float64("capacity", 40, "scrub capacity in Gbps")
 	listen := flag.String("listen", "127.0.0.1:9091", "local decide/metrics address")
+	advertise := flag.String("advertise", "", "address other components use to reach this node (default: -listen, or hostname:port when -listen is a wildcard)")
 	flag.Parse()
 	token := os.Getenv("SCRUBLINE_API_TOKEN")
 	if token == "" {
@@ -44,8 +46,15 @@ func main() {
 		log.Fatalf("-capacity must not be negative, got %v", *capacity)
 	}
 
+	// Registering the listen address advertised "0.0.0.0:9091" to the control
+	// plane, which no peer can dial.
+	advertised, certain := advertiseAddr(*advertise, *listen)
+	if !certain {
+		log.Printf("warning: -listen %s is a wildcard; advertising %s. Set -advertise to the address peers should dial.", *listen, advertised)
+	}
+
 	desired := model.Node{
-		Name: *name, Region: *region, CapacityGbps: *capacity, Advertise: *listen,
+		Name: *name, Region: *region, CapacityGbps: *capacity, Advertise: advertised,
 		Backends: []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC},
 	}
 
@@ -104,9 +113,31 @@ func main() {
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
+// advertiseAddr picks the address the control plane should record for this
+// node. It reports false when it had to guess, so the operator can be told.
+func advertiseAddr(explicit, listen string) (string, bool) {
+	if explicit != "" {
+		return explicit, true
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen, false
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		if h, hostErr := os.Hostname(); hostErr == nil && h != "" {
+			return net.JoinHostPort(h, port), false
+		}
+		return listen, false
+	}
+	return listen, true
+}
+
 func poll(apiURL, token, id string, desired model.Node, pipe *pipeline.Pipeline) {
 	var lastPolicy string
 	var lastVersion int
+	var lastCompiled time.Time
+	var modelCleared bool
 	for {
 		// A control plane that restarted has no record of this node, so its
 		// heartbeat 404s. Re-register instead of polling a program forever.
@@ -126,13 +157,13 @@ func poll(apiURL, token, id string, desired model.Node, pipe *pipeline.Pipeline)
 			if !errors.Is(err, errNotFound) {
 				log.Printf("fetching program: %v", err)
 			}
-		} else {
+		} else if prog.PolicyID != lastPolicy || prog.Version != lastVersion || !prog.CompiledAt.Equal(lastCompiled) {
+			// Only reload on a real change. Loading every poll took the
+			// datapath lock and walked the whole rate table twice a second.
 			pipe.Load(prog)
-			if prog.PolicyID != lastPolicy || prog.Version != lastVersion {
-				lastPolicy, lastVersion = prog.PolicyID, prog.Version
-				log.Printf("programmed node %s policy=%s version=%d asic=%d fpga=%d zc=%d prefixes=%v",
-					id, prog.PolicyID, prog.Version, len(prog.ASIC), len(prog.FPGA), len(prog.ZC), prog.Prefixes)
-			}
+			lastPolicy, lastVersion, lastCompiled = prog.PolicyID, prog.Version, prog.CompiledAt
+			log.Printf("programmed node %s policy=%s version=%d asic=%d fpga=%d zc=%d prefixes=%v",
+				id, prog.PolicyID, prog.Version, len(prog.ASIC), len(prog.FPGA), len(prog.ZC), prog.Prefixes)
 		}
 
 		var trained ml.Model
@@ -140,6 +171,13 @@ func poll(apiURL, token, id string, desired model.Node, pipe *pipeline.Pipeline)
 			log.Printf("fetching model: %v", err)
 		} else if trained.Ready {
 			pipe.SetModel(trained)
+			modelCleared = false
+		} else if trained.Withdrawn && !modelCleared {
+			// An explicit withdrawal is the only way to retire a bad model
+			// without restarting the fleet.
+			pipe.SetModel(ml.Model{})
+			modelCleared = true
+			log.Printf("control plane withdrew the ZC model; classifier disabled on %s", id)
 		}
 
 		time.Sleep(pollInterval)

@@ -62,6 +62,8 @@ paths:
     post:
       summary: Train the logistic flow model used on the PF_RING ZC path
   /v1/ml/model:
+    delete:
+      summary: Retire the published model; agents clear their copy on the next poll
     get:
       summary: Current model weights and threshold
   /v1/ml/score:

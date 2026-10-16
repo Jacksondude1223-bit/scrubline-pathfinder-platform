@@ -297,3 +297,178 @@ func TestBodyLimitIsEnforced(t *testing.T) {
 		t.Fatalf("expected an oversized body to be rejected, got %d", rec.Code)
 	}
 }
+
+// newTestAPI returns the server alongside its handler, for tests that need to
+// reach past the HTTP surface.
+func newTestAPI() (*Server, http.Handler) {
+	s := &Server{Token: testToken, Store: store.New()}
+	return s, s.Handler()
+}
+
+func registerNode(t *testing.T, h http.Handler, name, region string, capacity int) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"name":%q,"region":%q,"capacity_gbps":%d,"advertise":"%s:9091"}`, name, region, capacity, name)
+	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/register", body), http.StatusOK)
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatalf("register %s returned no id: %v", name, out)
+	}
+	return id
+}
+
+const zcCapPolicy = `{
+  "name": "cap",
+  "protected": ["203.0.113.0/24"],
+  "rules": [{"id":"zc-cap","stage":"zc","action":"rate_limit","pps":100,"match":{"dst_cidr":"203.0.113.0/24","proto":"tcp"}}]
+}`
+
+func savePolicyAndDeploy(t *testing.T, h http.Handler, policy string) string {
+	t.Helper()
+	saved := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", policy), http.StatusOK)
+	id, _ := saved["id"].(string)
+	if id == "" {
+		t.Fatalf("policy save returned no id: %v", saved)
+	}
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies/"+id+"/deploy", ""), http.StatusOK)
+	return id
+}
+
+// /v1/decide built a fresh pipeline per request, so the ZC behavioral cap
+// never accumulated and the control plane disagreed with the node agent about
+// the same policy.
+func TestDecideAccumulatesRateStateAcrossRequests(t *testing.T) {
+	_, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	flow := fmt.Sprintf(`{"node_id":%q,"flow":{"src_ip":"192.0.2.5","dst_ip":"203.0.113.9","proto":"tcp","dport":443,"pps":60}}`, node)
+	first := requireJSON(t, do(t, h, http.MethodPost, "/v1/decide", flow), http.StatusOK)
+	if first["action"] != "permit" {
+		t.Fatalf("60 pps is under the 100 pps cap: %v", first)
+	}
+	second := requireJSON(t, do(t, h, http.MethodPost, "/v1/decide", flow), http.StatusOK)
+	if second["action"] != "drop" {
+		t.Fatalf("120 pps inside one second is over the cap, got %v", second)
+	}
+}
+
+// A node that registers after a deploy used to 404 on its program forever,
+// enforcing nothing until a human deployed again.
+func TestNodeRegisteringAfterADeployGetsAProgram(t *testing.T) {
+	_, h := newTestAPI()
+	registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	late := registerNode(t, h, "scrub-b", "fra", 80)
+	prog := requireJSON(t, do(t, h, http.MethodGet, "/v1/nodes/"+late+"/program", ""), http.StatusOK)
+	if prog["policy_id"] != "pol-1" {
+		t.Fatalf("the late node was not compiled into the fabric: %v", prog)
+	}
+
+	// The standing policy is now spread over both nodes.
+	fabric := requireJSON(t, do(t, h, http.MethodGet, "/v1/fabric", ""), http.StatusOK)
+	programs, _ := fabric["programs"].([]any)
+	if len(programs) != 2 {
+		t.Fatalf("expected the fabric to cover both nodes, got %d programs", len(programs))
+	}
+}
+
+// Recompiling must not run when nothing changed: a stable fabric should keep
+// the programs it has, untouched.
+func TestReconcileIsANoOpWhileMembershipIsStable(t *testing.T) {
+	s, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	before, ok := s.Store.Program(node)
+	if !ok {
+		t.Fatal("expected a program after deploy")
+	}
+	for i := 0; i < 3; i++ {
+		s.reconcile()
+	}
+	after, _ := s.Store.Program(node)
+	if !after.CompiledAt.Equal(before.CompiledAt) {
+		t.Fatalf("a stable fabric was recompiled: %v then %v", before.CompiledAt, after.CompiledAt)
+	}
+}
+
+// Losing every node must not blank the fabric: whatever is still enforcing the
+// last program should keep doing so.
+func TestReconcileKeepsTheFabricWhenEveryNodeIsStale(t *testing.T) {
+	s, h := newTestAPI()
+	node := registerNode(t, h, "scrub-a", "iad", 100)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	s.lastLive = "something-else" // force the membership check to fire
+	s.reconcile()
+	if _, ok := s.Store.Program(node); !ok {
+		t.Fatal("the node's program was dropped")
+	}
+}
+
+// Two scrubbers sharing a name and region collapse onto one node ID.
+func TestRegisteringOverALiveNodeIsRefused(t *testing.T) {
+	_, h := newTestAPI()
+	registerNode(t, h, "scrub-a", "iad", 100)
+	rec := do(t, h, http.MethodPost, "/v1/nodes/register",
+		`{"name":"scrub-a","region":"iad","capacity_gbps":50,"advertise":"10.0.0.9:9091"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a duplicate live node, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// pps is only consumed by an FPGA meter and the ZC inspect path. Accepting it
+// elsewhere and ignoring it is how a count rule ended up dropping traffic.
+func TestPolicyRejectsPPSOnRulesThatDoNotMeter(t *testing.T) {
+	_, h := newTestAPI()
+	for _, tc := range []struct{ name, rule, want string }{
+		{"count on zc", `{"id":"r","stage":"zc","action":"count","pps":10,"match":{}}`, "observe-only"},
+		{"count on fpga", `{"id":"r","stage":"fpga","action":"count","pps":10,"match":{}}`, "observe-only"},
+		{"inspect on fpga", `{"id":"r","stage":"fpga","action":"inspect","pps":10,"match":{}}`, "does not meter"},
+		{"drop on zc", `{"id":"r","stage":"zc","action":"drop","pps":10,"match":{}}`, "does not meter"},
+		{"permit on asic", `{"id":"r","stage":"asic","action":"permit","pps":10,"match":{}}`, "does not meter"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"name":"p","protected":["203.0.113.0/24"],"rules":[%s]}`, tc.rule)
+			out := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusBadRequest)
+			if msg, _ := out["error"].(string); !strings.Contains(msg, tc.want) {
+				t.Fatalf("expected an error mentioning %q, got %q", tc.want, msg)
+			}
+		})
+	}
+}
+
+// The stage/action pairs that do meter must still be accepted.
+func TestPolicyAcceptsPPSOnMeteringRules(t *testing.T) {
+	_, h := newTestAPI()
+	body := `{"name":"p","protected":["203.0.113.0/24"],"rules":[
+	  {"id":"f","stage":"fpga","action":"rate_limit","pps":10,"match":{}},
+	  {"id":"z","stage":"zc","action":"rate_limit","pps":10,"match":{}},
+	  {"id":"zi","stage":"zc","action":"inspect","pps":10,"match":{}}
+	]}`
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", body), http.StatusOK)
+}
+
+// A bad model has to be retirable without restarting every agent.
+func TestModelCanBeWithdrawn(t *testing.T) {
+	_, h := newTestAPI()
+	samples := `{"samples":[
+	  {"flow":{"proto":"tcp","dport":443,"sport":40001,"pps":40},"label":0},
+	  {"flow":{"proto":"udp","dport":19132,"sport":1001,"pps":300000},"label":1}
+	]}`
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/ml/samples", samples), http.StatusOK)
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/ml/train", `{"epochs":100,"lr":0.2,"threshold":0.6}`), http.StatusOK)
+	if got := requireJSON(t, do(t, h, http.MethodGet, "/v1/ml/model", ""), http.StatusOK); got["ready"] != true {
+		t.Fatalf("expected a ready model, got %v", got)
+	}
+
+	withdrawn := requireJSON(t, do(t, h, http.MethodDelete, "/v1/ml/model", ""), http.StatusOK)
+	if withdrawn["withdrawn"] != true || withdrawn["ready"] == true {
+		t.Fatalf("expected a withdrawn model, got %v", withdrawn)
+	}
+	after := requireJSON(t, do(t, h, http.MethodGet, "/v1/ml/model", ""), http.StatusOK)
+	if after["withdrawn"] != true {
+		t.Fatalf("the withdrawal was not published to agents: %v", after)
+	}
+}

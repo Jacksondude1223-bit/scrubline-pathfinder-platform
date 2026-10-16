@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -26,6 +27,11 @@ const (
 // MaxSamples.
 var ErrSampleLimit = fmt.Errorf("training set is limited to %d samples", MaxSamples)
 
+// ErrNodeConflict is returned when a registration would take over the identity
+// of a different node that is still live. Node IDs derive from name and region,
+// so two scrubbers sharing both used to silently overwrite each other.
+var ErrNodeConflict = errors.New("a different live node is already registered under this name and region")
+
 type Store struct {
 	mu          sync.Mutex
 	nodes       map[string]*model.Node
@@ -35,6 +41,10 @@ type Store struct {
 	samples     []ml.Sample
 	model       ml.Model
 	seq         int
+	// lastPolicyID is the policy of the most recent deploy. The fabric is
+	// recompiled against it when the live node set changes, so a node that
+	// joins or recovers after a deploy is not left without a program.
+	lastPolicyID string
 	// now is swapped out in tests; production always uses the wall clock.
 	now func() time.Time
 }
@@ -56,7 +66,9 @@ func (s *Store) clock() time.Time {
 	return s.now()
 }
 
-func (s *Store) UpsertNode(n model.Node) model.Node {
+// UpsertNode registers or refreshes a node. It reports whether the node is new
+// to the fabric, which is what triggers a recompile.
+func (s *Store) UpsertNode(n model.Node) (model.Node, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if n.ID == "" {
@@ -65,23 +77,39 @@ func (s *Store) UpsertNode(n model.Node) model.Node {
 	if n.Backends == nil {
 		n.Backends = []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC}
 	}
-	n.LastSeen = s.clock()
+	now := s.clock()
+	prev, existed := s.nodes[n.ID]
+	if existed {
+		// Two scrubbers under the same name and region collapse onto one ID.
+		// Refuse while the incumbent is still live rather than merging them;
+		// once it has aged out, a replacement is free to take the identity.
+		stillLive := now.Sub(prev.LastSeen) <= NodeTTL
+		if stillLive && prev.Advertise != "" && n.Advertise != "" && prev.Advertise != n.Advertise {
+			return model.Node{}, false, fmt.Errorf("%w: %s is advertised by %s", ErrNodeConflict, n.ID, prev.Advertise)
+		}
+	}
+	n.LastSeen = now
 	n.Status = model.NodeReady
 	cp := n
 	s.nodes[n.ID] = &cp
-	return cp
+	return cp, !existed, nil
 }
 
-func (s *Store) Heartbeat(id string) bool {
+// Heartbeat refreshes a node's liveness. It reports whether the node was known,
+// and whether this heartbeat brought it back from stale, which changes the live
+// set and so has to trigger a recompile.
+func (s *Store) Heartbeat(id string) (ok, revived bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n, ok := s.nodes[id]
-	if !ok {
-		return false
+	n, found := s.nodes[id]
+	if !found {
+		return false, false
 	}
-	n.LastSeen = s.clock()
+	now := s.clock()
+	revived = now.Sub(n.LastSeen) > NodeTTL
+	n.LastSeen = now
 	n.Status = model.NodeReady
-	return true
+	return true, revived
 }
 
 // Nodes lists every registered node with its status refreshed against NodeTTL.
@@ -176,9 +204,10 @@ func (s *Store) Policy(id string) (model.Policy, bool) {
 	return *p, true
 }
 
-func (s *Store) PutDeploy(assignments []model.Assignment, programs map[string]*model.Program) {
+func (s *Store) PutDeploy(policyID string, assignments []model.Assignment, programs map[string]*model.Program) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastPolicyID = policyID
 	s.assignments = append([]model.Assignment(nil), assignments...)
 	// Copy the caller's map so a later mutation of it cannot reach into the store.
 	s.programs = make(map[string]*model.Program, len(programs))
@@ -243,6 +272,24 @@ func (s *Store) Train(epochs int, lr, threshold float64) (ml.Model, error) {
 	defer s.mu.Unlock()
 	s.model = m
 	return m, nil
+}
+
+// LastDeployedPolicy reports the policy the fabric was last compiled from, or
+// "" when nothing has been deployed yet.
+func (s *Store) LastDeployedPolicy() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastPolicyID
+}
+
+// WithdrawModel retires the published model. The zero model means "never
+// trained", which a node cannot tell from "retired", so the withdrawal is
+// explicit and nodes clear their copy when they see it.
+func (s *Store) WithdrawModel() ml.Model {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.model = ml.Model{Withdrawn: true}
+	return s.model
 }
 
 func (s *Store) Model() ml.Model {

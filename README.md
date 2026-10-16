@@ -6,15 +6,25 @@ Attack traffic is steered onto scrubbing nodes. Each node drops in hardware firs
 
 A node counts as live while it has heartbeated within the last 30 seconds. A node past that window is reported `stale` and is skipped by prefix assignment, so a prefix is never handed to a scrubber that stopped answering. A node that holds no prefix assignment enforces nothing.
 
+The fabric is kept compiled against the live set rather than against whoever happened to be up at the last deploy. A node that registers or recovers after a deploy is compiled into the standing policy immediately, and the control plane re-checks membership every few seconds so a node that dies has its prefixes reassigned. If every node goes stale the last programs are kept rather than blanked, so whatever is still enforcing them keeps doing so.
+
+Node IDs derive from name and region, so two scrubbers sharing both collapse onto one identity. A registration that would take over a node that is still live is refused with `409`; once the incumbent has aged out, a replacement is free to take the identity. Each agent advertises the address peers should dial with `-advertise` — it defaults to `-listen`, or to `hostname:port` when `-listen` is a wildcard.
+
 ## Datapath
 
 Within a stage the first matching rule decides: `drop` and `permit` are both terminal, so a `permit` rule acts as an allow-list that exempts a source from the stages behind it. A TCAM entry carries no meter, so `rate_limit` is rejected on the `asic` stage.
+
+Rules are ordered by `priority` on every stage, not just the ASIC, and the ordering is stable, so rules sharing a priority keep policy order and compile identically on every node. A node is only given entries for the backends it advertised at registration.
+
+`count` is observe-only and never drops: it records the match and leaves the verdict to a later rule. Only two stage/action pairs consume `pps` — an `fpga` `rate_limit` meter, and the `zc` behavioral cap on `rate_limit` or `inspect`. A policy carrying `pps` anywhere else is rejected rather than accepted and ignored.
 
 1. ASIC / TCAM ACL. Longest-prefix and port ACLs. Terminal drops never leave the chip.
 2. FPGA. Line-rate meters and flag matches for what the TCAM did not already drop.
 3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path. A logistic classifier trained from the control API scores this stage and drops flows over the threshold.
 
 The model is flow-level only: rate, protocol, ports, and TCP flags. It does not inspect payloads. Train it with labeled samples, then nodes pull the weights on the same poll as the hardware program.
+
+One sample in five is held out of the fit, and the reported `accuracy`, `precision`, and `recall` are measured on that holdout. Watch precision: a false positive here is dropped customer traffic. Sets below ten samples are too small to split and report training metrics with `validation: 0`. `DELETE /v1/ml/model` retires a published model; agents clear their copy on the next poll, which is the only way to pull a bad model without restarting the fleet.
 
 Hardware programming is represented as compiled programs the node agent pulls. A node without a switch ASIC, FPGA, or PF_RING license still enforces the same decision order in the software pipeline so the control plane can be tested. On an appliance, the agent writes the TCAM key, FPGA table, and `zc:<node>` cluster from that program.
 
@@ -38,7 +48,8 @@ go run ./cmd/scrubctl fabric
 ```
 
 Three nodes in Docker. The nodes wait on the API's healthcheck, so they no
-longer race it on startup:
+longer race it on startup. The token is read from the environment rather than
+baked into the compose file, so it has to be set:
 
 ```sh
 SCRUBLINE_API_TOKEN=dev-scrubline-token docker compose -f deploy/docker-compose.yml up --build
@@ -70,6 +81,7 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `POST /v1/ml/samples` labeled flow records (`label` 0 clean, 1 attack)
 - `POST /v1/ml/train` fit the ZC logistic model
 - `GET /v1/ml/model` weights the node agent installs
+- `DELETE /v1/ml/model` retire the published model; agents clear it on the next poll
 
 Example policy: `configs/policy.example.json`. Example training set: `configs/ml.samples.json`.
 
