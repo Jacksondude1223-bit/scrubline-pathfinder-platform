@@ -46,9 +46,36 @@ type requestKey struct {
 	status int
 }
 
+// Role is what a caller is allowed to do.
+type Role string
+
+const (
+	// RoleOperator is full control-plane access: policy, deploy, ML, fabric.
+	RoleOperator Role = "operator"
+	// RoleEnroll may only register a node and collect its credential.
+	RoleEnroll Role = "enroll"
+	// RoleNode is one scrubber acting for itself: its own heartbeat, its own
+	// program, and the published model. Nothing else, and nothing belonging
+	// to another node.
+	RoleNode Role = "node"
+)
+
+// principal is the authenticated caller behind a request.
+type principal struct {
+	role Role
+	// nodeID is set for RoleNode and names the one node this caller may act
+	// for.
+	nodeID string
+}
+
 type Server struct {
+	// Token is the operator credential: full control-plane access.
 	Token string
-	Store *store.Store
+	// EnrollToken lets a node register and collect its own credential. It is
+	// the fleet's bootstrap secret and nothing more: on its own it cannot
+	// read a program, change a policy, or move an announcement.
+	EnrollToken string
+	Store       *store.Store
 
 	// requestsMu guards the API request counters.
 	requestsMu sync.Mutex
@@ -259,8 +286,15 @@ func (s *Server) Handler() http.Handler {
 // fleet reported on its heartbeats. It takes the same bearer token as the rest
 // of the control plane: rule IDs and traffic volumes are not public.
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+	who, ok := s.authenticate(r)
+	if !ok {
+		unauthorized(w)
+		return
+	}
+	if !who.isOperator() {
+		// The fleet view names every node, its load, and its rule hits. A
+		// single scrubber has no business reading it.
+		forbidden(w, "the operator credential is required to scrape the control plane")
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -457,24 +491,49 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 // what the request counter is labeled by. Returning a name from the switch
 // keeps the label set bounded and in step with the routing.
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
-	if !s.auth(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+	who, ok := s.authenticate(r)
+	if !ok {
+		unauthorized(w)
 		return "unauthorized"
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/v1/")
+
+	// Everything below is operator-only unless the case says otherwise. A
+	// scrubber holds a credential scoped to itself, so a compromised node
+	// cannot rewrite policy, move another node's announcement, or read the
+	// fabric.
 	switch {
 	case r.Method == http.MethodPost && path == "nodes/register":
+		// Enrollment is the one thing the bootstrap credential can do.
+		if !who.isOperator() && who.role != RoleEnroll {
+			forbidden(w, "registering a node requires the enrollment or operator credential")
+			return "nodes/register"
+		}
 		s.register(w, r)
 		return "nodes/register"
 	case r.Method == http.MethodPost && hasSubpath(path, "nodes", "heartbeat"):
 		id, _ := subpathID(path, "nodes", "heartbeat")
+		if !who.actsFor(id) {
+			forbidden(w, "a node may only heartbeat for itself")
+			return "nodes/heartbeat"
+		}
 		s.heartbeat(w, r, id)
 		return "nodes/heartbeat"
 	case r.Method == http.MethodGet && path == "nodes":
+		if !who.isOperator() {
+			forbidden(w, "listing the fleet requires the operator credential")
+			return "nodes"
+		}
 		writeJSON(w, http.StatusOK, s.Store.Nodes())
 		return "nodes"
 	case r.Method == http.MethodGet && hasSubpath(path, "nodes", "program"):
 		id, _ := subpathID(path, "nodes", "program")
+		if !who.actsFor(id) {
+			// A program names the prefixes a node scrubs and what it
+			// announces. One scrubber must not be able to read another's.
+			forbidden(w, "a node may only fetch its own program")
+			return "nodes/program"
+		}
 		prog, found := s.Store.Program(id)
 		if !found {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no program deployed"})
@@ -484,6 +543,10 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		return "nodes/program"
 	case r.Method == http.MethodGet && hasSubpath(path, "nodes", "stats"):
 		id, _ := subpathID(path, "nodes", "stats")
+		if !who.actsFor(id) {
+			forbidden(w, "a node may only read its own counters")
+			return "nodes/stats"
+		}
 		report, found := s.Store.Report(id)
 		if !found {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no counters reported for this node"})
@@ -492,41 +555,77 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		writeJSON(w, http.StatusOK, report)
 		return "nodes/stats"
 	case r.Method == http.MethodPost && path == "policies":
+		if !operatorOnly(w, who) {
+			return "policies"
+		}
 		s.savePolicy(w, r)
 		return "policies"
 	case r.Method == http.MethodGet && path == "policies":
+		if !operatorOnly(w, who) {
+			return "policies"
+		}
 		writeJSON(w, http.StatusOK, s.Store.Policies())
 		return "policies"
 	case r.Method == http.MethodPost && hasSubpath(path, "policies", "deploy"):
+		if !operatorOnly(w, who) {
+			return "policies/deploy"
+		}
 		id, _ := subpathID(path, "policies", "deploy")
 		s.deploy(w, id)
 		return "policies/deploy"
 	case r.Method == http.MethodGet && path == "fabric":
+		if !operatorOnly(w, who) {
+			return "fabric"
+		}
 		plan, programs := s.Store.Fabric()
 		writeJSON(w, http.StatusOK, map[string]any{"announcements": plan, "programs": programs, "ml": s.Store.Model()})
 		return "fabric"
 	case r.Method == http.MethodPost && path == "ml/samples":
+		if !operatorOnly(w, who) {
+			return "ml/samples"
+		}
 		s.addSamples(w, r)
 		return "ml/samples"
 	case r.Method == http.MethodGet && path == "ml/samples":
+		if !operatorOnly(w, who) {
+			return "ml/samples"
+		}
 		writeJSON(w, http.StatusOK, s.Store.Samples())
 		return "ml/samples"
 	case r.Method == http.MethodPost && path == "ml/train":
+		if !operatorOnly(w, who) {
+			return "ml/train"
+		}
 		s.train(w, r)
 		return "ml/train"
 	case r.Method == http.MethodGet && path == "ml/model":
+		// Every node installs the published model, so a node credential may
+		// read it. It carries weights, not policy or fleet detail.
+		if !who.isOperator() && who.role != RoleNode {
+			forbidden(w, "reading the model requires a node or operator credential")
+			return "ml/model"
+		}
 		writeJSON(w, http.StatusOK, s.Store.Model())
 		return "ml/model"
 	case r.Method == http.MethodDelete && path == "ml/model":
+		if !operatorOnly(w, who) {
+			return "ml/model"
+		}
 		// Explicitly retire a model. Nodes clear their installed copy on the
 		// next poll; without this a bad model could only be removed by
 		// restarting every agent in the fleet.
 		writeJSON(w, http.StatusOK, s.Store.WithdrawModel())
 		return "ml/model"
 	case r.Method == http.MethodPost && path == "ml/score":
+		if !operatorOnly(w, who) {
+			return "ml/score"
+		}
 		s.score(w, r)
 		return "ml/score"
 	case r.Method == http.MethodPost && path == "decide":
+		if !operatorOnly(w, who) {
+			return "decide"
+		}
 		s.decide(w, r)
 		return "decide"
 	default:
@@ -563,6 +662,24 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, id string) {
 		s.reconcile()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// operatorOnly writes a refusal and reports false unless the caller holds the
+// operator credential.
+func operatorOnly(w http.ResponseWriter, who principal) bool {
+	if who.isOperator() {
+		return true
+	}
+	forbidden(w, "the operator credential is required for this endpoint")
+	return false
+}
+
+func unauthorized(w http.ResponseWriter) {
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+}
+
+func forbidden(w http.ResponseWriter, reason string) {
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": reason})
 }
 
 // hasSubpath reports whether path is exactly "{collection}/{id}/{leaf}".
@@ -604,12 +721,21 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// Registration is also credential issue: the node gets a credential
+	// scoped to itself, returned once and never again. Re-registering rotates
+	// it, so a restarted agent does not leave a second working key behind.
+	token, err := s.Store.IssueNodeToken(registered.ID)
+	if err != nil {
+		log.Printf("api: issuing a credential for %s failed: %v", registered.ID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not issue a node credential"})
+		return
+	}
 	if isNew {
 		// Compile the standing policy onto the new node now rather than leaving
 		// it with no program until someone deploys again.
 		s.reconcile()
 	}
-	writeJSON(w, http.StatusOK, registered)
+	writeJSON(w, http.StatusOK, map[string]any{"node": registered, "token": token})
 }
 
 func (s *Server) savePolicy(w http.ResponseWriter, r *http.Request) {
@@ -898,18 +1024,40 @@ func metersPPS(rule model.Rule) bool {
 	return false
 }
 
-func (s *Server) auth(r *http.Request) bool {
-	// Fail closed. An empty token used to disable authentication entirely, which
-	// turned a misconfiguration into an open control plane.
-	if s.Token == "" {
-		return false
-	}
+// authenticate resolves the bearer credential on a request to a principal.
+//
+// Credentials are checked in order of privilege, and an unset credential never
+// matches: an empty operator token used to disable authentication entirely,
+// which turned a misconfiguration into an open control plane.
+func (s *Server) authenticate(r *http.Request) (principal, bool) {
 	scheme, token, found := strings.Cut(r.Header.Get("Authorization"), " ")
-	if !found || !strings.EqualFold(scheme, "Bearer") {
-		return false
+	if !found || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		return principal{}, false
 	}
-	// Constant time: a byte-wise compare leaks the token through response timing.
-	return subtle.ConstantTimeCompare([]byte(token), []byte(s.Token)) == 1
+	// Constant time: a byte-wise compare leaks the token through response
+	// timing. Both comparisons run regardless of the first result, so the
+	// reply does not time differently for an operator and a node.
+	operator := s.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.Token)) == 1
+	enroll := s.EnrollToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.EnrollToken)) == 1
+	if operator {
+		return principal{role: RoleOperator}, true
+	}
+	if enroll {
+		return principal{role: RoleEnroll}, true
+	}
+	if nodeID, ok := s.Store.NodeForToken(token); ok {
+		return principal{role: RoleNode, nodeID: nodeID}, true
+	}
+	return principal{}, false
+}
+
+// isOperator reports whether the caller holds the operator credential.
+func (p principal) isOperator() bool { return p.role == RoleOperator }
+
+// actsFor reports whether the caller may act for a specific node. An operator
+// may act for any; a node may act only for itself.
+func (p principal) actsFor(nodeID string) bool {
+	return p.isOperator() || (p.role == RoleNode && p.nodeID == nodeID && nodeID != "")
 }
 
 func decode(r *http.Request, v any) error {

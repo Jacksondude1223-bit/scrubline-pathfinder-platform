@@ -16,10 +16,48 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
 )
 
-const testToken = "test-token"
+const (
+	testToken       = "test-token"
+	testEnrollToken = "test-enroll-token"
+)
 
 func newTestServer() http.Handler {
-	return (&Server{Token: testToken, Store: store.New()}).Handler()
+	return (&Server{Token: testToken, EnrollToken: testEnrollToken, Store: store.New()}).Handler()
+}
+
+// doAs issues a request with a specific credential, for the authorization
+// tests.
+func doAs(t *testing.T, h http.Handler, token, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var r io.Reader
+	if body != "" {
+		r = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, path, r)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// enroll registers a node and returns its id and the credential it was
+// issued.
+func enroll(t *testing.T, h http.Handler, body string) (id, token string) {
+	t.Helper()
+	out := requireJSON(t, doAs(t, h, testEnrollToken, http.MethodPost, "/v1/nodes/register", body), http.StatusOK)
+	node, _ := out["node"].(map[string]any)
+	if node == nil {
+		t.Fatalf("register returned no node: %v", out)
+	}
+	id, _ = node["id"].(string)
+	token, _ = out["token"].(string)
+	if id == "" || token == "" {
+		t.Fatalf("register returned id %q token %q", id, token)
+	}
+	return id, token
 }
 
 func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
@@ -207,8 +245,7 @@ func TestDeployUnknownPolicy(t *testing.T) {
 
 func TestFullDeployAndDecideFlow(t *testing.T) {
 	h := newTestServer()
-	node := requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/register", `{"name":"scrub-a","region":"iad","capacity_gbps":100}`), http.StatusOK)
-	nodeID := node["id"].(string)
+	nodeID, _ := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
 
 	policyBody := `{"name":"game-edge","protected":["203.0.113.0/24"],"rules":[
 		{"id":"allow-ops","stage":"asic","action":"permit","priority":10,"match":{"src_cidr":"192.0.2.7/32"}},
@@ -243,8 +280,7 @@ func TestFullDeployAndDecideFlow(t *testing.T) {
 
 func TestHeartbeatAndProgramPathsAreExact(t *testing.T) {
 	h := newTestServer()
-	node := requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/register", `{"name":"scrub-a","region":"iad","capacity_gbps":10}`), http.StatusOK)
-	id := node["id"].(string)
+	id, _ := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":10}`)
 	requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+id+"/heartbeat", ""), http.StatusOK)
 	requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/nope/heartbeat", ""), http.StatusNotFound)
 	// A nested or missing id must not be read as a node id. ServeMux collapses a
@@ -304,7 +340,7 @@ func TestBodyLimitIsEnforced(t *testing.T) {
 // newTestAPI returns the server alongside its handler, for tests that need to
 // reach past the HTTP surface.
 func newTestAPI() (*Server, http.Handler) {
-	s := &Server{Token: testToken, Store: store.New()}
+	s := &Server{Token: testToken, EnrollToken: testEnrollToken, Store: store.New()}
 	return s, s.Handler()
 }
 
@@ -320,7 +356,7 @@ func newTestAPIWithClock() (s *Server, h http.Handler, advance func(time.Duratio
 		return now
 	}
 	st.SetClock(clock)
-	s = &Server{Token: testToken, Store: st}
+	s = &Server{Token: testToken, EnrollToken: testEnrollToken, Store: st}
 	// The store, the server's freshness check, and the steering controller's
 	// dwell all run off the same clock, so a test can age the whole fabric.
 	s.SetClock(clock)
@@ -334,11 +370,7 @@ func newTestAPIWithClock() (s *Server, h http.Handler, advance func(time.Duratio
 func registerNode(t *testing.T, h http.Handler, name, region string, capacity int) string {
 	t.Helper()
 	body := fmt.Sprintf(`{"name":%q,"region":%q,"capacity_gbps":%d,"advertise":"%s:9091"}`, name, region, capacity, name)
-	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/register", body), http.StatusOK)
-	id, _ := out["id"].(string)
-	if id == "" {
-		t.Fatalf("register %s returned no id: %v", name, out)
-	}
+	id, _ := enroll(t, h, body)
 	return id
 }
 
@@ -834,11 +866,7 @@ func registerNodeWithPPS(t *testing.T, h http.Handler, name, region string, gbps
 	t.Helper()
 	body := fmt.Sprintf(`{"name":%q,"region":%q,"capacity_gbps":%d,"capacity_pps":%d,"advertise":"%s:9091"}`,
 		name, region, gbps, pps, name)
-	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/register", body), http.StatusOK)
-	id, _ := out["id"].(string)
-	if id == "" {
-		t.Fatalf("register %s returned no id: %v", name, out)
-	}
+	id, _ := enroll(t, h, body)
 	return id
 }
 
@@ -989,5 +1017,174 @@ func TestRegisterRejectsNegativePacketCapacity(t *testing.T) {
 	rec := do(t, h, http.MethodPost, "/v1/nodes/register", `{"name":"n","region":"iad","capacity_pps":-1}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The point of per-node credentials: a compromised scrubber holds a key
+// scoped to itself and nothing more. These are the things it must not be able
+// to do with it.
+func TestNodeCredentialCannotActAsOperator(t *testing.T) {
+	_, h := newTestAPI()
+	_, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	for _, tc := range []struct{ name, method, path, body string }{
+		{"write a policy", http.MethodPost, "/v1/policies", twoPrefixPolicy},
+		{"read policies", http.MethodGet, "/v1/policies", ""},
+		{"deploy", http.MethodPost, "/v1/policies/pol-1/deploy", ""},
+		{"read the fabric", http.MethodGet, "/v1/fabric", ""},
+		{"list the fleet", http.MethodGet, "/v1/nodes", ""},
+		{"scrape the control plane", http.MethodGet, "/metrics", ""},
+		{"add training samples", http.MethodPost, "/v1/ml/samples", `{"samples":[]}`},
+		{"train", http.MethodPost, "/v1/ml/train", "{}"},
+		{"withdraw the model", http.MethodDelete, "/v1/ml/model", ""},
+		{"read samples", http.MethodGet, "/v1/ml/samples", ""},
+		{"score a flow", http.MethodPost, "/v1/ml/score", `{"proto":"tcp"}`},
+		{"simulate a decision", http.MethodPost, "/v1/decide", `{"node_id":"x","flow":{}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doAs(t, h, nodeToken, tc.method, tc.path, tc.body)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("a node credential was allowed to %s: got %d, want 403: %s", tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// A node's credential is scoped to that node, not to the fleet. A program
+// names the prefixes a scrubber carries and what it announces.
+func TestNodeCredentialCannotReachAnotherNode(t *testing.T) {
+	_, h := newTestAPI()
+	a, aToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	b, _ := enroll(t, h, `{"name":"scrub-b","region":"fra","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	// Its own program and counters are fine.
+	requireJSON(t, doAs(t, h, aToken, http.MethodGet, "/v1/nodes/"+a+"/program", ""), http.StatusOK)
+	requireJSON(t, doAs(t, h, aToken, http.MethodPost, "/v1/nodes/"+a+"/heartbeat", ""), http.StatusOK)
+
+	for _, tc := range []struct{ name, method, path string }{
+		{"read another node's program", http.MethodGet, "/v1/nodes/" + b + "/program"},
+		{"heartbeat as another node", http.MethodPost, "/v1/nodes/" + b + "/heartbeat"},
+		{"read another node's counters", http.MethodGet, "/v1/nodes/" + b + "/stats"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := doAs(t, h, aToken, tc.method, tc.path, ""); rec.Code != http.StatusForbidden {
+				t.Fatalf("node A was allowed to %s: got %d, want 403", tc.name, rec.Code)
+			}
+		})
+	}
+}
+
+// A node does install the published model, so it may read that one thing.
+func TestNodeCredentialMayReadTheModel(t *testing.T) {
+	_, h := newTestAPI()
+	_, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	requireJSON(t, doAs(t, h, nodeToken, http.MethodGet, "/v1/ml/model", ""), http.StatusOK)
+}
+
+// The enrollment credential is a bootstrap secret and nothing more: on its
+// own it cannot read a program, change a policy, or move an announcement.
+func TestEnrollCredentialCanOnlyEnroll(t *testing.T) {
+	_, h := newTestAPI()
+	node, _ := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	for _, tc := range []struct{ name, method, path, body string }{
+		{"read a program", http.MethodGet, "/v1/nodes/" + node + "/program", ""},
+		{"heartbeat", http.MethodPost, "/v1/nodes/" + node + "/heartbeat", ""},
+		{"read the model", http.MethodGet, "/v1/ml/model", ""},
+		{"read the fabric", http.MethodGet, "/v1/fabric", ""},
+		{"write a policy", http.MethodPost, "/v1/policies", twoPrefixPolicy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := doAs(t, h, testEnrollToken, tc.method, tc.path, tc.body); rec.Code != http.StatusForbidden {
+				t.Fatalf("the enrollment credential was allowed to %s: got %d, want 403", tc.name, rec.Code)
+			}
+		})
+	}
+}
+
+// An unknown credential is rejected outright, not downgraded to a node.
+func TestUnknownCredentialIsUnauthorized(t *testing.T) {
+	_, h := newTestAPI()
+	for _, token := range []string{"", "nope", "0000000000000000000000000000000000000000000000000000000000000000"} {
+		if rec := doAs(t, h, token, http.MethodGet, "/v1/nodes", ""); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("token %q: expected 401, got %d", token, rec.Code)
+		}
+	}
+}
+
+// Enrolling returns a credential once. It must not be a value the caller
+// could have predicted, and it must not be the enrollment token.
+func TestEnrollmentIssuesAFreshScopedCredential(t *testing.T) {
+	_, h := newTestAPI()
+	a, aToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	_, bToken := enroll(t, h, `{"name":"scrub-b","region":"fra","capacity_gbps":100}`)
+
+	if aToken == bToken {
+		t.Fatal("two nodes were issued the same credential")
+	}
+	for _, shared := range []string{testToken, testEnrollToken} {
+		if aToken == shared {
+			t.Fatal("the node credential is one of the shared secrets")
+		}
+	}
+	if len(aToken) != 64 {
+		t.Fatalf("expected a 256-bit credential, got %d characters", len(aToken))
+	}
+	// The node resource itself must not carry the secret.
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+	listed := do(t, h, http.MethodGet, "/v1/nodes", "")
+	if strings.Contains(listed.Body.String(), aToken) {
+		t.Fatalf("a node credential leaked through the fleet listing: %s", listed.Body.String())
+	}
+	_ = a
+}
+
+// Re-enrolling rotates the credential, so a restarted agent does not leave a
+// second working key behind.
+func TestReEnrollingRevokesThePreviousCredential(t *testing.T) {
+	_, h := newTestAPI()
+	node, first := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	_, second := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	if first == second {
+		t.Fatal("re-enrolling returned the same credential")
+	}
+	if rec := doAs(t, h, first, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("the superseded credential still works: got %d", rec.Code)
+	}
+	requireJSON(t, doAs(t, h, second, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", ""), http.StatusOK)
+}
+
+// The operator credential still reaches everything, including on a node's
+// behalf.
+func TestOperatorCredentialReachesEverything(t *testing.T) {
+	_, h := newTestAPI()
+	node, _ := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+	for _, path := range []string{
+		"/v1/nodes", "/v1/fabric", "/v1/policies", "/v1/ml/model",
+		"/v1/nodes/" + node + "/program", "/metrics",
+	} {
+		if rec := doAs(t, h, testToken, http.MethodGet, path, ""); rec.Code != http.StatusOK {
+			t.Fatalf("the operator was refused %s: got %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// An unset credential must never match. An empty operator token used to
+// disable authentication entirely.
+func TestUnsetCredentialsNeverMatch(t *testing.T) {
+	h := (&Server{Store: store.New()}).Handler() // neither token configured
+	for _, token := range []string{"", "anything"} {
+		if rec := doAs(t, h, token, http.MethodGet, "/v1/nodes", ""); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("token %q against an unconfigured server: expected 401, got %d", token, rec.Code)
+		}
+	}
+	// An enroll-only server must not accept the empty operator token as operator.
+	h2 := (&Server{EnrollToken: testEnrollToken, Store: store.New()}).Handler()
+	if rec := doAs(t, h2, "", http.MethodGet, "/v1/fabric", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for an empty token, got %d", rec.Code)
 	}
 }

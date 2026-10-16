@@ -1,4 +1,4 @@
-.PHONY: build test bench demo
+.PHONY: build test bench certs demo
 
 build:
 	mkdir -p bin
@@ -11,6 +11,10 @@ build:
 test:
 	go test -race ./...
 
+# Throwaway CA and server certificate for trying TLS locally. Not for deployment.
+certs:
+	go run scripts/gen-dev-certs.go -dir certs -host 127.0.0.1,localhost
+
 bench:
 	go test -run xxx -bench . -benchmem ./internal/pipeline/
 
@@ -21,7 +25,8 @@ bench:
 demo: build
 	@set -e; \
 	SCRUBLINE_API_TOKEN=$${SCRUBLINE_API_TOKEN:-dev-scrubline-token}; \
-	export SCRUBLINE_API_TOKEN; \
+	SCRUBLINE_ENROLL_TOKEN=$${SCRUBLINE_ENROLL_TOKEN:-dev-scrubline-enroll}; \
+	export SCRUBLINE_API_TOKEN SCRUBLINE_ENROLL_TOKEN; \
 	./bin/scrub-api -addr 127.0.0.1:8080 & \
 	api_pid=$$!; \
 	trap 'kill $$api_pid 2>/dev/null || true; wait $$api_pid 2>/dev/null || true' EXIT INT TERM; \

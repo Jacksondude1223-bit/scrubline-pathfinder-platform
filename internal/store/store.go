@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -50,17 +51,24 @@ type Store struct {
 	// reports holds the datapath counters each node last sent with its
 	// heartbeat, keyed by node ID so the map stays bounded by the node set.
 	reports map[string]telemetry.Report
+	// nodeTokens maps a node to the hash of its current credential, and
+	// tokenNodes maps back from the hash. Only hashes are kept: a dump of
+	// this store must not hand anyone a working credential.
+	nodeTokens map[string]string
+	tokenNodes map[string]string
 	// now is swapped out in tests; production always uses the wall clock.
 	now func() time.Time
 }
 
 func New() *Store {
 	return &Store{
-		nodes:    map[string]*model.Node{},
-		policies: map[string]*model.Policy{},
-		programs: map[string]*model.Program{},
-		reports:  map[string]telemetry.Report{},
-		now:      func() time.Time { return time.Now().UTC() },
+		nodes:      map[string]*model.Node{},
+		policies:   map[string]*model.Policy{},
+		programs:   map[string]*model.Program{},
+		reports:    map[string]telemetry.Report{},
+		nodeTokens: map[string]string{},
+		tokenNodes: map[string]string{},
+		now:        func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -331,6 +339,67 @@ func (s *Store) Reports() []telemetry.Report {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
+}
+
+// IssueNodeToken mints a fresh credential for a node and returns it. The
+// plaintext is returned exactly once, at enrollment; only its hash is kept.
+//
+// Issuing replaces whatever the node had, so a restart rotates the credential
+// and an old one stops working the moment a new one is handed out.
+func (s *Store) IssueNodeToken(nodeID string) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generating a node credential: %w", err)
+	}
+	token := hex.EncodeToString(raw)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.nodeTokens == nil {
+		s.nodeTokens = map[string]string{}
+		s.tokenNodes = map[string]string{}
+	}
+	if previous, ok := s.nodeTokens[nodeID]; ok {
+		delete(s.tokenNodes, previous)
+	}
+	sum := tokenHash(token)
+	s.nodeTokens[nodeID] = sum
+	s.tokenNodes[sum] = nodeID
+	return token, nil
+}
+
+// NodeForToken resolves a presented credential to the node that holds it.
+//
+// The lookup is by hash, so the store never compares against a live secret and
+// a timing signal would only reveal something about the hash of a value the
+// caller already knows.
+func (s *Store) NodeForToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	sum := tokenHash(token)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.tokenNodes[sum]
+	return id, ok
+}
+
+// RevokeNodeToken drops a node's credential.
+func (s *Store) RevokeNodeToken(nodeID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sum, ok := s.nodeTokens[nodeID]
+	if !ok {
+		return false
+	}
+	delete(s.nodeTokens, nodeID)
+	delete(s.tokenNodes, sum)
+	return true
+}
+
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // LastDeployedPolicy reports the policy the fabric was last compiled from, or

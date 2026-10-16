@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -319,5 +320,99 @@ func TestReportsAreOnlyKeptForKnownNodes(t *testing.T) {
 	s.PutReport(node.ID, pipeline.Stats{Decisions: 9})
 	if got := s.Reports(); len(got) != 1 || got[0].Stats.Decisions != 9 {
 		t.Fatalf("expected the report to be replaced, got %+v", got)
+	}
+}
+
+// A node credential is handed out once and only its hash is kept, so a dump
+// of the store cannot be replayed against the control plane.
+func TestNodeTokensAreStoredHashed(t *testing.T) {
+	s := New()
+	node, _, err := s.UpsertNode(model.Node{Name: "scrub-a", Region: "iad"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	token, err := s.IssueNodeToken(node.ID)
+	if err != nil {
+		t.Fatalf("IssueNodeToken: %v", err)
+	}
+	if len(token) != 64 {
+		t.Fatalf("expected a 256-bit hex credential, got %d characters", len(token))
+	}
+	for _, held := range s.nodeTokens {
+		if held == token {
+			t.Fatal("the plaintext credential was stored")
+		}
+	}
+	if got, ok := s.NodeForToken(token); !ok || got != node.ID {
+		t.Fatalf("expected the credential to resolve to %s, got %q (%v)", node.ID, got, ok)
+	}
+}
+
+func TestUnknownAndEmptyTokensResolveToNothing(t *testing.T) {
+	s := New()
+	for _, token := range []string{"", "nope", "0000000000000000000000000000000000000000000000000000000000000000"} {
+		if _, ok := s.NodeForToken(token); ok {
+			t.Fatalf("token %q should not resolve", token)
+		}
+	}
+}
+
+// Two nodes must never share a credential.
+func TestIssuedTokensAreDistinct(t *testing.T) {
+	s := New()
+	seen := map[string]bool{}
+	for i := 0; i < 50; i++ {
+		token, err := s.IssueNodeToken(fmt.Sprintf("node-%d", i))
+		if err != nil {
+			t.Fatalf("IssueNodeToken: %v", err)
+		}
+		if seen[token] {
+			t.Fatalf("credential %s was issued twice", token)
+		}
+		seen[token] = true
+	}
+}
+
+// Re-issuing rotates: the old credential stops working the moment a new one
+// is handed out, so a restart does not leave a second valid key behind.
+func TestReissuingRotatesTheCredential(t *testing.T) {
+	s := New()
+	first, err := s.IssueNodeToken("node-a")
+	if err != nil {
+		t.Fatalf("IssueNodeToken: %v", err)
+	}
+	second, err := s.IssueNodeToken("node-a")
+	if err != nil {
+		t.Fatalf("IssueNodeToken: %v", err)
+	}
+	if first == second {
+		t.Fatal("re-issuing returned the same credential")
+	}
+	if _, ok := s.NodeForToken(first); ok {
+		t.Fatal("the superseded credential still works")
+	}
+	if got, ok := s.NodeForToken(second); !ok || got != "node-a" {
+		t.Fatalf("the new credential does not resolve: %q %v", got, ok)
+	}
+	// Rotation must not leave the old hash behind in the reverse index.
+	if len(s.tokenNodes) != 1 {
+		t.Fatalf("expected one live credential, got %d", len(s.tokenNodes))
+	}
+}
+
+func TestRevokingACredentialStopsIt(t *testing.T) {
+	s := New()
+	token, err := s.IssueNodeToken("node-a")
+	if err != nil {
+		t.Fatalf("IssueNodeToken: %v", err)
+	}
+	if !s.RevokeNodeToken("node-a") {
+		t.Fatal("expected the revocation to find the credential")
+	}
+	if _, ok := s.NodeForToken(token); ok {
+		t.Fatal("a revoked credential still works")
+	}
+	if s.RevokeNodeToken("node-a") {
+		t.Fatal("revoking twice should report nothing to revoke")
 	}
 }

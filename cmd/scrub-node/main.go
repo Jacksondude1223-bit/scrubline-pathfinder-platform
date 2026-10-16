@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/transport"
 )
 
 const (
@@ -33,6 +35,8 @@ const (
 	registerAttempts = 30
 )
 
+// client reaches the control plane. It is replaced at startup once the CA
+// bundle is known; certificate verification is never turned off.
 var client = &http.Client{Timeout: 5 * time.Second}
 
 func main() {
@@ -45,10 +49,28 @@ func main() {
 	advertise := flag.String("advertise", "", "address other components use to reach this node (default: -listen, or hostname:port when -listen is a wildcard)")
 	localAS := flag.Int("local-as", 0, "AS this node's BGP speaker announces from; required for AS-path prepends")
 	bgpNextHop := flag.String("bgp-next-hop", "", "next hop to advertise with, when it differs from the address peers reach this node on")
+	certFile := flag.String("tls-cert", "", "TLS certificate for this agent's local API")
+	keyFile := flag.String("tls-key", "", "TLS key for this agent's local API")
+	caFile := flag.String("ca", "", "PEM bundle to verify the control plane against; empty uses the system roots")
+	insecure := flag.Bool("insecure", false, "serve a routable local API without TLS; credentials then cross the network in the clear")
 	flag.Parse()
-	token := os.Getenv("SCRUBLINE_API_TOKEN")
-	if token == "" {
-		log.Fatal("SCRUBLINE_API_TOKEN is required")
+	httpClient, err := transport.Client(transport.ClientConfig{CAFile: *caFile, Timeout: 5 * time.Second})
+	if err != nil {
+		log.Fatalf("configuring the control-plane client: %v", err)
+	}
+	client = httpClient
+
+	// Three credentials, three blast radii. The enrollment token only buys a
+	// registration; the credential the control plane hands back is scoped to
+	// this node alone; the local token guards this agent's own read-only
+	// endpoints. The agent never holds the operator credential.
+	enrollToken := os.Getenv("SCRUBLINE_ENROLL_TOKEN")
+	if enrollToken == "" {
+		log.Fatal("SCRUBLINE_ENROLL_TOKEN is required to enroll with the control plane")
+	}
+	localToken := os.Getenv("SCRUBLINE_NODE_API_TOKEN")
+	if localToken == "" {
+		log.Fatal("SCRUBLINE_NODE_API_TOKEN is required to guard this agent's /decide, /metrics, and /bgp")
 	}
 	if *capacity < 0 {
 		log.Fatalf("-capacity must not be negative, got %v", *capacity)
@@ -81,9 +103,9 @@ func main() {
 	}
 
 	var node model.Node
-	var err error
+	var nodeToken string
 	for attempt := 1; ; attempt++ {
-		node, err = register(*apiURL, token, desired)
+		node, nodeToken, err = register(*apiURL, enrollToken, desired)
 		if err == nil {
 			break
 		}
@@ -97,14 +119,18 @@ func main() {
 		log.Printf("registering with %s failed (attempt %d/%d): %v; retrying in %s", *apiURL, attempt, registerAttempts, err, backoff)
 		time.Sleep(backoff)
 	}
-	log.Printf("registered %s as %s backends=asic,fpga,zc", node.Name, node.ID)
+	log.Printf("registered %s as %s backends=asic,fpga,zc (credential scoped to this node)", node.Name, node.ID)
+
+	// creds holds the node credential, which rotates on every re-enrollment.
+	creds := &credentials{}
+	creds.set(nodeToken)
 
 	pipe := pipeline.New(model.Program{NodeID: node.ID})
 	// The steering plan is held separately from the datapath: /bgp and
 	// /metrics serve it, and the speaker beside this agent consumes it.
 	var steering atomic.Pointer[steeringPlan]
 	steering.Store(&steeringPlan{})
-	go poll(*apiURL, token, node, desired, pipe, &steering, *localAS, *bgpNextHop)
+	go poll(*apiURL, enrollToken, creds, node, desired, pipe, &steering, *localAS, *bgpNextHop)
 
 	mux := http.NewServeMux()
 	// /health stays open for liveness probes; it carries no policy detail.
@@ -114,7 +140,7 @@ func main() {
 	// /metrics carries rule IDs and traffic volumes, so it takes the same
 	// bearer token as /decide. Point the scraper at it with that token.
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, token) {
+		if !authorized(r, localToken) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
 			return
 		}
@@ -138,7 +164,7 @@ func main() {
 	// Scrubline does not speak BGP itself: it compiles the plan and serves it,
 	// the way it serves the TCAM, FPGA, and ZC programs.
 	mux.HandleFunc("/bgp", func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, token) {
+		if !authorized(r, localToken) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
 			return
 		}
@@ -166,7 +192,7 @@ func main() {
 	// /decide reveals what the policy does with a given flow, so it takes the
 	// same bearer token as the control API.
 	mux.HandleFunc("/decide", func(w http.ResponseWriter, r *http.Request) {
-		if !authorized(r, token) {
+		if !authorized(r, localToken) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
 			return
 		}
@@ -187,8 +213,14 @@ func main() {
 		d.NodeID = node.ID
 		writeJSON(w, http.StatusOK, d)
 	})
-	log.Printf("node dataplane listening on %s", *listen)
-	log.Fatal(http.ListenAndServe(*listen, mux))
+	scheme := "http"
+	if *certFile != "" {
+		scheme = "https"
+	}
+	log.Printf("node dataplane listening on %s://%s", scheme, *listen)
+	log.Fatal(transport.Serve(transport.Config{
+		Addr: *listen, CertFile: *certFile, KeyFile: *keyFile, Insecure: *insecure,
+	}, mux))
 }
 
 // advertiseAddr picks the address the control plane should record for this
@@ -250,7 +282,27 @@ func renderSteering(prog model.Program, localAS int, nextHop string) *steeringPl
 	return plan
 }
 
-func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipeline.Pipeline, steering *atomic.Pointer[steeringPlan], localAS int, nextHop string) {
+// credentials holds the node credential the control plane issued. It is
+// replaced wholesale on re-enrollment rather than mutated, so a poll in
+// flight never reads a half-written token.
+type credentials struct {
+	mu    sync.RWMutex
+	token string
+}
+
+func (c *credentials) get() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.token
+}
+
+func (c *credentials) set(token string) {
+	c.mu.Lock()
+	c.token = token
+	c.mu.Unlock()
+}
+
+func poll(apiURL, enrollToken string, creds *credentials, node model.Node, desired model.Node, pipe *pipeline.Pipeline, steering *atomic.Pointer[steeringPlan], localAS int, nextHop string) {
 	id := node.ID
 	var lastPolicy string
 	var lastVersion int
@@ -262,19 +314,23 @@ func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipel
 		// The heartbeat carries this node's counters. It is the one call the
 		// agent already makes every poll, so the control plane gets a fleet
 		// view without a second round trip.
-		if err := heartbeat(apiURL, token, id, pipe.Stats()); err != nil {
+		if err := heartbeat(apiURL, creds.get(), id, pipe.Stats()); err != nil {
 			log.Printf("heartbeat: %v", err)
-			if errors.Is(err, errUnknownNode) {
-				if _, err := register(apiURL, token, desired); err != nil {
-					log.Printf("re-registering: %v", err)
+			// A control plane that restarted has no record of this node, and a
+			// rotated or revoked credential is rejected rather than ignored.
+			// Both are fixed by enrolling again.
+			if errors.Is(err, errUnknownNode) || errors.Is(err, errUnauthenticated) {
+				if _, token, err := register(apiURL, enrollToken, desired); err != nil {
+					log.Printf("re-enrolling: %v", err)
 				} else {
-					log.Printf("re-registered %s after the control plane lost it", id)
+					creds.set(token)
+					log.Printf("re-enrolled %s and rotated its credential", id)
 				}
 			}
 		}
 
 		var prog model.Program
-		if err := get(apiURL+"/v1/nodes/"+id+"/program", token, &prog); err != nil {
+		if err := get(apiURL+"/v1/nodes/"+id+"/program", creds.get(), &prog); err != nil {
 			if !errors.Is(err, errNotFound) {
 				log.Printf("fetching program: %v", err)
 			}
@@ -300,7 +356,7 @@ func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipel
 		}
 
 		var trained ml.Model
-		if err := get(apiURL+"/v1/ml/model", token, &trained); err != nil {
+		if err := get(apiURL+"/v1/ml/model", creds.get(), &trained); err != nil {
 			log.Printf("fetching model: %v", err)
 		} else if trained.Ready {
 			pipe.SetModel(trained)
@@ -318,20 +374,32 @@ func poll(apiURL, token string, node model.Node, desired model.Node, pipe *pipel
 }
 
 var (
-	errUnknownNode = errors.New("control plane does not know this node")
-	errNotFound    = errors.New("not found")
+	errUnknownNode     = errors.New("control plane does not know this node")
+	errNotFound        = errors.New("not found")
+	errUnauthenticated = errors.New("control plane rejected this node's credential")
 )
 
-func register(apiURL, token string, node model.Node) (model.Node, error) {
+// register enrolls with the control plane and collects the credential it
+// issues. The credential is returned once, here, and never served again.
+func register(apiURL, enrollToken string, node model.Node) (model.Node, string, error) {
 	raw, err := json.Marshal(node)
 	if err != nil {
-		return model.Node{}, err
+		return model.Node{}, "", err
 	}
-	var out model.Node
-	if err := send(http.MethodPost, apiURL+"/v1/nodes/register", token, raw, &out); err != nil {
-		return model.Node{}, err
+	var out struct {
+		Node  model.Node `json:"node"`
+		Token string     `json:"token"`
 	}
-	return out, nil
+	if err := send(http.MethodPost, apiURL+"/v1/nodes/register", enrollToken, raw, &out); err != nil {
+		return model.Node{}, "", err
+	}
+	if out.Node.ID == "" {
+		return model.Node{}, "", errors.New("the control plane returned no node id")
+	}
+	if out.Token == "" {
+		return model.Node{}, "", errors.New("the control plane issued no credential")
+	}
+	return out.Node, out.Token, nil
 }
 
 func heartbeat(apiURL, token, id string, stats pipeline.Stats) error {
@@ -375,6 +443,9 @@ func send(method, url, token string, body []byte, out any) error {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return errUnauthenticated
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return errNotFound
 	}

@@ -140,14 +140,17 @@ Hardware programming is represented as compiled programs the node agent pulls. A
 
 ```sh
 export SCRUBLINE_API_TOKEN=dev-scrubline-token
+export SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll
 go test ./...
 go run ./cmd/scrub-api -addr 127.0.0.1:8080
 ```
 
-In other shells:
+In other shells (see [Credentials](#credentials); the agent never holds the
+operator token):
 
 ```sh
-export SCRUBLINE_API_TOKEN=dev-scrubline-token
+export SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll
+export SCRUBLINE_NODE_API_TOKEN=dev-scrubline-node
 go run ./cmd/scrub-node -name scrub-a -region iad -capacity 100 -listen 127.0.0.1:9091
 go run ./cmd/scrub-node -name scrub-b -region fra -capacity 80 -listen 127.0.0.1:9092
 go run ./cmd/scrub-node -name scrub-c -region sin -capacity 40 -listen 127.0.0.1:9093
@@ -160,14 +163,21 @@ longer race it on startup. The token is read from the environment rather than
 baked into the compose file, so it has to be set:
 
 ```sh
-SCRUBLINE_API_TOKEN=dev-scrubline-token docker compose -f deploy/docker-compose.yml up --build
+SCRUBLINE_API_TOKEN=dev-scrubline-token \
+SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll \
+SCRUBLINE_NODE_API_TOKEN=dev-scrubline-node \
+  docker compose -f deploy/docker-compose.yml up --build
 ```
+
+The compose file passes `-insecure`, because the compose network is not
+loopback and these containers carry no certificates. That is for the demo; a
+deployment mounts a certificate and drops the flag.
 
 The control API is published on 8080 and the three node dataplanes on 9091,
 9092, and 9093:
 
 ```sh
-curl -H "Authorization: Bearer dev-scrubline-token" \
+curl -H "Authorization: Bearer dev-scrubline-node" \
   -d '{"dst_ip":"203.0.113.10","proto":"tcp","dport":443,"pps":10}' \
   http://127.0.0.1:9091/decide
 ```
@@ -175,8 +185,8 @@ curl -H "Authorization: Bearer dev-scrubline-token" \
 ## Observability
 
 Both binaries expose Prometheus metrics at `/metrics`. The exposition carries
-rule IDs and traffic volumes, so it takes the same bearer token as the rest of
-the control plane — configure the scraper with it. `/health` stays open for
+rule IDs and traffic volumes, so the control plane's takes the operator
+credential and each agent's takes that agent's local one. `/health` stays open for
 liveness probes.
 
 A node counts what its datapath did and attaches those counters to the
@@ -209,17 +219,77 @@ the published model's holdout metrics, and
 `scrubline_api_requests_total{route,status}`.
 
 ```sh
-curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN" http://127.0.0.1:8080/metrics
-curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN" http://127.0.0.1:9091/metrics
+curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      http://127.0.0.1:8080/metrics
+curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/metrics
 ```
+
+## Credentials
+
+Three secrets, three blast radii. A scrubbing node sits at the edge in someone
+else's datacentre, so it never holds a credential that can change the fabric.
+
+| Secret | Held by | Can do |
+| --- | --- | --- |
+| `SCRUBLINE_API_TOKEN` | operators, `scrubctl` | everything: policy, deploy, ML, fabric, `/metrics` |
+| `SCRUBLINE_ENROLL_TOKEN` | every node agent | register, and collect a credential. Nothing else |
+| `SCRUBLINE_NODE_API_TOKEN` | the agent, and whatever scrapes it | that agent's own `/decide`, `/metrics`, `/bgp` |
+
+Registering is also credential issue. The control plane mints a 256-bit
+credential scoped to that node, returns it once, and keeps only its hash, so a
+dump of the control plane hands nobody a working key. Re-enrolling rotates it,
+and the superseded credential stops working immediately — a restarted agent
+never leaves a second key behind. An agent that is told its credential is no
+longer valid enrols again rather than failing in place.
+
+What a node credential buys, and nothing more:
+
+- heartbeat **as itself**, and report its own counters
+- fetch **its own** program
+- read the published model, which it installs
+
+It cannot read another node's program, heartbeat as another node, list the
+fleet, read the fabric, scrape the control plane, write a policy, deploy, or
+touch the classifier. The enrollment credential cannot do any of those either:
+on its own it only enrols. It is still a shared bootstrap secret, so protect
+it — but a scrubber that is taken over yields a key scoped to one node, not
+the control plane.
+
+## Transport
+
+Both binaries serve TLS with `-tls-cert` and `-tls-key`, and **refuse to serve
+a routable address without it**. Credentials crossing a network in the clear
+should be something an operator asks for, not something they get by leaving a
+flag off; `-insecure` is that ask. Loopback is exempt so the single-host demo
+stays simple.
+
+Agents and `scrubctl` verify the control plane with the system roots, or with
+`-ca` for a private CA. Verification is never disabled anywhere: an unverified
+TLS connection is a plaintext connection that looks safe.
+
+Throwaway certificates for trying it locally:
+
+```sh
+make certs
+export SCRUBLINE_API_TOKEN=op-secret SCRUBLINE_ENROLL_TOKEN=enroll-secret
+go run ./cmd/scrub-api -addr 127.0.0.1:8080 -tls-cert certs/server.pem -tls-key certs/server-key.pem
+```
+
+```sh
+export SCRUBLINE_ENROLL_TOKEN=enroll-secret SCRUBLINE_NODE_API_TOKEN=node-local-secret
+go run ./cmd/scrub-node -api https://127.0.0.1:8080 -ca certs/ca.pem \
+  -name scrub-a -region iad -capacity 100 -capacity-pps 100000 \
+  -listen 127.0.0.1:9091 -advertise 198.51.100.1:9091 -local-as 65001
+go run ./cmd/scrubctl -api https://127.0.0.1:8080 -ca certs/ca.pem fabric
+```
+
+Listeners carry read, write, header and idle timeouts, so a handful of idle
+connections cannot hold one open.
 
 ## API
 
-Bearer token is `SCRUBLINE_API_TOKEN`. Spec is in `api/openapi.yaml`. The token is required: an empty one is a misconfiguration, not a way to open the control plane. The node agent's own `/decide` takes the same bearer token; its `/health` is open for liveness probes.
-
 Policies are validated on save. A prefix or match CIDR that does not parse is rejected rather than compiled into a rule that silently never matches, and flow records are rejected if `pps` is negative or a port falls outside 0..65535.
 
-- `POST /v1/nodes/register` node name, region, capacity (`capacity_gbps` and `capacity_pps`), backends
+- `POST /v1/nodes/register` node name, region, capacity (`capacity_gbps` and `capacity_pps`), backends; returns the node and the credential issued to it
 - `GET /v1/nodes`
 - `POST /v1/policies` protected prefixes, stage rules, and per-prefix steering
 - `POST /v1/policies/{id}/deploy` compile the ASIC, FPGA, and ZC programs and the fabric's BGP plan

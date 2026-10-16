@@ -11,14 +11,23 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
+
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/transport"
 )
 
 func main() {
 	api := flag.String("api", "http://127.0.0.1:8080", "control API")
+	caFile := flag.String("ca", "", "PEM bundle to verify the control plane against; empty uses the system roots")
 	flag.Parse()
+	httpClient, err := transport.Client(transport.ClientConfig{CAFile: *caFile, Timeout: 30 * time.Second})
+	if err != nil {
+		exit(err.Error())
+	}
+	client = httpClient
 	token := os.Getenv("SCRUBLINE_API_TOKEN")
 	if token == "" {
-		fmt.Fprintln(os.Stderr, "SCRUBLINE_API_TOKEN is required")
+		fmt.Fprintln(os.Stderr, "SCRUBLINE_API_TOKEN is required (the operator credential)")
 		os.Exit(1)
 	}
 	args := flag.Args()
@@ -138,6 +147,9 @@ func orDash(s string) string {
 	return s
 }
 
+// client reaches the control plane; it is configured in main.
+var client = http.DefaultClient
+
 func call(token, method, url string, body []byte) []byte {
 	req, err := http.NewRequest(method, url, bytes.NewReader(body))
 	if err != nil {
@@ -145,7 +157,7 @@ func call(token, method, url string, body []byte) []byte {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		exit(err.Error())
 	}
