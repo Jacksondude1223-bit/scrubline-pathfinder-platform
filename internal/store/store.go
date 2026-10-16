@@ -56,8 +56,21 @@ type Store struct {
 	// this store must not hand anyone a working credential.
 	nodeTokens map[string]string
 	tokenNodes map[string]string
+	// path is where durable state is written. Empty keeps everything in
+	// memory, which is what the tests and the single-shot demo use.
+	path string
 	// now is swapped out in tests; production always uses the wall clock.
 	now func() time.Time
+}
+
+// sortNodes and sortPolicies keep a snapshot byte-stable, so an unchanged
+// state does not rewrite the file differently each time.
+func sortNodes(nodes []model.Node) {
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+}
+
+func sortPolicies(policies []model.Policy) {
+	sort.Slice(policies, func(i, j int) bool { return policies[i].ID < policies[j].ID })
 }
 
 func New() *Store {
@@ -114,6 +127,16 @@ func (s *Store) UpsertNode(n model.Node) (model.Node, bool, error) {
 	n.Status = model.NodeReady
 	cp := n
 	s.nodes[n.ID] = &cp
+	if err := s.persistLocked(); err != nil {
+		// Roll back rather than report a registration the control plane
+		// cannot remember across a restart.
+		if existed {
+			s.nodes[n.ID] = prev
+		} else {
+			delete(s.nodes, n.ID)
+		}
+		return model.Node{}, false, err
+	}
 	return cp, !existed, nil
 }
 
@@ -175,7 +198,7 @@ func (s *Store) snapshot(liveOnly bool) []model.Node {
 	return out
 }
 
-func (s *Store) SavePolicy(p model.Policy) model.Policy {
+func (s *Store) SavePolicy(p model.Policy) (model.Policy, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if p.ID == "" {
@@ -196,8 +219,17 @@ func (s *Store) SavePolicy(p model.Policy) model.Policy {
 	}
 	p.UpdatedAt = s.clock()
 	cp := p
+	previous, existed := s.policies[p.ID]
 	s.policies[p.ID] = &cp
-	return cp
+	if err := s.persistLocked(); err != nil {
+		if existed {
+			s.policies[p.ID] = previous
+		} else {
+			delete(s.policies, p.ID)
+		}
+		return model.Policy{}, err
+	}
+	return cp, nil
 }
 
 func (s *Store) Policies() []model.Policy {
@@ -226,9 +258,14 @@ func (s *Store) Policy(id string) (model.Policy, bool) {
 	return *p, true
 }
 
-func (s *Store) PutDeploy(policyID string, plan []model.Announcement, programs map[string]*model.Program) {
+func (s *Store) PutDeploy(policyID string, plan []model.Announcement, programs map[string]*model.Program) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Only the deployed policy is durable; the plan and the programs are
+	// recompiled from it. A recompile that does not change which policy is
+	// deployed therefore does not touch the disk, which matters because
+	// membership churn recompiles often.
+	changed := s.lastPolicyID != policyID
 	s.lastPolicyID = policyID
 	s.plan = append([]model.Announcement(nil), plan...)
 	// Copy the caller's map so a later mutation of it cannot reach into the store.
@@ -237,6 +274,10 @@ func (s *Store) PutDeploy(policyID string, plan []model.Announcement, programs m
 		cp := *v
 		s.programs[k] = &cp
 	}
+	if !changed {
+		return nil
+	}
+	return s.persistLocked()
 }
 
 func (s *Store) Program(nodeID string) (model.Program, bool) {
@@ -268,7 +309,12 @@ func (s *Store) AddSamples(in []ml.Sample) (int, error) {
 	if len(s.samples)+len(in) > MaxSamples {
 		return len(s.samples), ErrSampleLimit
 	}
+	before := len(s.samples)
 	s.samples = append(s.samples, in...)
+	if err := s.persistLocked(); err != nil {
+		s.samples = s.samples[:before]
+		return before, err
+	}
 	return len(s.samples), nil
 }
 
@@ -293,7 +339,12 @@ func (s *Store) Train(epochs int, lr, threshold float64) (ml.Model, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := s.model
 	s.model = m
+	if err := s.persistLocked(); err != nil {
+		s.model = previous
+		return ml.Model{}, err
+	}
 	return m, nil
 }
 
@@ -365,6 +416,13 @@ func (s *Store) IssueNodeToken(nodeID string) (string, error) {
 	sum := tokenHash(token)
 	s.nodeTokens[nodeID] = sum
 	s.tokenNodes[sum] = nodeID
+	if err := s.persistLocked(); err != nil {
+		// A credential the control plane cannot remember is worse than none:
+		// the agent would hold a key that stops working at the next restart.
+		delete(s.nodeTokens, nodeID)
+		delete(s.tokenNodes, sum)
+		return "", err
+	}
 	return token, nil
 }
 
@@ -385,16 +443,21 @@ func (s *Store) NodeForToken(token string) (string, bool) {
 }
 
 // RevokeNodeToken drops a node's credential.
-func (s *Store) RevokeNodeToken(nodeID string) bool {
+func (s *Store) RevokeNodeToken(nodeID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sum, ok := s.nodeTokens[nodeID]
 	if !ok {
-		return false
+		return false, nil
 	}
 	delete(s.nodeTokens, nodeID)
 	delete(s.tokenNodes, sum)
-	return true
+	if err := s.persistLocked(); err != nil {
+		s.nodeTokens[nodeID] = sum
+		s.tokenNodes[sum] = nodeID
+		return false, err
+	}
+	return true, nil
 }
 
 func tokenHash(token string) string {
@@ -413,11 +476,16 @@ func (s *Store) LastDeployedPolicy() string {
 // WithdrawModel retires the published model. The zero model means "never
 // trained", which a node cannot tell from "retired", so the withdrawal is
 // explicit and nodes clear their copy when they see it.
-func (s *Store) WithdrawModel() ml.Model {
+func (s *Store) WithdrawModel() (ml.Model, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous := s.model
 	s.model = ml.Model{Withdrawn: true}
-	return s.model
+	if err := s.persistLocked(); err != nil {
+		s.model = previous
+		return ml.Model{}, err
+	}
+	return s.model, nil
 }
 
 func (s *Store) Model() ml.Model {

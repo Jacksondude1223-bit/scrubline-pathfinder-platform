@@ -14,6 +14,16 @@ import (
 // Joining the id parts without a separator made ("scrub","ab") and
 // ("scru","bab") hash to the same node id, so one node silently replaced
 // the other.
+// mustSave saves a policy and fails the test if the store could not.
+func mustSave(t *testing.T, s *Store, p model.Policy) model.Policy {
+	t.Helper()
+	saved, err := s.SavePolicy(p)
+	if err != nil {
+		t.Fatalf("SavePolicy: %v", err)
+	}
+	return saved
+}
+
 func TestNodeIDsDoNotCollideAcrossNameRegionSplits(t *testing.T) {
 	s := New()
 	a, _, _ := s.UpsertNode(model.Node{Name: "scrub", Region: "ab", CapacityGbps: 10})
@@ -83,8 +93,8 @@ func TestHeartbeatForUnknownNodeFails(t *testing.T) {
 // A generated id must not land on one a client already claimed.
 func TestGeneratedPolicyIDSkipsClientSuppliedIDs(t *testing.T) {
 	s := New()
-	claimed := s.SavePolicy(model.Policy{ID: "pol-1", Name: "claimed", Protected: []string{"203.0.113.0/24"}})
-	generated := s.SavePolicy(model.Policy{Name: "generated", Protected: []string{"203.0.114.0/24"}})
+	claimed := mustSave(t, s, model.Policy{ID: "pol-1", Name: "claimed", Protected: []string{"203.0.113.0/24"}})
+	generated := mustSave(t, s, model.Policy{Name: "generated", Protected: []string{"203.0.114.0/24"}})
 	if generated.ID == claimed.ID {
 		t.Fatalf("generated id %s collided with the client-supplied one", generated.ID)
 	}
@@ -98,11 +108,11 @@ func TestGeneratedPolicyIDSkipsClientSuppliedIDs(t *testing.T) {
 
 func TestSavePolicyBumpsVersion(t *testing.T) {
 	s := New()
-	first := s.SavePolicy(model.Policy{Name: "p", Protected: []string{"203.0.113.0/24"}})
+	first := mustSave(t, s, model.Policy{Name: "p", Protected: []string{"203.0.113.0/24"}})
 	if first.Version != 1 {
 		t.Fatalf("expected version 1, got %d", first.Version)
 	}
-	second := s.SavePolicy(model.Policy{ID: first.ID, Name: "p", Protected: []string{"203.0.113.0/24"}})
+	second := mustSave(t, s, model.Policy{ID: first.ID, Name: "p", Protected: []string{"203.0.113.0/24"}})
 	if second.Version != 2 {
 		t.Fatalf("expected version 2, got %d", second.Version)
 	}
@@ -148,7 +158,9 @@ func TestPutDeployCopiesPrograms(t *testing.T) {
 	progs := map[string]*model.Program{
 		"node-a": {NodeID: "node-a", PolicyID: "pol-1", Version: 1, Prefixes: []string{"203.0.113.0/24"}},
 	}
-	s.PutDeploy("pol-1", []model.Announcement{{Prefix: "203.0.113.0/24", NodeID: "node-a", State: model.StateAnnounce}}, progs)
+	if err := s.PutDeploy("pol-1", []model.Announcement{{Prefix: "203.0.113.0/24", NodeID: "node-a", State: model.StateAnnounce}}, progs); err != nil {
+		t.Fatalf("PutDeploy: %v", err)
+	}
 	progs["node-a"].Version = 99
 	got, ok := s.Program("node-a")
 	if !ok {
@@ -253,7 +265,9 @@ func TestPutDeployRecordsThePolicy(t *testing.T) {
 	if got := s.LastDeployedPolicy(); got != "" {
 		t.Fatalf("expected no deployed policy on a fresh store, got %q", got)
 	}
-	s.PutDeploy("pol-7", nil, map[string]*model.Program{})
+	if err := s.PutDeploy("pol-7", nil, map[string]*model.Program{}); err != nil {
+		t.Fatalf("PutDeploy: %v", err)
+	}
 	if got := s.LastDeployedPolicy(); got != "pol-7" {
 		t.Fatalf("expected pol-7, got %q", got)
 	}
@@ -279,7 +293,10 @@ func TestWithdrawModelIsDistinguishableFromUntrained(t *testing.T) {
 	if !s.Model().Ready {
 		t.Fatal("expected a ready model")
 	}
-	withdrawn := s.WithdrawModel()
+	withdrawn, err := s.WithdrawModel()
+	if err != nil {
+		t.Fatalf("WithdrawModel: %v", err)
+	}
 	if withdrawn.Ready || !withdrawn.Withdrawn {
 		t.Fatalf("expected a withdrawn, not-ready model, got %+v", withdrawn)
 	}
@@ -406,13 +423,13 @@ func TestRevokingACredentialStopsIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IssueNodeToken: %v", err)
 	}
-	if !s.RevokeNodeToken("node-a") {
-		t.Fatal("expected the revocation to find the credential")
+	if revoked, err := s.RevokeNodeToken("node-a"); err != nil || !revoked {
+		t.Fatalf("expected the revocation to find the credential: %v %v", revoked, err)
 	}
 	if _, ok := s.NodeForToken(token); ok {
 		t.Fatal("a revoked credential still works")
 	}
-	if s.RevokeNodeToken("node-a") {
-		t.Fatal("revoking twice should report nothing to revoke")
+	if revoked, err := s.RevokeNodeToken("node-a"); err != nil || revoked {
+		t.Fatalf("revoking twice should report nothing to revoke: %v %v", revoked, err)
 	}
 }

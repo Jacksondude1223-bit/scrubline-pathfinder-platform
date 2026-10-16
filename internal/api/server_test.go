@@ -1188,3 +1188,128 @@ func TestUnsetCredentialsNeverMatch(t *testing.T) {
 		t.Fatalf("expected 401 for an empty token, got %d", rec.Code)
 	}
 }
+
+// A replica holds a current copy of the state so it can take over without
+// losing anything, and refuses every write so two control planes can never
+// compile conflicting announcement plans.
+func TestReplicaRefusesWrites(t *testing.T) {
+	s, h := newTestAPI()
+	node, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+	s.SetMode(ModeReplica)
+
+	for _, tc := range []struct{ name, token, method, path, body string }{
+		{"save a policy", testToken, http.MethodPost, "/v1/policies", twoPrefixPolicy},
+		{"deploy", testToken, http.MethodPost, "/v1/policies/pol-1/deploy", ""},
+		{"add samples", testToken, http.MethodPost, "/v1/ml/samples", `{"samples":[{"flow":{"proto":"tcp","pps":1},"label":0}]}`},
+		{"train", testToken, http.MethodPost, "/v1/ml/train", "{}"},
+		{"withdraw the model", testToken, http.MethodDelete, "/v1/ml/model", ""},
+		{"register a node", testEnrollToken, http.MethodPost, "/v1/nodes/register", `{"name":"scrub-b","region":"fra"}`},
+		{"heartbeat", nodeToken, http.MethodPost, "/v1/nodes/" + node + "/heartbeat", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doAs(t, h, tc.token, tc.method, tc.path, tc.body)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("a replica accepted %s: got %d, want 409: %s", tc.name, rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "replica") {
+				t.Fatalf("the refusal should say where to send writes: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// Reads keep working on a replica: that is what makes it a warm standby
+// rather than a cold one.
+func TestReplicaStillServesReads(t *testing.T) {
+	s, h := newTestAPI()
+	node, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+	s.SetMode(ModeReplica)
+
+	for _, tc := range []struct{ name, token, path string }{
+		{"the fabric", testToken, "/v1/fabric"},
+		{"the fleet", testToken, "/v1/nodes"},
+		{"policies", testToken, "/v1/policies"},
+		{"metrics", testToken, "/metrics"},
+		{"its own program", nodeToken, "/v1/nodes/" + node + "/program"},
+		{"the model", nodeToken, "/v1/ml/model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := doAs(t, h, tc.token, http.MethodGet, tc.path, ""); rec.Code != http.StatusOK {
+				t.Fatalf("a replica refused to serve %s: got %d: %s", tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// The durable state is the control plane's own, so only an operator may pull
+// it. A node credential must not be able to walk off with every policy and
+// every credential hash in the fleet.
+func TestStateEndpointIsOperatorOnly(t *testing.T) {
+	_, h := newTestAPI()
+	_, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	if rec := doAs(t, h, nodeToken, http.MethodGet, "/v1/state", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("a node credential read the control-plane state: got %d", rec.Code)
+	}
+	if rec := doAs(t, h, testEnrollToken, http.MethodGet, "/v1/state", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("the enrollment credential read the control-plane state: got %d", rec.Code)
+	}
+	out := requireJSON(t, doAs(t, h, testToken, http.MethodGet, "/v1/state", ""), http.StatusOK)
+	if out["version"] == nil || out["policies"] == nil {
+		t.Fatalf("expected a snapshot, got %v", out)
+	}
+}
+
+// Promotion is deliberate and one-way, and only an operator can do it.
+func TestPromotionIsOperatorOnlyAndIdempotentlyRefused(t *testing.T) {
+	s, h := newTestAPI()
+	_, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"iad","capacity_gbps":100}`)
+	s.SetMode(ModeReplica)
+
+	if rec := doAs(t, h, nodeToken, http.MethodPost, "/v1/promote", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("a node credential promoted a replica: got %d", rec.Code)
+	}
+	if s.Mode() != ModeReplica {
+		t.Fatal("the refused promotion took effect anyway")
+	}
+
+	out := requireJSON(t, doAs(t, h, testToken, http.MethodPost, "/v1/promote", ""), http.StatusOK)
+	if out["mode"] != string(ModePrimary) {
+		t.Fatalf("expected the new mode reported, got %v", out)
+	}
+	if s.Mode() != ModePrimary {
+		t.Fatal("promotion did not take effect")
+	}
+	// Writes work again once promoted.
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", twoPrefixPolicy), http.StatusOK)
+	// Promoting a primary is a no-op worth reporting rather than silently accepting.
+	if rec := doAs(t, h, testToken, http.MethodPost, "/v1/promote", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("expected promoting a primary to be refused, got %d", rec.Code)
+	}
+}
+
+// A plain Server literal is a primary, so nothing that existed before this
+// change starts refusing its own writes.
+func TestZeroValueServerIsPrimary(t *testing.T) {
+	s := &Server{Token: testToken, EnrollToken: testEnrollToken, Store: store.New()}
+	if s.Mode() != ModePrimary {
+		t.Fatalf("expected a plain Server to be the primary, got %q", s.Mode())
+	}
+	requireJSON(t, do(t, s.Handler(), http.MethodPost, "/v1/policies", twoPrefixPolicy), http.StatusOK)
+}
+
+func TestHealthReportsTheMode(t *testing.T) {
+	s, h := newTestAPI()
+	rec := do(t, h, http.MethodGet, "/health", "")
+	if !strings.Contains(rec.Body.String(), `"mode":"primary"`) {
+		t.Fatalf("expected the mode on /health, got %s", rec.Body.String())
+	}
+	s.SetMode(ModeReplica)
+	rec = do(t, h, http.MethodGet, "/health", "")
+	if !strings.Contains(rec.Body.String(), `"mode":"replica"`) {
+		t.Fatalf("expected the replica mode on /health, got %s", rec.Body.String())
+	}
+}

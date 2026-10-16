@@ -68,6 +68,18 @@ type principal struct {
 	nodeID string
 }
 
+// Mode is whether this control plane owns the fabric or follows one.
+type Mode string
+
+const (
+	// ModePrimary owns the fabric: it accepts writes and compiles the plan.
+	ModePrimary Mode = "primary"
+	// ModeReplica follows a primary. It holds a current copy of the durable
+	// state so it can take over without losing anything, and refuses writes
+	// so two control planes can never compile conflicting plans.
+	ModeReplica Mode = "replica"
+)
+
 type Server struct {
 	// Token is the operator credential: full control-plane access.
 	Token string
@@ -76,6 +88,10 @@ type Server struct {
 	// read a program, change a policy, or move an announcement.
 	EnrollToken string
 	Store       *store.Store
+
+	// modeMu guards mode, which a promotion changes at runtime.
+	modeMu sync.RWMutex
+	mode   Mode
 
 	// requestsMu guards the API request counters.
 	requestsMu sync.Mutex
@@ -121,6 +137,53 @@ func (s *Server) StartReconciler(ctx context.Context, interval time.Duration) {
 			s.reconcile()
 		}
 	}
+}
+
+// Mode reports whether this control plane is the primary or a replica. The
+// zero value is primary, so a Server built as a plain struct literal behaves
+// as it always has.
+func (s *Server) Mode() Mode {
+	s.modeMu.RLock()
+	defer s.modeMu.RUnlock()
+	if s.mode == "" {
+		return ModePrimary
+	}
+	return s.mode
+}
+
+// SetMode sets the role. Promotion is deliberate: see Promote.
+func (s *Server) SetMode(m Mode) {
+	s.modeMu.Lock()
+	s.mode = m
+	s.modeMu.Unlock()
+}
+
+// Promote turns a replica into the primary. It is an operator action and it
+// does not check whether the old primary is gone, because nothing reachable
+// from here can tell a dead primary from an unreachable one. Promoting while
+// the old primary still lives gives two control planes compiling conflicting
+// announcement plans, so the old one has to be fenced first.
+func (s *Server) Promote() bool {
+	s.modeMu.Lock()
+	defer s.modeMu.Unlock()
+	if s.mode != ModeReplica {
+		return false
+	}
+	s.mode = ModePrimary
+	return true
+}
+
+// writesAllowed reports whether this control plane may change state, and
+// writes the refusal if it may not.
+func (s *Server) writesAllowed(w http.ResponseWriter) bool {
+	if s.Mode() != ModeReplica {
+		return true
+	}
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error": "this control plane is a replica and does not accept writes; send them to the primary",
+		"mode":  string(ModeReplica),
+	})
+	return false
 }
 
 // SetClock replaces the server's time source. Report freshness and report age
@@ -198,7 +261,11 @@ func (s *Server) reconcile() {
 	if !ok {
 		return
 	}
-	plan, programs := s.applyDeploy(policy, s.Store.Nodes(), live, shedding)
+	plan, programs, err := s.applyDeploy(policy, s.Store.Nodes(), live, shedding)
+	if err != nil {
+		log.Printf("api: recompiling policy %s failed: %v", policy.ID, err)
+		return
+	}
 	log.Printf("api: fabric changed, recompiled policy %s v%d across %d nodes (%d announcements)",
 		policy.ID, policy.Version, len(programs), len(plan))
 }
@@ -210,14 +277,16 @@ func (s *Server) reconcile() {
 // anycast, so a node that stopped answering needs an explicit withdrawal
 // rather than to be left out, and a node that comes back finds its program
 // already compiled. live is the set membership is tracked against.
-func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node, shedding map[string]int) ([]model.Announcement, map[string]*model.Program) {
+func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node, shedding map[string]int) ([]model.Announcement, map[string]*model.Program, error) {
 	plan := compiler.Plan(policy, all, shedding)
 	programs := compiler.Compile(policy, all, plan)
-	s.Store.PutDeploy(policy.ID, plan, programs)
+	if err := s.Store.PutDeploy(policy.ID, plan, programs); err != nil {
+		return nil, nil, err
+	}
 	s.lastLive = fabricKey(live, shedding)
 	s.prunePipelines(programs)
 	s.recompiles.Add(1)
-	return plan, programs
+	return plan, programs, nil
 }
 
 // fabricKey identifies everything a recompile depends on: which nodes are
@@ -275,7 +344,11 @@ func (s *Server) prunePipelines(programs map[string]*model.Program) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "product": "scrubline-cloud", "datapath": "asic-tcam+fpga+pfring-zc+ml"})
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "ok", "product": "scrubline-cloud",
+			"datapath": "asic-tcam+fpga+pfring-zc+ml",
+			"mode":     string(s.Mode()),
+		})
 	})
 	mux.HandleFunc("/metrics", s.metrics)
 	mux.HandleFunc("/v1/", s.route)
@@ -502,11 +575,39 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 	// scrubber holds a credential scoped to itself, so a compromised node
 	// cannot rewrite policy, move another node's announcement, or read the
 	// fabric.
+	//
+	// Anything that changes durable state also passes writesAllowed, so a
+	// replica refuses it. Three POSTs deliberately do not: promote is how a
+	// replica stops being one, and score and decide only compute an answer
+	// from state already held.
 	switch {
+	case r.Method == http.MethodGet && path == "state":
+		// A replica follows the primary by pulling this. It is the whole
+		// durable state, so it is operator-only: a replica is part of the
+		// control plane, not an edge node.
+		if !operatorOnly(w, who) {
+			return "state"
+		}
+		writeJSON(w, http.StatusOK, s.Store.Snapshot())
+		return "state"
+	case r.Method == http.MethodPost && path == "promote":
+		if !operatorOnly(w, who) {
+			return "promote"
+		}
+		if !s.Promote() {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "this control plane is already the primary"})
+			return "promote"
+		}
+		log.Printf("api: promoted to primary by an operator")
+		writeJSON(w, http.StatusOK, map[string]string{"mode": string(ModePrimary)})
+		return "promote"
 	case r.Method == http.MethodPost && path == "nodes/register":
 		// Enrollment is the one thing the bootstrap credential can do.
 		if !who.isOperator() && who.role != RoleEnroll {
 			forbidden(w, "registering a node requires the enrollment or operator credential")
+			return "nodes/register"
+		}
+		if !s.writesAllowed(w) {
 			return "nodes/register"
 		}
 		s.register(w, r)
@@ -515,6 +616,9 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		id, _ := subpathID(path, "nodes", "heartbeat")
 		if !who.actsFor(id) {
 			forbidden(w, "a node may only heartbeat for itself")
+			return "nodes/heartbeat"
+		}
+		if !s.writesAllowed(w) {
 			return "nodes/heartbeat"
 		}
 		s.heartbeat(w, r, id)
@@ -555,7 +659,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		writeJSON(w, http.StatusOK, report)
 		return "nodes/stats"
 	case r.Method == http.MethodPost && path == "policies":
-		if !operatorOnly(w, who) {
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
 			return "policies"
 		}
 		s.savePolicy(w, r)
@@ -567,7 +671,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		writeJSON(w, http.StatusOK, s.Store.Policies())
 		return "policies"
 	case r.Method == http.MethodPost && hasSubpath(path, "policies", "deploy"):
-		if !operatorOnly(w, who) {
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
 			return "policies/deploy"
 		}
 		id, _ := subpathID(path, "policies", "deploy")
@@ -581,7 +685,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		writeJSON(w, http.StatusOK, map[string]any{"announcements": plan, "programs": programs, "ml": s.Store.Model()})
 		return "fabric"
 	case r.Method == http.MethodPost && path == "ml/samples":
-		if !operatorOnly(w, who) {
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
 			return "ml/samples"
 		}
 		s.addSamples(w, r)
@@ -593,7 +697,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		writeJSON(w, http.StatusOK, s.Store.Samples())
 		return "ml/samples"
 	case r.Method == http.MethodPost && path == "ml/train":
-		if !operatorOnly(w, who) {
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
 			return "ml/train"
 		}
 		s.train(w, r)
@@ -608,13 +712,18 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		writeJSON(w, http.StatusOK, s.Store.Model())
 		return "ml/model"
 	case r.Method == http.MethodDelete && path == "ml/model":
-		if !operatorOnly(w, who) {
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
 			return "ml/model"
 		}
 		// Explicitly retire a model. Nodes clear their installed copy on the
 		// next poll; without this a bad model could only be removed by
 		// restarting every agent in the fleet.
-		writeJSON(w, http.StatusOK, s.Store.WithdrawModel())
+		withdrawn, err := s.Store.WithdrawModel()
+		if err != nil {
+			storeFailure(w, "withdrawing the model", err)
+			return "ml/model"
+		}
+		writeJSON(w, http.StatusOK, withdrawn)
 		return "ml/model"
 	case r.Method == http.MethodPost && path == "ml/score":
 		if !operatorOnly(w, who) {
@@ -672,6 +781,16 @@ func operatorOnly(w http.ResponseWriter, who principal) bool {
 	}
 	forbidden(w, "the operator credential is required for this endpoint")
 	return false
+}
+
+// storeFailure reports that durable state could not be written. The change
+// has been rolled back, so the caller is told it did not take rather than
+// being left to assume it did.
+func storeFailure(w http.ResponseWriter, what string, err error) {
+	log.Printf("api: %s failed: %v", what, err)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+		"error": fmt.Sprintf("%s failed and was rolled back: the control plane could not write its state", what),
+	})
 }
 
 func unauthorized(w http.ResponseWriter) {
@@ -752,7 +871,12 @@ func (s *Server) savePolicy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.Store.SavePolicy(p))
+	saved, err := s.Store.SavePolicy(p)
+	if err != nil {
+		storeFailure(w, "saving the policy", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
 }
 
 func (s *Server) deploy(w http.ResponseWriter, id string) {
@@ -772,8 +896,12 @@ func (s *Server) deploy(w http.ResponseWriter, id string) {
 		return
 	}
 	all := s.Store.Nodes()
-	plan, programs := s.applyDeploy(policy, all, live, s.observeLoad(all))
+	plan, programs, err := s.applyDeploy(policy, all, live, s.observeLoad(all))
 	s.reconcileMu.Unlock()
+	if err != nil {
+		storeFailure(w, "deploying the policy", err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"policy_id":     policy.ID,
 		"version":       policy.Version,

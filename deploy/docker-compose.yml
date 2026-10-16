@@ -11,7 +11,9 @@ services:
     # -insecure is for this single-host demo only. The compose network is not
     # loopback, so without it the control plane refuses to serve in the clear.
     # In a deployment, mount a certificate and pass -tls-cert/-tls-key.
-    command: ["scrub-api", "-addr", "0.0.0.0:8080", "-insecure"]
+    command: ["scrub-api", "-addr", "0.0.0.0:8080", "-insecure", "-state", "/var/lib/scrubline/state.json"]
+    volumes:
+      - api-state:/var/lib/scrubline
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 2s
@@ -70,3 +72,6 @@ services:
       api:
         condition: service_healthy
     restart: on-failure
+
+volumes:
+  api-state:

@@ -99,6 +99,19 @@ paths:
           required: true
           schema:
             type: string
+  /v1/state:
+    get:
+      summary: The durable control-plane state a replica follows
+      description: >-
+        Operator only. Carries every policy and every node credential hash, so
+        it is not reachable with a node or enrollment credential.
+  /v1/promote:
+    post:
+      summary: Turn a replica into the primary
+      description: >-
+        Operator only, and deliberate. Promoting while the old primary still
+        lives gives two control planes compiling conflicting announcement
+        plans, so the old one must be fenced first.
   /v1/fabric:
     get:
       summary: The BGP announcement plan plus compiled ASIC, FPGA, and ZC programs

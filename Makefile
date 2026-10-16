@@ -27,7 +27,8 @@ demo: build
 	SCRUBLINE_API_TOKEN=$${SCRUBLINE_API_TOKEN:-dev-scrubline-token}; \
 	SCRUBLINE_ENROLL_TOKEN=$${SCRUBLINE_ENROLL_TOKEN:-dev-scrubline-enroll}; \
 	export SCRUBLINE_API_TOKEN SCRUBLINE_ENROLL_TOKEN; \
-	./bin/scrub-api -addr 127.0.0.1:8080 & \
+	state=$$(mktemp -d)/state.json; \
+	./bin/scrub-api -addr 127.0.0.1:8080 -state $$state & \
 	api_pid=$$!; \
 	trap 'kill $$api_pid 2>/dev/null || true; wait $$api_pid 2>/dev/null || true' EXIT INT TERM; \
 	for i in $$(seq 1 50); do \

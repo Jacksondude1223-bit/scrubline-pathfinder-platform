@@ -142,7 +142,7 @@ Hardware programming is represented as compiled programs the node agent pulls. A
 export SCRUBLINE_API_TOKEN=dev-scrubline-token
 export SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll
 go test ./...
-go run ./cmd/scrub-api -addr 127.0.0.1:8080
+go run ./cmd/scrub-api -addr 127.0.0.1:8080 -state scrubline-state.json
 ```
 
 In other shells (see [Credentials](#credentials); the agent never holds the
@@ -223,6 +223,79 @@ curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      http://127.0.0.1:8080/
 curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/metrics
 ```
 
+## State and recovery
+
+The control plane keeps its state in one file, named with `-state`. Without
+one it runs entirely in memory and loses everything on restart, which it says
+loudly at startup.
+
+A write is durable before it is acknowledged. Saving a policy writes the state
+to a sibling temp file, flushes it, renames it over the real one and flushes
+the directory, so a crash mid-write leaves the previous state intact rather
+than a truncated file. If the write fails the change is rolled back and the
+call returns `503` — a caller is never told a policy was saved that the
+control plane will forget.
+
+What is durable: node registrations and their credential **hashes**, policies,
+which policy is deployed, the training set, and the fitted model. What is not:
+
+- **Liveness.** Heartbeats arrive every couple of seconds per node; persisting
+  them would mean rewriting the file constantly to save something worthless
+  the moment the process stops. Nodes load back stale and are withdrawn from
+  anycast until they check in, which is the truth — nobody knows whether they
+  are up.
+- **Programs, the announcement plan, the steering levels.** All derived.
+  Recompiling them from a snapshot would hand the fabric announcements built
+  for nodes that may be gone.
+- **Reported counters.** A measurement from before the restart is not a
+  measurement of now.
+
+Recovery needs no operator. Nodes keep enforcing their last program while the
+control plane is down — they only install a program they successfully fetched
+— and their credentials survive, so they do not even re-enrol. Once they
+heartbeat, the standing policy is recompiled onto the live set automatically:
+
+```
+$ kill -9 <control plane>          # nodes keep dropping: drop asic tcam-udp-flood
+$ scrub-api -state state.json      # same file
+  policies recovered:  pol-1 game-edge v1
+  model recovered:     ready, 40 samples, 8 held out
+  fabric:              recompiled, both nodes announcing
+```
+
+## Replicas
+
+A replica is a second control plane that follows the primary, so a takeover
+loses nothing:
+
+```sh
+scrub-api -addr 0.0.0.0:8080 -state replica.json \
+  -role replica -primary https://primary:8080 -ca ca.pem
+```
+
+It pulls `GET /v1/state` on an interval — pulling rather than being pushed, so
+a replica that was down catches up on its own — writes what it gets through to
+its own file, and serves every read. It **refuses every write** with `409`,
+pointing at the primary.
+
+That refusal is the design, not a limitation to work around. Two control
+planes accepting writes would compile conflicting announcement plans and flap
+the fabric's BGP, and nothing reachable from a replica can tell a dead primary
+from an unreachable one. So **promotion is deliberate**:
+
+```sh
+curl -X POST -H "Authorization: Bearer $SCRUBLINE_API_TOKEN" https://replica:8080/v1/promote
+```
+
+Fence the old primary first. Automatic failover needs a consensus store to
+decide who is leader; this does not have one, and inventing one here would be
+worse than an operator making the call. `/health` reports which mode a control
+plane is in.
+
+A replica holds the whole durable state, including every credential hash, so
+it authenticates to the primary with the operator credential. A replica is
+part of the control plane, not an edge node.
+
 ## Credentials
 
 Three secrets, three blast radii. A scrubbing node sits at the edge in someone
@@ -296,6 +369,8 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `POST /v1/nodes/{id}/heartbeat` keep a node live; the body optionally carries the node's datapath counters
 - `GET /v1/nodes/{id}/stats` the counters a node last reported
 - `GET /v1/fabric` the BGP announcement plan and the compiled programs
+- `GET /v1/state` the durable state a replica follows (operator only)
+- `POST /v1/promote` turn a replica into the primary (operator only)
 - `GET /metrics` Prometheus exposition for the control plane and the fleet
 - `GET /v1/nodes/{id}/program` what a node agent installs
 - `POST /v1/decide` run a flow record through a node's pipeline
