@@ -93,19 +93,21 @@ type ACLEntry struct {
 }
 
 type FPGAEntry struct {
-	Table  string `json:"table"`
-	Match  Match  `json:"match"`
-	Meter  int    `json:"meter_pps,omitempty"`
-	Action Action `json:"action"`
-	RuleID string `json:"rule_id"`
+	Table    string `json:"table"`
+	Priority int    `json:"priority"`
+	Match    Match  `json:"match"`
+	Meter    int    `json:"meter_pps,omitempty"`
+	Action   Action `json:"action"`
+	RuleID   string `json:"rule_id"`
 }
 
 type ZCEntry struct {
-	Cluster string `json:"cluster"`
-	Match   Match  `json:"match"`
-	Action  Action `json:"action"`
-	PPS     int    `json:"pps,omitempty"`
-	RuleID  string `json:"rule_id"`
+	Cluster  string `json:"cluster"`
+	Priority int    `json:"priority"`
+	Match    Match  `json:"match"`
+	Action   Action `json:"action"`
+	PPS      int    `json:"pps,omitempty"`
+	RuleID   string `json:"rule_id"`
 }
 
 type Program struct {

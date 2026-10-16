@@ -1,7 +1,9 @@
 package compiler
 
 import (
+	"fmt"
 	"math"
+	"reflect"
 	"testing"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
@@ -158,5 +160,114 @@ func TestCompileRoutesRulesToTheirStage(t *testing.T) {
 	}
 	if prog.Version != 2 || prog.PolicyID != "pol-1" {
 		t.Fatalf("program lost its policy identity: %+v", prog)
+	}
+}
+
+// A node only installs the backends it advertised. Compiling TCAM entries onto
+// a node with no switch ASIC reported it as programmed with rules it cannot
+// enforce.
+func TestCompileHonorsAdvertisedBackends(t *testing.T) {
+	policy := model.Policy{
+		ID: "pol-1", Version: 1, Protected: []string{"203.0.113.0/24"},
+		Rules: []model.Rule{
+			{ID: "a", Stage: model.StageASIC, Action: model.ActionDrop},
+			{ID: "f", Stage: model.StageFPGA, Action: model.ActionLimit, PPS: 10},
+			{ID: "z", Stage: model.StageZC, Action: model.ActionInspect},
+		},
+	}
+	nodes := []model.Node{
+		{ID: "zc-only", Name: "zc-only", Backends: []model.Stage{model.StageZC}},
+		{ID: "full", Name: "full", Backends: []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC}},
+		{ID: "unset", Name: "unset"},
+	}
+	progs := Compile(policy, nodes, Assign(policy.Protected, nodes))
+
+	zcOnly := progs["zc-only"]
+	if len(zcOnly.ASIC) != 0 || len(zcOnly.FPGA) != 0 {
+		t.Fatalf("a zc-only node was handed asic=%d fpga=%d entries", len(zcOnly.ASIC), len(zcOnly.FPGA))
+	}
+	if len(zcOnly.ZC) != 1 {
+		t.Fatalf("expected the zc rule, got %d", len(zcOnly.ZC))
+	}
+	for _, id := range []string{"full", "unset"} {
+		// An unset backend list means full-stack, matching registration.
+		p := progs[id]
+		if len(p.ASIC) != 1 || len(p.FPGA) != 1 || len(p.ZC) != 1 {
+			t.Fatalf("%s: expected one entry per stage, got asic=%d fpga=%d zc=%d", id, len(p.ASIC), len(p.FPGA), len(p.ZC))
+		}
+	}
+}
+
+// Every stage decides by first match, so Priority has to order every stage.
+// It used to be applied to the ASIC only.
+func TestCompileOrdersEveryStageByPriority(t *testing.T) {
+	policy := model.Policy{
+		ID: "pol-1", Version: 1, Protected: []string{"203.0.113.0/24"},
+		Rules: []model.Rule{
+			{ID: "f-late", Stage: model.StageFPGA, Action: model.ActionLimit, PPS: 10, Priority: 900},
+			{ID: "f-early", Stage: model.StageFPGA, Action: model.ActionPermit, Priority: 100},
+			{ID: "z-late", Stage: model.StageZC, Action: model.ActionInspect, Priority: 900},
+			{ID: "z-early", Stage: model.StageZC, Action: model.ActionPermit, Priority: 100},
+			{ID: "a-late", Stage: model.StageASIC, Action: model.ActionDrop, Priority: 900},
+			{ID: "a-early", Stage: model.StageASIC, Action: model.ActionPermit, Priority: 100},
+		},
+	}
+	nodes := []model.Node{{ID: "n", Name: "n"}}
+	prog := Compile(policy, nodes, Assign(policy.Protected, nodes))["n"]
+	if prog.ASIC[0].RuleID != "a-early" {
+		t.Fatalf("asic out of priority order: %s first", prog.ASIC[0].RuleID)
+	}
+	if prog.FPGA[0].RuleID != "f-early" {
+		t.Fatalf("fpga out of priority order: %s first", prog.FPGA[0].RuleID)
+	}
+	if prog.ZC[0].RuleID != "z-early" {
+		t.Fatalf("zc out of priority order: %s first", prog.ZC[0].RuleID)
+	}
+}
+
+// Rules sharing a priority must keep policy order, and compile the same way on
+// every node. An unstable sort made the first match nondeterministic.
+func TestCompileIsStableForEqualPriorities(t *testing.T) {
+	var rules []model.Rule
+	for i := 0; i < 24; i++ {
+		rules = append(rules,
+			model.Rule{ID: fmt.Sprintf("a%d", i), Stage: model.StageASIC, Action: model.ActionCount, Priority: 10},
+			model.Rule{ID: fmt.Sprintf("f%d", i), Stage: model.StageFPGA, Action: model.ActionCount, Priority: 10},
+			model.Rule{ID: fmt.Sprintf("z%d", i), Stage: model.StageZC, Action: model.ActionCount, Priority: 10},
+		)
+	}
+	policy := model.Policy{ID: "pol-1", Version: 1, Protected: []string{"203.0.113.0/24"}, Rules: rules}
+	nodes := []model.Node{{ID: "n1", Name: "n1"}, {ID: "n2", Name: "n2"}}
+	assigned := Assign(policy.Protected, nodes)
+
+	order := func(p *model.Program) []string {
+		var ids []string
+		for _, e := range p.ASIC {
+			ids = append(ids, e.RuleID)
+		}
+		for _, e := range p.FPGA {
+			ids = append(ids, e.RuleID)
+		}
+		for _, e := range p.ZC {
+			ids = append(ids, e.RuleID)
+		}
+		return ids
+	}
+
+	first := Compile(policy, nodes, assigned)
+	want := order(first["n1"])
+	if got := order(first["n2"]); !reflect.DeepEqual(want, got) {
+		t.Fatalf("two nodes compiled the same policy in different orders:\n%v\n%v", want, got)
+	}
+	for i := 0; i < 20; i++ {
+		if got := order(Compile(policy, nodes, assigned)["n1"]); !reflect.DeepEqual(want, got) {
+			t.Fatalf("recompiling the same policy changed rule order:\n%v\n%v", want, got)
+		}
+	}
+	// Policy order is the tie-break.
+	for i, id := range want[:24] {
+		if id != fmt.Sprintf("a%d", i) {
+			t.Fatalf("equal priorities did not keep policy order: position %d is %s", i, id)
+		}
 	}
 }

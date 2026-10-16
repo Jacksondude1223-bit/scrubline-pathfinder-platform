@@ -62,6 +62,7 @@ func Compile(policy model.Policy, nodes []model.Node, assigned []model.Assignmen
 		if prefixes == nil {
 			prefixes = []string{}
 		}
+		stages := backendSet(n)
 		prog := &model.Program{
 			NodeID:     n.ID,
 			PolicyID:   policy.ID,
@@ -70,6 +71,12 @@ func Compile(policy model.Policy, nodes []model.Node, assigned []model.Assignmen
 			CompiledAt: now,
 		}
 		for _, rule := range policy.Rules {
+			// A node only gets entries for the backends it advertised. Handing
+			// TCAM entries to a node with no switch ASIC reported it as
+			// programmed with rules it cannot install.
+			if !stages[rule.Stage] {
+				continue
+			}
 			switch rule.Stage {
 			case model.StageASIC:
 				prog.ASIC = append(prog.ASIC, model.ACLEntry{
@@ -81,26 +88,47 @@ func Compile(policy model.Policy, nodes []model.Node, assigned []model.Assignmen
 				})
 			case model.StageFPGA:
 				prog.FPGA = append(prog.FPGA, model.FPGAEntry{
-					Table:  "scrub_meter",
-					Match:  rule.Match,
-					Meter:  rule.PPS,
-					Action: rule.Action,
-					RuleID: rule.ID,
+					Table:    "scrub_meter",
+					Match:    rule.Match,
+					Meter:    rule.PPS,
+					Action:   rule.Action,
+					RuleID:   rule.ID,
+					Priority: rule.Priority,
 				})
 			case model.StageZC:
 				prog.ZC = append(prog.ZC, model.ZCEntry{
-					Cluster: "zc:" + n.Name,
-					Match:   rule.Match,
-					Action:  rule.Action,
-					PPS:     rule.PPS,
-					RuleID:  rule.ID,
+					Cluster:  "zc:" + n.Name,
+					Match:    rule.Match,
+					Action:   rule.Action,
+					PPS:      rule.PPS,
+					RuleID:   rule.ID,
+					Priority: rule.Priority,
 				})
 			}
 		}
-		sort.Slice(prog.ASIC, func(i, j int) bool { return prog.ASIC[i].Priority < prog.ASIC[j].Priority })
+		// Every stage decides by first match, so every stage has to honour
+		// Priority, not just the ASIC. The sort is stable so rules sharing a
+		// priority keep policy order and compile identically on every node.
+		sort.SliceStable(prog.ASIC, func(i, j int) bool { return prog.ASIC[i].Priority < prog.ASIC[j].Priority })
+		sort.SliceStable(prog.FPGA, func(i, j int) bool { return prog.FPGA[i].Priority < prog.FPGA[j].Priority })
+		sort.SliceStable(prog.ZC, func(i, j int) bool { return prog.ZC[i].Priority < prog.ZC[j].Priority })
 		out[n.ID] = prog
 	}
 	return out
+}
+
+// backendSet reports which stages a node can install. A node that advertised no
+// backends is treated as full-stack, matching the control plane's own default
+// at registration.
+func backendSet(n model.Node) map[model.Stage]bool {
+	if len(n.Backends) == 0 {
+		return map[model.Stage]bool{model.StageASIC: true, model.StageFPGA: true, model.StageZC: true}
+	}
+	set := make(map[model.Stage]bool, len(n.Backends))
+	for _, b := range n.Backends {
+		set[b] = true
+	}
+	return set
 }
 
 func tcamKey(rule model.Rule) string {

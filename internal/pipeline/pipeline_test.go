@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"fmt"
 	"net/netip"
 	"sync"
 	"testing"
@@ -331,5 +332,105 @@ func TestZeroValuePipelineDoesNotPanic(t *testing.T) {
 	})
 	if d := p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 1}); d.Action != model.ActionPermit {
 		t.Fatalf("expected a permit, got %+v", d)
+	}
+}
+
+// A count rule is observe-only. The meter and the behavioral cap used to apply
+// to any action that reached them, so adding a rule to measure an attack
+// started dropping it.
+func TestCountRulesDoNotDrop(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		FPGA:     []model.FPGAEntry{{Table: "scrub_meter", Action: model.ActionCount, Meter: 100, RuleID: "fcount", Match: model.Match{Proto: "udp"}}},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionCount, PPS: 100, RuleID: "zcount", Match: model.Match{Proto: "tcp"}}},
+	}
+	p := New(prog)
+	// Both flows are far over the rule's number, which an observe-only rule
+	// must not act on.
+	if d := p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "udp", PPS: 50000}); d.Action != model.ActionPermit {
+		t.Fatalf("an FPGA count rule dropped traffic: %+v", d)
+	}
+	if d := p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", PPS: 50000}); d.Action != model.ActionPermit {
+		t.Fatalf("a ZC count rule dropped traffic: %+v", d)
+	}
+}
+
+// A count rule must not swallow the verdict either: a later rule still decides.
+func TestCountRuleFallsThroughToTheNextRule(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC: []model.ZCEntry{
+			{Cluster: "zc:a", Action: model.ActionCount, PPS: 1, RuleID: "zcount", Match: model.Match{Proto: "tcp"}},
+			{Cluster: "zc:a", Action: model.ActionDrop, RuleID: "zdrop", Match: model.Match{Proto: "tcp", DPort: 443}},
+		},
+	}
+	p := New(prog)
+	d := p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 10})
+	if d.Action != model.ActionDrop || d.RuleID != "zdrop" {
+		t.Fatalf("expected the drop rule behind the count rule to decide, got %+v", d)
+	}
+}
+
+// Matches are compiled once at Load. A CIDR that does not parse has to keep
+// failing closed the way the per-flow parse did: the rule never fires.
+func TestUnparseableMatchCIDRNeverMatches(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "bad", Match: model.Match{SrcCIDR: "not-a-cidr"}}},
+	}
+	p := New(prog)
+	if d := p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1}); d.Action != model.ActionPermit {
+		t.Fatalf("a rule with an unparseable CIDR must never match, got %+v", d)
+	}
+}
+
+// An unparseable protected prefix must not make the node claim everything.
+func TestUnparseablePrefixDoesNotWidenOwnership(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"garbage"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "denyall", Match: model.Match{Proto: "tcp"}}},
+	}
+	p := New(prog)
+	if d := p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1}); d.Reason != "prefix not assigned to this node" {
+		t.Fatalf("expected the node to own nothing, got %+v", d)
+	}
+}
+
+// Program identity has to include CompiledAt: a recompile can reassign
+// prefixes without bumping the policy version, and a caller that skips the
+// reload on an unchanged version would keep scrubbing the wrong prefixes.
+func TestProgramIdentityTracksRecompiles(t *testing.T) {
+	first := model.Program{PolicyID: "pol-1", Version: 1, CompiledAt: time.Unix(100, 0), Prefixes: []string{"203.0.113.0/24"}}
+	p := New(first)
+	id, version, compiled := p.Program()
+	if id != "pol-1" || version != 1 || !compiled.Equal(first.CompiledAt) {
+		t.Fatalf("unexpected program identity %s/%d/%v", id, version, compiled)
+	}
+	second := first
+	second.CompiledAt = time.Unix(200, 0)
+	second.Prefixes = []string{"198.51.100.0/24"}
+	p.Load(second)
+	if _, _, compiled := p.Program(); !compiled.Equal(second.CompiledAt) {
+		t.Fatalf("expected the recompile to be visible, got %v", compiled)
+	}
+}
+
+// BenchmarkDecide guards the hot path. Matching used to parse each rule's CIDR
+// text for every flow, which cost about four times the comparison itself.
+func BenchmarkDecide(b *testing.B) {
+	prog := model.Program{NodeID: "n1", Prefixes: []string{"203.0.113.0/24"}}
+	for i := 0; i < 20; i++ {
+		prog.ASIC = append(prog.ASIC, model.ACLEntry{
+			Action: model.ActionDrop,
+			RuleID: fmt.Sprintf("acl-%d", i),
+			Match:  model.Match{SrcCIDR: "198.51.100.0/24", DstCIDR: "203.0.113.0/24", Proto: "udp", DPort: 53},
+		})
+	}
+	p := New(prog)
+	f := model.Flow{SrcIP: "192.0.2.9", DstIP: "203.0.113.5", Proto: "tcp", DPort: 443, PPS: 10}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = p.Decide(f)
 	}
 }
