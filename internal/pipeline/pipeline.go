@@ -17,6 +17,11 @@ const (
 	// rateWindow is the span the ZC behavioral cap measures over. The cap is a
 	// packets-per-second number, so the window is one second.
 	rateWindow = time.Second
+	// loadWindowSeconds is how long the offered-load average looks back. The
+	// steering controller reacts to this number by moving BGP announcements,
+	// so it is deliberately smoothed: a one-second spike must not reach the
+	// routing table.
+	loadWindowSeconds = 10
 	// maxBuckets bounds the per-source rate table. A spoofed flood presents
 	// effectively unlimited source addresses; without a bound the table is a
 	// memory-exhaustion vector on the scrubbing node itself.
@@ -26,6 +31,15 @@ const (
 type bucket struct {
 	windowStart time.Time
 	pps         int
+}
+
+// loadBucket is one second of the rolling load window. second identifies which
+// second it holds, so a bucket left behind by a quiet period is recognised as
+// stale rather than counted again.
+type loadBucket struct {
+	second  int64
+	offered uint64
+	dropped uint64
 }
 
 // compiledMatch is a model.Match with its CIDRs parsed and its string fields
@@ -218,6 +232,8 @@ type Pipeline struct {
 	// handle that lets counters outlive a reprogram.
 	stats    map[string]*ruleStats
 	counters counters
+	// load is the rolling per-second window behind the offered-load average.
+	load [loadWindowSeconds]loadBucket
 	// lastSweep throttles reclaiming the rate table to once per window, so a
 	// flood of fresh source addresses cannot make every packet pay for a full
 	// scan of the table.
@@ -317,25 +333,69 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 		p.compiled = cp
 	}
 
+	// One clock read per decision, shared with the rate limiter below rather
+	// than taken again there.
+	now := p.clock()
+	pps := nonNegative(pf.pps)
+
 	p.counters.decisions.Add(1)
 	if !cp.owns(pf) {
-		// Traffic for a prefix this node was not assigned. Counted separately:
-		// a rising number here means the steering layer and the fabric
-		// disagree about who scrubs what.
+		// Traffic for a prefix this node does not carry. Counted separately: a
+		// rising number here means the steering layer and the fabric disagree
+		// about who scrubs what. It still arrived, so it still counts as load.
 		p.counters.unowned.Add(1)
+		p.observeLoad(now, pps, false)
 		return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, Reason: "prefix not assigned to this node"}
 	}
 
-	d, decidedBy := p.evaluate(cp, pf, f)
+	d, decidedBy := p.evaluate(cp, pf, f, now)
 	// Every outcome is recorded in one place, so no return path can forget a
 	// counter.
 	p.record(d, decidedBy, pf)
+	p.observeLoad(now, pps, d.Action == model.ActionDrop)
 	return d
+}
+
+// observeLoad folds one decision into the rolling window. Callers hold p.mu.
+func (p *Pipeline) observeLoad(now time.Time, pps uint64, dropped bool) {
+	sec := now.Unix()
+	// One modulo plus a predictable branch, rather than two modulos, on a
+	// path that runs for every decision.
+	idx := sec % loadWindowSeconds
+	if idx < 0 {
+		idx += loadWindowSeconds
+	}
+	b := &p.load[idx]
+	if b.second != sec {
+		*b = loadBucket{second: sec}
+	}
+	b.offered += pps
+	if dropped {
+		b.dropped += pps
+	}
+}
+
+// loadRates averages the window into a per-second offered and dropped rate.
+// Buckets outside the window are skipped, so a node that has gone quiet
+// reports load falling away rather than holding its last peak. Callers hold
+// p.mu.
+func (p *Pipeline) loadRates(now time.Time) (offered, dropped uint64) {
+	sec := now.Unix()
+	oldest := sec - loadWindowSeconds + 1
+	var o, d uint64
+	for _, b := range p.load {
+		if b.second < oldest || b.second > sec {
+			continue
+		}
+		o += b.offered
+		d += b.dropped
+	}
+	return o / loadWindowSeconds, d / loadWindowSeconds
 }
 
 // evaluate walks the three stages and returns the decision together with the
 // rule that produced it, which is nil when no rule did. Callers hold p.mu.
-func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow) (model.Decision, *ruleStats) {
+func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow, now time.Time) (model.Decision, *ruleStats) {
 	for i := range cp.asic {
 		acl := &cp.asic[i]
 		if !acl.match.matches(pf) {
@@ -389,7 +449,7 @@ func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow) (m
 		}
 		// rate_limit and inspect both reach the ZC inspect path: the behavioral
 		// cap first, then the classifier.
-		if zc.limit > 0 && p.overRate(zc.ruleID, zc.limit, pf) {
+		if zc.limit > 0 && p.overRate(now, zc.ruleID, zc.limit, pf) {
 			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC behavioral cap %d pps exceeded", zc.limit)}, zc.stats
 		}
 		if p.model.Ready {
@@ -455,6 +515,12 @@ type Stats struct {
 	// every source.
 	RateBuckets    int `json:"rate_buckets"`
 	RateBucketsMax int `json:"rate_buckets_max"`
+	// OfferedPPS and DroppedPPS are moving averages over LoadWindowSeconds,
+	// not totals. They are what the steering controller reads to decide
+	// whether this node is saturated.
+	OfferedPPS        uint64 `json:"offered_pps"`
+	DroppedPPS        uint64 `json:"dropped_pps"`
+	LoadWindowSeconds int    `json:"load_window_seconds"`
 }
 
 type StageStats struct {
@@ -485,13 +551,17 @@ type MLStats struct {
 func (p *Pipeline) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	offered, dropped := p.loadRates(p.clock())
 	out := Stats{
-		Decisions:      p.counters.decisions.Load(),
-		Unowned:        p.counters.unowned.Load(),
-		Stages:         make([]StageStats, 0, stageCount),
-		Rules:          make([]RuleStats, 0, len(p.stats)),
-		RateBuckets:    len(p.buckets),
-		RateBucketsMax: maxBuckets,
+		Decisions:         p.counters.decisions.Load(),
+		Unowned:           p.counters.unowned.Load(),
+		OfferedPPS:        offered,
+		DroppedPPS:        dropped,
+		LoadWindowSeconds: loadWindowSeconds,
+		Stages:            make([]StageStats, 0, stageCount),
+		Rules:             make([]RuleStats, 0, len(p.stats)),
+		RateBuckets:       len(p.buckets),
+		RateBucketsMax:    maxBuckets,
 		ML: MLStats{
 			Ready:  p.model.Ready,
 			Scored: p.counters.mlScored.Load(),
@@ -524,11 +594,10 @@ func (p *Pipeline) Stats() Stats {
 
 // overRate accumulates the source's packet rate inside the current one-second
 // window and reports whether it is above the rule's cap. Callers hold p.mu.
-func (p *Pipeline) overRate(ruleID string, limit int, f parsedFlow) bool {
+func (p *Pipeline) overRate(now time.Time, ruleID string, limit int, f parsedFlow) bool {
 	if limit <= 0 {
 		return false
 	}
-	now := p.clock()
 	if p.buckets == nil {
 		p.buckets = map[string]*bucket{}
 	}

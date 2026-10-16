@@ -18,7 +18,7 @@ the whole fabric instead of landing on whichever node won a hash. Traffic lands
 wherever BGP decides is closest to the source, which also puts scrubbing near
 the attack rather than hauling it across the backbone.
 
-Two things shape the plan:
+Three things shape the plan:
 
 - **Capacity, as AS-path prepends.** The largest announcing node advertises
   unpadded; each halving of capacity relative to it costs one prepend, up to
@@ -29,6 +29,53 @@ Two things shape the plan:
 - **Liveness.** A node past its TTL is withdrawn, and the survivors re-weight
   against each other. That withdrawal *is* the failover — nothing is
   reassigned, and the prefix is still announced from everywhere else.
+- **Measured load.** A node running near its packet-rate ceiling is padded
+  further so the next-closest node takes the overflow, and is unpadded again
+  once it recovers. See [Load-driven shedding](#load-driven-shedding).
+
+### Load-driven shedding
+
+Capacity weighting is static — it says how big a node is, not how busy. The
+control loop adds the reactive half: each node reports the packet rate it is
+carrying, averaged over ten seconds, and a node measured near its ceiling gets
+extra prepends until it recovers.
+
+A node declares its ceiling with `-capacity-pps`. It is separate from
+`-capacity` because the ZC inspect path runs out of packets per second long
+before it runs out of bits. **A node that does not declare one is never padded
+for load** — an unmeasurable node is left alone rather than guessed at.
+
+Three properties keep this from doing more harm than the saturation it is
+fixing:
+
+- **Hysteresis.** A node sheds above 80% of its ceiling and recovers below 50%.
+  Between the two nothing moves, so a node sitting at its threshold does not
+  oscillate.
+- **Dwell.** A level holds for at least 30 seconds whatever the load does. BGP
+  punishes churn — upstreams damp a route that flaps, and a damped route is
+  worse than a saturated node. Load that crosses a watermark repeatedly cannot
+  become a stream of updates.
+- **Load pads; only death withdraws.** Shedding adds at most 3 prepends, on top
+  of the capacity baseline and still bounded at 5 in total. A saturated node is
+  never withdrawn: pulling it entirely would dump its whole share on its
+  neighbours and can cascade the saturation across the fabric. It keeps
+  scrubbing whatever still reaches it.
+
+Counters that stop arriving hold the level where it is. Acting on a
+measurement from minutes ago is worse than not acting.
+
+Each step takes one dwell, so shedding ramps rather than jumps:
+
+```
+t=12s  offered=152000  scrub-a prepends=1   # crossed 80% of its 100k ceiling
+t=44s  offered=171000  scrub-a prepends=2   # still saturated, one dwell later
+t=+20s offered=0       scrub-a prepends=1   # recovering
+t=+70s offered=0       scrub-a prepends=0   # back to full preference
+```
+
+`scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}`
+and `scrubline_offered_pps{node}` show the loop working; without them a
+deliberate shed is indistinguishable from a misconfiguration.
 
 A policy can override the default posture per prefix:
 
@@ -146,6 +193,8 @@ work":
 - `scrubline_*_pps_total` — the same counts weighted by the per-flow rate reported on each decision. A volume indicator, not a packet counter.
 - `scrubline_unowned_flows_total{node}` — flows for a prefix the node does not carry. A rising value means the steering layer and the fabric disagree about who scrubs what.
 - `scrubline_bgp_announced{node,prefix}` and `scrubline_bgp_prepends{node,prefix}` — the steering posture. A prefix with no node at 1 is attracting no traffic to the fabric at all.
+- `scrubline_offered_pps{node}` and `scrubline_dropped_pps{node}` — current packet rates, averaged over the node's load window. These are rates, not totals: they are what load-driven shedding reacts to.
+- `scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}` and `scrubline_node_capacity_pps{node}` — the shedding loop. A node at a non-zero escalation is deliberately leaning away from traffic.
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
 - `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
 
@@ -170,7 +219,7 @@ Bearer token is `SCRUBLINE_API_TOKEN`. Spec is in `api/openapi.yaml`. The token 
 
 Policies are validated on save. A prefix or match CIDR that does not parse is rejected rather than compiled into a rule that silently never matches, and flow records are rejected if `pps` is negative or a port falls outside 0..65535.
 
-- `POST /v1/nodes/register` node name, region, capacity, backends
+- `POST /v1/nodes/register` node name, region, capacity (`capacity_gbps` and `capacity_pps`), backends
 - `GET /v1/nodes`
 - `POST /v1/policies` protected prefixes, stage rules, and per-prefix steering
 - `POST /v1/policies/{id}/deploy` compile the ASIC, FPGA, and ZC programs and the fabric's BGP plan
@@ -192,5 +241,5 @@ go run ./cmd/scrubctl ml-load configs/ml.samples.json
 go run ./cmd/scrubctl ml-train
 ```
 
-The node agent also takes `-local-as` and `-bgp-next-hop` for steering; see
-[Steering](#steering).
+The node agent also takes `-local-as`, `-bgp-next-hop` and `-capacity-pps` for
+steering; see [Steering](#steering).

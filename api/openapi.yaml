@@ -15,6 +15,11 @@ paths:
   /v1/nodes/register:
     post:
       summary: Register a node and its hardware backends
+      description: >-
+        capacity_gbps weights the node's AS-path padding against the rest of
+        the fabric. capacity_pps is the packet-rate ceiling load-driven
+        shedding measures against; a node that declares none is never padded
+        for load.
   /metrics:
     get:
       summary: Prometheus exposition for the control plane and the reporting fleet

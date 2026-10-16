@@ -25,6 +25,7 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/steering"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 )
@@ -56,6 +57,15 @@ type Server struct {
 	// plane reacting to membership churn.
 	recompiles atomic.Uint64
 
+	// steeringOnce guards lazy creation of the load controller, so a Server
+	// built as a plain struct literal still gets one.
+	steeringOnce sync.Once
+	steering     *steering.Controller
+
+	// clockMu guards now, which tests replace to age reports without sleeping.
+	clockMu sync.RWMutex
+	now     func() time.Time
+
 	// reconcileMu serialises recompiles so two membership changes cannot
 	// compile competing fabrics.
 	reconcileMu sync.Mutex
@@ -86,8 +96,58 @@ func (s *Server) StartReconciler(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// reconcile recompiles the last deployed policy when the live node set has
-// moved on from the one the current fabric was built for.
+// SetClock replaces the server's time source. Report freshness and report age
+// are measured against it, so a test can age the fleet without sleeping.
+func (s *Server) SetClock(now func() time.Time) {
+	s.clockMu.Lock()
+	s.now = now
+	s.clockMu.Unlock()
+	s.Steering().SetClock(now)
+}
+
+func (s *Server) clock() time.Time {
+	s.clockMu.RLock()
+	defer s.clockMu.RUnlock()
+	if s.now == nil {
+		return time.Now().UTC()
+	}
+	return s.now()
+}
+
+// Steering returns the load controller, creating it on first use.
+func (s *Server) Steering() *steering.Controller {
+	s.steeringOnce.Do(func() {
+		if s.steering == nil {
+			s.steering = steering.New()
+		}
+	})
+	return s.steering
+}
+
+// observeLoad folds the fleet's latest counters into the steering controller
+// and returns the extra padding each node should carry. A node whose counters
+// are missing or stale is marked unfresh, which holds its level where it is.
+func (s *Server) observeLoad(nodes []model.Node) map[string]int {
+	reports := map[string]telemetry.Report{}
+	for _, r := range s.Store.Reports() {
+		reports[r.NodeID] = r
+	}
+	now := s.clock()
+	samples := make([]steering.Sample, 0, len(nodes))
+	for _, n := range nodes {
+		sample := steering.Sample{NodeID: n.ID, CapacityPPS: n.CapacityPPS}
+		if r, ok := reports[n.ID]; ok {
+			sample.OfferedPPS = r.Stats.OfferedPPS
+			sample.Fresh = !r.ReportedAt.IsZero() && now.Sub(r.ReportedAt) <= steering.ReportFreshness
+		}
+		samples = append(samples, sample)
+	}
+	return s.Steering().Observe(samples)
+}
+
+// reconcile recompiles the last deployed policy when the live node set, or
+// the load-driven padding, has moved on from what the current fabric was
+// built for.
 func (s *Server) reconcile() {
 	s.reconcileMu.Lock()
 	defer s.reconcileMu.Unlock()
@@ -97,7 +157,8 @@ func (s *Server) reconcile() {
 		return
 	}
 	live := s.Store.LiveNodes()
-	if fingerprint(live) == s.lastLive {
+	shedding := s.observeLoad(s.Store.Nodes())
+	if fabricKey(live, shedding) == s.lastLive {
 		return
 	}
 	if len(live) == 0 {
@@ -110,8 +171,8 @@ func (s *Server) reconcile() {
 	if !ok {
 		return
 	}
-	plan, programs := s.applyDeploy(policy, s.Store.Nodes(), live)
-	log.Printf("api: live node set changed, recompiled policy %s v%d across %d nodes (%d announcements)",
+	plan, programs := s.applyDeploy(policy, s.Store.Nodes(), live, shedding)
+	log.Printf("api: fabric changed, recompiled policy %s v%d across %d nodes (%d announcements)",
 		policy.ID, policy.Version, len(programs), len(plan))
 }
 
@@ -122,25 +183,34 @@ func (s *Server) reconcile() {
 // anycast, so a node that stopped answering needs an explicit withdrawal
 // rather than to be left out, and a node that comes back finds its program
 // already compiled. live is the set membership is tracked against.
-func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node) ([]model.Announcement, map[string]*model.Program) {
-	plan := compiler.Plan(policy, all)
+func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node, shedding map[string]int) ([]model.Announcement, map[string]*model.Program) {
+	plan := compiler.Plan(policy, all, shedding)
 	programs := compiler.Compile(policy, all, plan)
 	s.Store.PutDeploy(policy.ID, plan, programs)
-	s.lastLive = fingerprint(live)
+	s.lastLive = fabricKey(live, shedding)
 	s.prunePipelines(programs)
 	s.recompiles.Add(1)
 	return plan, programs
 }
 
-// fingerprint identifies a live node set, so a recompile only runs when
-// membership actually changed.
-func fingerprint(nodes []model.Node) string {
-	ids := make([]string, 0, len(nodes))
-	for _, n := range nodes {
+// fabricKey identifies everything a recompile depends on: which nodes are
+// live, and how hard each is being padded for load. A recompile only runs
+// when one of those actually changed.
+func fabricKey(live []model.Node, shedding map[string]int) string {
+	ids := make([]string, 0, len(live))
+	for _, n := range live {
 		ids = append(ids, n.ID)
 	}
 	sort.Strings(ids)
-	return strings.Join(ids, ",")
+
+	padded := make([]string, 0, len(shedding))
+	for id, p := range shedding {
+		if p != 0 {
+			padded = append(padded, fmt.Sprintf("%s=%d", id, p))
+		}
+	}
+	sort.Strings(padded)
+	return strings.Join(ids, ",") + "|" + strings.Join(padded, ",")
 }
 
 // pipelineFor returns the cached pipeline for a node, reloading it when the
@@ -198,7 +268,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var buf bytes.Buffer
-	families := append(s.controlFamilies(), telemetry.Families(s.Store.Reports(), time.Now().UTC())...)
+	families := append(s.controlFamilies(), telemetry.Families(s.Store.Reports(), s.clock())...)
 	if err := metrics.Write(&buf, families); err != nil {
 		log.Printf("api: rendering metrics failed: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
@@ -293,7 +363,45 @@ func (s *Server) controlFamilies() []metrics.Family {
 		},
 	}
 	families = append(families, telemetry.AnnouncementFamilies(plan)...)
+	families = append(families, s.steeringFamilies(nodes)...)
 	return append(families, s.requestFamily())
+}
+
+// steeringFamilies exposes the load controller: what it measured, how hard it
+// is padding each node, and the ceiling it is measuring against. Without
+// these an operator cannot tell a deliberate shed from a misconfiguration.
+func (s *Server) steeringFamilies(nodes []model.Node) []metrics.Family {
+	byID := make(map[string]model.Node, len(nodes))
+	for _, n := range nodes {
+		byID[n.ID] = n
+	}
+	escalation := metrics.Family{
+		Name: "scrubline_steering_escalation", Type: metrics.Gauge,
+		Help: "Extra AS-path prepends a node carries because of measured load, on top of what its capacity earns it.",
+	}
+	ratio := metrics.Family{
+		Name: "scrubline_steering_load_ratio", Type: metrics.Gauge,
+		Help: "A node's measured packet rate as a share of its declared packet-rate capacity. Zero when the node declares no capacity to measure against.",
+	}
+	capacity := metrics.Family{
+		Name: "scrubline_node_capacity_pps", Type: metrics.Gauge,
+		Help: "A node's declared packet-rate ceiling. Zero leaves the node out of load-driven steering.",
+	}
+	for id, level := range s.Steering().Levels() {
+		n, known := byID[id]
+		if !known {
+			continue
+		}
+		labels := []metrics.Label{
+			{Name: "node", Value: n.ID},
+			{Name: "name", Value: n.Name},
+			{Name: "region", Value: n.Region},
+		}
+		escalation.Samples = append(escalation.Samples, metrics.Sample{Labels: labels, Value: float64(level.Prepends)})
+		ratio.Samples = append(ratio.Samples, metrics.Sample{Labels: labels, Value: level.Ratio})
+		capacity.Samples = append(capacity.Samples, metrics.Sample{Labels: labels, Value: float64(n.CapacityPPS)})
+	}
+	return []metrics.Family{escalation, ratio, capacity}
 }
 
 func (s *Server) requestFamily() metrics.Family {
@@ -537,7 +645,8 @@ func (s *Server) deploy(w http.ResponseWriter, id string) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "no live nodes registered"})
 		return
 	}
-	plan, programs := s.applyDeploy(policy, s.Store.Nodes(), live)
+	all := s.Store.Nodes()
+	plan, programs := s.applyDeploy(policy, all, live, s.observeLoad(all))
 	s.reconcileMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"policy_id":     policy.ID,
@@ -652,6 +761,9 @@ func validateNode(n model.Node) error {
 	}
 	if n.CapacityGbps < 0 {
 		return fmt.Errorf("capacity_gbps must not be negative, got %v", n.CapacityGbps)
+	}
+	if n.CapacityPPS < 0 {
+		return fmt.Errorf("capacity_pps must not be negative, got %d", n.CapacityPPS)
 	}
 	for _, b := range n.Backends {
 		switch b {

@@ -113,6 +113,14 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		Name: "scrubline_rate_buckets_max", Type: metrics.Gauge,
 		Help: "Bound on the per-source rate table. At the bound, new sources go untracked and the cap is no longer measuring every source.",
 	}
+	offeredPPS := metrics.Family{
+		Name: "scrubline_offered_pps", Type: metrics.Gauge,
+		Help: "Packet rate currently offered to a node, averaged over its load window. This is the number load-driven steering reacts to.",
+	}
+	droppedPPSRate := metrics.Family{
+		Name: "scrubline_dropped_pps", Type: metrics.Gauge,
+		Help: "Packet rate a node is currently dropping, averaged over its load window.",
+	}
 	age := metrics.Family{
 		Name: "scrubline_report_age_seconds", Type: metrics.Gauge,
 		Help: "Seconds since this node last reported its counters.",
@@ -128,6 +136,8 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		mlPasses.Samples = append(mlPasses.Samples, metrics.Sample{Labels: id, Value: float64(s.ML.Passes)})
 		mlReady.Samples = append(mlReady.Samples, metrics.Sample{Labels: id, Value: boolValue(s.ML.Ready)})
 		buckets.Samples = append(buckets.Samples, metrics.Sample{Labels: id, Value: float64(s.RateBuckets)})
+		offeredPPS.Samples = append(offeredPPS.Samples, metrics.Sample{Labels: id, Value: float64(s.OfferedPPS)})
+		droppedPPSRate.Samples = append(droppedPPSRate.Samples, metrics.Sample{Labels: id, Value: float64(s.DroppedPPS)})
 		bucketsMax.Samples = append(bucketsMax.Samples, metrics.Sample{Labels: id, Value: float64(s.RateBucketsMax)})
 
 		for _, st := range s.Stages {
@@ -160,7 +170,7 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		stageDropped, stagePermitted, stageDroppedPPS, stagePermittedPPS,
 		ruleMatches, ruleDrops, ruleSeenPPS, ruleDroppedPPS,
 		mlScored, mlDrops, mlPasses, mlReady,
-		buckets, bucketsMax, age,
+		buckets, bucketsMax, offeredPPS, droppedPPSRate, age,
 	}
 }
 

@@ -28,7 +28,12 @@ const MaxPrepends = 5
 //   - Liveness. A node past its heartbeat TTL is withdrawn, so its share of
 //     the traffic moves to the nodes still answering. That withdrawal is the
 //     failover: nothing has to be reassigned.
-func Plan(policy model.Policy, nodes []model.Node) []model.Announcement {
+//
+// shedding adds per-node padding on top of the capacity baseline, keyed by
+// node ID. It is how measured load reaches the routing table; the decision to
+// pad is made in internal/steering, which owns the hysteresis and the dwell.
+// Only liveness can withdraw a node: load pads, it never removes.
+func Plan(policy model.Policy, nodes []model.Node, shedding map[string]int) []model.Announcement {
 	steering := steeringByPrefix(policy)
 	// Padding is relative to the largest node that is actually announcing. A
 	// node that has gone stale is not attracting traffic, so weighting the
@@ -63,9 +68,14 @@ func Plan(policy model.Policy, nodes []model.Node) []model.Announcement {
 				a.State = model.StateWithdraw
 				a.Reason = "node has not heartbeated within its TTL"
 			} else {
+				base := prependsFor(n, maxCapacity)
+				extra := shedding[n.ID]
+				if extra < 0 {
+					extra = 0
+				}
 				a.State = model.StateAnnounce
-				a.Prepends = prependsFor(n, maxCapacity)
-				a.Reason = prependReason(a.Prepends)
+				a.Prepends = clampPrepends(base + extra)
+				a.Reason = prependReason(a.Prepends, base, extra)
 			}
 			out = append(out, a)
 		}
@@ -79,11 +89,26 @@ func Plan(policy model.Policy, nodes []model.Node) []model.Announcement {
 	return out
 }
 
-func prependReason(prepends int) string {
-	if prepends == 0 {
-		return "anycast member at full preference"
+func clampPrepends(p int) int {
+	if p < 0 {
+		return 0
 	}
-	return fmt.Sprintf("anycast member padded %d to weight for capacity", prepends)
+	if p > MaxPrepends {
+		return MaxPrepends
+	}
+	return p
+}
+
+func prependReason(total, base, shedding int) string {
+	switch {
+	case total == 0:
+		return "anycast member at full preference"
+	case shedding == 0:
+		return fmt.Sprintf("anycast member padded %d to weight for capacity", total)
+	case base == 0:
+		return fmt.Sprintf("anycast member padded %d, shedding measured load", total)
+	}
+	return fmt.Sprintf("anycast member padded %d: %d for capacity, %d shedding measured load", total, base, shedding)
 }
 
 // steeringByPrefix indexes a policy's steering overrides. A prefix with no

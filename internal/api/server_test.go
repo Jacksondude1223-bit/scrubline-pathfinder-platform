@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/steering"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
 )
 
@@ -313,12 +314,16 @@ func newTestAPIWithClock() (s *Server, h http.Handler, advance func(time.Duratio
 	st := store.New()
 	var mu sync.Mutex
 	now := time.Now().UTC()
-	st.SetClock(func() time.Time {
+	clock := func() time.Time {
 		mu.Lock()
 		defer mu.Unlock()
 		return now
-	})
+	}
+	st.SetClock(clock)
 	s = &Server{Token: testToken, Store: st}
+	// The store, the server's freshness check, and the steering controller's
+	// dwell all run off the same clock, so a test can age the whole fabric.
+	s.SetClock(clock)
 	return s, s.Handler(), func(d time.Duration) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -822,5 +827,167 @@ func TestRegisterRejectsNonFiniteCapacity(t *testing.T) {
 		if rec := do(t, h, http.MethodPost, "/v1/nodes/register", body); rec.Code != http.StatusBadRequest {
 			t.Fatalf("body %s: expected 400, got %d: %s", body, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func registerNodeWithPPS(t *testing.T, h http.Handler, name, region string, gbps int, pps int64) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"name":%q,"region":%q,"capacity_gbps":%d,"capacity_pps":%d,"advertise":"%s:9091"}`,
+		name, region, gbps, pps, name)
+	out := requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/register", body), http.StatusOK)
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatalf("register %s returned no id: %v", name, out)
+	}
+	return id
+}
+
+// reportLoad sends a heartbeat carrying an offered packet rate.
+func reportLoad(t *testing.T, h http.Handler, node string, offered uint64) {
+	t.Helper()
+	body := fmt.Sprintf(`{"stats":{"offered_pps":%d,"load_window_seconds":10}}`, offered)
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+node+"/heartbeat", body), http.StatusOK)
+}
+
+func prependsByName(t *testing.T, h http.Handler) map[string]float64 {
+	t.Helper()
+	out := map[string]float64{}
+	for _, row := range fabricPlan(t, h) {
+		if row["state"] == "announce" {
+			out[row["node_name"].(string)] = row["prepends"].(float64)
+		}
+	}
+	return out
+}
+
+// The whole point of the loop: a node measured near its ceiling is padded so
+// the next-closest node takes the overflow, and is unpadded once it recovers.
+func TestSaturatedNodeIsPaddedAndRecovers(t *testing.T) {
+	s, h, advance := newTestAPIWithClock()
+	hot := registerNodeWithPPS(t, h, "scrub-hot", "iad", 100, 1_000_000)
+	registerNodeWithPPS(t, h, "scrub-cool", "fra", 100, 1_000_000)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	if got := prependsByName(t, h); got["scrub-hot"] != 0 {
+		t.Fatalf("expected an even fabric to start, got %v", got)
+	}
+
+	reportLoad(t, h, hot, 950_000) // 95% of its ceiling
+	s.reconcile()
+	if got := prependsByName(t, h); got["scrub-hot"] != 1 || got["scrub-cool"] != 0 {
+		t.Fatalf("expected the saturated node padded and its neighbour left alone, got %v", got)
+	}
+
+	// Still saturated, but inside the dwell window: nothing moves.
+	reportLoad(t, h, hot, 990_000)
+	s.reconcile()
+	if got := prependsByName(t, h); got["scrub-hot"] != 1 {
+		t.Fatalf("padding moved inside the dwell window, got %v", got)
+	}
+
+	// Past the dwell and recovered: the padding unwinds.
+	advance(steering.MinDwell + time.Second)
+	reportLoad(t, h, hot, 50_000)
+	s.reconcile()
+	if got := prependsByName(t, h); got["scrub-hot"] != 0 {
+		t.Fatalf("expected the padding to unwind once load fell, got %v", got)
+	}
+}
+
+// A node that declares no packet ceiling cannot be measured, so it is never
+// padded for load however much traffic it reports.
+func TestNodeWithoutAPacketCeilingIsNeverPaddedForLoad(t *testing.T) {
+	s, h, _ := newTestAPIWithClock()
+	node := registerNode(t, h, "scrub-a", "iad", 100) // no capacity_pps
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	reportLoad(t, h, node, 500_000_000)
+	s.reconcile()
+	if got := prependsByName(t, h); got["scrub-a"] != 0 {
+		t.Fatalf("a node with no declared ceiling was padded: %v", got)
+	}
+}
+
+// Counters that stopped arriving must not drive the routing table: a node
+// whose agent went quiet holds the padding it had rather than being judged on
+// a measurement from minutes ago.
+func TestStaleCountersHoldThePadding(t *testing.T) {
+	s, h, advance := newTestAPIWithClock()
+	hot := registerNodeWithPPS(t, h, "scrub-hot", "iad", 100, 1_000_000)
+	cool := registerNodeWithPPS(t, h, "scrub-cool", "fra", 100, 1_000_000)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+
+	reportLoad(t, h, hot, 950_000)
+	s.reconcile()
+	if got := prependsByName(t, h)["scrub-hot"]; got != 1 {
+		t.Fatalf("expected the node padded while reporting, got %v", got)
+	}
+
+	// The agent keeps heartbeating but stops attaching counters, so the node
+	// stays live while its measurement ages out. Well past the dwell, a fresh
+	// idle report would unwind the padding; a stale one must not.
+	for i := 0; i < 8; i++ {
+		advance((steering.ReportFreshness + steering.MinDwell) / 4)
+		// A bodiless heartbeat keeps the node live without refreshing stats.
+		requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+hot+"/heartbeat", ""), http.StatusOK)
+		requireJSON(t, do(t, h, http.MethodPost, "/v1/nodes/"+cool+"/heartbeat", ""), http.StatusOK)
+		s.reconcile()
+	}
+	if got := len(prependsByName(t, h)); got != 2 {
+		t.Fatalf("both nodes should still be live and announcing, got %d", got)
+	}
+	if got := prependsByName(t, h)["scrub-hot"]; got != 1 {
+		t.Fatalf("a stale report moved the padding, got %v", got)
+	}
+	if reason := s.Steering().Levels()[hot].Reason; !strings.Contains(reason, "no recent counters") {
+		t.Fatalf("the controller should say it is holding on stale data, got %q", reason)
+	}
+}
+
+// Nothing should recompile while the fabric and the load picture are steady:
+// a needless recompile is a needless BGP update.
+func TestSteadyLoadDoesNotRecompile(t *testing.T) {
+	s, h, _ := newTestAPIWithClock()
+	node := registerNodeWithPPS(t, h, "scrub-a", "iad", 100, 1_000_000)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+	reportLoad(t, h, node, 100_000)
+	s.reconcile()
+
+	before, _ := s.Store.Program(node)
+	for i := 0; i < 5; i++ {
+		reportLoad(t, h, node, 100_000)
+		s.reconcile()
+	}
+	after, _ := s.Store.Program(node)
+	if !after.CompiledAt.Equal(before.CompiledAt) {
+		t.Fatalf("steady load triggered a recompile: %v then %v", before.CompiledAt, after.CompiledAt)
+	}
+}
+
+func TestSteeringMetricsExposeTheLoop(t *testing.T) {
+	s, h, _ := newTestAPIWithClock()
+	node := registerNodeWithPPS(t, h, "scrub-a", "iad", 100, 1_000_000)
+	savePolicyAndDeploy(t, h, zcCapPolicy)
+	reportLoad(t, h, node, 900_000)
+	s.reconcile()
+
+	out := scrape(t, h)
+	for _, want := range []string{
+		`scrubline_steering_escalation{node="` + node + `",name="scrub-a",region="iad"} 1`,
+		`scrubline_steering_load_ratio{node="` + node + `",name="scrub-a",region="iad"} 0.9`,
+		`scrubline_node_capacity_pps{node="` + node + `",name="scrub-a",region="iad"} 1e+06`,
+		`scrubline_offered_pps{node="` + node + `",name="scrub-a",region="iad"} 900000`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in scrape:\n%s", want, out)
+		}
+	}
+}
+
+func TestRegisterRejectsNegativePacketCapacity(t *testing.T) {
+	_, h := newTestAPI()
+	rec := do(t, h, http.MethodPost, "/v1/nodes/register", `{"name":"n","region":"iad","capacity_pps":-1}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

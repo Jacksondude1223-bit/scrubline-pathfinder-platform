@@ -23,7 +23,7 @@ func TestThreeStageDropPath(t *testing.T) {
 		},
 	}
 	nodes := []model.Node{{ID: "node-a", Name: "scrub-a", CapacityGbps: 100, Status: model.NodeReady}}
-	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes))
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil))
 	pipe := New(*progs["node-a"])
 
 	acl := pipe.Decide(model.Flow{SrcIP: "198.51.100.9", DstIP: "203.0.113.10", Proto: "udp", DPort: 19132, PPS: 10})
@@ -51,7 +51,7 @@ func TestEveryNodeEnforcesEveryPrefix(t *testing.T) {
 	policy := model.Policy{ID: "pol-1", Version: 1, Protected: []string{
 		"203.0.113.0/24", "203.0.114.0/24", "203.0.115.0/24",
 	}}
-	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes))
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil))
 
 	flow := model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.114.9", Proto: "udp", PPS: 10}
 	for _, n := range nodes {
@@ -629,5 +629,81 @@ func TestStatsReportRateTableOccupancy(t *testing.T) {
 	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1})
 	if got := p.Stats().RateBuckets; got != 1 {
 		t.Fatalf("expected one tracked source, got %d", got)
+	}
+}
+
+// Steering reacts to a rate, not a total, so the load window has to decay.
+func TestLoadWindowReportsARateNotATotal(t *testing.T) {
+	p := New(model.Program{Prefixes: []string{"203.0.113.0/24"}})
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	// 1000 pps every second for the whole window.
+	for i := 0; i < loadWindowSeconds; i++ {
+		p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1000})
+		clock = clock.Add(time.Second)
+	}
+	// The averaging window has not advanced past the samples yet.
+	clock = clock.Add(-time.Second)
+	if got := p.Stats().OfferedPPS; got != 1000 {
+		t.Fatalf("expected a 1000 pps average, got %d", got)
+	}
+
+	// Go quiet: the average has to fall away rather than hold its peak.
+	clock = clock.Add(2 * loadWindowSeconds * time.Second)
+	if got := p.Stats().OfferedPPS; got != 0 {
+		t.Fatalf("expected the load average to decay once traffic stopped, got %d", got)
+	}
+}
+
+func TestLoadWindowSeparatesDroppedFromOffered(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ASIC:     []model.ACLEntry{{Priority: 1, Action: model.ActionDrop, RuleID: "tcam", Match: model.Match{Proto: "udp"}}},
+	}
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	p.Decide(model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.113.9", Proto: "udp", PPS: 8000})
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 2000})
+
+	s := p.Stats()
+	if s.OfferedPPS != 1000 {
+		t.Fatalf("expected 10000 pps over a %ds window, got %d", loadWindowSeconds, s.OfferedPPS)
+	}
+	if s.DroppedPPS != 800 {
+		t.Fatalf("expected only the dropped flow counted as dropped load, got %d", s.DroppedPPS)
+	}
+	if s.LoadWindowSeconds != loadWindowSeconds {
+		t.Fatalf("stats should report the window they were averaged over, got %d", s.LoadWindowSeconds)
+	}
+}
+
+// Traffic for a prefix this node does not carry still arrives and still costs
+// it capacity, so it counts toward offered load.
+func TestUnownedTrafficCountsAsLoad(t *testing.T) {
+	p := New(model.Program{Prefixes: []string{"203.0.113.0/24"}})
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "198.18.0.1", Proto: "tcp", PPS: 5000})
+	if got := p.Stats().OfferedPPS; got != 500 {
+		t.Fatalf("expected unowned traffic to count as load, got %d", got)
+	}
+}
+
+// A bucket left behind by a quiet period must not be counted again when the
+// ring wraps back onto it.
+func TestStaleWindowBucketsAreNotRecounted(t *testing.T) {
+	p := New(model.Program{Prefixes: []string{"203.0.113.0/24"}})
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 10000})
+	// Wrap the ring exactly, landing on the same bucket a full window later.
+	clock = clock.Add(loadWindowSeconds * time.Second)
+	p.Decide(model.Flow{SrcIP: "192.0.2.1", DstIP: "203.0.113.9", Proto: "tcp", PPS: 1000})
+	if got := p.Stats().OfferedPPS; got != 100 {
+		t.Fatalf("a stale bucket was counted again: got %d, expected only the fresh 1000 pps", got)
 	}
 }

@@ -67,14 +67,20 @@ const (
 )
 
 type Node struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Region       string    `json:"region"`
-	CapacityGbps float64   `json:"capacity_gbps"`
-	Backends     []Stage   `json:"backends"`
-	LastSeen     time.Time `json:"last_seen"`
-	Status       string    `json:"status"`
-	Advertise    string    `json:"advertise,omitempty"`
+	ID           string  `json:"id"`
+	Name         string  `json:"name"`
+	Region       string  `json:"region"`
+	CapacityGbps float64 `json:"capacity_gbps"`
+	// CapacityPPS is the packet rate this node can scrub. It is separate from
+	// CapacityGbps because the ZC inspect path runs out of packets per second
+	// long before it runs out of bits, and load-driven steering compares a
+	// measured packet rate against it. Zero means unknown, which leaves this
+	// node out of load-driven padding entirely.
+	CapacityPPS int64     `json:"capacity_pps,omitempty"`
+	Backends    []Stage   `json:"backends"`
+	LastSeen    time.Time `json:"last_seen"`
+	Status      string    `json:"status"`
+	Advertise   string    `json:"advertise,omitempty"`
 }
 
 type Flow struct {

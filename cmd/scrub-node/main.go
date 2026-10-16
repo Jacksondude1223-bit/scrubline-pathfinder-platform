@@ -40,6 +40,7 @@ func main() {
 	name := flag.String("name", "scrub-a", "node name")
 	region := flag.String("region", "iad", "node region")
 	capacity := flag.Float64("capacity", 40, "scrub capacity in Gbps")
+	capacityPPS := flag.Int64("capacity-pps", 0, "packet-rate ceiling; load-driven steering is off for this node without it")
 	listen := flag.String("listen", "127.0.0.1:9091", "local decide/metrics address")
 	advertise := flag.String("advertise", "", "address other components use to reach this node (default: -listen, or hostname:port when -listen is a wildcard)")
 	localAS := flag.Int("local-as", 0, "AS this node's BGP speaker announces from; required for AS-path prepends")
@@ -51,6 +52,12 @@ func main() {
 	}
 	if *capacity < 0 {
 		log.Fatalf("-capacity must not be negative, got %v", *capacity)
+	}
+	if *capacityPPS < 0 {
+		log.Fatalf("-capacity-pps must not be negative, got %d", *capacityPPS)
+	}
+	if *capacityPPS == 0 {
+		log.Printf("warning: no -capacity-pps given, so this node is never padded for load; set it to the packet rate this node can scrub")
 	}
 	if *localAS < 0 || *localAS > 4294967295 {
 		log.Fatalf("-local-as %d is out of range", *localAS)
@@ -69,7 +76,7 @@ func main() {
 	}
 
 	desired := model.Node{
-		Name: *name, Region: *region, CapacityGbps: *capacity, Advertise: advertised,
+		Name: *name, Region: *region, CapacityGbps: *capacity, CapacityPPS: *capacityPPS, Advertise: advertised,
 		Backends: []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC},
 	}
 
