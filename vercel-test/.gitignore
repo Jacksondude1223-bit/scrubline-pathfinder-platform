@@ -1,0 +1,4 @@
+/server
+/.vercel/
+/.env
+/.env.local
