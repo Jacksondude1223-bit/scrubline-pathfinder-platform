@@ -369,7 +369,11 @@ func poll(apiURL, enrollToken string, creds *credentials, node model.Node, desir
 			log.Printf("control plane withdrew the ZC model; classifier disabled on %s", id)
 		}
 
-		time.Sleep(pollInterval)
+		// Spread the cadence. A fixed two seconds is a schedule, and a
+		// burst timed to land between two samples is measured as nothing;
+		// a fleet polling in lockstep hands that schedule to an attacker
+		// identically on every node.
+		time.Sleep(transport.Jitter(pollInterval))
 	}
 }
 

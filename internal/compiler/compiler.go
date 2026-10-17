@@ -224,6 +224,7 @@ func Compile(policy model.Policy, nodes []model.Node, plan []model.Announcement)
 			// do it.
 			Games:           gamesFor(policy, prefixes, stages[model.StageZC]),
 			ChallengeSecret: policy.ChallengeSecret,
+			PulseFloorPPS:   policy.PulseFloorPPS,
 			CompiledAt:      now,
 		}
 		for _, rule := range policy.Rules {

@@ -13,12 +13,25 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/gamefilter"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pulse"
 )
 
 const (
 	// rateWindow is the span the ZC behavioral cap measures over. The cap is a
 	// packets-per-second number, so the window is one second.
 	rateWindow = time.Second
+	// rateSlots divides that window. The cap used to be a fixed window that
+	// reset wholesale, which let a source send its whole allowance at the
+	// end of one window and again at the start of the next: twice the cap,
+	// and exactly the shape a pulse attack sends. Counting over a trailing
+	// window built from slots closes that.
+	//
+	// The slots hold exact counts rather than the usual weighted estimate of
+	// the previous window, because that estimate assumes traffic is spread
+	// evenly through it and over-counts a source that sends in bursts —
+	// which would drop a flow sitting exactly at its cap.
+	rateSlots    = 4
+	rateSlotSpan = rateWindow / rateSlots
 	// loadWindowSeconds is how long the offered-load average looks back. The
 	// steering controller reacts to this number by moving BGP announcements,
 	// so it is deliberately smoothed: a one-second spike must not reach the
@@ -30,9 +43,51 @@ const (
 	maxBuckets = 1 << 16
 )
 
+// bucket is one source's trailing-window counter for one rule. slotID
+// records which slot each count belongs to, so a slot left behind by a
+// quiet stretch is recognised as stale rather than counted again when the
+// ring wraps onto it.
 type bucket struct {
-	windowStart time.Time
-	pps         int
+	slotID [rateSlots]int64
+	count  [rateSlots]int
+}
+
+// rateSlotOf is the slot a moment falls in, counted from the epoch so it is
+// monotonic and comparable across buckets.
+func rateSlotOf(t time.Time) int64 {
+	return t.UnixNano() / int64(rateSlotSpan)
+}
+
+// add folds a rate into the trailing window and reports the window's total.
+func (b *bucket) add(now time.Time, pps int) int {
+	slot := rateSlotOf(now)
+	oldest := slot - rateSlots + 1
+	idx := int(((slot % rateSlots) + rateSlots) % rateSlots)
+	if b.slotID[idx] != slot {
+		b.slotID[idx] = slot
+		b.count[idx] = 0
+	}
+	b.count[idx] += pps
+
+	total := 0
+	for i := 0; i < rateSlots; i++ {
+		if b.slotID[i] >= oldest && b.slotID[i] <= slot {
+			total += b.count[i]
+		}
+	}
+	return total
+}
+
+// idle reports whether a bucket has seen nothing for a whole window, which
+// is what makes it reclaimable.
+func (b *bucket) idle(now time.Time) bool {
+	oldest := rateSlotOf(now) - rateSlots + 1
+	for i := 0; i < rateSlots; i++ {
+		if b.slotID[i] >= oldest {
+			return false
+		}
+	}
+	return true
 }
 
 // bucketID keys the per-source rate table. A struct key costs no allocation,
@@ -187,7 +242,10 @@ type counters struct {
 
 // compiledProgram is the per-flow form of a model.Program.
 type compiledProgram struct {
-	prefixes       []netip.Prefix
+	prefixes []netip.Prefix
+	// prefixText is the same prefixes as written, for keying measurements
+	// without formatting one per packet.
+	prefixText     []string
 	asic, fpga, zc []compiledRule
 }
 
@@ -196,6 +254,7 @@ func compileProgram(prog model.Program) *compiledProgram {
 	for _, cidr := range prog.Prefixes {
 		if p, err := netip.ParsePrefix(cidr); err == nil {
 			cp.prefixes = append(cp.prefixes, p)
+			cp.prefixText = append(cp.prefixText, cidr)
 		}
 	}
 	for _, acl := range prog.ASIC {
@@ -263,6 +322,9 @@ type Pipeline struct {
 	// gameBindings is how many filters are installed, cached here so a
 	// policy with none does not pay for the engine's lock on every packet.
 	gameBindings int
+	// pulses recognises burst attacks per protected prefix, and keeps the
+	// flag up through the gaps between bursts.
+	pulses *pulse.Detector
 	// load is the rolling per-second window behind the offered-load average.
 	load [loadWindowSeconds]loadBucket
 	// lastSweep throttles reclaiming the rate table to once per window, so a
@@ -279,7 +341,27 @@ func New(p model.Program) *Pipeline {
 	pipe.attachStats(compiled)
 	pipe.compiled = compiled
 	pipe.loadGames(p)
+	pipe.loadPulse(p)
 	return pipe
+}
+
+// loadPulse installs the pulse detector and forgets prefixes the policy no
+// longer protects. Callers hold p.mu, or hold the pipeline alone.
+func (p *Pipeline) loadPulse(prog model.Program) {
+	if p.pulses == nil {
+		p.pulses = pulse.New()
+		if p.now != nil {
+			p.pulses.SetClock(p.clock)
+		}
+	}
+	if prog.PulseFloorPPS > 0 {
+		p.pulses.SetFloor(uint64(prog.PulseFloorPPS))
+	}
+	live := make(map[string]struct{}, len(prog.Prefixes))
+	for _, cidr := range prog.Prefixes {
+		live[cidr] = struct{}{}
+	}
+	p.pulses.Forget(live)
 }
 
 // loadGames installs the program's game filters. A filter that does not
@@ -369,6 +451,7 @@ func (p *Pipeline) Load(prog model.Program) {
 	}
 	p.attachStats(compiled)
 	p.loadGames(prog)
+	p.loadPulse(prog)
 	p.program = prog
 	p.compiled = compiled
 }
@@ -405,13 +488,21 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	pps := nonNegative(pf.pps)
 
 	p.counters.decisions.Add(1)
-	if !cp.owns(pf) {
+	prefix, owned := cp.owns(pf)
+	if !owned {
 		// Traffic for a prefix this node does not carry. Counted separately: a
 		// rising number here means the steering layer and the fabric disagree
 		// about who scrubs what. It still arrived, so it still counts as load.
 		p.counters.unowned.Add(1)
 		p.observeLoad(now, pps, false)
 		return model.Decision{Action: model.ActionPermit, Stage: model.StageASIC, Reason: "prefix not assigned to this node"}
+	}
+
+	// Measured at the resolution a burst actually has, and keyed by the
+	// prefix it is aimed at. A mean over ten seconds would average the
+	// burst away, which is the blindness a pulse attack is paying for.
+	if p.pulses != nil {
+		p.pulses.Observe(prefix, pps)
 	}
 
 	d, decidedBy := p.evaluate(cp, pf, f, now)
@@ -636,7 +727,14 @@ type Stats struct {
 	Stages    []StageStats `json:"stages"`
 	Rules     []RuleStats  `json:"rules"`
 	Games     []GameStats  `json:"games"`
+	Pulse     []PulseStats `json:"pulse"`
 	ML        MLStats      `json:"ml"`
+	// Pulsing is true while any protected prefix is under a recognised
+	// burst train, and PulsePeakPPS is the heaviest burst seen across them.
+	// The peak is the number that matters: a pulse attack's whole point is
+	// that its mean stays under a watermark.
+	Pulsing      bool   `json:"pulsing"`
+	PulsePeakPPS uint64 `json:"pulse_peak_pps"`
 	// GameSessions is how many sources the game filter is tracking, against
 	// its bound. At the bound it is admitting without tracking.
 	GameSessions    int `json:"game_sessions"`
@@ -669,6 +767,18 @@ type RuleStats struct {
 	Drops      uint64      `json:"drops"`
 	PPSSeen    uint64      `json:"pps_seen"`
 	PPSDropped uint64      `json:"pps_dropped"`
+}
+
+// PulseStats is the shape of traffic aimed at one protected prefix.
+type PulseStats struct {
+	Prefix    string  `json:"prefix"`
+	Pulsing   bool    `json:"pulsing"`
+	PeakPPS   uint64  `json:"peak_pps"`
+	MeanPPS   uint64  `json:"mean_pps"`
+	Crest     float64 `json:"crest"`
+	DutyCycle float64 `json:"duty_cycle"`
+	Bursts    int     `json:"bursts"`
+	HeldFor   float64 `json:"held_for_seconds"`
 }
 
 // GameStats is one game filter's counters.
@@ -744,6 +854,24 @@ func (p *Pipeline) Stats() Stats {
 	if p.games != nil {
 		out.GameSessions, out.GameSessionsMax = p.games.Sessions()
 	}
+	if p.pulses != nil {
+		for _, prefix := range p.pulses.Keys() {
+			a := p.pulses.Assess(prefix)
+			out.Pulse = append(out.Pulse, PulseStats{
+				Prefix: prefix, Pulsing: a.Pulsing,
+				PeakPPS: a.PeakPPS, MeanPPS: a.MeanPPS,
+				Crest: a.Crest, DutyCycle: a.DutyCycle, Bursts: a.Bursts,
+				HeldFor: a.HeldFor.Seconds(),
+			})
+			if a.Pulsing {
+				out.Pulsing = true
+				if a.PeakPPS > out.PulsePeakPPS {
+					out.PulsePeakPPS = a.PeakPPS
+				}
+			}
+		}
+		sort.Slice(out.Pulse, func(i, j int) bool { return out.Pulse[i].Prefix < out.Pulse[j].Prefix })
+	}
 	sort.Slice(out.Rules, func(i, j int) bool { return out.Rules[i].RuleID < out.Rules[j].RuleID })
 	sort.Slice(out.Games, func(i, j int) bool { return out.Games[i].FilterID < out.Games[j].FilterID })
 	return out
@@ -767,15 +895,10 @@ func (p *Pipeline) overRate(now time.Time, ruleID string, limit int, f parsedFlo
 			// untracked rather than being dropped on a cap we cannot measure.
 			return false
 		}
-		b = &bucket{windowStart: now}
+		b = &bucket{}
 		p.buckets[key] = b
 	}
-	if now.Sub(b.windowStart) >= rateWindow {
-		b.windowStart = now
-		b.pps = 0
-	}
-	b.pps += f.pps
-	return b.pps > limit
+	return b.add(now, f.pps) > limit
 }
 
 // reclaim frees room in the rate table by dropping buckets whose window has
@@ -788,23 +911,26 @@ func (p *Pipeline) reclaim(now time.Time) bool {
 	}
 	p.lastSweep = now
 	for key, b := range p.buckets {
-		if now.Sub(b.windowStart) >= rateWindow {
+		if b.idle(now) {
 			delete(p.buckets, key)
 		}
 	}
 	return len(p.buckets) < maxBuckets
 }
 
-func (cp *compiledProgram) owns(f parsedFlow) bool {
+// owns reports whether a flow is for a prefix this node carries, and which
+// one. The prefix is how pulse measurement is keyed: an attack aimed at one
+// customer is the unit that matters.
+func (cp *compiledProgram) owns(f parsedFlow) (string, bool) {
 	if !f.dstOK {
-		return false
+		return "", false
 	}
-	for _, pfx := range cp.prefixes {
+	for i, pfx := range cp.prefixes {
 		if pfx.Contains(f.dst) {
-			return true
+			return cp.prefixText[i], true
 		}
 	}
-	return false
+	return "", false
 }
 
 // ruleOf recovers the rule ID from a bucket key. Rule IDs are validated to

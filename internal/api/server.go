@@ -31,6 +31,7 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/steering"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/transport"
 )
 
 // maxBody bounds every request body. Policies and sample batches are the large
@@ -130,7 +131,11 @@ func (s *Server) StartReconciler(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = ReconcileInterval
 	}
-	t := time.NewTicker(interval)
+	// A timer rather than a ticker, reset to a fresh interval each round:
+	// this cadence decides when shedding is revisited, so a burst train
+	// tuned to a fixed five seconds could sit in the gap between two
+	// reconciles forever.
+	t := time.NewTimer(transport.Jitter(interval))
 	defer t.Stop()
 	for {
 		select {
@@ -138,6 +143,7 @@ func (s *Server) StartReconciler(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			s.reconcile()
+			t.Reset(transport.Jitter(interval))
 		}
 	}
 }
@@ -231,6 +237,8 @@ func (s *Server) observeLoad(nodes []model.Node) map[string]int {
 		sample := steering.Sample{NodeID: n.ID, CapacityPPS: n.CapacityPPS}
 		if r, ok := reports[n.ID]; ok {
 			sample.OfferedPPS = r.Stats.OfferedPPS
+			sample.Pulsing = r.Stats.Pulsing
+			sample.PeakPPS = r.Stats.PulsePeakPPS
 			sample.Fresh = !r.ReportedAt.IsZero() && now.Sub(r.ReportedAt) <= steering.ReportFreshness
 		}
 		samples = append(samples, sample)
@@ -1065,6 +1073,9 @@ func validatePolicy(p model.Policy) error {
 	}
 	if err := validateGames(p); err != nil {
 		return err
+	}
+	if p.PulseFloorPPS < 0 {
+		return fmt.Errorf("pulse_floor_pps must not be negative, got %d", p.PulseFloorPPS)
 	}
 	seen := map[string]bool{}
 	for i, rule := range p.Rules {

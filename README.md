@@ -33,6 +33,76 @@ Three things shape the plan:
   further so the next-closest node takes the overflow, and is unpadded again
   once it recovers. See [Load-driven shedding](#load-driven-shedding).
 
+### Burst attacks
+
+A pulse attack sends short heavy bursts on a repeating interval instead of a
+steady flood, and it beats a volumetric defence twice over. The average stays
+low, so a mean never crosses a watermark: one second at five times capacity
+every twenty seconds averages to a quarter of it. And the burst is over before
+mitigation engages, so a defence that reacts to load and then relaxes spends
+the attack chasing its own tail — which is the behaviour the attacker is
+paying for.
+
+Three things answer that.
+
+**Traffic is measured at a resolution short enough to see a burst**, in
+250ms buckets over a minute, per protected prefix, and judged on its *shape*
+rather than its average: peak against mean, and how much of the horizon is
+quiet. A train is three or more distinct bursts with a crest factor of four or
+more and a duty cycle under a half.
+
+Shape alone is not enough, because a sparse trickle has exactly the same shape
+as an attack. A burst only counts if it clears `pulse_floor_pps`, which
+belongs to the deployment — set it from what the protected service actually
+carries.
+
+**A recognised train latches.** Once a prefix is known to be under one, the
+flag stands through the quiet stretches, and every further burst pushes the
+lapse out. Nothing disengages between bursts, so the attacker's interval buys
+them nothing. Staying flagged asks less than becoming flagged did, so
+stretching the interval until the detector cannot see a train no longer clears
+it either.
+
+**Shedding is judged on the peak while the flag stands.** This is what makes
+the attack visible to the steering loop at all. From a live run, measured at a
+moment between bursts:
+
+```
+offered_pps (10s mean): 0        ->   0% of a 1M pps ceiling
+pulse peak:             4000000  -> 400% of a 1M pps ceiling
+pulsing: true
+  -> scrub-a  announce  prepends 2  "padded 2, shedding measured load"
+```
+
+The mean says the node is idle. Judged on it, nothing would happen at all —
+and the padding would unwind during every gap.
+
+### Desynchronising our own cadences
+
+Every repeating interval in the fabric is a schedule an attacker can learn. A
+burst timed to land between two samples and stop before the next is measured
+as nothing, and a fleet polling in lockstep hands out that schedule for free,
+identically on every node.
+
+The node poll and the control plane's reconcile are therefore spread ±20%
+around their nominal intervals, drawn from the system entropy source rather
+than a seeded generator — a schedule recoverable from a node's start time
+would be no better than a fixed one. A train tuned to one interval drifts into
+the next sample instead of hiding between them, and no two nodes are blind at
+the same moment.
+
+The ZC behavioural cap was a fixed window that reset wholesale, which let a
+source send its whole allowance at the end of one window and again at the
+start of the next: twice the cap, and exactly the shape a pulse sends. It now
+counts over a trailing second built from 250ms slots. Those slots hold exact
+counts rather than the usual weighted estimate of the previous window, because
+that estimate assumes traffic is spread evenly through it and would drop a
+flow sitting honestly at its cap.
+
+`scrubline_pulse_active`, `_peak_pps`, `_mean_pps`, `_crest`, `_duty_cycle`,
+`_bursts` and `_hold_seconds` carry this per prefix. Peak against mean is the
+pair to watch: a wide gap is the attack.
+
 ### Load-driven shedding
 
 Capacity weighting is static — it says how big a node is, not how busy. The
@@ -48,6 +118,9 @@ for load** — an unmeasurable node is left alone rather than guessed at.
 Three properties keep this from doing more harm than the saturation it is
 fixing:
 
+- **Burst trains hold.** While a prefix is flagged (see [Burst
+  attacks](#burst-attacks)) the padding never unwinds, whatever the gaps look
+  like, and the ratio is taken from the peak rather than the mean.
 - **Hysteresis.** A node sheds above 80% of its ceiling and recovers below 50%.
   Between the two nothing moves, so a node sitting at its threshold does not
   oscillate.

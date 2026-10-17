@@ -202,3 +202,64 @@ func TestZeroValueControllerDoesNotPanic(t *testing.T) {
 		t.Fatalf("expected a usable zero-value controller, got %d", got["n1"])
 	}
 }
+
+// A burst train's average is low by construction, so judged on the mean the
+// node looks idle while it is being knocked over.
+func TestPulsingNodeIsJudgedOnItsPeak(t *testing.T) {
+	c := New()
+	// A quarter of capacity on average, five times capacity at the peak.
+	got := c.Observe([]Sample{{
+		NodeID: "n1", CapacityPPS: 1_000_000, OfferedPPS: 250_000,
+		Pulsing: true, PeakPPS: 5_000_000, Fresh: true,
+	}})
+	if got["n1"] != 1 {
+		t.Fatalf("expected a pulsing node to shed on its peak, got %d", got["n1"])
+	}
+
+	// The same average without the pulse flag is simply a quiet node.
+	quiet := New()
+	if got := quiet.Observe([]Sample{{
+		NodeID: "n1", CapacityPPS: 1_000_000, OfferedPPS: 250_000, Fresh: true,
+	}}); got["n1"] != 0 {
+		t.Fatalf("a quarter-loaded node should not shed, got %d", got["n1"])
+	}
+}
+
+// Unwinding during a gap is the behaviour the attacker is paying for: the
+// next burst lands on a fabric that just relaxed.
+func TestPaddingHoldsThroughAPulseGap(t *testing.T) {
+	h := newHarness()
+	// Shed up under a burst train.
+	for i := 0; i < 3; i++ {
+		h.c.Observe([]Sample{{
+			NodeID: "n1", CapacityPPS: 1_000_000, OfferedPPS: 900_000,
+			Pulsing: true, PeakPPS: 4_000_000, Fresh: true,
+		}})
+		h.advance(MinDwell)
+	}
+	padded := h.c.Levels()["n1"].Prepends
+	if padded == 0 {
+		t.Fatal("expected the node padded under a burst train")
+	}
+
+	// Now a long quiet stretch, with the flag still latched by the detector.
+	for i := 0; i < 10; i++ {
+		got := h.c.Observe([]Sample{{
+			NodeID: "n1", CapacityPPS: 1_000_000, OfferedPPS: 0,
+			Pulsing: true, PeakPPS: 4_000_000, Fresh: true,
+		}})
+		if got["n1"] != padded {
+			t.Fatalf("round %d: padding unwound during a pulse gap: %d then %d", i, padded, got["n1"])
+		}
+		h.advance(MinDwell)
+	}
+
+	// Once the flag lapses, it unwinds normally.
+	for i := 0; i < 5; i++ {
+		h.c.Observe([]Sample{{NodeID: "n1", CapacityPPS: 1_000_000, OfferedPPS: 0, Fresh: true}})
+		h.advance(MinDwell)
+	}
+	if got := h.c.Levels()["n1"].Prepends; got != 0 {
+		t.Fatalf("expected the padding to unwind once the attack really stopped, got %d", got)
+	}
+}

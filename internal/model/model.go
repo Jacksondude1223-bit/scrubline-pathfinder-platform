@@ -50,6 +50,12 @@ type Policy struct {
 	Steering  []Steering `json:"steering,omitempty"`
 	// Games binds protocol filters to ports on protected addresses.
 	Games []GameFilter `json:"games,omitempty"`
+	// PulseFloorPPS is how loud a burst must be before it counts toward a
+	// burst train. Shape alone cannot decide it: a sparse trickle has the
+	// same crest factor and duty cycle as an attack, so this belongs to the
+	// deployment — set it from what the protected service actually carries.
+	// Zero takes the platform default.
+	PulseFloorPPS int `json:"pulse_floor_pps,omitempty"`
 	// ChallengeSecret keys the cookies the challenge gate mints. The control
 	// plane generates it and ships it to every node, because under anycast a
 	// cookie minted by one scrubber has to verify on another.
@@ -162,7 +168,10 @@ type Program struct {
 	// the secret their challenge cookies are keyed with.
 	Games           []GameFilter `json:"games,omitempty"`
 	ChallengeSecret string       `json:"challenge_secret,omitempty"`
-	CompiledAt      time.Time    `json:"compiled_at"`
+	// PulseFloorPPS is how loud a burst must be before it counts toward a
+	// pulse train. Zero takes the platform default.
+	PulseFloorPPS int       `json:"pulse_floor_pps,omitempty"`
+	CompiledAt    time.Time `json:"compiled_at"`
 }
 
 // GameFilter admits traffic to a game port only if it looks like that game.

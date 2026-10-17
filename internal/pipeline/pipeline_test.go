@@ -910,3 +910,116 @@ func BenchmarkDecideGameFiltered(b *testing.B) {
 		_ = p.Decide(f)
 	}
 }
+
+// The fixed window let a source send its whole allowance at the end of one
+// window and again at the start of the next: twice the cap, and exactly
+// the shape a pulse attack sends.
+func TestCapCannotBeDoubledAcrossAWindowBoundary(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 100, RuleID: "zc", Match: model.Match{Proto: "tcp"}}},
+	}
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	flow := model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 100}
+	if d := p.Decide(flow); d.Action != model.ActionPermit {
+		t.Fatalf("the first allowance is within the cap: %+v", d)
+	}
+	// Straddle the old window boundary: the whole allowance again, a moment
+	// later. The trailing window still sees the first one.
+	clock = clock.Add(rateWindow - rateSlotSpan/2)
+	if d := p.Decide(flow); d.Action != model.ActionDrop {
+		t.Fatalf("200 pps inside a trailing second must be dropped, got %+v", d)
+	}
+}
+
+// A source genuinely under its cap stays under it, however the packets fall
+// inside the second. This is what the usual weighted estimate gets wrong.
+func TestASourceAtItsCapIsNotDropped(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24"},
+		ZC:       []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 100, RuleID: "zc", Match: model.Match{Proto: "tcp"}}},
+	}
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	flow := model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "tcp", DPort: 443, PPS: 25}
+	// 100 pps delivered as four bursts a second, for a minute.
+	for second := 0; second < 60; second++ {
+		for i := 0; i < 4; i++ {
+			if d := p.Decide(flow); d.Action != model.ActionPermit {
+				t.Fatalf("second %d: a 100 pps flow was dropped by a 100 pps cap: %+v", second, d)
+			}
+			clock = clock.Add(rateSlotSpan)
+		}
+	}
+}
+
+// The datapath measures pulses per protected prefix, at a resolution short
+// enough to see a burst.
+func TestPipelineRecognisesABurstTrain(t *testing.T) {
+	prog := model.Program{
+		Prefixes:      []string{"203.0.113.0/24"},
+		PulseFloorPPS: 1000,
+	}
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	flow := model.Flow{SrcIP: "198.51.100.5", DstIP: "203.0.113.9", Proto: "udp", PPS: 400_000}
+	for i := 0; i < 4; i++ {
+		p.Decide(flow)
+		clock = clock.Add(10 * time.Second)
+	}
+
+	s := p.Stats()
+	if !s.Pulsing {
+		t.Fatalf("expected a burst train recognised, got %+v", s.Pulse)
+	}
+	if s.PulsePeakPPS != 400_000 {
+		t.Fatalf("expected the peak reported, got %d", s.PulsePeakPPS)
+	}
+	if len(s.Pulse) != 1 || s.Pulse[0].Prefix != "203.0.113.0/24" {
+		t.Fatalf("expected the attacked prefix named, got %+v", s.Pulse)
+	}
+	// The mean is what a watermark would have seen, and it is nothing.
+	if s.Pulse[0].MeanPPS*4 > s.Pulse[0].PeakPPS {
+		t.Fatalf("this test is not exercising a low average: %+v", s.Pulse[0])
+	}
+}
+
+// Steady traffic is not a pulse, so the flag does not stand for ordinary
+// load.
+func TestPipelineDoesNotFlagSteadyTraffic(t *testing.T) {
+	p := New(model.Program{Prefixes: []string{"203.0.113.0/24"}, PulseFloorPPS: 1000})
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	flow := model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "udp", PPS: 50_000}
+	for i := 0; i < 240; i++ {
+		p.Decide(flow)
+		clock = clock.Add(250 * time.Millisecond)
+	}
+	if s := p.Stats(); s.Pulsing {
+		t.Fatalf("steady traffic was flagged as a burst train: %+v", s.Pulse)
+	}
+}
+
+// Prefixes the policy no longer protects are forgotten.
+func TestPipelineForgetsPulsesForDroppedPrefixes(t *testing.T) {
+	prog := model.Program{Prefixes: []string{"203.0.113.0/24"}, PulseFloorPPS: 1000}
+	p := New(prog)
+	p.Decide(model.Flow{SrcIP: "198.51.100.5", DstIP: "203.0.113.9", Proto: "udp", PPS: 5000})
+	if len(p.Stats().Pulse) != 1 {
+		t.Fatal("expected the prefix tracked")
+	}
+	next := prog
+	next.Prefixes = []string{"198.18.0.0/24"}
+	p.Load(next)
+	if got := len(p.Stats().Pulse); got != 0 {
+		t.Fatalf("expected the dropped prefix forgotten, got %d tracked", got)
+	}
+}
