@@ -23,6 +23,8 @@ info:
 
     | `nodeToken` | one scrubber | its own heartbeat, program and counters, plus `GET /v1/ml/model` |
 
+    | `tenantToken` | one protected customer | `GET /v1/analytics/*`, for their own prefixes only |
+
 
     A node credential is issued at registration, scoped to that node, 256 bits, stored only as a hash
     and rotated whenever the node enrols again. An unset credential never matches: an empty token is a
@@ -30,6 +32,20 @@ info:
 
 
     Anything a credential is not allowed to reach answers `403`, not `404`.
+
+
+    ## Analytics
+
+
+    A customer buys protection for a prefix, not for a node, so everything under `/v1/analytics` is keyed
+    by prefix and summed across the fabric. History is bucketed by the minute, kept for a day, and held
+    in memory: it is derived from reports that keep arriving, so a restarted control plane rebuilds it
+    within a couple of heartbeats rather than carrying stale numbers across the gap.
+
+
+    Nodes report cumulative counters and the control plane deltas them. That is deliberate: a counter
+    that only counts up survives a report being missed, and one that goes backwards is read as a node
+    that restarted rather than as negative traffic.
 
 
     ## Transport
@@ -69,6 +85,9 @@ tags:
     fabric.
 - name: Classifier
   description: The flow-level model the ZC stage scores with.
+- name: Analytics
+  description: 'What a protected customer sees: their own traffic, what was scrubbed out of it, and the
+    attacks they have been under. Also the customer records and credentials behind that view.'
 - name: Replication
   description: Following a primary, and taking over from one.
 security: &id001
@@ -663,6 +682,234 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/DecideRequest'
+  /v1/analytics/overview:
+    get:
+      summary: How each protected prefix is doing
+      tags:
+      - Analytics
+      security: &id008
+      - tenantToken: []
+      - operatorToken: []
+      responses:
+        '200':
+          description: The current view.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsOverview'
+        '400':
+          description: The window will not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'The customer-facing view: one row per protected prefix, summed across the whole fabric
+        rather than reported per node. A customer does not have a node, they have a prefix, and under
+        anycast it is carried by every scrubber at once.
+
+
+        A tenant credential sees only the prefixes it is entitled to, and an entitlement nothing has reported
+        for yet comes back reading zero rather than being left out — an empty page is indistinguishable
+        from an outage.'
+      parameters:
+      - &id009
+        name: window
+        in: query
+        required: false
+        schema:
+          type: string
+          default: 24h
+        description: How far back to report, as a duration (15m, 6h, 24h). Clamped to the retention horizon.
+          A value that will not parse is refused rather than silently answering a different question.
+  /v1/analytics/series:
+    get:
+      summary: One prefix's traffic over time
+      tags:
+      - Analytics
+      security: *id008
+      responses:
+        '200':
+          description: The series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsSeries'
+        '400':
+          description: No prefix, or a window or step that will not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'Each point reports the heaviest moment inside it rather than an average over it, because
+        an average is what a burst attack is shaped to hide.
+
+
+        A prefix the credential is not entitled to answers 403 whether or not it exists: a customer must
+        not be able to map the platform''s other customers by watching which prefixes answer differently.'
+      parameters:
+      - name: prefix
+        in: query
+        required: true
+        schema:
+          type: string
+        example: 203.0.113.0/24
+        description: Must be one the credential is entitled to.
+      - *id009
+      - name: step
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Interval per point. Rounded up to the resolution, and defaulted to about 120 points
+          across the window. Points are aligned to the step, so two reads of the same dashboard line up.
+  /v1/analytics/events:
+    get:
+      summary: The attacks a prefix has been under
+      tags:
+      - Analytics
+      security: *id008
+      responses:
+        '200':
+          description: The attack log.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsEvents'
+        '400':
+          description: The window will not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'Newest first. Each attack names the rules and filters that stopped it, because "you
+        were attacked" on its own is not something a customer can act on.
+
+
+        An attack is opened when a meaningful share of a prefix''s traffic is being scrubbed, or when
+        the burst detector recognises a pulse train. It is not closed on the first quiet moment: a burst
+        train is quiet between bursts by design, and closing early would record one attack as fifty.'
+      parameters:
+      - name: prefix
+        in: query
+        required: false
+        schema:
+          type: string
+        description: One prefix. Omit for every prefix the credential can see.
+      - *id009
+  /v1/tenants:
+    get:
+      summary: List customers
+      tags:
+      - Analytics
+      security: *id001
+      responses:
+        '200':
+          description: Every customer.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tenant'
+        '401': *id002
+        '403': *id003
+      description: 'Entitlements, not credentials: a credential''s plaintext is returned once at issue
+        and never kept.'
+    post:
+      summary: Create or replace a customer
+      tags:
+      - Analytics
+      security: *id001
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '400':
+          description: Missing name, no prefixes, or a prefix that will not parse or is not masked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'Saving does not issue a credential; POST the token endpoint for that. An id that already
+        exists is replaced, which is how entitlements are changed.
+
+
+        Prefixes must be written masked. The entitlement is matched against what was written, so one with
+        host bits set would authorize differently than it reads.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Tenant'
+  /v1/tenants/{id}/token:
+    post:
+      summary: Issue or rotate a customer's credential
+      tags:
+      - Analytics
+      security: *id001
+      responses:
+        '200':
+          description: The credential.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantCredential'
+        '404':
+          description: Unknown customer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Returned once and never served again. Only the hash is kept, so a lost credential is
+        rotated rather than recovered, and issuing again invalidates the previous one immediately.
+      parameters: *id005
+  /v1/tenants/{id}:
+    delete:
+      summary: Offboard a customer
+      tags:
+      - Analytics
+      security: *id001
+      responses:
+        '200':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: string
+        '404':
+          description: Unknown customer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Takes the credential with it. One that outlived its tenant would authenticate to an
+        empty entitlement rather than to nothing.
+      parameters: *id005
 components:
   securitySchemes:
     operatorToken:
@@ -677,6 +924,12 @@ components:
       type: http
       scheme: bearer
       description: Issued at registration, scoped to one node.
+    tenantToken:
+      type: http
+      scheme: bearer
+      description: 'Issued to a customer, scoped to the prefixes they are entitled to. Read-only, and
+        the narrowest credential the platform issues: it cannot see the fleet, the policy behind the protection,
+        or another customer''s traffic.'
   schemas:
     Error:
       type: object
@@ -1239,11 +1492,34 @@ components:
             value means the datapath is not supplying payloads and the filter is doing nothing.
         pps_dropped:
           type: integer
-    PulseStats:
+    PrefixStats:
       type: object
+      description: 'Everything one node knows about the traffic aimed at one protected prefix. Reported
+        per prefix rather than per node because that is the unit a customer buys: a scrubber carries many
+        prefixes, so its own totals say nothing about whether any particular one was attacked.'
       properties:
         prefix:
           type: string
+        flows:
+          type: integer
+          description: Decisions for this prefix. Cumulative since the node started carrying it; the control
+            plane deltas these, and a counter that only counts up survives a report being missed.
+        flows_dropped:
+          type: integer
+          description: Of those, dropped or challenged. Cumulative.
+        offered:
+          type: integer
+          description: Sum of the per-flow rates reported on flows arriving for this prefix. A volume
+            weighting of the flow count, not a packet counter. Cumulative.
+        dropped:
+          type: integer
+          description: The same weighting over the flows that were scrubbed. Cumulative.
+        offered_pps:
+          type: integer
+          description: Moving average over the node's load window, not a total.
+        dropped_pps:
+          type: integer
+          description: Moving average over the node's load window, not a total.
         pulsing:
           type: boolean
           description: True while a burst train is recognised, including through the quiet stretches between
@@ -1295,10 +1571,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GameStats'
-        pulse:
+        prefixes:
           type: array
           items:
-            $ref: '#/components/schemas/PulseStats'
+            $ref: '#/components/schemas/PrefixStats'
         ml:
           $ref: '#/components/schemas/MLStats'
         pulsing:
@@ -1383,6 +1659,249 @@ components:
             $ref: '#/components/schemas/Sample'
         model:
           $ref: '#/components/schemas/MLModel'
+        tenants:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tenant'
+        tenant_tokens:
+          type: object
+          additionalProperties:
+            type: string
+          description: Tenant id to credential hash. Hashes only, for the same reason node_tokens are.
+    Tenant:
+      type: object
+      required:
+      - name
+      - prefixes
+      description: A customer of the scrubbing service. It exists so a customer can be given a credential
+        that reads their own traffic and nothing else; without it the only way to show someone their analytics
+        is to hand them an operator token, which also reads every other customer's prefixes, the fleet's
+        topology and the policy behind it.
+      properties:
+        id:
+          type: string
+          description: Derived from the name when omitted, so re-sending the same customer updates them
+            rather than creating a second record holding half their prefixes.
+        name:
+          type: string
+        prefixes:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: 'What this customer may read. An entitlement covers anything inside it, so a customer
+            who brings a /22 and has it protected as four /24s is entitled once rather than on every split.
+            Must be written masked: host bits are refused, because the entitlement is matched against
+            what was written.'
+        contact:
+          type: string
+          description: Free text for whoever runs the platform. Never matched on.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    TenantCredential:
+      type: object
+      properties:
+        tenant_id:
+          type: string
+        token:
+          type: string
+          description: Returned once, here, and never served again. Only its hash is kept, so a lost credential
+            is rotated rather than recovered; issuing again rotates it and the previous one stops working
+            immediately.
+    AnalyticsVector:
+      type: object
+      description: One way traffic was stopped during an attack.
+      properties:
+        rule_id:
+          type: string
+        filter_id:
+          type: string
+        stage:
+          type: string
+          enum:
+          - asic
+          - fpga
+          - zc
+        shared:
+          type: boolean
+          description: The rule guards the whole policy rather than this prefix specifically, so its volume
+            is not necessarily this customer's.
+        flows:
+          type: integer
+        dropped:
+          type: integer
+    AnalyticsEvent:
+      type: object
+      description: One attack against one prefix.
+      properties:
+        prefix:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+          description: Absent while the attack is still running. Dated to when the traffic stopped, not
+            to the end of the window spent confirming it.
+        ongoing:
+          type: boolean
+        seconds:
+          type: number
+        peak_pps:
+          type: integer
+          description: Summed across the fleet. The bursts need not be simultaneous, so this is an upper
+            bound on the instantaneous fabric peak rather than a measurement of it.
+        peak_dropped_pps:
+          type: integer
+        dropped:
+          type: integer
+          description: 'Volume scrubbed over the whole attack, summed over vectors. Not always the same
+            number as the prefix''s own dropped total: a rule guarding several prefixes has its volume
+            attributed to each of them, and those vectors are marked shared. Read the prefix total when
+            the two disagree.'
+        flows:
+          type: integer
+        pulse:
+          type: boolean
+          description: The burst detector recognised a pulse train, which is why mitigation stayed engaged
+            through the quiet stretches.
+        vectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsVector'
+    AnalyticsPoint:
+      type: object
+      properties:
+        at:
+          type: string
+          format: date-time
+        flows:
+          type: integer
+        flows_dropped:
+          type: integer
+        offered:
+          type: integer
+        dropped:
+          type: integer
+        delivered:
+          type: integer
+        challenged:
+          type: integer
+        peak_pps:
+          type: integer
+          description: 'The heaviest fleet-wide rate inside the interval, not an average over it: an average
+            is exactly what a burst attack is shaped to hide.'
+        offered_pps:
+          type: integer
+        dropped_pps:
+          type: integer
+        pulsing:
+          type: boolean
+    AnalyticsSummary:
+      type: object
+      properties:
+        prefix:
+          type: string
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        flows:
+          type: integer
+        flows_dropped:
+          type: integer
+        offered:
+          type: integer
+        dropped:
+          type: integer
+        delivered:
+          type: integer
+          description: What reached the customer. A subtraction rather than its own counter, because the
+            datapath only knows what it stopped.
+        challenged:
+          type: integer
+        mitigated_pct:
+          type: number
+        peak_pps:
+          type: integer
+        peak_dropped_pps:
+          type: integer
+        offered_pps:
+          type: integer
+          description: Where the prefix stands right now, summed across the nodes currently reporting.
+            A node that has gone quiet is left out.
+        dropped_pps:
+          type: integer
+        nodes:
+          type: integer
+          description: Scrubbers currently carrying traffic for this prefix. Under anycast this is the
+            fabric absorbing the attack, so one node during a flood is a problem.
+        under_attack:
+          type: boolean
+        pulsing:
+          type: boolean
+        attacks:
+          type: integer
+        attack_seconds:
+          type: number
+    AnalyticsOverview:
+      type: object
+      properties:
+        window:
+          type: string
+          example: 24h
+        resolution:
+          type: string
+          description: How finely history is bucketed.
+        retention:
+          type: string
+          description: 'How far back history is kept. It is in memory and not durable: it is derived from
+            reports that keep arriving, so a restarted control plane rebuilds it within a couple of heartbeats
+            rather than carrying stale numbers across the gap.'
+        generated:
+          type: string
+          format: date-time
+        tenant:
+          type: object
+          description: Present only for a tenant credential.
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+        prefixes:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsSummary'
+    AnalyticsSeries:
+      type: object
+      properties:
+        prefix:
+          type: string
+        window:
+          type: string
+        step:
+          type: string
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsPoint'
+    AnalyticsEvents:
+      type: object
+      properties:
+        window:
+          type: string
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsEvent'
     DeployResult:
       type: object
       properties:

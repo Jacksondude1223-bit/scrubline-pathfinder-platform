@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/analytics"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/bgp"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/compiler"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/gamefilter"
@@ -62,6 +63,11 @@ const (
 	// program, and the published model. Nothing else, and nothing belonging
 	// to another node.
 	RoleNode Role = "node"
+	// RoleTenant is a customer reading the analytics for the prefixes they
+	// pay to have protected. It is read-only, and it is the narrowest
+	// credential the platform issues: it cannot see the fleet, the policy
+	// behind the protection, or another customer's traffic.
+	RoleTenant Role = "tenant"
 )
 
 // principal is the authenticated caller behind a request.
@@ -70,6 +76,9 @@ type principal struct {
 	// nodeID is set for RoleNode and names the one node this caller may act
 	// for.
 	nodeID string
+	// tenant is set for RoleTenant and carries the prefixes this caller is
+	// entitled to read.
+	tenant model.Tenant
 }
 
 // Mode is whether this control plane owns the fabric or follows one.
@@ -108,6 +117,18 @@ type Server struct {
 	// built as a plain struct literal still gets one.
 	steeringOnce sync.Once
 	steering     *steering.Controller
+
+	// analyticsOnce guards lazy creation of the customer-facing history, for
+	// the same reason.
+	analyticsOnce sync.Once
+	analytics     *analytics.Collector
+
+	// attrMu guards the per-node attribution cache, which maps a node's rule
+	// and filter IDs onto the prefixes they guard. It is rebuilt only when
+	// the node's program changes, because it is consulted on every
+	// heartbeat.
+	attrMu    sync.Mutex
+	attrCache map[string]cachedAttribution
 
 	// clockMu guards now, which tests replace to age reports without sleeping.
 	clockMu sync.RWMutex
@@ -202,6 +223,7 @@ func (s *Server) SetClock(now func() time.Time) {
 	s.now = now
 	s.clockMu.Unlock()
 	s.Steering().SetClock(now)
+	s.Analytics().SetClock(now)
 }
 
 func (s *Server) clock() time.Time {
@@ -211,6 +233,111 @@ func (s *Server) clock() time.Time {
 		return time.Now().UTC()
 	}
 	return s.now()
+}
+
+// cachedAttribution is one node's attribution together with the program
+// version it was built from.
+type cachedAttribution struct {
+	policyID   string
+	version    int
+	compiledAt time.Time
+	attr       analytics.Attribution
+}
+
+// Analytics returns the customer-facing history, creating it on first use.
+func (s *Server) Analytics() *analytics.Collector {
+	s.analyticsOnce.Do(func() {
+		if s.analytics == nil {
+			s.analytics = analytics.New()
+		}
+	})
+	return s.analytics
+}
+
+// attributionFor maps a node's rules and game filters onto the protected
+// prefixes they guard, caching the result until the node's program changes.
+//
+// Only the compiled program knows both halves: the rule, and the prefix list
+// it was compiled against. Doing it here rather than on the node keeps the
+// nodes reporting plain counters, which is what lets a counter survive a
+// report being missed.
+func (s *Server) attributionFor(nodeID string, prog model.Program) analytics.Attribution {
+	s.attrMu.Lock()
+	defer s.attrMu.Unlock()
+	if s.attrCache == nil {
+		s.attrCache = map[string]cachedAttribution{}
+	}
+	if c, ok := s.attrCache[nodeID]; ok &&
+		c.policyID == prog.PolicyID && c.version == prog.Version && c.compiledAt.Equal(prog.CompiledAt) {
+		return c.attr
+	}
+	attr := buildAttribution(prog)
+	s.attrCache[nodeID] = cachedAttribution{
+		policyID: prog.PolicyID, version: prog.Version, compiledAt: prog.CompiledAt, attr: attr,
+	}
+	return attr
+}
+
+// buildAttribution works out which protected prefix each rule and filter in a
+// program guards.
+func buildAttribution(prog model.Program) analytics.Attribution {
+	protected := make([]netip.Prefix, 0, len(prog.Prefixes))
+	text := make([]string, 0, len(prog.Prefixes))
+	for _, cidr := range prog.Prefixes {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			continue
+		}
+		protected = append(protected, p)
+		text = append(text, cidr)
+	}
+
+	attr := analytics.Attribution{
+		Rules:   map[string]analytics.Scope{},
+		Filters: map[string]analytics.Scope{},
+	}
+	for _, e := range prog.ASIC {
+		attr.Rules[e.RuleID] = scopeFor(e.Match.DstCIDR, protected, text, string(model.StageASIC))
+	}
+	for _, e := range prog.FPGA {
+		attr.Rules[e.RuleID] = scopeFor(e.Match.DstCIDR, protected, text, string(model.StageFPGA))
+	}
+	for _, e := range prog.ZC {
+		attr.Rules[e.RuleID] = scopeFor(e.Match.DstCIDR, protected, text, string(model.StageZC))
+	}
+	for _, g := range prog.Games {
+		attr.Filters[g.ID] = scopeFor(g.DstCIDR, protected, text, string(model.StageZC))
+	}
+	return attr
+}
+
+// scopeFor resolves a rule's destination to the protected prefixes it covers.
+//
+// A rule that names no destination guards everything the node carries, and
+// one written against a supernet guards several customers at once. Both are
+// attributed to every prefix they cover and marked shared, because the
+// alternative — attributing them to nobody — hides the rule that is actually
+// doing the work from the customer it is protecting.
+func scopeFor(dst string, protected []netip.Prefix, text []string, stage string) analytics.Scope {
+	scope := analytics.Scope{Stage: stage}
+	if dst == "" {
+		scope.Prefixes = append([]string(nil), text...)
+		scope.Shared = len(scope.Prefixes) != 1
+		return scope
+	}
+	target, err := netip.ParsePrefix(dst)
+	if err != nil {
+		// A destination that does not parse cannot match traffic either, so
+		// the rule guards nothing and is attributed to nobody.
+		return analytics.Scope{Stage: stage}
+	}
+	for i, p := range protected {
+		if p.Overlaps(target) {
+			scope.Prefixes = append(scope.Prefixes, text[i])
+		}
+	}
+	scope.Shared = len(scope.Prefixes) != 1
+	return scope
 }
 
 // Steering returns the load controller, creating it on first use.
@@ -296,6 +423,14 @@ func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node, sheddi
 	}
 	s.lastLive = fabricKey(live, shedding)
 	s.prunePipelines(programs)
+	// A customer whose policy no longer protects a prefix stops being
+	// accounted for it, rather than sitting at the numbers it had when the
+	// protection was withdrawn.
+	protected := make(map[string]struct{}, len(policy.Protected))
+	for _, prefix := range policy.Protected {
+		protected[prefix] = struct{}{}
+	}
+	s.Analytics().Forget(protected)
 	s.recompiles.Add(1)
 	return plan, programs, nil
 }
@@ -742,6 +877,54 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 		}
 		s.score(w, r)
 		return "ml/score"
+	case r.Method == http.MethodGet && path == "analytics/overview":
+		// The customer-facing view. A tenant credential reaches it, and sees
+		// only the prefixes it is entitled to.
+		if !mayReadAnalytics(w, who) {
+			return "analytics/overview"
+		}
+		s.analyticsOverview(w, r, who)
+		return "analytics/overview"
+	case r.Method == http.MethodGet && path == "analytics/series":
+		if !mayReadAnalytics(w, who) {
+			return "analytics/series"
+		}
+		s.analyticsSeries(w, r, who)
+		return "analytics/series"
+	case r.Method == http.MethodGet && path == "analytics/events":
+		if !mayReadAnalytics(w, who) {
+			return "analytics/events"
+		}
+		s.analyticsEvents(w, r, who)
+		return "analytics/events"
+	case r.Method == http.MethodPost && path == "tenants":
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
+			return "tenants"
+		}
+		s.saveTenant(w, r)
+		return "tenants"
+	case r.Method == http.MethodGet && path == "tenants":
+		// Tenant records carry entitlements, not credentials: the plaintext
+		// is returned once at issue and never kept.
+		if !operatorOnly(w, who) {
+			return "tenants"
+		}
+		writeJSON(w, http.StatusOK, s.Store.Tenants())
+		return "tenants"
+	case r.Method == http.MethodPost && hasSubpath(path, "tenants", "token"):
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
+			return "tenants/token"
+		}
+		id, _ := subpathID(path, "tenants", "token")
+		s.issueTenantToken(w, id)
+		return "tenants/token"
+	case r.Method == http.MethodDelete && pathHasID(path, "tenants"):
+		if !operatorOnly(w, who) || !s.writesAllowed(w) {
+			return "tenants/delete"
+		}
+		id, _ := pathID(path, "tenants")
+		s.deleteTenant(w, id)
+		return "tenants/delete"
 	case r.Method == http.MethodPost && path == "decide":
 		if !operatorOnly(w, who) {
 			return "decide"
@@ -776,6 +959,14 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, id string) {
 	// holds, not from the body, so a report cannot claim to be another node.
 	if reported {
 		s.Store.PutReport(id, body.Stats)
+		// Fold the counters into the customer-facing history here, which is
+		// the moment they arrive. Sampling on a timer instead would miss
+		// whatever moved between two samples, and a burst attack is shaped
+		// to live in exactly that gap.
+		if report, ok := s.Store.Report(id); ok {
+			prog, _ := s.Store.Program(id)
+			s.Analytics().Observe(report, s.attributionFor(id, prog))
+		}
 	}
 	if revived {
 		// The node is back in the live set, so it needs a program again.
@@ -825,6 +1016,22 @@ func forbidden(w http.ResponseWriter, reason string) {
 func hasSubpath(path, collection, leaf string) bool {
 	_, ok := subpathID(path, collection, leaf)
 	return ok
+}
+
+// pathHasID reports whether path is exactly "{collection}/{id}".
+func pathHasID(path, collection string) bool {
+	_, ok := pathID(path, collection)
+	return ok
+}
+
+// pathID pulls {id} out of "{collection}/{id}". An empty or nested id does
+// not match, so "tenants" alone is never read as an id.
+func pathID(path, collection string) (string, bool) {
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] != collection || parts[1] == "" {
+		return "", false
+	}
+	return parts[1], true
 }
 
 // subpathID pulls {id} out of "{collection}/{id}/{leaf}". An empty or nested id
@@ -1032,6 +1239,215 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request) {
 	d := pipe.Decide(body.Flow)
 	d.NodeID = body.NodeID
 	writeJSON(w, http.StatusOK, d)
+}
+
+// defaultWindow is the span an analytics request covers when it does not ask
+// for one. A day is what a customer looks at after an incident.
+const defaultWindow = 24 * time.Hour
+
+// seriesPoints is roughly how many points a series returns when the caller
+// does not pick a step, which is about what a chart can draw.
+const seriesPoints = 120
+
+// queryDuration reads a Go duration from the query string, falling back when
+// it is absent and refusing one that cannot be parsed rather than silently
+// answering a different question than the one asked.
+func queryDuration(r *http.Request, name string, fallback time.Duration) (time.Duration, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %v (expected a duration such as 15m, 6h or 24h)", name, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be positive, got %s", name, raw)
+	}
+	return d, nil
+}
+
+// visiblePrefixes is the set of protected prefixes a caller may read,
+// ordered. For a tenant it also includes entitlements nothing has reported
+// for yet, so a customer who has just been onboarded sees their prefix
+// reading zero rather than an empty page they cannot tell from an outage.
+func (s *Server) visiblePrefixes(who principal) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, prefix := range s.Analytics().Prefixes() {
+		if !who.maySeePrefix(prefix) {
+			continue
+		}
+		seen[prefix] = true
+		out = append(out, prefix)
+	}
+	if who.role == RoleTenant {
+		for _, prefix := range who.tenant.Prefixes {
+			if !seen[prefix] {
+				out = append(out, prefix)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// analyticsOverview answers "how is my protection doing" for every prefix the
+// caller can see.
+func (s *Server) analyticsOverview(w http.ResponseWriter, r *http.Request, who principal) {
+	span, err := queryDuration(r, "window", defaultWindow)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	prefixes := s.visiblePrefixes(who)
+	summaries := make([]analytics.Summary, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		summaries = append(summaries, s.Analytics().Summary(prefix, span))
+	}
+	body := map[string]any{
+		"window":     span.String(),
+		"resolution": analytics.Resolution.String(),
+		"retention":  analytics.Horizon.String(),
+		"generated":  s.clock(),
+		"prefixes":   summaries,
+	}
+	if who.role == RoleTenant {
+		body["tenant"] = map[string]string{"id": who.tenant.ID, "name": who.tenant.Name}
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// analyticsSeries answers "what did it look like over time" for one prefix.
+func (s *Server) analyticsSeries(w http.ResponseWriter, r *http.Request, who principal) {
+	prefix := r.URL.Query().Get("prefix")
+	if prefix == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "prefix required"})
+		return
+	}
+	span, err := queryDuration(r, "window", defaultWindow)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	step, err := queryDuration(r, "step", span/seriesPoints)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !who.maySeePrefix(prefix) {
+		// Deliberately the same refusal whether the prefix exists or not: a
+		// customer must not be able to map the platform's other customers by
+		// watching which prefixes answer differently.
+		forbidden(w, "this credential is not entitled to that prefix")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"prefix": prefix,
+		"window": span.String(),
+		"step":   step.String(),
+		"points": s.Analytics().Series(prefix, span, step),
+	})
+}
+
+// analyticsEvents lists the attacks the caller's prefixes have been under.
+func (s *Server) analyticsEvents(w http.ResponseWriter, r *http.Request, who principal) {
+	span, err := queryDuration(r, "window", defaultWindow)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	prefixes := s.visiblePrefixes(who)
+	if wanted := r.URL.Query().Get("prefix"); wanted != "" {
+		if !who.maySeePrefix(wanted) {
+			forbidden(w, "this credential is not entitled to that prefix")
+			return
+		}
+		prefixes = []string{wanted}
+	}
+	events := []analytics.Event{}
+	for _, prefix := range prefixes {
+		events = append(events, s.Analytics().Events(prefix, span)...)
+	}
+	// Newest first across prefixes, so an operator watching several
+	// customers reads the page top-down as it happened.
+	sort.Slice(events, func(i, j int) bool {
+		if !events[i].StartedAt.Equal(events[j].StartedAt) {
+			return events[i].StartedAt.After(events[j].StartedAt)
+		}
+		return events[i].Prefix < events[j].Prefix
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window": span.String(),
+		"events": events,
+	})
+}
+
+func (s *Server) saveTenant(w http.ResponseWriter, r *http.Request) {
+	var t model.Tenant
+	if err := decode(r, &t); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if t.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
+	}
+	if len(t.Prefixes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at least one prefix required, or the tenant is entitled to nothing"})
+		return
+	}
+	for i, prefix := range t.Prefixes {
+		p, err := netip.ParsePrefix(prefix)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("prefixes[%d] %q: %v", i, prefix, err)})
+			return
+		}
+		// An entitlement with host bits set would be read as a different
+		// prefix by netip than by whoever typed it, and the difference is
+		// what the caller is authorized against.
+		if p.Masked() != p {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("prefixes[%d] %q has host bits set; write it as %s", i, prefix, p.Masked()),
+			})
+			return
+		}
+	}
+	saved, err := s.Store.SaveTenant(t)
+	if err != nil {
+		storeFailure(w, "saving the tenant", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, saved)
+}
+
+// issueTenantToken mints a customer's credential. It is returned exactly
+// once: only its hash is kept, so a lost credential is rotated rather than
+// recovered.
+func (s *Server) issueTenantToken(w http.ResponseWriter, id string) {
+	token, err := s.Store.IssueTenantToken(id)
+	if errors.Is(err, store.ErrUnknownTenant) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown tenant"})
+		return
+	}
+	if err != nil {
+		storeFailure(w, "issuing a tenant credential", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"tenant_id": id, "token": token})
+}
+
+func (s *Server) deleteTenant(w http.ResponseWriter, id string) {
+	removed, err := s.Store.DeleteTenant(id)
+	if err != nil {
+		storeFailure(w, "deleting the tenant", err)
+		return
+	}
+	if !removed {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown tenant"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
 func validateNode(n model.Node) error {
@@ -1252,11 +1668,53 @@ func (s *Server) authenticate(r *http.Request) (principal, bool) {
 	if nodeID, ok := s.Store.NodeForToken(token); ok {
 		return principal{role: RoleNode, nodeID: nodeID}, true
 	}
+	if tenant, ok := s.Store.TenantForToken(token); ok {
+		return principal{role: RoleTenant, tenant: tenant}, true
+	}
 	return principal{}, false
 }
 
 // isOperator reports whether the caller holds the operator credential.
 func (p principal) isOperator() bool { return p.role == RoleOperator }
+
+// maySeePrefix reports whether the caller may read analytics for a prefix.
+//
+// A tenant's entitlement covers anything inside it, so a customer who brings
+// a /22 and has it protected as four /24s reads all four without being
+// re-entitled on every split. Containment, not equality: a /24 entitlement
+// must never open up the /22 around it.
+func (p principal) maySeePrefix(prefix string) bool {
+	if p.isOperator() {
+		return true
+	}
+	if p.role != RoleTenant {
+		return false
+	}
+	target, err := netip.ParsePrefix(prefix)
+	if err != nil {
+		return false
+	}
+	for _, owned := range p.tenant.Prefixes {
+		held, err := netip.ParsePrefix(owned)
+		if err != nil {
+			continue
+		}
+		if held.Bits() <= target.Bits() && held.Contains(target.Masked().Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
+// mayReadAnalytics reports whether the caller may reach the analytics API at
+// all, and writes the refusal if not.
+func mayReadAnalytics(w http.ResponseWriter, who principal) bool {
+	if who.isOperator() || who.role == RoleTenant {
+		return true
+	}
+	forbidden(w, "reading analytics requires a tenant or operator credential")
+	return false
+}
 
 // actsFor reports whether the caller may act for a specific node. An operator
 // may act for any; a node may act only for itself.

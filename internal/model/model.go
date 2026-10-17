@@ -98,6 +98,27 @@ type Node struct {
 	Advertise   string    `json:"advertise,omitempty"`
 }
 
+// Tenant is a customer of the scrubbing service.
+//
+// It exists so a customer can be given a credential that reads their own
+// traffic and nothing else. Without it the only way to show someone their
+// analytics is to hand them an operator token, which also reads every other
+// customer's prefixes, the fleet's topology and the policy behind it.
+//
+// Prefixes are what the tenant may see. A prefix here covers anything inside
+// it, so a customer who brings a /22 and has it protected as four /24s is
+// given the /22 once rather than having to be re-entitled on every split.
+type Tenant struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Prefixes []string `json:"prefixes"`
+	// Contact is free text for whoever runs the platform: who to call. It is
+	// never matched on.
+	Contact   string    `json:"contact,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 type Flow struct {
 	SrcIP string `json:"src_ip"`
 	DstIP string `json:"dst_ip"`

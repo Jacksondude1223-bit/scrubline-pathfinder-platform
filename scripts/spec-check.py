@@ -58,8 +58,10 @@ for l in b.split('\n'):
     m=re.search(r'Method(\w+)',l)
     if not m: continue
     p=re.search(r'path == "([^"]*)"',l); sp=re.search(r'hasSubpath\(path, "(\w+)", "(\w+)"\)',l)
+    ip=re.search(r'pathHasID\(path, "(\w+)"\)',l)
     if p: code.add((m.group(1).lower(),'/v1/'+p.group(1)))
     elif sp: code.add((m.group(1).lower(),f"/v1/{sp.group(1)}/{{id}}/{sp.group(2)}"))
+    elif ip: code.add((m.group(1).lower(),f"/v1/{ip.group(1)}/{{id}}"))
 code |= {('get','/health'),('get','/metrics')}
 d=yaml.safe_load(open('api/openapi.yaml'))
 doc={(m,p) for p,ops in d['paths'].items() for m in ops if m in ('get','post','put','delete','patch')}

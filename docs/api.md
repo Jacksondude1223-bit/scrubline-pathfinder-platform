@@ -21,12 +21,15 @@ else's datacentre, so it never holds one that can change the fabric.
 | `SCRUBLINE_API_TOKEN` | operators, `scrubctl` | everything |
 | `SCRUBLINE_ENROLL_TOKEN` | node agents | `POST /v1/nodes/register`, and nothing else |
 | node credential | one scrubber | its own heartbeat, program and counters, plus `GET /v1/ml/model` |
+| tenant credential | one protected customer | `GET /v1/analytics/*`, for their own prefixes only |
 | `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/metrics`, `/bgp` |
 
 A node credential is issued at registration, scoped to that node, 256 bits,
-kept only as a hash, and rotated whenever the node enrols again. An unset
-credential never matches: an empty token is a misconfiguration, not a way to
-open the control plane.
+kept only as a hash, and rotated whenever the node enrols again. A tenant
+credential works the same way and is the narrowest thing the platform issues:
+read-only, and blind to the fleet, the policy and every other customer. An
+unset credential never matches: an empty token is a misconfiguration, not a way
+to open the control plane.
 
 ## Status codes
 
@@ -235,6 +238,159 @@ $ curl -X DELETE -H "Authorization: Bearer $API_TOKEN" $API/v1/ml/model
 see it — the zero model cannot say this, because it is indistinguishable from
 "never trained".
 
+### 8. Customer analytics
+
+A customer buys protection for a prefix, not for a node. Under anycast that
+prefix is carried by every scrubber at once, so nothing under `/v1/analytics`
+is reported per node: it is keyed by prefix and summed across the fabric.
+
+Onboard the customer, then issue their credential:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $API_TOKEN" $API/v1/tenants -d '{
+    "name":"Northwind Games","prefixes":["203.0.113.0/24"],
+    "contact":"noc@northwind.example"}'
+{"id":"ten-3699abaf8b8b4cf5","name":"Northwind Games","prefixes":["203.0.113.0/24"],
+ "contact":"noc@northwind.example","created_at":"2026-10-17T11:35:58Z",
+ "updated_at":"2026-10-17T11:35:58Z"}
+
+$ scrubctl tenant-token ten-3699abaf8b8b4cf5
+{"tenant_id":"ten-3699abaf8b8b4cf5","token":"<64 hex characters>"}
+this credential is shown once; only its hash is kept
+```
+
+An entitlement covers everything **inside** it, so a customer who brings a /22
+and has it protected as four /24s is entitled once rather than on every split.
+Containment, not equality — a /24 entitlement never opens up the /22 around it.
+Prefixes must be written masked; `203.0.113.5/24` is refused with the form to
+use instead, because the entitlement is matched against what was written.
+
+Now the customer's own view, with their own credential:
+
+```console
+$ curl -H "Authorization: Bearer $TENANT_TOKEN" "$API/v1/analytics/overview?window=1h"
+{"window":"1h0m0s","resolution":"1m0s","retention":"24h0m0s",
+ "generated":"2026-10-17T11:35:59Z",
+ "tenant":{"id":"ten-3699abaf8b8b4cf5","name":"Northwind Games"},
+ "prefixes":[
+   {"prefix":"203.0.113.0/24","from":"2026-10-17T10:35:00Z","to":"2026-10-17T11:35:59Z",
+    "flows":42000,"flows_dropped":40000,
+    "offered":33000000,"dropped":32000000,"delivered":1000000,"challenged":240,
+    "mitigated_pct":96.97,
+    "peak_pps":2230000,"peak_dropped_pps":1600000,
+    "offered_pps":1650000,"dropped_pps":1600000,
+    "nodes":2,"under_attack":true,"pulsing":false,
+    "attacks":1,"attack_seconds":1.04}]}
+```
+
+`nodes` is how many scrubbers are carrying this prefix right now. Under anycast
+that is the fabric absorbing the attack — a customer seeing `1` during a flood
+is seeing a problem, not a quiet day.
+
+`delivered` is `offered - dropped`. It is a subtraction rather than its own
+counter because the datapath only knows what it stopped.
+
+#### The attack log
+
+"You were attacked" on its own is not something a customer can act on, so every
+event names what stopped it:
+
+```console
+$ scrubctl attacks 1h
+STARTED               PREFIX          FOR           PEAK PPS  SCRUBBED PPS  SHAPE  STOPPED BY
+2026-10-17T11:35:58Z  203.0.113.0/24  1s (ongoing)  2230000   1600000       flood  dns-amp(asic) mc-survival(zc)
+```
+
+```console
+$ curl -H "Authorization: Bearer $TENANT_TOKEN" "$API/v1/analytics/events?window=1h"
+{"window":"1h0m0s","events":[
+  {"prefix":"203.0.113.0/24","started_at":"2026-10-17T11:35:58Z","ongoing":true,
+   "seconds":1.04,"peak_pps":2230000,"peak_dropped_pps":1600000,
+   "dropped":32180000,"flows":41800,"pulse":false,
+   "vectors":[
+     {"rule_id":"dns-amp","stage":"asic","flows":40000,"dropped":32000000},
+     {"filter_id":"mc-survival","stage":"zc","flows":1800,"dropped":180000}]}]}
+```
+
+`ended_at` is **absent** while an attack is running, rather than a zero time.
+When it closes it is dated to the moment the traffic stopped, not to the end of
+the window spent confirming it: a customer is not under attack for the two
+minutes it takes to be sure they are not.
+
+An event opens when a meaningful share of a prefix's traffic is being scrubbed
+— above a floor, so a stray packet against a quiet prefix is not billed as an
+attack — or when the burst detector recognises a pulse train. It does **not**
+close on the first quiet poll. A burst train is quiet between bursts by design,
+and closing early would record one attack as fifty, which is exactly the
+reporting the attacker's interval is paying for. `pulse: true` marks the ones
+that were latched that way.
+
+#### Over time
+
+```console
+$ curl -H "Authorization: Bearer $TENANT_TOKEN" \
+    "$API/v1/analytics/series?prefix=203.0.113.0/24&window=10m&step=5m"
+{"prefix":"203.0.113.0/24","window":"10m0s","step":"5m0s","points":[
+  {"at":"2026-10-17T11:25:00Z","flows":0,"offered":0,"dropped":0,"delivered":0,
+   "peak_pps":0,"offered_pps":0,"dropped_pps":0,"pulsing":false},
+  {"at":"2026-10-17T11:30:00Z","flows":42000,"flows_dropped":40000,
+   "offered":33000000,"dropped":32000000,"delivered":1000000,"challenged":240,
+   "peak_pps":2230000,"offered_pps":1650000,"dropped_pps":1600000,"pulsing":false}]}
+```
+
+Each point reports the **heaviest moment inside it**, not an average over it.
+An average is precisely what a burst attack is shaped to hide. Points are
+aligned to the step, so two reads of the same dashboard line up.
+
+#### What a tenant cannot reach
+
+```console
+$ curl -H "Authorization: Bearer $TENANT_TOKEN" \
+    "$API/v1/analytics/series?prefix=198.51.100.0/24"      # another customer
+{"error":"this credential is not entitled to that prefix"}            # 403
+
+$ curl -H "Authorization: Bearer $TENANT_TOKEN" $API/v1/nodes
+{"error":"listing the fleet requires the operator credential"}        # 403
+
+$ curl -H "Authorization: Bearer $TENANT_TOKEN" $API/metrics
+{"error":"the operator credential is required to scrape the control plane"}  # 403
+```
+
+The refusal for an unentitled prefix is the same whether or not that prefix
+exists. A customer must not be able to map the platform's other customers by
+watching which prefixes answer differently.
+
+Offboarding takes the credential with it — one that outlived its tenant would
+authenticate to an empty entitlement rather than to nothing:
+
+```console
+$ scrubctl tenant-rm ten-3699abaf8b8b4cf5
+{"deleted":"ten-3699abaf8b8b4cf5"}
+```
+
+#### The operator's view
+
+The same endpoints with the operator credential span every customer, and
+`scrubctl analytics` renders them:
+
+```console
+$ scrubctl analytics 1h
+PREFIX           OFFERED   SCRUBBED  MITIGATED  PEAK PPS  NOW PPS  NODES  ATTACKS  STATE
+198.51.100.0/24  240000    0         0.0%       0         2400     2      0        clear
+203.0.113.0/24   33000000  32000000  97.0%      2230000   1650000  2      1        UNDER ATTACK
+
+over the last 1h0m0s
+```
+
+Per-node detail stays on `/metrics`, where the new `scrubline_prefix_*` series
+break each node's traffic down by the prefix it was aimed at:
+
+```
+scrubline_prefix_offered_pps{node="…",name="edge-lhr",region="us-east",prefix="203.0.113.0/24"} 940000
+scrubline_prefix_offered_pps{node="…",name="edge-fra",region="eu-central",prefix="203.0.113.0/24"} 710000
+scrubline_prefix_dropped_pps{node="…",name="edge-lhr",region="us-east",prefix="203.0.113.0/24"} 910000
+```
+
 ## The node agent
 
 ```console
@@ -288,7 +444,25 @@ its mean under the watermark on purpose, so `offered_pps` can read zero on a
 node being knocked over. `pulsing`, `pulse_peak_pps` and the `pulse` array are
 the real picture.
 
-**`403` is not `404`.** An endpoint you cannot reach says so.
+**`403` is not `404`.** An endpoint you cannot reach says so. The one
+deliberate exception is an analytics prefix a credential is not entitled to:
+that answers `403` whether or not the prefix exists, so a customer cannot map
+the platform's other customers by watching which ones answer differently.
+
+**Analytics history is in memory, and is not durable.** It is derived from
+reports that keep arriving, so a restarted control plane rebuilds it within a
+couple of heartbeats — which beats carrying stale numbers across the gap. The
+durable half (customers, entitlements, credential hashes) does survive.
+
+**Nodes report cumulative counters; the control plane deltas them.** That is
+deliberate. A counter that only counts up survives a report being missed, and
+one that goes backwards is read as a node that restarted rather than as
+negative traffic.
+
+**An event's `dropped` is the sum over its vectors**, which can exceed the
+prefix's own `dropped` total: a rule guarding several prefixes has its volume
+attributed to each of them, marked `shared`. Read the prefix total when the two
+disagree.
 
 ## Reading the specs
 

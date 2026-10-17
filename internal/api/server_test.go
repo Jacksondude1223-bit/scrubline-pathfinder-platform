@@ -1477,3 +1477,231 @@ func TestGameFilterMetricsAreExposed(t *testing.T) {
 		}
 	}
 }
+
+// --- analytics -------------------------------------------------------------
+
+// onboard registers a customer and returns their id and credential.
+func onboard(t *testing.T, h http.Handler, body string) (id, token string) {
+	t.Helper()
+	tenant := requireJSON(t, doAs(t, h, testToken, http.MethodPost, "/v1/tenants", body), http.StatusOK)
+	id, _ = tenant["id"].(string)
+	if id == "" {
+		t.Fatalf("saving the tenant returned no id: %v", tenant)
+	}
+	out := requireJSON(t, doAs(t, h, testToken, http.MethodPost, "/v1/tenants/"+id+"/token", ""), http.StatusOK)
+	token, _ = out["token"].(string)
+	if token == "" {
+		t.Fatalf("issuing a tenant credential returned none: %v", out)
+	}
+	return id, token
+}
+
+// analyticsSetup brings up a server with one node reporting traffic against
+// two prefixes, and a customer entitled to the first of them.
+func analyticsSetup(t *testing.T) (h http.Handler, tenantToken string) {
+	t.Helper()
+	h = newTestServer()
+	nodeID, nodeToken := enroll(t, h, `{"name":"scrub-a","region":"us-east","capacity_gbps":100,"capacity_pps":2000000}`)
+
+	policy := `{"name":"two customers","protected":["203.0.113.0/24","198.51.100.0/24"],
+	  "rules":[{"id":"udp-flood","stage":"asic","action":"drop",
+	            "match":{"dst_cidr":"203.0.113.0/24","proto":"udp","dport":53}}]}`
+	saved := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", policy), http.StatusOK)
+	policyID, _ := saved["id"].(string)
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies/"+policyID+"/deploy", ""), http.StatusOK)
+
+	// The node reports a flood at one customer and quiet at the other.
+	stats := `{"stats":{"prefixes":[
+	  {"prefix":"203.0.113.0/24","flows":500,"flows_dropped":480,"offered":900000,"dropped":850000,
+	   "offered_pps":90000,"dropped_pps":85000,"peak_pps":120000},
+	  {"prefix":"198.51.100.0/24","flows":40,"offered":40000,"offered_pps":4000}],
+	  "rules":[{"rule_id":"udp-flood","stage":"asic","matches":480,"drops":480,"pps_dropped":850000}]}}`
+	requireJSON(t, doAs(t, h, nodeToken, http.MethodPost, "/v1/nodes/"+nodeID+"/heartbeat", stats), http.StatusOK)
+
+	_, tenantToken = onboard(t, h, `{"name":"Northwind","prefixes":["203.0.113.0/24"]}`)
+	return h, tenantToken
+}
+
+// A customer sees their own traffic, summed across the fabric, without
+// holding an operator credential.
+func TestTenantReadsTheirOwnAnalytics(t *testing.T) {
+	h, tenantToken := analyticsSetup(t)
+
+	out := requireJSON(t, doAs(t, h, tenantToken, http.MethodGet, "/v1/analytics/overview", ""), http.StatusOK)
+	prefixes, _ := out["prefixes"].([]any)
+	if len(prefixes) != 1 {
+		t.Fatalf("expected exactly the customer's own prefix, got %v", out["prefixes"])
+	}
+	row, _ := prefixes[0].(map[string]any)
+	if row["prefix"] != "203.0.113.0/24" {
+		t.Fatalf("expected the customer's prefix, got %v", row["prefix"])
+	}
+	if row["offered"].(float64) != 900000 || row["dropped"].(float64) != 850000 {
+		t.Fatalf("expected the customer's own volume, got %v", row)
+	}
+	if row["under_attack"] != true {
+		t.Fatalf("expected the flood recorded as an attack, got %v", row)
+	}
+	// The ratio is what a customer is actually buying.
+	if pct := row["mitigated_pct"].(float64); pct < 90 || pct > 100 {
+		t.Fatalf("expected most of the flood reported as mitigated, got %v", pct)
+	}
+}
+
+// A customer's credential must not reach another customer's traffic, the
+// fleet, or the policy behind the protection.
+func TestTenantCannotReachAnythingElse(t *testing.T) {
+	h, tenantToken := analyticsSetup(t)
+
+	// Not the other customer's prefix, even though the control plane holds it.
+	rec := doAs(t, h, tenantToken, http.MethodGet, "/v1/analytics/series?prefix=198.51.100.0/24", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a tenant read another customer's prefix: %d %s", rec.Code, rec.Body.String())
+	}
+	// And the overview does not leak its existence either.
+	out := requireJSON(t, doAs(t, h, tenantToken, http.MethodGet, "/v1/analytics/overview", ""), http.StatusOK)
+	if strings.Contains(fmt.Sprint(out), "198.51.100.0/24") {
+		t.Fatalf("the overview named another customer's prefix: %v", out)
+	}
+
+	for _, path := range []string{
+		"/v1/nodes", "/v1/policies", "/v1/fabric", "/v1/state", "/v1/tenants",
+		"/v1/ml/samples", "/v1/ml/model", "/v1/metrics",
+	} {
+		if rec := doAs(t, h, tenantToken, http.MethodGet, path, ""); rec.Code != http.StatusForbidden && rec.Code != http.StatusNotFound {
+			t.Fatalf("a tenant credential reached %s: %d %s", path, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := doAs(t, h, tenantToken, http.MethodGet, "/metrics", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("a tenant credential scraped the fleet: %d", rec.Code)
+	}
+	// Read-only: nothing a tenant holds may change state.
+	for _, call := range [][2]string{
+		{http.MethodPost, "/v1/policies"},
+		{http.MethodPost, "/v1/tenants"},
+		{http.MethodPost, "/v1/promote"},
+		{http.MethodDelete, "/v1/ml/model"},
+	} {
+		if rec := doAs(t, h, tenantToken, call[0], call[1], `{}`); rec.Code != http.StatusForbidden {
+			t.Fatalf("a tenant wrote via %s %s: %d %s", call[0], call[1], rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// An entitlement covers what is inside it, so a customer who brings a /22 and
+// has it protected as /24s reads all of them — but a /24 entitlement never
+// opens up the supernet around it.
+func TestTenantEntitlementIsContainmentNotEquality(t *testing.T) {
+	h := newTestServer()
+	_, wide := onboard(t, h, `{"name":"Wide","prefixes":["203.0.112.0/22"]}`)
+	_, narrow := onboard(t, h, `{"name":"Narrow","prefixes":["203.0.113.0/24"]}`)
+
+	if rec := doAs(t, h, wide, http.MethodGet, "/v1/analytics/series?prefix=203.0.113.0/24", ""); rec.Code != http.StatusOK {
+		t.Fatalf("a /22 entitlement did not cover a /24 inside it: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := doAs(t, h, narrow, http.MethodGet, "/v1/analytics/series?prefix=203.0.112.0/22", ""); rec.Code != http.StatusForbidden {
+		t.Fatalf("a /24 entitlement opened up the /22 around it: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Deleting a customer takes their credential with it, which is what makes
+// offboarding real rather than cosmetic.
+func TestDeletingATenantStopsTheirCredentialWorking(t *testing.T) {
+	h := newTestServer()
+	id, token := onboard(t, h, `{"name":"Northwind","prefixes":["203.0.113.0/24"]}`)
+	requireJSON(t, doAs(t, h, token, http.MethodGet, "/v1/analytics/overview", ""), http.StatusOK)
+
+	requireJSON(t, do(t, h, http.MethodDelete, "/v1/tenants/"+id, ""), http.StatusOK)
+	if rec := doAs(t, h, token, http.MethodGet, "/v1/analytics/overview", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a deleted customer's credential still works: %d", rec.Code)
+	}
+	requireJSON(t, do(t, h, http.MethodDelete, "/v1/tenants/"+id, ""), http.StatusNotFound)
+}
+
+// An attack names the rule that stopped it, because "you were attacked" on
+// its own is not something a customer can act on.
+func TestAnalyticsEventsNameTheVector(t *testing.T) {
+	h, tenantToken := analyticsSetup(t)
+
+	out := requireJSON(t, doAs(t, h, tenantToken, http.MethodGet, "/v1/analytics/events", ""), http.StatusOK)
+	events, _ := out["events"].([]any)
+	if len(events) != 1 {
+		t.Fatalf("expected one attack, got %v", out["events"])
+	}
+	e, _ := events[0].(map[string]any)
+	if e["prefix"] != "203.0.113.0/24" || e["ongoing"] != true {
+		t.Fatalf("expected an open attack on the customer's prefix, got %v", e)
+	}
+	vectors, _ := e["vectors"].([]any)
+	if len(vectors) != 1 {
+		t.Fatalf("expected the attack attributed to a rule, got %v", e["vectors"])
+	}
+	v, _ := vectors[0].(map[string]any)
+	if v["rule_id"] != "udp-flood" || v["stage"] != "asic" {
+		t.Fatalf("expected the udp-flood ASIC rule named, got %v", v)
+	}
+	if v["shared"] == true {
+		t.Fatalf("a rule written against one prefix was reported as shared: %v", v)
+	}
+}
+
+// A newly onboarded customer sees their prefix reading zero, not an empty
+// page they cannot tell from an outage.
+func TestANewTenantSeesTheirPrefixAtZero(t *testing.T) {
+	h := newTestServer()
+	_, token := onboard(t, h, `{"name":"Fresh","prefixes":["203.0.113.0/24"]}`)
+
+	out := requireJSON(t, doAs(t, h, token, http.MethodGet, "/v1/analytics/overview", ""), http.StatusOK)
+	prefixes, _ := out["prefixes"].([]any)
+	if len(prefixes) != 1 {
+		t.Fatalf("expected the entitlement listed, got %v", out["prefixes"])
+	}
+	row, _ := prefixes[0].(map[string]any)
+	if row["prefix"] != "203.0.113.0/24" || row["offered"].(float64) != 0 {
+		t.Fatalf("expected a zeroed row for the new customer, got %v", row)
+	}
+}
+
+// An entitlement is matched against whatever the caller wrote, so a prefix
+// with host bits set would authorize differently than it reads.
+func TestTenantPrefixesMustBeMasked(t *testing.T) {
+	h := newTestServer()
+	rec := doAs(t, h, testToken, http.MethodPost, "/v1/tenants", `{"name":"Sloppy","prefixes":["203.0.113.5/24"]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected an unmasked entitlement refused, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "203.0.113.0/24") {
+		t.Fatalf("expected the refusal to say what to write instead, got %s", rec.Body.String())
+	}
+}
+
+// A malformed window is refused rather than silently answering a different
+// question than the one asked.
+func TestAnalyticsRefusesABadWindow(t *testing.T) {
+	h, token := analyticsSetup(t)
+	rec := doAs(t, h, token, http.MethodGet, "/v1/analytics/overview?window=lastweek", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected a malformed window refused, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A replica serves analytics but accepts no customer changes: two control
+// planes issuing credentials for the same customer is a split brain of its
+// own.
+func TestReplicaServesAnalyticsButRefusesTenantWrites(t *testing.T) {
+	s := &Server{Token: testToken, EnrollToken: testEnrollToken, Store: store.New()}
+	h := s.Handler()
+	id, token := onboard(t, h, `{"name":"Northwind","prefixes":["203.0.113.0/24"]}`)
+
+	s.SetMode(ModeReplica)
+	requireJSON(t, doAs(t, h, token, http.MethodGet, "/v1/analytics/overview", ""), http.StatusOK)
+	for _, call := range [][3]string{
+		{http.MethodPost, "/v1/tenants", `{"name":"New","prefixes":["198.51.100.0/24"]}`},
+		{http.MethodPost, "/v1/tenants/" + id + "/token", ""},
+		{http.MethodDelete, "/v1/tenants/" + id, ""},
+	} {
+		if rec := doAs(t, h, testToken, call[0], call[1], call[2]); rec.Code != http.StatusConflict {
+			t.Fatalf("a replica accepted %s %s: %d", call[0], call[1], rec.Code)
+		}
+	}
+}

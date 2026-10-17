@@ -357,6 +357,8 @@ work":
 - `scrubline_offered_pps{node}` and `scrubline_dropped_pps{node}` — current packet rates, averaged over the node's load window. These are rates, not totals: they are what load-driven shedding reacts to.
 - `scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}` and `scrubline_node_capacity_pps{node}` — the shedding loop. A node at a non-zero escalation is deliberately leaning away from traffic.
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
+- `scrubline_prefix_offered_pps{node,prefix}` and `scrubline_prefix_dropped_pps{node,prefix}` — the same rates broken down by the protected prefix the traffic was aimed at. The node-wide pair cannot answer "which customer is being attacked": a scrubber carries many prefixes at once.
+- `scrubline_prefix_flows_total{node,prefix}`, `scrubline_prefix_flows_dropped_total{...}`, `scrubline_prefix_offered_total{...}` and `scrubline_prefix_dropped_total{...}` — the cumulative per-prefix counters the customer-facing analytics are deltaed from.
 - `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
 
 Counters survive a reprogram for rules that stay in the policy, so a poll every
@@ -373,6 +375,83 @@ the published model's holdout metrics, and
 curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      http://127.0.0.1:8080/metrics
 curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/metrics
 ```
+
+## Customer analytics
+
+Observability above is for the people running the fabric. This is for the
+people buying it, and it is a different question.
+
+A customer does not have a node. They have a prefix, and under anycast it is
+carried by every scrubber at once, so per-node counters cannot answer "was I
+attacked, how big was it, and did you stop it". Everything under
+`/v1/analytics` is therefore keyed by **prefix** and summed across the fabric.
+
+The datapath accounts traffic per protected prefix — offered and scrubbed, as
+both cumulative volume and a rolling rate. Nodes attach those counters to the
+heartbeat they already send, and the control plane deltas them into per-minute
+buckets kept for a day. Cumulative counters rather than rates, deliberately: a
+counter that only counts up survives a report being missed, and one that goes
+backwards is read as a node that restarted rather than as negative traffic.
+
+```sh
+scrubctl analytics 1h
+```
+
+```
+PREFIX           OFFERED   SCRUBBED  MITIGATED  PEAK PPS  NOW PPS  NODES  ATTACKS  STATE
+198.51.100.0/24  240000    0         0.0%       0         2400     2      0        clear
+203.0.113.0/24   33000000  32000000  97.0%      2230000   1650000  2      1        UNDER ATTACK
+```
+
+`NODES` is how many scrubbers are carrying the prefix right now. Under anycast
+that is the fabric absorbing the attack: a customer seeing `1` during a flood
+is seeing a problem, not a quiet day.
+
+### Attacks, not just numbers
+
+An attack is recorded as an event with a start, an end, a peak, and the rules
+and filters that did the stopping — "you were attacked" on its own is not
+something a customer can act on.
+
+```
+STARTED               PREFIX          FOR           PEAK PPS  SCRUBBED PPS  SHAPE  STOPPED BY
+2026-10-17T11:35:58Z  203.0.113.0/24  1s (ongoing)  2230000   1600000       flood  dns-amp(asic) mc-survival(zc)
+```
+
+An event opens when a meaningful share of a prefix's traffic is being scrubbed
+— above a magnitude floor, so a stray packet against a quiet prefix is not
+billed as an attack — or when the burst detector recognises a pulse train. It
+does not close on the first quiet poll: a burst train is quiet between bursts
+by design, and closing early would report one attack as fifty, which is the
+reporting the attacker's interval is paying for. When it does close, it is
+dated to when the traffic stopped, not to the end of the time spent confirming
+it.
+
+The time series works the same way. Each point reports the heaviest moment
+inside it rather than an average over it, because an average is precisely what
+a burst attack is shaped to hide.
+
+### Tenants
+
+Showing a customer their traffic used to mean handing them an operator token,
+which also reads every other customer's prefixes, the fleet's topology and the
+policy behind it. A tenant credential is scoped to the prefixes that customer
+is entitled to and is read-only:
+
+```sh
+scrubctl tenant-add customer.json      # {"name":"...","prefixes":["203.0.113.0/24"]}
+scrubctl tenant-token ten-3699abaf8b8b4cf5
+```
+
+A prefix the credential is not entitled to answers `403` whether or not it
+exists, so a customer cannot map the platform's other customers by watching
+which prefixes answer differently.
+
+History is in memory and is not durable: it is derived from reports that keep
+arriving, so a restarted control plane rebuilds it within a couple of
+heartbeats rather than carrying stale numbers across the gap. The customers
+themselves, their entitlements and their credential hashes are durable, and
+replicate to a follower like everything else.
 
 ## State and recovery
 
@@ -457,6 +536,7 @@ else's datacentre, so it never holds a credential that can change the fabric.
 | `SCRUBLINE_API_TOKEN` | operators, `scrubctl` | everything: policy, deploy, ML, fabric, `/metrics` |
 | `SCRUBLINE_ENROLL_TOKEN` | every node agent | register, and collect a credential. Nothing else |
 | `SCRUBLINE_NODE_API_TOKEN` | the agent, and whatever scrapes it | that agent's own `/decide`, `/metrics`, `/bgp` |
+| tenant credential | one protected customer | read the analytics for their own prefixes. Nothing else |
 
 Registering is also credential issue. The control plane mints a 256-bit
 credential scoped to that node, returns it once, and keeps only its hash, so a
@@ -470,6 +550,15 @@ What a node credential buys, and nothing more:
 - heartbeat **as itself**, and report its own counters
 - fetch **its own** program
 - read the published model, which it installs
+
+A tenant credential is narrower still, and issued the same way: minted per
+customer, returned once, kept as a hash, rotated by issuing again. It is
+read-only and reaches `/v1/analytics` for the prefixes that customer is
+entitled to, and nothing else — not the fleet, not the policy behind their
+protection, not another customer's traffic. Entitlement is by containment, so
+a customer who brings a /22 is entitled once however it is later split, but a
+/24 entitlement never opens up the /22 around it. Deleting the customer takes
+the credential with it.
 
 It cannot read another node's program, heartbeat as another node, list the
 fleet, read the fabric, scrape the control plane, write a policy, deploy, or
@@ -535,6 +624,11 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `POST /v1/ml/train` fit the ZC logistic model
 - `GET /v1/ml/model` weights the node agent installs
 - `DELETE /v1/ml/model` retire the published model; agents clear it on the next poll
+- `GET /v1/analytics/overview` per-prefix traffic, mitigation and attack state, summed across the fabric
+- `GET /v1/analytics/series` one prefix over time; each point is the heaviest moment inside it, not an average
+- `GET /v1/analytics/events` the attack log, each entry naming the rules and filters that stopped it
+- `POST /v1/tenants`, `GET /v1/tenants`, `DELETE /v1/tenants/{id}` customers and their entitlements (operator only)
+- `POST /v1/tenants/{id}/token` issue or rotate a customer's credential; returned once (operator only)
 
 Example policy: `configs/policy.example.json`. Example training set: `configs/ml.samples.json`.
 

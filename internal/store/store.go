@@ -56,6 +56,11 @@ type Store struct {
 	// this store must not hand anyone a working credential.
 	nodeTokens map[string]string
 	tokenNodes map[string]string
+	// tenants are the customers whose traffic is being scrubbed, with their
+	// credentials held the same way the nodes' are.
+	tenants      map[string]*model.Tenant
+	tenantTokens map[string]string
+	tokenTenants map[string]string
 	// path is where durable state is written. Empty keeps everything in
 	// memory, which is what the tests and the single-shot demo use.
 	path string
@@ -73,6 +78,15 @@ func sortPolicies(policies []model.Policy) {
 	sort.Slice(policies, func(i, j int) bool { return policies[i].ID < policies[j].ID })
 }
 
+func sortTenants(tenants []model.Tenant) {
+	sort.Slice(tenants, func(i, j int) bool {
+		if tenants[i].Name != tenants[j].Name {
+			return tenants[i].Name < tenants[j].Name
+		}
+		return tenants[i].ID < tenants[j].ID
+	})
+}
+
 func New() *Store {
 	return &Store{
 		nodes:      map[string]*model.Node{},
@@ -81,7 +95,12 @@ func New() *Store {
 		reports:    map[string]telemetry.Report{},
 		nodeTokens: map[string]string{},
 		tokenNodes: map[string]string{},
-		now:        func() time.Time { return time.Now().UTC() },
+
+		tenants:      map[string]*model.Tenant{},
+		tenantTokens: map[string]string{},
+		tokenTenants: map[string]string{},
+
+		now: func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -458,6 +477,144 @@ func (s *Store) RevokeNodeToken(nodeID string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// ErrUnknownTenant is returned when a tenant is named that does not exist.
+var ErrUnknownTenant = errors.New("unknown tenant")
+
+// SaveTenant creates or replaces a customer record.
+func (s *Store) SaveTenant(t model.Tenant) (model.Tenant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tenants == nil {
+		s.tenants = map[string]*model.Tenant{}
+	}
+	now := s.clock()
+	if t.ID == "" {
+		// Derived from the name, so re-sending the same customer updates
+		// them rather than quietly creating a second record holding half
+		// their prefixes.
+		t.ID = id("ten", t.Name)
+	}
+	previous, existed := s.tenants[t.ID]
+	if existed {
+		t.CreatedAt = previous.CreatedAt
+	} else {
+		t.CreatedAt = now
+	}
+	t.UpdatedAt = now
+	cp := t
+	s.tenants[t.ID] = &cp
+	if err := s.persistLocked(); err != nil {
+		if existed {
+			s.tenants[t.ID] = previous
+		} else {
+			delete(s.tenants, t.ID)
+		}
+		return model.Tenant{}, err
+	}
+	return cp, nil
+}
+
+// Tenants lists the customers, by name.
+func (s *Store) Tenants() []model.Tenant {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Tenant, 0, len(s.tenants))
+	for _, t := range s.tenants {
+		out = append(out, *t)
+	}
+	sortTenants(out)
+	return out
+}
+
+// Tenant returns one customer.
+func (s *Store) Tenant(id string) (model.Tenant, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tenants[id]
+	if !ok {
+		return model.Tenant{}, false
+	}
+	return *t, true
+}
+
+// DeleteTenant removes a customer and the credential they hold. Both go
+// together: a credential that outlived its tenant would authenticate to an
+// empty entitlement rather than to nothing.
+func (s *Store) DeleteTenant(id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, ok := s.tenants[id]
+	if !ok {
+		return false, nil
+	}
+	hash, hadToken := s.tenantTokens[id]
+	delete(s.tenants, id)
+	delete(s.tenantTokens, id)
+	delete(s.tokenTenants, hash)
+	if err := s.persistLocked(); err != nil {
+		s.tenants[id] = previous
+		if hadToken {
+			s.tenantTokens[id] = hash
+			s.tokenTenants[hash] = id
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// IssueTenantToken mints a credential for a customer and returns it. Like a
+// node's, the plaintext is returned exactly once and only its hash is kept,
+// so issuing again rotates it and the previous one stops working.
+func (s *Store) IssueTenantToken(tenantID string) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generating a tenant credential: %w", err)
+	}
+	token := hex.EncodeToString(raw)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tenants[tenantID]; !ok {
+		return "", ErrUnknownTenant
+	}
+	if s.tenantTokens == nil {
+		s.tenantTokens = map[string]string{}
+		s.tokenTenants = map[string]string{}
+	}
+	if previous, ok := s.tenantTokens[tenantID]; ok {
+		delete(s.tokenTenants, previous)
+	}
+	sum := tokenHash(token)
+	s.tenantTokens[tenantID] = sum
+	s.tokenTenants[sum] = tenantID
+	if err := s.persistLocked(); err != nil {
+		delete(s.tenantTokens, tenantID)
+		delete(s.tokenTenants, sum)
+		return "", err
+	}
+	return token, nil
+}
+
+// TenantForToken resolves a presented credential to the customer holding it.
+// The lookup is by hash, so the store never compares against a live secret.
+func (s *Store) TenantForToken(token string) (model.Tenant, bool) {
+	if token == "" {
+		return model.Tenant{}, false
+	}
+	sum := tokenHash(token)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.tokenTenants[sum]
+	if !ok {
+		return model.Tenant{}, false
+	}
+	t, ok := s.tenants[id]
+	if !ok {
+		return model.Tenant{}, false
+	}
+	return *t, true
 }
 
 func tokenHash(token string) string {

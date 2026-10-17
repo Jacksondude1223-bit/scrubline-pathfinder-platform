@@ -977,17 +977,17 @@ func TestPipelineRecognisesABurstTrain(t *testing.T) {
 
 	s := p.Stats()
 	if !s.Pulsing {
-		t.Fatalf("expected a burst train recognised, got %+v", s.Pulse)
+		t.Fatalf("expected a burst train recognised, got %+v", s.Prefixes)
 	}
 	if s.PulsePeakPPS != 400_000 {
 		t.Fatalf("expected the peak reported, got %d", s.PulsePeakPPS)
 	}
-	if len(s.Pulse) != 1 || s.Pulse[0].Prefix != "203.0.113.0/24" {
-		t.Fatalf("expected the attacked prefix named, got %+v", s.Pulse)
+	if len(s.Prefixes) != 1 || s.Prefixes[0].Prefix != "203.0.113.0/24" {
+		t.Fatalf("expected the attacked prefix named, got %+v", s.Prefixes)
 	}
 	// The mean is what a watermark would have seen, and it is nothing.
-	if s.Pulse[0].MeanPPS*4 > s.Pulse[0].PeakPPS {
-		t.Fatalf("this test is not exercising a low average: %+v", s.Pulse[0])
+	if s.Prefixes[0].MeanPPS*4 > s.Prefixes[0].PeakPPS {
+		t.Fatalf("this test is not exercising a low average: %+v", s.Prefixes[0])
 	}
 }
 
@@ -1004,22 +1004,109 @@ func TestPipelineDoesNotFlagSteadyTraffic(t *testing.T) {
 		clock = clock.Add(250 * time.Millisecond)
 	}
 	if s := p.Stats(); s.Pulsing {
-		t.Fatalf("steady traffic was flagged as a burst train: %+v", s.Pulse)
+		t.Fatalf("steady traffic was flagged as a burst train: %+v", s.Prefixes)
 	}
 }
 
-// Prefixes the policy no longer protects are forgotten.
+// Prefixes the policy no longer protects are forgotten, and the ones it now
+// protects are reported even before any traffic arrives: a customer's prefix
+// reading zero is a measurement, where its absence is indistinguishable from
+// the node not carrying it.
 func TestPipelineForgetsPulsesForDroppedPrefixes(t *testing.T) {
 	prog := model.Program{Prefixes: []string{"203.0.113.0/24"}, PulseFloorPPS: 1000}
 	p := New(prog)
 	p.Decide(model.Flow{SrcIP: "198.51.100.5", DstIP: "203.0.113.9", Proto: "udp", PPS: 5000})
-	if len(p.Stats().Pulse) != 1 {
-		t.Fatal("expected the prefix tracked")
+	rows := p.Stats().Prefixes
+	if len(rows) != 1 || rows[0].Prefix != "203.0.113.0/24" || rows[0].Flows != 1 {
+		t.Fatalf("expected the prefix tracked with its traffic, got %+v", rows)
 	}
+
 	next := prog
 	next.Prefixes = []string{"198.18.0.0/24"}
 	p.Load(next)
-	if got := len(p.Stats().Pulse); got != 0 {
-		t.Fatalf("expected the dropped prefix forgotten, got %d tracked", got)
+
+	rows = p.Stats().Prefixes
+	if len(rows) != 1 || rows[0].Prefix != "198.18.0.0/24" {
+		t.Fatalf("expected only the newly protected prefix tracked, got %+v", rows)
+	}
+	if rows[0].Flows != 0 {
+		t.Fatalf("the new prefix inherited the old one's counters: %+v", rows[0])
+	}
+}
+
+// Traffic is accounted per protected prefix, because a node's own totals
+// cannot say which customer was attacked. Two prefixes on one node, one under
+// a flood and one quiet, have to come out as two different rows.
+func TestPipelineAccountsTrafficPerPrefix(t *testing.T) {
+	prog := model.Program{
+		Prefixes: []string{"203.0.113.0/24", "198.51.100.0/24"},
+		ASIC: []model.ACLEntry{{
+			Action: model.ActionDrop, RuleID: "flood",
+			Match: model.Match{DstCIDR: "203.0.113.0/24", Proto: "udp", DPort: 53},
+		}},
+	}
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	// A flood at one customer, ordinary traffic at the other.
+	for i := 0; i < 10; i++ {
+		p.Decide(model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "udp", DPort: 53, PPS: 50_000})
+		p.Decide(model.Flow{SrcIP: "192.0.2.6", DstIP: "198.51.100.9", Proto: "tcp", DPort: 443, PPS: 1_000})
+	}
+
+	rows := map[string]PrefixStats{}
+	for _, row := range p.Stats().Prefixes {
+		rows[row.Prefix] = row
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected both protected prefixes accounted, got %+v", rows)
+	}
+
+	attacked := rows["203.0.113.0/24"]
+	if attacked.Flows != 10 || attacked.FlowsDropped != 10 {
+		t.Fatalf("expected ten flows all dropped for the attacked prefix, got %+v", attacked)
+	}
+	if attacked.Offered != 500_000 || attacked.Dropped != 500_000 {
+		t.Fatalf("expected the attacked prefix's volume accounted, got %+v", attacked)
+	}
+
+	quiet := rows["198.51.100.0/24"]
+	if quiet.FlowsDropped != 0 || quiet.Dropped != 0 {
+		t.Fatalf("the quiet customer was charged with the other one's drops: %+v", quiet)
+	}
+	if quiet.Offered != 10_000 {
+		t.Fatalf("expected the quiet prefix's own volume, got %+v", quiet)
+	}
+}
+
+// The per-prefix rates are rates: they decay once the traffic stops, so a
+// customer's dashboard does not keep reporting an attack that is over.
+func TestPipelinePrefixRatesDecay(t *testing.T) {
+	p := New(model.Program{Prefixes: []string{"203.0.113.0/24"}})
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	flow := model.Flow{SrcIP: "192.0.2.5", DstIP: "203.0.113.9", Proto: "udp", PPS: 20_000}
+	// One sample in each second of the window, read in the last of them, so
+	// the whole window is full.
+	for i := 0; i < loadWindowSeconds; i++ {
+		if i > 0 {
+			clock = clock.Add(time.Second)
+		}
+		p.Decide(flow)
+	}
+	if got := p.Stats().Prefixes[0].OfferedPPS; got != 20_000 {
+		t.Fatalf("expected the offered rate measured, got %d", got)
+	}
+
+	clock = clock.Add(2 * loadWindowSeconds * time.Second)
+	if got := p.Stats().Prefixes[0].OfferedPPS; got != 0 {
+		t.Fatalf("expected the rate to decay once the traffic stopped, got %d", got)
+	}
+	// The cumulative totals do not decay: they are what the control plane
+	// deltas its history from.
+	if got := p.Stats().Prefixes[0].Offered; got != uint64(loadWindowSeconds)*20_000 {
+		t.Fatalf("expected the cumulative total to stand, got %d", got)
 	}
 }
