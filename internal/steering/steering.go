@@ -51,6 +51,16 @@ type Sample struct {
 	CapacityPPS int64
 	// Fresh is whether the measurement is recent enough to act on.
 	Fresh bool
+	// Pulsing is whether the node is under a recognised burst train, and
+	// PeakPPS is the heaviest burst it measured.
+	//
+	// These are what make a pulse attack visible here at all. OfferedPPS is
+	// an average, and a burst train's average is low by construction: one
+	// second at five times capacity every twenty seconds averages to a
+	// quarter of it, so judged on the mean the node looks idle while it is
+	// being knocked over.
+	Pulsing bool
+	PeakPPS uint64
 }
 
 // Level is one node's current load-driven padding and why it holds.
@@ -128,12 +138,28 @@ func apply(level *Level, s Sample, now time.Time) {
 		return
 	}
 
-	level.Ratio = float64(s.OfferedPPS) / float64(s.CapacityPPS)
+	// Under a pulse train, judge on the peak. The mean is exactly what the
+	// attacker is keeping low.
+	measured := s.OfferedPPS
+	if s.Pulsing && s.PeakPPS > measured {
+		measured = s.PeakPPS
+	}
+	level.Ratio = float64(measured) / float64(s.CapacityPPS)
+
 	want := level.Prepends
 	switch {
 	case level.Ratio >= HighWatermark:
 		want++
 	case level.Ratio <= LowWatermark:
+		// A burst train spends most of its time looking like nothing.
+		// Unwinding during a gap is the behaviour the attacker is paying
+		// for: the next burst lands on a fabric that just relaxed. While
+		// the flag stands, the padding stands.
+		if s.Pulsing {
+			level.Reason = fmt.Sprintf("holding %d: under a burst train, peak %d of %d pps",
+				level.Prepends, s.PeakPPS, s.CapacityPPS)
+			return
+		}
 		want--
 	}
 	if want > MaxEscalation {
@@ -144,7 +170,7 @@ func apply(level *Level, s Sample, now time.Time) {
 	}
 
 	if want == level.Prepends {
-		level.Reason = holdReason(level.Ratio, level.Prepends)
+		level.Reason = holdReason(level.Ratio, level.Prepends, s.Pulsing)
 		return
 	}
 	// BGP churn is expensive, so a level that changed recently stays put even
@@ -155,8 +181,13 @@ func apply(level *Level, s Sample, now time.Time) {
 		return
 	}
 	if want > level.Prepends {
-		level.Reason = fmt.Sprintf("shedding: load is %.0f%% of capacity, above the %.0f%% mark",
-			level.Ratio*100, HighWatermark*100)
+		if s.Pulsing {
+			level.Reason = fmt.Sprintf("shedding: burst train peaking at %.0f%% of capacity, above the %.0f%% mark",
+				level.Ratio*100, HighWatermark*100)
+		} else {
+			level.Reason = fmt.Sprintf("shedding: load is %.0f%% of capacity, above the %.0f%% mark",
+				level.Ratio*100, HighWatermark*100)
+		}
 	} else {
 		level.Reason = fmt.Sprintf("recovering: load is %.0f%% of capacity, below the %.0f%% mark",
 			level.Ratio*100, LowWatermark*100)
@@ -165,11 +196,15 @@ func apply(level *Level, s Sample, now time.Time) {
 	level.ChangedAt = now
 }
 
-func holdReason(ratio float64, prepends int) string {
-	if prepends == 0 {
-		return fmt.Sprintf("load is %.0f%% of capacity, inside the band", ratio*100)
+func holdReason(ratio float64, prepends int, pulsing bool) string {
+	what := "load"
+	if pulsing {
+		what = "burst peak"
 	}
-	return fmt.Sprintf("holding %d: load is %.0f%% of capacity", prepends, ratio*100)
+	if prepends == 0 {
+		return fmt.Sprintf("%s is %.0f%% of capacity, inside the band", what, ratio*100)
+	}
+	return fmt.Sprintf("holding %d: %s is %.0f%% of capacity", prepends, what, ratio*100)
 }
 
 // Levels copies the current table out for metrics and for the operator.

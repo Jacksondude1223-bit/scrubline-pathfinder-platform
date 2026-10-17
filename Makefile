@@ -1,4 +1,4 @@
-.PHONY: build test bench certs demo
+.PHONY: build test bench certs spec-check demo
 
 build:
 	mkdir -p bin
@@ -14,6 +14,12 @@ test:
 # Throwaway CA and server certificate for trying TLS locally. Not for deployment.
 certs:
 	go run scripts/gen-dev-certs.go -dir certs -host 127.0.0.1,localhost
+
+# Checks the OpenAPI specs resolve, and that the routes they document match the
+# dispatch switch in both directions: a spec that drifts from the code is worse
+# than none.
+spec-check:
+	python3 scripts/spec-check.py
 
 bench:
 	go test -run xxx -bench . -benchmem ./internal/pipeline/

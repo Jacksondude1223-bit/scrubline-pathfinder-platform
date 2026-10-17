@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to a branch makes the first run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Tracks the module rather than pinning a version here, so the two
+          # cannot drift apart.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: gofmt
+        # gofmt reports by printing filenames and exits 0 either way, so the
+        # output is what has to be checked.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test
+        # -race is the cheap safety net for the Pipeline, the Store and the
+        # filter engines, all of which are written for concurrent use.
+        run: go test -race ./...
+
+  spec:
+    name: API spec matches the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PyYAML
+        run: python3 -m pip install --disable-pip-version-check --quiet PyYAML
+
+      - name: Check the specs
+        # Resolves every $ref and security scheme, requires a summary and
+        # responses on every operation, and compares the documented routes
+        # against the server's dispatch switch in both directions. A spec that
+        # has drifted from the implementation is worse than no spec.
+        run: make spec-check

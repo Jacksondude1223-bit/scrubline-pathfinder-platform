@@ -149,6 +149,34 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		Name: "scrubline_game_sessions_max", Type: metrics.Gauge,
 		Help: "Bound on the game filter's session table. At the bound it admits without tracking rather than evicting connected players.",
 	}
+	pulsing := metrics.Family{
+		Name: "scrubline_pulse_active", Type: metrics.Gauge,
+		Help: "1 while a protected prefix is under a recognised burst train, including through the quiet stretches between bursts.",
+	}
+	pulsePeak := metrics.Family{
+		Name: "scrubline_pulse_peak_pps", Type: metrics.Gauge,
+		Help: "Heaviest burst measured against a prefix, at sub-second resolution. This is the number a mean hides: a pulse attack keeps its average under the watermark on purpose.",
+	}
+	pulseMean := metrics.Family{
+		Name: "scrubline_pulse_mean_pps", Type: metrics.Gauge,
+		Help: "Mean rate against a prefix over the pulse horizon. Compare with the peak: a wide gap is the attack.",
+	}
+	pulseCrest := metrics.Family{
+		Name: "scrubline_pulse_crest", Type: metrics.Gauge,
+		Help: "Peak-to-mean ratio of traffic to a prefix. Steady traffic sits near one however heavy it is.",
+	}
+	pulseDuty := metrics.Family{
+		Name: "scrubline_pulse_duty_cycle", Type: metrics.Gauge,
+		Help: "Share of the pulse horizon a prefix saw any traffic at all. A burst train is quiet most of the time.",
+	}
+	pulseBursts := metrics.Family{
+		Name: "scrubline_pulse_bursts", Type: metrics.Gauge,
+		Help: "Distinct bursts counted against a prefix in the horizon.",
+	}
+	pulseHold := metrics.Family{
+		Name: "scrubline_pulse_hold_seconds", Type: metrics.Gauge,
+		Help: "How much longer the pulse flag stands without another burst. While this is above zero, mitigation does not disengage.",
+	}
 	age := metrics.Family{
 		Name: "scrubline_report_age_seconds", Type: metrics.Gauge,
 		Help: "Seconds since this node last reported its counters.",
@@ -177,6 +205,16 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		}
 		gameSessions.Samples = append(gameSessions.Samples, metrics.Sample{Labels: id, Value: float64(s.GameSessions)})
 		gameSessionsMax.Samples = append(gameSessionsMax.Samples, metrics.Sample{Labels: id, Value: float64(s.GameSessionsMax)})
+		for _, ps := range s.Pulse {
+			labels := with(id, metrics.Label{Name: "prefix", Value: ps.Prefix})
+			pulsing.Samples = append(pulsing.Samples, metrics.Sample{Labels: labels, Value: boolValue(ps.Pulsing)})
+			pulsePeak.Samples = append(pulsePeak.Samples, metrics.Sample{Labels: labels, Value: float64(ps.PeakPPS)})
+			pulseMean.Samples = append(pulseMean.Samples, metrics.Sample{Labels: labels, Value: float64(ps.MeanPPS)})
+			pulseCrest.Samples = append(pulseCrest.Samples, metrics.Sample{Labels: labels, Value: ps.Crest})
+			pulseDuty.Samples = append(pulseDuty.Samples, metrics.Sample{Labels: labels, Value: ps.DutyCycle})
+			pulseBursts.Samples = append(pulseBursts.Samples, metrics.Sample{Labels: labels, Value: float64(ps.Bursts)})
+			pulseHold.Samples = append(pulseHold.Samples, metrics.Sample{Labels: labels, Value: ps.HeldFor})
+		}
 		for _, g := range s.Games {
 			labels := with(id,
 				metrics.Label{Name: "filter", Value: g.FilterID},
@@ -212,7 +250,9 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		mlScored, mlDrops, mlPasses, mlReady,
 		buckets, bucketsMax, offeredPPS, droppedPPSRate,
 		gameInspected, gameDropped, gameChallenged, gameUninspectable, gameDroppedPPS,
-		gameSessions, gameSessionsMax, age,
+		gameSessions, gameSessionsMax,
+		pulsing, pulsePeak, pulseMean, pulseCrest, pulseDuty, pulseBursts, pulseHold,
+		age,
 	}
 }
 

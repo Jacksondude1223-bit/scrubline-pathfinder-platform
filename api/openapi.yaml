@@ -1,140 +1,1449 @@
 openapi: 3.0.3
 info:
-  title: Scrubline Cloud API
-  version: 0.1.0
-  description: >-
-    Control plane for the distributed scrubbing fabric. Drop path is ASIC/TCAM
-    ACLs, FPGA, and PF_RING ZC. Not XDP.
+  title: Scrubline Cloud control plane
+  version: 0.2.0
+  description: 'Control plane for the distributed scrubbing fabric. The drop path is ASIC/TCAM ACLs, FPGA
+    meters and a PF_RING ZC userspace inspect path; it is not XDP.
 
-    Three bearer credentials. The operator token reaches every endpoint. The
-    enrollment token may only POST /v1/nodes/register. A node credential,
-    issued at registration, may heartbeat and read the program for its own
-    node id, and read /v1/ml/model; anything else is 403.
+
+    ## Credentials
+
+
+    Three bearer credentials, three blast radii. A scrubbing node sits at the edge in someone else''s
+    datacentre, so it never holds one that can change the fabric.
+
+
+    | Credential | Held by | Reaches |
+
+    | --- | --- | --- |
+
+    | `operatorToken` | operators, `scrubctl` | everything |
+
+    | `enrollToken` | node agents | `POST /v1/nodes/register`, and nothing else |
+
+    | `nodeToken` | one scrubber | its own heartbeat, program and counters, plus `GET /v1/ml/model` |
+
+
+    A node credential is issued at registration, scoped to that node, 256 bits, stored only as a hash
+    and rotated whenever the node enrols again. An unset credential never matches: an empty token is a
+    misconfiguration, not a way to open the control plane.
+
+
+    Anything a credential is not allowed to reach answers `403`, not `404`.
+
+
+    ## Transport
+
+
+    Both binaries serve TLS and refuse to serve a routable address without it. Clients verify against
+    the system roots or a private CA; verification is never disabled.
+
+
+    ## Replicas
+
+
+    A replica answers every read and refuses every write with `409`. Two control planes accepting writes
+    would compile conflicting announcement plans and flap the fabric''s BGP.
+
+
+    ## Durability
+
+
+    A write is durable before it is acknowledged. If the state cannot be written the change is rolled
+    back and the call answers `503` — a caller is never told a policy was saved that the control plane
+    will forget.'
+  license:
+    name: See repository
 servers:
-  - url: https://127.0.0.1:8080
+- url: https://127.0.0.1:8080
+  description: A control plane serving TLS
+- url: http://127.0.0.1:8080
+  description: Loopback without TLS, which is the only address allowed to
+tags:
+- name: Operations
+  description: Liveness and metrics.
+- name: Nodes
+  description: Enrolment, liveness and what each scrubber installs.
+- name: Policy
+  description: Protected prefixes, stage rules, steering, game filters, and compiling them across the
+    fabric.
+- name: Classifier
+  description: The flow-level model the ZC stage scores with.
+- name: Replication
+  description: Following a primary, and taking over from one.
+security: &id001
+- operatorToken: []
+paths:
+  /health:
+    get:
+      summary: Liveness, and which mode this control plane is in
+      tags:
+      - Operations
+      security: []
+      description: 'Open: no credential. It carries no policy detail.'
+      responses:
+        '200':
+          description: The control plane is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /metrics:
+    get:
+      summary: Prometheus exposition for the control plane and the reporting fleet
+      tags:
+      - Operations
+      security: *id001
+      responses:
+        '200':
+          description: Exposition in the Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '405':
+          description: Only GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: The exposition could not be rendered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': &id002
+          description: No bearer credential, or one the control plane does not know.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403': &id003
+          description: The credential is valid but not allowed here. The body says which credential the
+            endpoint needs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      description: Node series are built from the counters each node attached to its heartbeat. The exposition
+        names every node, its load and its rule hits, so a node credential cannot read it.
+  /v1/state:
+    get:
+      summary: The durable control-plane state a replica follows
+      tags:
+      - Replication
+      security: *id001
+      responses:
+        '200':
+          description: The current durable state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Snapshot'
+        '401': *id002
+        '403': *id003
+      description: Carries every policy and every node credential hash, so it is reachable only with the
+        operator credential. A replica polls this and writes what it gets through to its own state file.
+  /v1/promote:
+    post:
+      summary: Turn a replica into the primary
+      tags:
+      - Replication
+      security: *id001
+      responses:
+        '200':
+          description: Promoted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:
+                    type: string
+                    enum:
+                    - primary
+        '409':
+          description: This control plane is already the primary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: Deliberate, and one way. Promoting while the old primary still lives gives two control
+        planes compiling conflicting announcement plans, so fence the old one first. Nothing reachable
+        from a replica can tell a dead primary from an unreachable one, which is why this is not automatic.
+  /v1/nodes/register:
+    post:
+      summary: Register a node, and issue the credential scoped to it
+      tags:
+      - Nodes
+      security:
+      - enrollToken: []
+      - operatorToken: []
+      responses:
+        '200':
+          description: Registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationResult'
+        '400':
+          description: Missing name, or a field that will not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: A different live node already holds this name and region, or this control plane
+            is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: A credential could not be issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'Registration is also credential issue. The token in the response is returned once
+        and never served again; re-registering rotates it and the previous one stops working immediately.
+
+
+        Node ids derive from name and region, so two scrubbers sharing both collapse onto one identity.
+        A registration that would take over a node that is still live, from a different advertise address,
+        is refused with 409; once the incumbent has aged out a replacement may take the identity.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Node'
+  /v1/nodes:
+    get:
+      summary: List the fleet
+      tags:
+      - Nodes
+      security: *id001
+      responses:
+        '200':
+          description: Every registered node.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Node'
+        '401': *id002
+        '403': *id003
+      description: 'Status is derived from the last heartbeat: a node past its TTL reads stale and is
+        withdrawn from anycast.'
+  /v1/nodes/{id}/heartbeat:
+    post:
+      summary: Keep a node live, and report its datapath counters
+      tags:
+      - Nodes
+      security: &id004
+      - nodeToken: []
+      - operatorToken: []
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+        '400':
+          description: The body was present but malformed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The control plane does not know this node. Enrol again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': &id006
+          description: This control plane is a replica and does not accept writes. Send them to the primary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: A node may heartbeat only for itself. The body is optional; an agent that sends none
+        still heartbeats. Counters are keyed to the node the path names and labelled from the record the
+        control plane already holds, so a report cannot claim to be another node.
+      parameters: &id005
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                stats:
+                  $ref: '#/components/schemas/Stats'
+  /v1/nodes/{id}/program:
+    get:
+      summary: What a node installs
+      tags:
+      - Nodes
+      security: *id004
+      responses:
+        '200':
+          description: The compiled program.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Program'
+        '404':
+          description: No program has been deployed for this node yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: A program names the prefixes a node scrubs and what it announces, so a node may fetch
+        only its own.
+      parameters: *id005
+  /v1/nodes/{id}/stats:
+    get:
+      summary: The counters a node last reported
+      tags:
+      - Nodes
+      security: *id004
+      responses:
+        '200':
+          description: The last report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+        '404':
+          description: This node has reported no counters.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      parameters: *id005
+  /v1/policies:
+    get:
+      summary: List policies
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: Every policy.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Policy'
+        '401': *id002
+        '403': *id003
+    post:
+      summary: Create or replace a policy
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '400':
+          description: A field will not validate. The message names the offending index and why.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': *id006
+        '503': &id007
+          description: Durable state could not be written. The change was rolled back and did not take
+            effect.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'Saving does not deploy; POST the deploy endpoint for that. An id that already exists
+        is replaced and its version bumped.
+
+
+        Everything is validated here rather than on fifty scrubbers: CIDRs, ports, rule and filter ids,
+        steering regions and communities, and the game filters are compiled. A policy carrying game filters
+        is issued a challenge secret, shared across the fabric so a cookie minted by one node verifies
+        on another.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Policy'
+  /v1/policies/{id}/deploy:
+    post:
+      summary: Compile a policy across the fabric
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: Deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeployResult'
+        '404':
+          description: No such policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No live nodes to deploy onto, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'Compiles the ASIC, FPGA and ZC programs and the BGP announcement plan, and stores
+        them. Agents pick their program up on their next poll.
+
+
+        The plan covers every registered node, not only the live ones: a node that stopped answering needs
+        an explicit withdrawal, and one that comes back finds its program already compiled.'
+      parameters: *id005
+  /v1/fabric:
+    get:
+      summary: The BGP announcement plan and the compiled programs
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: The current fabric.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Fabric'
+        '401': *id002
+        '403': *id003
+  /v1/ml/samples:
+    get:
+      summary: The labelled training set
+      tags:
+      - Classifier
+      security: *id001
+      responses:
+        '200':
+          description: Every stored sample.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Sample'
+        '401': *id002
+        '403': *id003
+    post:
+      summary: Add labelled flow records
+      tags:
+      - Classifier
+      security: *id001
+      responses:
+        '200':
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stored:
+                    type: integer
+        '400':
+          description: A sample will not validate. The message names the index.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The batch would push the training set past its limit.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  stored:
+                    type: integer
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'The whole batch is refused on the first bad record: one out-of-range field would otherwise
+        train a model whose weights are all NaN.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SampleBatch'
+  /v1/ml/train:
+    post:
+      summary: Fit the ZC classifier
+      tags:
+      - Classifier
+      security: *id001
+      responses:
+        '200':
+          description: The fitted model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MLModel'
+        '400':
+          description: Fewer than two samples, a malformed body, or a fit that diverged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'An absent body takes the defaults; a malformed one is an error rather than something
+        to ignore.
+
+
+        One sample in five is held out of the fit and the reported metrics are measured on that holdout.
+        Sets below ten samples are too small to split and report training metrics with validation 0.'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrainRequest'
+  /v1/ml/model:
+    get:
+      summary: The published model weights
+      tags:
+      - Classifier
+      security:
+      - nodeToken: []
+      - operatorToken: []
+      responses:
+        '200':
+          description: The current model. ready is false when none has been fitted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MLModel'
+        '401': *id002
+        '403': *id003
+      description: Every node installs this, so a node credential may read it. It carries weights, not
+        policy or fleet detail.
+    delete:
+      summary: Retire the published model
+      tags:
+      - Classifier
+      security: *id001
+      responses:
+        '200':
+          description: Withdrawn.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MLModel'
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Agents clear their installed copy on the next poll. Without this a bad model could
+        only be removed by restarting every agent in the fleet.
+  /v1/ml/score:
+    post:
+      summary: Score one flow without running the hardware stages
+      tags:
+      - Classifier
+      security: *id001
+      responses:
+        '200':
+          description: The score.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  score:
+                    type: number
+                  label:
+                    type: integer
+                    enum:
+                    - 0
+                    - 1
+                  ready:
+                    type: boolean
+        '400':
+          description: The flow will not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Flow'
+  /v1/decide:
+    post:
+      summary: Run a flow record through a node's pipeline
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: The decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decision'
+        '400':
+          description: The flow will not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No program is deployed for that node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'Evaluates against the program deployed to that node, in the real pipeline. Useful
+        for asking what a policy would do before trusting it.
+
+
+        The flow may carry a base64 payload. Without one the game filter reports the packet uninspectable
+        and never drops it, because it refuses to judge what it was not given. Rate state accumulates
+        across calls, so repeated calls can trip a behavioural cap.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecideRequest'
 components:
   securitySchemes:
     operatorToken:
       type: http
       scheme: bearer
-      description: Full control-plane access.
+      description: Full control-plane access. SCRUBLINE_API_TOKEN.
     enrollToken:
       type: http
       scheme: bearer
-      description: Registers a node and collects its credential. Nothing else.
+      description: Registers a node and collects its credential. Nothing else. SCRUBLINE_ENROLL_TOKEN.
     nodeToken:
       type: http
       scheme: bearer
       description: Issued at registration, scoped to one node.
-security:
-  - operatorToken: []
-paths:
-  /health:
-    get:
-      summary: Liveness
-  /v1/nodes:
-    get:
-      summary: List scrubbing nodes
-  /v1/nodes/register:
-    post:
-      summary: Register a node, and issue the credential scoped to it
-      security:
-        - enrollToken: []
-        - operatorToken: []
-      description: >-
-        capacity_gbps weights the node's AS-path padding against the rest of
-        the fabric. capacity_pps is the packet-rate ceiling load-driven
-        shedding measures against; a node that declares none is never padded
-        for load.
-  /metrics:
-    get:
-      summary: Prometheus exposition for the control plane and the reporting fleet
-      description: Takes the same bearer token as /v1. Node series are built from the counters each node attached to its heartbeat.
-  /v1/nodes/{id}/stats:
-    get:
-      summary: Datapath counters a node last reported
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
+  schemas:
+    Error:
+      type: object
+      required:
+      - error
+      properties:
+        error:
+          type: string
+          description: What went wrong, in a sentence an operator can act on.
+    Match:
+      type: object
+      description: Which packets a rule applies to. Every field is optional; an empty match applies to
+        everything the stage sees.
+      properties:
+        src_cidr:
+          type: string
+          example: 198.51.100.0/24
+        dst_cidr:
+          type: string
+          example: 203.0.113.0/24
+        proto:
+          type: string
+          enum:
+          - tcp
+          - udp
+          - icmp
+          - any
+        dport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        sport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        tcp_flags:
+          type: string
+          example: syn
+    Rule:
+      type: object
+      required:
+      - id
+      - stage
+      - action
+      properties:
+        id:
+          type: string
+          description: 'Unique within the policy. Must not contain ''|'': rule ids key the per-source
+            rate table.'
+        stage:
+          type: string
+          enum:
+          - asic
+          - fpga
+          - zc
+          description: asic is TCAM ACLs, fpga is line-rate meters, zc is the userspace inspect path.
+            Only zc sees payload.
+        action:
+          type: string
+          enum:
+          - drop
+          - permit
+          - rate_limit
+          - inspect
+          - count
+          description: drop and permit are terminal. count is observe-only and never drops. rate_limit
+            meters. inspect hands the flow to the ZC path.
+        match:
+          $ref: '#/components/schemas/Match'
+        pps:
+          type: integer
+          minimum: 0
+          description: Only an fpga rate_limit, and a zc rate_limit or inspect, consume this. Set anywhere
+            else the policy is refused rather than the value silently ignored.
+        priority:
+          type: integer
+          description: First match decides, on every stage. Equal priorities keep policy order.
+        comment:
+          type: string
+    Steering:
+      type: object
+      required:
+      - prefix
+      properties:
+        prefix:
+          type: string
+          description: Must be one of the policy's protected prefixes.
+        regions:
+          type: array
+          items:
             type: string
-  /v1/nodes/{id}/heartbeat:
-    post:
-      summary: Keep a node live; a node past its TTL is not assigned prefixes
-      description: >-
-        The body is optional and may carry the node's datapath counters as a
-        "stats" object. The report is keyed to the node the path names, not to
-        anything in the body.
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
+          description: A hard boundary. A node outside these neither announces the prefix nor inspects
+            traffic for it.
+        communities:
+          type: array
+          items:
             type: string
-  /v1/nodes/{id}/program:
-    get:
-      summary: Compiled ASIC, FPGA, and ZC program a node agent installs
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
+          description: 'BGP communities to attach. Validated here because agents write them into a routing
+            daemon: only ASN:value, ASN:value:value, or a well-known name.'
+    GameMagic:
+      type: object
+      required:
+      - offset
+      - hex
+      properties:
+        offset:
+          type: integer
+          minimum: 0
+        hex:
+          type: string
+          example: deadbeef
+          description: Bytes that must appear at offset.
+    GameSignature:
+      type: object
+      description: A protocol described in the policy, for a game the platform ships no profile for.
+      properties:
+        min_len:
+          type: integer
+          minimum: 0
+        max_len:
+          type: integer
+          minimum: 0
+        packet_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: Allowed first byte. Empty allows any.
+        magic:
+          type: array
+          items:
+            $ref: '#/components/schemas/GameMagic'
+        gate:
+          type: string
+          enum:
+          - none
+          - handshake
+          description: 'A challenge gate cannot be described here: answering one means emitting protocol-correct
+            bytes, and a wrong guess breaks every client rather than failing closed.'
+        opener_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: Packet ids an unadmitted source may send.
+        complete_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: Packet ids that finish the handshake and admit the source. Required with a handshake
+            gate.
+    GameFilter:
+      type: object
+      required:
+      - id
+      description: Admits traffic to a game port only if it looks like that game. Bound to a port on a
+        protected address, not to a game the platform knows about.
+      properties:
+        id:
+          type: string
+          description: Unique within the policy. Must not contain '|'.
+        dst_cidr:
+          type: string
+        proto:
+          type: string
+          enum:
+          - tcp
+          - udp
+          - any
+        dport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        profile:
+          type: string
+          enum:
+          - raknet
+          - a2s
+          description: A built-in protocol. Omit when custom describes one inline; setting both is refused.
+        custom:
+          $ref: '#/components/schemas/GameSignature'
+        observe:
+          type: boolean
+          description: Record what the filter would have done without acting on it.
+        comment:
+          type: string
+    Policy:
+      type: object
+      required:
+      - name
+      - protected
+      properties:
+        id:
+          type: string
+          description: Assigned on save when omitted.
+        name:
+          type: string
+        protected:
+          type: array
+          items:
             type: string
-  /v1/policies:
-    get:
-      summary: List policies
-    post:
-      summary: Create or replace a policy
-      description: >-
-        Carries protected prefixes, stage rules, optional per-prefix
-        steering, and game filters. Steering regions are a hard boundary, and
-        communities are validated here because the agents write them into a
-        routing daemon. Game filters are compiled here too, so a filter that
-        cannot be compiled is refused at save rather than logged on every
-        node. A policy carrying game filters is issued a challenge secret,
-        shared across the fabric so an anycast cookie verifies on any node.
-  /v1/policies/{id}/deploy:
-    post:
-      summary: Compile policy onto the fabric and assign prefixes to live nodes
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
+          minItems: 1
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rule'
+        steering:
+          type: array
+          items:
+            $ref: '#/components/schemas/Steering'
+        games:
+          type: array
+          items:
+            $ref: '#/components/schemas/GameFilter'
+        pulse_floor_pps:
+          type: integer
+          minimum: 0
+          description: 'How loud a burst must be to count toward a burst train. Shape alone cannot decide
+            it: a sparse trickle has the same crest factor and duty cycle as an attack. Zero takes the
+            platform default.'
+        challenge_secret:
+          type: string
+          description: Generated on save when the policy carries game filters, and shipped to every node
+            so a cookie minted by one scrubber verifies on another.
+        updated_at:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          description: Bumped on every save of the same id.
+    Node:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        region:
+          type: string
+        capacity_gbps:
+          type: number
+          minimum: 0
+          description: Weights AS-path prepends against the rest of the fabric.
+        capacity_pps:
+          type: integer
+          minimum: 0
+          description: Packet-rate ceiling load-driven shedding measures against. A node that declares
+            none is never padded for load.
+        backends:
+          type: array
+          items:
             type: string
-  /v1/state:
-    get:
-      summary: The durable control-plane state a replica follows
-      description: >-
-        Operator only. Carries every policy and every node credential hash, so
-        it is not reachable with a node or enrollment credential.
-  /v1/promote:
-    post:
-      summary: Turn a replica into the primary
-      description: >-
-        Operator only, and deliberate. Promoting while the old primary still
-        lives gives two control planes compiling conflicting announcement
-        plans, so the old one must be fenced first.
-  /v1/fabric:
-    get:
-      summary: The BGP announcement plan plus compiled ASIC, FPGA, and ZC programs
-  /v1/decide:
-    post:
-      summary: Run a flow record through a node's three-stage pipeline
-  /v1/ml/samples:
-    get:
-      summary: List the labeled flow samples held for training
-    post:
-      summary: Add labeled flow samples for the ZC classifier
-  /v1/ml/train:
-    post:
-      summary: Train the logistic flow model used on the PF_RING ZC path
-  /v1/ml/model:
-    delete:
-      summary: Retire the published model; agents clear their copy on the next poll
-    get:
-      summary: Current model weights and threshold
-  /v1/ml/score:
-    post:
-      summary: Score one flow without running the hardware stages
+            enum:
+            - asic
+            - fpga
+            - zc
+          description: Stages this node can install. Empty means full-stack.
+        advertise:
+          type: string
+          description: Address peers reach this node on; its host becomes the BGP next hop.
+        last_seen:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum:
+          - ready
+          - stale
+    RegistrationResult:
+      type: object
+      properties:
+        node:
+          $ref: '#/components/schemas/Node'
+        token:
+          type: string
+          description: The credential issued to this node, scoped to it. Returned once, here, and never
+            served again. Re-registering rotates it and the previous one stops working immediately.
+    Announcement:
+      type: object
+      properties:
+        prefix:
+          type: string
+        node_id:
+          type: string
+        node_name:
+          type: string
+        region:
+          type: string
+        state:
+          type: string
+          enum:
+          - announce
+          - withdraw
+        prepends:
+          type: integer
+          description: AS-path padding. Higher means the node is a less attractive path and takes less
+            of the prefix's traffic.
+        communities:
+          type: array
+          items:
+            type: string
+        next_hop:
+          type: string
+        reason:
+          type: string
+    ACLEntry:
+      type: object
+      properties:
+        priority:
+          type: integer
+        action:
+          type: string
+        match:
+          $ref: '#/components/schemas/Match'
+        rule_id:
+          type: string
+        tcam_key:
+          type: string
+    FPGAEntry:
+      type: object
+      properties:
+        table:
+          type: string
+        priority:
+          type: integer
+        match:
+          $ref: '#/components/schemas/Match'
+        meter_pps:
+          type: integer
+        action:
+          type: string
+        rule_id:
+          type: string
+    ZCEntry:
+      type: object
+      properties:
+        cluster:
+          type: string
+        priority:
+          type: integer
+        match:
+          $ref: '#/components/schemas/Match'
+        action:
+          type: string
+        pps:
+          type: integer
+        rule_id:
+          type: string
+    Program:
+      type: object
+      description: What one node installs. Compiled from the policy and the live node set.
+      properties:
+        node_id:
+          type: string
+        policy_id:
+          type: string
+        version:
+          type: integer
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: 'Prefixes this node enforces policy on, including ones it is currently withdrawing:
+            BGP takes time to converge and traffic still arriving should be scrubbed.'
+        asic:
+          type: array
+          items:
+            $ref: '#/components/schemas/ACLEntry'
+        fpga:
+          type: array
+          items:
+            $ref: '#/components/schemas/FPGAEntry'
+        zc:
+          type: array
+          items:
+            $ref: '#/components/schemas/ZCEntry'
+        announcements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Announcement'
+        games:
+          type: array
+          items:
+            $ref: '#/components/schemas/GameFilter'
+        challenge_secret:
+          type: string
+        pulse_floor_pps:
+          type: integer
+        compiled_at:
+          type: string
+          format: date-time
+          description: Changes on every recompile, including one that reassigns prefixes without bumping
+            the policy version. Agents key their reload on it.
+    Flow:
+      type: object
+      description: One flow record.
+      properties:
+        src_ip:
+          type: string
+        dst_ip:
+          type: string
+        proto:
+          type: string
+          enum:
+          - tcp
+          - udp
+          - icmp
+        sport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        dport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        flags:
+          type: string
+          example: syn
+        pps:
+          type: integer
+          minimum: 0
+          description: The flow's observed packet rate.
+        payload:
+          type: string
+          format: byte
+          description: 'Packet bytes, base64. Only the ZC stage sees it. Without one the game filter reports
+            the packet uninspectable and never drops it: it refuses to judge what it was not given.'
+    Decision:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - drop
+          - permit
+          - rate_limit
+          - inspect
+          - count
+          - challenge
+          description: challenge means this packet is dropped and reply is emitted to the source.
+        stage:
+          type: string
+          enum:
+          - asic
+          - fpga
+          - zc
+        rule_id:
+          type: string
+        reason:
+          type: string
+        node_id:
+          type: string
+        score:
+          type: number
+          description: Classifier score, when the ZC model decided.
+        filter:
+          type: string
+          description: The game filter that decided, when one did.
+        reply:
+          type: string
+          format: byte
+          description: Bytes the datapath sends back to the source. Set only on a challenge.
+    MLModel:
+      type: object
+      properties:
+        weights:
+          type: array
+          items:
+            type: number
+        bias:
+          type: number
+        threshold:
+          type: number
+        epochs:
+          type: integer
+        loss:
+          type: number
+        accuracy:
+          type: number
+          description: Measured on the holdout, not on the samples the model was fitted on.
+        precision:
+          type: number
+          description: 'On the holdout. Watch this one: a false positive here is dropped customer traffic.'
+        recall:
+          type: number
+          description: On the holdout.
+        validation:
+          type: integer
+          description: Samples held out of the fit. Zero means the set was too small to split.
+        samples:
+          type: integer
+        ready:
+          type: boolean
+        withdrawn:
+          type: boolean
+          description: Set by DELETE /v1/ml/model. Agents clear their copy when they see it; the zero
+            model cannot signal this because it is indistinguishable from never trained.
+    Sample:
+      type: object
+      required:
+      - flow
+      - label
+      properties:
+        flow:
+          $ref: '#/components/schemas/Flow'
+        label:
+          type: integer
+          enum:
+          - 0
+          - 1
+          description: 0 clean, 1 attack.
+    StageStats:
+      type: object
+      properties:
+        stage:
+          type: string
+        dropped:
+          type: integer
+        permitted:
+          type: integer
+        pps_dropped:
+          type: integer
+        pps_permitted:
+          type: integer
+    RuleStats:
+      type: object
+      properties:
+        rule_id:
+          type: string
+        stage:
+          type: string
+        matches:
+          type: integer
+        drops:
+          type: integer
+        pps_seen:
+          type: integer
+        pps_dropped:
+          type: integer
+    GameStats:
+      type: object
+      properties:
+        filter_id:
+          type: string
+        profile:
+          type: string
+        inspected:
+          type: integer
+        dropped:
+          type: integer
+        challenged:
+          type: integer
+        uninspectable:
+          type: integer
+          description: Packets the filter was given no payload for. It never drops on these, so a rising
+            value means the datapath is not supplying payloads and the filter is doing nothing.
+        pps_dropped:
+          type: integer
+    PulseStats:
+      type: object
+      properties:
+        prefix:
+          type: string
+        pulsing:
+          type: boolean
+          description: True while a burst train is recognised, including through the quiet stretches between
+            bursts.
+        peak_pps:
+          type: integer
+        mean_pps:
+          type: integer
+        crest:
+          type: number
+          description: Peak over mean. Steady traffic sits near one however heavy it is.
+        duty_cycle:
+          type: number
+        bursts:
+          type: integer
+        held_for_seconds:
+          type: number
+    MLStats:
+      type: object
+      properties:
+        ready:
+          type: boolean
+        scored:
+          type: integer
+        drops:
+          type: integer
+        passes:
+          type: integer
+    Stats:
+      type: object
+      description: A node's datapath counters. Most are monotonic totals; the fields documented as rates
+        are moving averages.
+      properties:
+        decisions:
+          type: integer
+        unowned:
+          type: integer
+          description: Flows for a prefix this node does not carry. A rising value means the steering
+            layer and the fabric disagree about who scrubs what.
+        stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/StageStats'
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuleStats'
+        games:
+          type: array
+          items:
+            $ref: '#/components/schemas/GameStats'
+        pulse:
+          type: array
+          items:
+            $ref: '#/components/schemas/PulseStats'
+        ml:
+          $ref: '#/components/schemas/MLStats'
+        pulsing:
+          type: boolean
+        pulse_peak_pps:
+          type: integer
+        game_sessions:
+          type: integer
+        game_sessions_max:
+          type: integer
+        rate_buckets:
+          type: integer
+        rate_buckets_max:
+          type: integer
+        offered_pps:
+          type: integer
+          description: Moving average over load_window_seconds, not a total.
+        dropped_pps:
+          type: integer
+          description: Moving average over load_window_seconds, not a total.
+        load_window_seconds:
+          type: integer
+    Report:
+      type: object
+      properties:
+        node_id:
+          type: string
+        name:
+          type: string
+        region:
+          type: string
+        stats:
+          $ref: '#/components/schemas/Stats'
+        reported_at:
+          type: string
+          format: date-time
+    Fabric:
+      type: object
+      properties:
+        announcements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Announcement'
+        programs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Program'
+        ml:
+          $ref: '#/components/schemas/MLModel'
+    Snapshot:
+      type: object
+      description: 'The durable control-plane state a replica follows. Liveness, derived state and reported
+        counters are deliberately absent: they are either worthless across a restart or recompiled from
+        the policy.'
+      properties:
+        version:
+          type: integer
+        saved_at:
+          type: string
+          format: date-time
+        seq:
+          type: integer
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        node_tokens:
+          type: object
+          additionalProperties:
+            type: string
+          description: Node id to credential hash. Hashes only; a dump of this hands nobody a working
+            credential.
+        policies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Policy'
+        last_policy_id:
+          type: string
+        samples:
+          type: array
+          items:
+            $ref: '#/components/schemas/Sample'
+        model:
+          $ref: '#/components/schemas/MLModel'
+    DeployResult:
+      type: object
+      properties:
+        policy_id:
+          type: string
+        version:
+          type: integer
+        announcements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Announcement'
+        nodes:
+          type: integer
+        datapath:
+          type: string
+        ml_ready:
+          type: boolean
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+        product:
+          type: string
+        datapath:
+          type: string
+        mode:
+          type: string
+          enum:
+          - primary
+          - replica
+    SampleBatch:
+      type: object
+      required:
+      - samples
+      properties:
+        samples:
+          type: array
+          items:
+            $ref: '#/components/schemas/Sample'
+          minItems: 1
+    TrainRequest:
+      type: object
+      properties:
+        epochs:
+          type: integer
+          minimum: 1
+          description: Default 200.
+        lr:
+          type: number
+          description: Learning rate. Default 0.15.
+        threshold:
+          type: number
+          description: Score at or above which a flow is an attack. Default 0.7.
+    DecideRequest:
+      type: object
+      required:
+      - node_id
+      - flow
+      properties:
+        node_id:
+          type: string
+        flow:
+          $ref: '#/components/schemas/Flow'

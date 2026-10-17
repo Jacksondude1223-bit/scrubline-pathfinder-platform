@@ -1,0 +1,293 @@
+openapi: 3.0.3
+info:
+  title: Scrubline scrub-node agent
+  version: 0.2.0
+  description: 'The HTTP surface a scrubbing node serves beside its datapath. This is a different service
+    from the control plane, on its own port, with its own credential.
+
+
+    `SCRUBLINE_NODE_API_TOKEN` guards everything here except `/health`. It is deliberately not the operator
+    credential and not the node''s control-plane credential: these endpoints are read-only local surfaces
+    for a scraper, a BGP speaker and an operator debugging a policy, so compromising one buys none of
+    the control plane.
+
+
+    The agent serves TLS with `-tls-cert`/`-tls-key` and refuses a routable address without it.'
+servers:
+- url: https://127.0.0.1:9091
+  description: A node agent serving TLS
+- url: http://127.0.0.1:9091
+  description: Loopback without TLS
+security:
+- nodeAPIToken: []
+paths:
+  /health:
+    get:
+      summary: Liveness
+      security: []
+      description: Open, for probes. It carries no policy detail.
+      responses:
+        '200':
+          description: The agent is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeHealth'
+  /metrics:
+    get:
+      summary: Prometheus exposition for this node's datapath
+      description: Per-rule hits, per-stage verdicts, game filter counters, pulse shape and the steering
+        posture. It names rule ids and traffic volumes, so it takes the token.
+      responses:
+        '200':
+          description: Exposition in the Prometheus text format.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Only GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: The exposition could not be rendered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /bgp:
+    get:
+      summary: What this node should advertise
+      description: 'Where a BGP speaker picks up its plan. Scrubline does not speak BGP: it compiles the
+        plan, the way it compiles the TCAM, FPGA and ZC programs, and serves it here.
+
+
+        `?format=exabgp` returns ExaBGP commands as plain text instead of JSON.'
+      parameters:
+      - name: format
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - exabgp
+        description: Return ExaBGP commands as text/plain rather than JSON.
+      responses:
+        '200':
+          description: The plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BGPPlan'
+            text/plain:
+              schema:
+                type: string
+              example: 'announce route 203.0.113.0/24 next-hop 198.51.100.3 as-path [ 65001 65001 65001
+                ]
+
+                withdraw route 203.0.114.10/32 next-hop 198.51.100.3
+
+                '
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Only GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /decide:
+    post:
+      summary: Run a flow record through this node's datapath
+      description: 'Evaluates in the node''s own pipeline, against the program it currently holds, with
+        its own rate and session state. Unlike the control plane''s /v1/decide this is the state real
+        traffic is being judged against, so repeated calls accumulate and can trip a behavioural cap or
+        clear a game filter''s gate.
+
+
+        A flow may carry a base64 payload; without one the game filter reports it uninspectable and never
+        drops it.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Flow'
+      responses:
+        '200':
+          description: The decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Decision'
+        '400':
+          description: The flow will not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Only POST.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    nodeAPIToken:
+      type: http
+      scheme: bearer
+      description: SCRUBLINE_NODE_API_TOKEN. Guards this agent's local endpoints only.
+  schemas:
+    Error:
+      type: object
+      required:
+      - error
+      properties:
+        error:
+          type: string
+          description: What went wrong, in a sentence an operator can act on.
+    Flow:
+      type: object
+      description: One flow record.
+      properties:
+        src_ip:
+          type: string
+        dst_ip:
+          type: string
+        proto:
+          type: string
+          enum:
+          - tcp
+          - udp
+          - icmp
+        sport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        dport:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        flags:
+          type: string
+          example: syn
+        pps:
+          type: integer
+          minimum: 0
+          description: The flow's observed packet rate.
+        payload:
+          type: string
+          format: byte
+          description: 'Packet bytes, base64. Only the ZC stage sees it. Without one the game filter reports
+            the packet uninspectable and never drops it: it refuses to judge what it was not given.'
+    Decision:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - drop
+          - permit
+          - rate_limit
+          - inspect
+          - count
+          - challenge
+          description: challenge means this packet is dropped and reply is emitted to the source.
+        stage:
+          type: string
+          enum:
+          - asic
+          - fpga
+          - zc
+        rule_id:
+          type: string
+        reason:
+          type: string
+        node_id:
+          type: string
+        score:
+          type: number
+          description: Classifier score, when the ZC model decided.
+        filter:
+          type: string
+          description: The game filter that decided, when one did.
+        reply:
+          type: string
+          format: byte
+          description: Bytes the datapath sends back to the source. Set only on a challenge.
+    Announcement:
+      type: object
+      properties:
+        prefix:
+          type: string
+        node_id:
+          type: string
+        node_name:
+          type: string
+        region:
+          type: string
+        state:
+          type: string
+          enum:
+          - announce
+          - withdraw
+        prepends:
+          type: integer
+          description: AS-path padding. Higher means the node is a less attractive path and takes less
+            of the prefix's traffic.
+        communities:
+          type: array
+          items:
+            type: string
+        next_hop:
+          type: string
+        reason:
+          type: string
+    NodeHealth:
+      type: object
+      properties:
+        node:
+          type: string
+        name:
+          type: string
+        datapath:
+          type: string
+    BGPPlan:
+      type: object
+      properties:
+        node:
+          type: string
+        local_as:
+          type: integer
+        announcements:
+          type: array
+          items:
+            $ref: '#/components/schemas/Announcement'
+        exabgp:
+          type: array
+          items:
+            type: string
+          description: The plan rendered as ExaBGP commands.
+        error:
+          type: string
+          description: Set when the plan could not be rendered. The datapath keeps running, but this node
+            is advertising something other than what the control plane decided.
