@@ -514,7 +514,8 @@ connections cannot hold one open.
 Full reference and a worked walkthrough: **[`docs/api.md`](docs/api.md)**.
 Machine-readable specs: [`api/openapi.yaml`](api/openapi.yaml) for the control
 plane, [`api/node-openapi.yaml`](api/node-openapi.yaml) for the node agent.
-`make spec-check` verifies both against the routes the code actually serves.
+`make spec-check` verifies both against the routes the code actually serves,
+and runs in CI alongside `make test`.
 
 Policies are validated on save. A prefix or match CIDR that does not parse is rejected rather than compiled into a rule that silently never matches, and flow records are rejected if `pps` is negative or a port falls outside 0..65535.
 

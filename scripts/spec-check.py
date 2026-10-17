@@ -6,8 +6,15 @@ verifies three things: every $ref and security scheme resolves, every operation
 declares a summary and responses, and the documented routes match the server's
 dispatch switch in both directions.
 """
-import yaml, re, sys
-probs=[]
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("spec-check needs PyYAML: python3 -m pip install PyYAML")
+
+probs = []
 for f in ('api/openapi.yaml','api/node-openapi.yaml'):
     d=yaml.safe_load(open(f))
     schemas=d['components']['schemas']; defined=set(d['components']['securitySchemes'])
