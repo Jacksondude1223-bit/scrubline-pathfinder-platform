@@ -11,6 +11,11 @@ The specs are the contract — schemas, status codes and which credential reache
 what. This page is the guide: how the pieces fit, and the behaviours that
 surprise people. Every response below is copied from a real run.
 
+To try these against something live rather than reading them, `make up` brings
+up a seeded fabric with traffic running through it and prints two customers'
+credentials; [`deploy/README.md`](../deploy/README.md) covers putting it on a
+URL you can reach from elsewhere.
+
 ## Credentials
 
 Three secrets, three blast radii. A scrubbing node sits at the edge in someone

@@ -309,29 +309,45 @@ sh scripts/demo.sh
 go run ./cmd/scrubctl fabric
 ```
 
-Three nodes in Docker. The nodes wait on the API's healthcheck, so they no
-longer race it on startup. The token is read from the environment rather than
-baked into the compose file, so it has to be set:
+### A demo fabric in containers
 
 ```sh
-SCRUBLINE_API_TOKEN=dev-scrubline-token \
-SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll \
-SCRUBLINE_NODE_API_TOKEN=dev-scrubline-node \
-  docker compose -f deploy/docker-compose.yml up --build
+make up
+```
+
+That brings up a control plane, three scrubbers in three regions, a seeded
+policy protecting two customers, and a generator driving traffic through the
+datapath — then prints both customers' credentials. `make creds` reprints
+them, `make logs` follows everything, `make down` stops it.
+
+The generator matters more than it sounds. Without traffic the whole stack
+reports zeros, which is indistinguishable from a stack that is broken, so
+trying the analytics API against an idle fabric teaches nothing. It posts flow
+records to each agent's `/decide`, which runs them through the real pipeline:
+steady legitimate traffic, a flood every few minutes, and a burst train whose
+average stays under every watermark on purpose.
+
+```sh
+curl -H "Authorization: Bearer $NORTHWIND" localhost:8080/v1/analytics/overview | jq
+curl -i -H "Authorization: Bearer $NORTHWIND" localhost:8080/v1/nodes   # 403
+```
+
+The control API is published on 8080 and the three node dataplanes on 9091,
+9092 and 9093, all bound to loopback:
+
+```sh
+curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" \
+  -d '{"dst_ip":"203.0.113.10","proto":"tcp","dport":443,"pps":10}' \
+  http://127.0.0.1:9091/decide
 ```
 
 The compose file passes `-insecure`, because the compose network is not
 loopback and these containers carry no certificates. That is for the demo; a
-deployment mounts a certificate and drops the flag.
-
-The control API is published on 8080 and the three node dataplanes on 9091,
-9092, and 9093:
-
-```sh
-curl -H "Authorization: Bearer dev-scrubline-node" \
-  -d '{"dst_ip":"203.0.113.10","proto":"tcp","dport":443,"pps":10}' \
-  http://127.0.0.1:9091/decide
-```
+deployment mounts a certificate and drops the flag. Which is why the published
+ports bind to loopback and not `0.0.0.0` — putting this on a routable address
+puts credentials on the wire in the clear.
+**[`deploy/README.md`](deploy/README.md)** covers reaching it on a real URL
+without doing that.
 
 ## Observability
 

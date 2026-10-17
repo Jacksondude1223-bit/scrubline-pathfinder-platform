@@ -269,3 +269,51 @@ func TestPrefixTableIsBounded(t *testing.T) {
 		t.Fatalf("expected the table held at %d, got %d", MaxPrefixes, got)
 	}
 }
+
+// The headline peak is an offered-side number, so it can never read below the
+// rate being scrubbed. A steady flood has no burst shape for the pulse
+// detector to find, which used to leave peak_pps at zero while the dropped
+// rate climbed — a customer reading "we scrubbed 3.8M pps of your 1.2M pps"
+// has been shown something incoherent.
+func TestPeakIsNeverBelowWhatWasScrubbed(t *testing.T) {
+	h := newHarness()
+	// A flood the burst detector does not flag: steady, so no crest, so the
+	// node reports peak_pps zero while the load window sees it plainly.
+	h.Observe(report("node-a", "203.0.113.0/24", pipeline.PrefixStats{
+		Flows: 500, FlowsDropped: 480,
+		Offered: 900_000, Dropped: 850_000,
+		OfferedPPS: 900_000, DroppedPPS: 850_000, PeakPPS: 0,
+	}), Attribution{})
+
+	got := h.Summary("203.0.113.0/24", time.Hour)
+	if got.PeakPPS < got.PeakDroppedPPS {
+		t.Fatalf("peak %d is below the scrubbed peak %d", got.PeakPPS, got.PeakDroppedPPS)
+	}
+	if got.PeakPPS < got.OfferedPPS {
+		t.Fatalf("peak %d is below the current offered rate %d", got.PeakPPS, got.OfferedPPS)
+	}
+	if got.PeakPPS != 900_000 {
+		t.Fatalf("expected the load window's rate to stand as the peak, got %d", got.PeakPPS)
+	}
+
+	events := h.Events("203.0.113.0/24", time.Hour)
+	if len(events) != 1 {
+		t.Fatalf("expected the flood recorded, got %d events", len(events))
+	}
+	if events[0].PeakPPS < events[0].PeakDroppedPPS {
+		t.Fatalf("event peak %d is below its scrubbed peak %d", events[0].PeakPPS, events[0].PeakDroppedPPS)
+	}
+}
+
+// A burst the load window averages away still sets the peak: the two
+// measurements exist because either can be the one that sees the attack.
+func TestABurstPeakSurvivesTheLoadWindow(t *testing.T) {
+	h := newHarness()
+	h.Observe(report("node-a", "203.0.113.0/24", pipeline.PrefixStats{
+		OfferedPPS: 12_000, DroppedPPS: 11_000, PeakPPS: 1_400_000, Pulsing: true,
+	}), Attribution{})
+
+	if got := h.Summary("203.0.113.0/24", time.Hour).PeakPPS; got != 1_400_000 {
+		t.Fatalf("expected the sub-second burst to stand as the peak, got %d", got)
+	}
+}
