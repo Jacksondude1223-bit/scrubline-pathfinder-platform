@@ -33,8 +33,15 @@ const MaxPrepends = 5
 // shedding adds per-node padding on top of the capacity baseline, keyed by
 // node ID. It is how measured load reaches the routing table; the decision to
 // pad is made in internal/steering, which owns the hysteresis and the dwell.
-// Only liveness can withdraw a node: load pads, it never removes.
-func Plan(policy model.Policy, nodes []model.Node, shedding map[string]int) []model.Announcement {
+// Load pads, it never removes.
+//
+// health is what each node last reported about its return tunnels. It is the
+// second thing that can withdraw a node, and for the same reason liveness
+// can: a node that cannot deliver a prefix's scrubbed traffic must not be
+// attracting it. Announcing a prefix whose return path is down is worse than
+// never announcing it — BGP hands over the customer's traffic and the node
+// drops all of it.
+func Plan(policy model.Policy, nodes []model.Node, shedding map[string]int, health TunnelHealth) []model.Announcement {
 	steering := steeringByPrefix(policy)
 	// Padding is relative to the largest node that is actually announcing. A
 	// node that has gone stale is not attracting traffic, so weighting the
@@ -65,10 +72,18 @@ func Plan(policy model.Policy, nodes []model.Node, shedding map[string]int) []mo
 				Communities: append([]string(nil), st.Communities...),
 				NextHop:     nextHop(n),
 			}
-			if n.Status == model.NodeStale {
+			canDeliver, why := deliverable(policy, n, prefix, health)
+			switch {
+			case n.Status == model.NodeStale:
 				a.State = model.StateWithdraw
 				a.Reason = "node has not heartbeated within its TTL"
-			} else {
+			case !canDeliver:
+				// Liveness is checked first: a node that is not answering is
+				// already withdrawn, and the state of its tunnels is not the
+				// useful thing to say about it.
+				a.State = model.StateWithdraw
+				a.Reason = why
+			default:
 				base := prependsFor(n, maxCapacity)
 				extra := shedding[n.ID]
 				if extra < 0 {
@@ -225,7 +240,13 @@ func Compile(policy model.Policy, nodes []model.Node, plan []model.Announcement)
 			Games:           gamesFor(policy, prefixes, stages[model.StageZC]),
 			ChallengeSecret: policy.ChallengeSecret,
 			PulseFloorPPS:   policy.PulseFloorPPS,
-			CompiledAt:      now,
+			// Where this node sends what it has scrubbed, and which
+			// customers it peers with. Both are per node: the tunnels
+			// because every node carrying a prefix needs its own, the
+			// sessions because a customer peers where they have a path.
+			Tunnels:    TunnelsFor(policy, n, prefixes),
+			Sessions:   SessionsFor(policy, n),
+			CompiledAt: now,
 		}
 		for _, rule := range policy.Rules {
 			// A node only gets entries for the backends it advertised. Handing

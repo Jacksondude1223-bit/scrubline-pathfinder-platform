@@ -24,7 +24,7 @@ func TestThreeStageDropPath(t *testing.T) {
 		},
 	}
 	nodes := []model.Node{{ID: "node-a", Name: "scrub-a", CapacityGbps: 100, Status: model.NodeReady}}
-	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil))
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil, nil))
 	pipe := New(*progs["node-a"])
 
 	acl := pipe.Decide(model.Flow{SrcIP: "198.51.100.9", DstIP: "203.0.113.10", Proto: "udp", DPort: 19132, PPS: 10})
@@ -52,7 +52,7 @@ func TestEveryNodeEnforcesEveryPrefix(t *testing.T) {
 	policy := model.Policy{ID: "pol-1", Version: 1, Protected: []string{
 		"203.0.113.0/24", "203.0.114.0/24", "203.0.115.0/24",
 	}}
-	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil))
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil, nil))
 
 	flow := model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.114.9", Proto: "udp", PPS: 10}
 	for _, n := range nodes {

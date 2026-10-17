@@ -109,6 +109,175 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /tunnels:
+    get:
+      summary: The return paths this node should be holding open
+      description: 'Where whatever provisions interfaces on this box picks up its work. Scrubline does
+        not create interfaces, the same way it does not speak BGP: it compiles the intent and serves it,
+        so what the fabric wants can be read and diffed rather than inferred from the state of a machine.
+
+
+        The fabric is anycast, so this is a fan-out rather than an assignment — every node carrying a
+        customer''s prefixes holds its own tunnel to the same customer endpoint, from its own address.
+
+
+        `?format=iproute2` returns the configuration as plain text instead of JSON.'
+      parameters:
+      - name: format
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - iproute2
+        description: Return iproute2 and nftables lines as text/plain rather than JSON.
+      responses:
+        '200':
+          description: The return paths, their rendered configuration, and what has been reported about
+            them.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node:
+                    type: string
+                  tunnels:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NodeTunnel'
+                  iproute2:
+                    type: array
+                    items:
+                      type: string
+                  status:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TunnelStatus'
+                  error:
+                    type: string
+                    description: Set when the configuration could not be rendered. The datapath keeps
+                      running, but this node may be attracting traffic it cannot deliver.
+            text/plain:
+              schema:
+                type: string
+              example: 'ip link add scr-northwind type gre local 192.0.2.1 remote 198.51.100.1 key 42
+
+                ip link set scr-northwind mtu 1472 up
+
+                ip route replace 203.0.113.0/24 dev scr-northwind
+
+                '
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Report what the provisioner actually built
+      description: 'The one write this agent accepts. Whatever builds the tunnels says which are carrying
+        traffic; the agent forwards that on its next heartbeat, and a tunnel reported down withdraws its
+        prefixes from this node.
+
+
+        A node announcing a prefix whose return path is down is worse than one that never announced it:
+        BGP hands over the customer''s traffic and it is dropped. That failure looks healthy from every
+        other angle — the datapath counters are fine and the announcements are up — so this report is
+        the only thing that catches it.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tunnels:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/TunnelStatus'
+      responses:
+        '200':
+          description: Recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted:
+                    type: integer
+        '400':
+          description: A status is missing its tunnel id, or names a state that is not up, down or unknown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /sessions:
+    get:
+      summary: The customer BGP peerings this node terminates
+      description: 'For the BGP daemon running beside this agent. Rendered as BIRD rather than as the
+        ExaBGP commands /bgp serves, and the split is deliberate: announcing is an imperative act, which
+        is what a command pipe is for, while peering with a customer is a standing configuration with
+        an import filter and a prefix limit on it.
+
+
+        The filter accepts the policy''s prefixes and anything more specific inside them. Routes learned
+        here do not add themselves to the protected set.
+
+
+        `?format=bird` returns the configuration as plain text instead of JSON.'
+      parameters:
+      - name: format
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - bird
+        description: Return BIRD configuration as text/plain rather than JSON.
+      responses:
+        '200':
+          description: The peerings and their rendered configuration.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node:
+                    type: string
+                  sessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Session'
+                  bird:
+                    type: array
+                    items:
+                      type: string
+                  error:
+                    type: string
+            text/plain:
+              schema:
+                type: string
+              example: "protocol bgp cust_northwind {\n    local 192.0.2.1 as 65000;\n    neighbor 198.51.100.1\
+                \ as 64512;\n}\n"
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Only GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /decide:
     post:
       summary: Run a flow record through this node's datapath
@@ -292,3 +461,135 @@ components:
           type: string
           description: Set when the plan could not be rendered. The datapath keeps running, but this node
             is advertising something other than what the control plane decided.
+    NodeTunnel:
+      type: object
+      description: One node's instance of a policy Tunnel, with the local end filled in and the derived
+        values resolved, so the agent renders configuration rather than recomputing policy.
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum:
+          - gre
+          - ipip
+        local:
+          type: string
+          description: This node's tunnel_src.
+        remote:
+          type: string
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: The tunnel's prefixes that this node actually carries.
+        mtu:
+          type: integer
+        mss_clamp:
+          type: integer
+        key:
+          type: integer
+        required:
+          type: boolean
+        interface:
+          type: string
+          example: scr-northwind
+          description: The link name this compiles to, inside the kernel's 15-character limit.
+        comment:
+          type: string
+    Session:
+      type: object
+      required:
+      - id
+      - peer_ip
+      - peer_as
+      - prefixes
+      description: 'A BGP peering with a customer, for customers who announce their own prefixes rather
+        than having them typed into a policy. What the session may carry is still declared here: a route
+        learned from a customer does not add itself to the protected set, or a peer that leaked a supernet
+        would have the fabric announcing address space it was never asked to protect.'
+      properties:
+        id:
+          type: string
+          description: Lowercase letters, digits, dashes and underscores. Becomes the peering's name in
+            the rendered configuration.
+        peer_ip:
+          type: string
+          example: 198.51.100.1
+        peer_as:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+        local_as:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: The AS the fabric peers from. Zero takes the node's own; a session with neither
+            is refused rather than coming up announcing from whatever the daemon happened to hold.
+        prefixes:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: What the session accepts, each one the policy protects. The rendered filter admits
+            these and anything more specific inside them, because customers de-aggregate under attack
+            and a filter that refused that would drop the announcement when it mattered most.
+        max_prefixes:
+          type: integer
+          minimum: 0
+          description: Tears the session down past this many accepted routes. Zero derives a limit with
+            headroom over the filter — a backstop against a leak, not an inventory.
+        password:
+          type: string
+          description: 'TCP-MD5 secret, shipped only to the nodes terminating this session. Printable
+            ASCII without spaces, quotes or backslashes: it is written into a routing daemon''s configuration,
+            so a value that could close its string is refused rather than quoted.'
+        multihop:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: TTL for a peer that is not directly attached.
+        passive:
+          type: boolean
+          description: Wait for the customer to connect rather than dialling them.
+        nodes:
+          type: array
+          items:
+            type: string
+          description: Node ids or names that terminate this session.
+        regions:
+          type: array
+          items:
+            type: string
+          description: 'Regions that terminate it. Empty nodes and regions means every node, which is
+            rarely wanted: a customer peers where they have a path, not with the whole fabric.'
+        comment:
+          type: string
+    TunnelStatus:
+      type: object
+      required:
+      - tunnel_id
+      - state
+      description: What a node's provisioner says about one return path. Nodes attach these to the heartbeat
+        they already send, because a tunnel that went down between two polls is a prefix being black-holed
+        until the next one.
+      properties:
+        tunnel_id:
+          type: string
+        state:
+          type: string
+          enum:
+          - up
+          - down
+          - unknown
+          description: 'A tunnel reported down withdraws its prefixes from that node. One that has never
+            reported does not: absence of a report usually means nothing is reporting, and inferring failure
+            from silence would blank the fabric of any operator who has not wired a provisioner up yet.
+            Set required on the tunnel to reverse that judgement.'
+        detail:
+          type: string
+          description: Free text from the provisioner, carried through unchanged.
+        reported_at:
+          type: string
+          format: date-time
+          description: 'Stamped by the control plane, not the node: the fleet''s clocks are not synchronised.'

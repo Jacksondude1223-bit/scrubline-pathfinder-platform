@@ -83,4 +83,14 @@ cat <<BANNER
   Traffic builds over the first minute or so, and the first flood starts about
   20 seconds in. Until then the numbers are honestly zero.
 
+  The return paths each node holds open, and the customer peering:
+    curl -H "Authorization: Bearer \$SCRUBLINE_NODE_API_TOKEN" "http://127.0.0.1:9091/tunnels?format=iproute2"
+    curl -H "Authorization: Bearer \$SCRUBLINE_NODE_API_TOKEN" "http://127.0.0.1:9091/sessions?format=bird"
+
+  Tell a node its return path died, and watch that prefix get withdrawn from
+  it alone while the rest of the fabric keeps carrying it:
+    curl -X POST -H "Authorization: Bearer \$SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/tunnels \\
+      -d '{"tunnels":[{"tunnel_id":"northwind","state":"down"}]}'
+    scrubctl bgp
+
 BANNER

@@ -45,7 +45,7 @@ services:
     environment:
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
       SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
-    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-a", "-advertise", "node-a:9091", "-region", "iad", "-capacity", "100", "-capacity-pps", "4000000", "-listen", "0.0.0.0:9091"]
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-a", "-advertise", "node-a:9091", "-tunnel-src", "192.0.2.1", "-local-as", "65000", "-region", "iad", "-capacity", "100", "-capacity-pps", "4000000", "-listen", "0.0.0.0:9091"]
     ports:
       - "${BIND_ADDR:-127.0.0.1}:9091:9091"
     depends_on:
@@ -66,7 +66,7 @@ services:
     environment:
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
       SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
-    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-b", "-advertise", "node-b:9091", "-region", "fra", "-capacity", "80", "-capacity-pps", "3000000", "-listen", "0.0.0.0:9091"]
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-b", "-advertise", "node-b:9091", "-tunnel-src", "192.0.2.2", "-local-as", "65000", "-region", "fra", "-capacity", "80", "-capacity-pps", "3000000", "-listen", "0.0.0.0:9091"]
     ports:
       - "${BIND_ADDR:-127.0.0.1}:9092:9091"
     depends_on:
@@ -87,7 +87,7 @@ services:
     environment:
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
       SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
-    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-c", "-advertise", "node-c:9091", "-region", "sin", "-capacity", "40", "-capacity-pps", "1500000", "-listen", "0.0.0.0:9091"]
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-c", "-advertise", "node-c:9091", "-tunnel-src", "192.0.2.3", "-local-as", "65000", "-region", "sin", "-capacity", "40", "-capacity-pps", "1500000", "-listen", "0.0.0.0:9091"]
     ports:
       - "${BIND_ADDR:-127.0.0.1}:9093:9091"
     depends_on:

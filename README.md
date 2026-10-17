@@ -2,7 +2,7 @@
 
 Distributed denial-of-service scrubbing for SecNov. Multi-node, API-controlled, and built on ASIC/TCAM ACLs, FPGA meters, and PF_RING ZC. This is the cloud fabric, not the XDP host filter.
 
-Attack traffic is steered onto scrubbing nodes by anycast. Each node drops in hardware first, then meters in the FPGA, then hands residual flows to a PF_RING ZC userspace inspect path. The control API compiles one policy into all three programs and into the fabric's BGP posture.
+Attack traffic is steered onto scrubbing nodes by anycast. Each node drops in hardware first, then meters in the FPGA, then hands residual flows to a PF_RING ZC userspace inspect path. Clean traffic goes back to the customer's own edge over a GRE or IPIP tunnel, because once the scrubbers announce a prefix there is no ordinary route back to it. The control API compiles one policy into all three datapath programs, the fabric's BGP posture, the return paths, and any BGP sessions the customer peers over.
 
 A node counts as live while it has heartbeated within the last 30 seconds. A node past that window is reported `stale` and is withdrawn from anycast, so traffic moves to the nodes still answering.
 
@@ -375,6 +375,8 @@ work":
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
 - `scrubline_prefix_offered_pps{node,prefix}` and `scrubline_prefix_dropped_pps{node,prefix}` — the same rates broken down by the protected prefix the traffic was aimed at. The node-wide pair cannot answer "which customer is being attacked": a scrubber carries many prefixes at once.
 - `scrubline_prefix_flows_total{node,prefix}`, `scrubline_prefix_flows_dropped_total{...}`, `scrubline_prefix_offered_total{...}` and `scrubline_prefix_dropped_total{...}` — the cumulative per-prefix counters the customer-facing analytics are deltaed from.
+- `scrubline_tunnel_up{node,tunnel,remote}` — 1 when a return path is reported carrying traffic, 0 when reported down. A never-reported tunnel is **absent**, not zero: `scrubline_tunnel_reported` is how you tell "nothing is reporting" from "it is broken".
+- `scrubline_tunnel_mtu_bytes{node,tunnel}` and `scrubline_tunnel_mss_clamp_bytes{...}` — the derived encapsulation numbers, so a hung-TCP complaint can be checked against them rather than guessed at.
 - `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
 
 Counters survive a reprogram for rules that stay in the policy, so a poll every
@@ -391,6 +393,81 @@ the published model's holdout metrics, and
 curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      http://127.0.0.1:8080/metrics
 curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/metrics
 ```
+
+## Return paths
+
+BGP gets a customer's traffic to the fabric. It cannot get it back: once the
+scrubbers are announcing the prefix, a route toward it leads to the
+scrubbers. Clean traffic is encapsulated to the customer's own edge instead,
+and that return path is part of the policy rather than something arranged
+alongside it.
+
+```json
+"tunnels": [{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"key":42}]
+```
+
+Nodes supply the local end with `-tunnel-src`, because it is per node, not
+per tunnel. The fabric is anycast, so a return path fans out rather than
+being assigned: every node carrying the prefix holds its own tunnel to the
+one customer endpoint. Ten scrubbers protecting one customer is ten tunnels.
+That is the cost of not pinning a prefix to one box.
+
+The agent serves the compiled result at `/tunnels`, the way it serves the
+announcement plan at `/bgp` — Scrubline does not create interfaces any more
+than it speaks BGP. The MTU and the TCP MSS clamp are derived from the
+encapsulation's overhead (1476/1436 for GRE, 1472/1432 with a key,
+1480/1440 for IPIP) and an MTU that does not fit is refused with the one
+that does. The clamp is the part people skip: without it, a customer whose
+path drops the ICMP that path-MTU discovery needs sees TCP complete its
+handshake and then hang, which reads as a scrubbing fault.
+
+### A dead tunnel withdraws the prefix
+
+This is the failure the design is actually for. A node announcing a prefix it
+cannot deliver attracts the customer's traffic and drops all of it — and it
+looks healthy from every angle that normally matters: datapath counters fine,
+announcements up, customer offline.
+
+So whatever provisions the tunnels reports back to the agent, the agent
+carries that on the heartbeat it already sends, and the compiler treats a
+dead return path the way it treats a dead node:
+
+```
+203.0.113.0/24   edge-lhr  lhr     withdraw  -   return tunnel northwind is down
+203.0.113.0/24   edge-fra  fra     announce  0   anycast member at full preference
+```
+
+One node withdrawn, one prefix, named cause; the rest of the fabric picks the
+traffic up. A shed, not an outage, and it reverses when the tunnel recovers.
+
+A tunnel that has never reported does **not** withdraw anything. Absence of a
+report usually means nothing is reporting, and inferring failure from silence
+would blank the fabric of anyone who has not wired a provisioner up yet.
+`"required": true` reverses that for operators who would rather drop traffic
+than black-hole it. `scrubline_tunnel_up` follows the same rule: a
+never-reported tunnel is absent from the series rather than reading zero, so
+an alert on it does not fire across a fleet that simply is not reporting.
+
+### Customer BGP sessions
+
+For customers who announce their own prefixes rather than having them typed
+into a policy:
+
+```json
+"sessions": [{"id":"northwind","peer_ip":"198.51.100.1","peer_as":64512,
+              "prefixes":["203.0.113.0/24"],"password":"...","regions":["lhr"]}]
+```
+
+These render as BIRD at the agent's `/sessions`, not as the ExaBGP commands
+`/bgp` serves. Announcing is an imperative act, which is what a command pipe
+is for; peering is a standing configuration with an import filter and a
+prefix limit on it. The filter admits the policy's prefixes and anything more
+specific inside them, since customers de-aggregate under attack.
+
+Routes learned from a customer do not add themselves to the protected set.
+The policy still decides what the fabric defends — otherwise a peer that
+leaked a supernet would have you announcing address space nobody asked you to
+protect, on the say-so of the peer.
 
 ## Customer analytics
 
@@ -640,6 +717,7 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `POST /v1/ml/train` fit the ZC logistic model
 - `GET /v1/ml/model` weights the node agent installs
 - `DELETE /v1/ml/model` retire the published model; agents clear it on the next poll
+- `POST /v1/nodes/{id}/heartbeat` also carries `tunnels`: what this node's provisioner says about its return paths
 - `GET /v1/analytics/overview` per-prefix traffic, mitigation and attack state, summed across the fabric
 - `GET /v1/analytics/series` one prefix over time; each point is the heaviest moment inside it, not an average
 - `GET /v1/analytics/events` the attack log, each entry naming the rules and filters that stopped it

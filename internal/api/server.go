@@ -33,6 +33,7 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/store"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/transport"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/tunnel"
 )
 
 // maxBody bounds every request body. Policies and sample batches are the large
@@ -386,7 +387,7 @@ func (s *Server) reconcile() {
 	}
 	live := s.Store.LiveNodes()
 	shedding := s.observeLoad(s.Store.Nodes())
-	if fabricKey(live, shedding) == s.lastLive {
+	if fabricKey(live, shedding, s.Store.TunnelHealth()) == s.lastLive {
 		return
 	}
 	if len(live) == 0 {
@@ -416,12 +417,12 @@ func (s *Server) reconcile() {
 // rather than to be left out, and a node that comes back finds its program
 // already compiled. live is the set membership is tracked against.
 func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node, shedding map[string]int) ([]model.Announcement, map[string]*model.Program, error) {
-	plan := compiler.Plan(policy, all, shedding)
+	plan := compiler.Plan(policy, all, shedding, s.Store.TunnelHealth())
 	programs := compiler.Compile(policy, all, plan)
 	if err := s.Store.PutDeploy(policy.ID, plan, programs); err != nil {
 		return nil, nil, err
 	}
-	s.lastLive = fabricKey(live, shedding)
+	s.lastLive = fabricKey(live, shedding, s.Store.TunnelHealth())
 	s.prunePipelines(programs)
 	// A customer whose policy no longer protects a prefix stops being
 	// accounted for it, rather than sitting at the numbers it had when the
@@ -436,9 +437,15 @@ func (s *Server) applyDeploy(policy model.Policy, all, live []model.Node, sheddi
 }
 
 // fabricKey identifies everything a recompile depends on: which nodes are
-// live, and how hard each is being padded for load. A recompile only runs
-// when one of those actually changed.
-func fabricKey(live []model.Node, shedding map[string]int) string {
+// live, how hard each is being padded for load, and whether each can still
+// deliver what it scrubs. A recompile only runs when one of those actually
+// changed.
+//
+// Return-path state belongs here for the same reason liveness does. It can
+// withdraw an announcement, so a tunnel going down has to be able to move
+// the fabric; leaving it out would mean a node kept attracting a customer's
+// traffic until something unrelated happened to trigger a recompile.
+func fabricKey(live []model.Node, shedding map[string]int, health map[string]map[string]string) string {
 	ids := make([]string, 0, len(live))
 	for _, n := range live {
 		ids = append(ids, n.ID)
@@ -452,7 +459,16 @@ func fabricKey(live []model.Node, shedding map[string]int) string {
 		}
 	}
 	sort.Strings(padded)
-	return strings.Join(ids, ",") + "|" + strings.Join(padded, ",")
+
+	paths := make([]string, 0, len(health))
+	for nodeID, byTunnel := range health {
+		for tunnelID, state := range byTunnel {
+			paths = append(paths, fmt.Sprintf("%s/%s=%s", nodeID, tunnelID, state))
+		}
+	}
+	sort.Strings(paths)
+
+	return strings.Join(ids, ",") + "|" + strings.Join(padded, ",") + "|" + strings.Join(paths, ",")
 }
 
 // pipelineFor returns the cached pipeline for a node, reloading it when the
@@ -617,6 +633,7 @@ func (s *Server) controlFamilies() []metrics.Family {
 	}
 	families = append(families, telemetry.AnnouncementFamilies(plan)...)
 	families = append(families, s.steeringFamilies(nodes)...)
+	families = append(families, s.tunnelFamilies(nodes)...)
 	return append(families, s.requestFamily())
 }
 
@@ -655,6 +672,54 @@ func (s *Server) steeringFamilies(nodes []model.Node) []metrics.Family {
 		capacity.Samples = append(capacity.Samples, metrics.Sample{Labels: labels, Value: float64(n.CapacityPPS)})
 	}
 	return []metrics.Family{escalation, ratio, capacity}
+}
+
+// tunnelFamilies is the fleet's return paths: what each node should be
+// holding open, and what it says about them.
+//
+// This is the view that catches the failure the rest of the exposition
+// cannot. A node whose return tunnel is down still has healthy datapath
+// counters and may still look like it is scrubbing; the customer is simply
+// offline. Here it reads as a withdrawn prefix with a named cause.
+func (s *Server) tunnelFamilies(nodes []model.Node) []metrics.Family {
+	health := s.Store.TunnelHealth()
+	var out []metrics.Family
+	for _, n := range nodes {
+		prog, ok := s.Store.Program(n.ID)
+		if !ok || len(prog.Tunnels) == 0 {
+			continue
+		}
+		reported := make([]model.TunnelStatus, 0, len(health[n.ID]))
+		for id, state := range health[n.ID] {
+			reported = append(reported, model.TunnelStatus{TunnelID: id, State: state})
+		}
+		out = append(out, telemetry.TunnelFamilies(n.ID, n.Name, n.Region, prog.Tunnels, reported)...)
+	}
+	// Families are merged by name, because the renderer refuses duplicates
+	// and every node contributes a copy of each.
+	return mergeFamilies(out)
+}
+
+// mergeFamilies folds same-named families together, keeping the first help
+// text and concatenating the samples.
+func mergeFamilies(in []metrics.Family) []metrics.Family {
+	order := []string{}
+	byName := map[string]*metrics.Family{}
+	for _, f := range in {
+		existing, ok := byName[f.Name]
+		if !ok {
+			cp := f
+			byName[f.Name] = &cp
+			order = append(order, f.Name)
+			continue
+		}
+		existing.Samples = append(existing.Samples, f.Samples...)
+	}
+	out := make([]metrics.Family, 0, len(order))
+	for _, name := range order {
+		out = append(out, *byName[name])
+	}
+	return out
 }
 
 func (s *Server) requestFamily() metrics.Family {
@@ -942,6 +1007,12 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) string {
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, id string) {
 	var body struct {
 		Stats pipeline.Stats `json:"stats"`
+		// Tunnels is what the node's provisioner says about its return
+		// paths. It rides the heartbeat rather than having an endpoint of
+		// its own, because it has to arrive as often as liveness does: a
+		// tunnel that went down between two polls is a prefix being
+		// black-holed until the next one.
+		Tunnels []model.TunnelStatus `json:"tunnels,omitempty"`
 	}
 	reported := false
 	if err := decode(r, &body); err != nil && !errors.Is(err, io.EOF) {
@@ -957,6 +1028,30 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	// The node's identity comes from the record the control plane already
 	// holds, not from the body, so a report cannot claim to be another node.
+	if len(body.Tunnels) > 0 {
+		for i, st := range body.Tunnels {
+			if st.TunnelID == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("tunnels[%d]: tunnel_id required", i),
+				})
+				return
+			}
+			if err := tunnel.ValidateStatus(st.State); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("tunnels[%d] (%s): %v", i, st.TunnelID, err),
+				})
+				return
+			}
+		}
+		// A return path going down withdraws the prefixes it carries, so
+		// this has to reach the plan now rather than at the next unrelated
+		// recompile.
+		before := s.Store.TunnelHealth()[id]
+		s.Store.PutTunnelStatus(id, body.Tunnels)
+		if !sameHealth(before, s.Store.TunnelHealth()[id]) {
+			defer s.reconcile()
+		}
+	}
 	if reported {
 		s.Store.PutReport(id, body.Stats)
 		// Fold the counters into the customer-facing history here, which is
@@ -973,6 +1068,22 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request, id string) {
 		s.reconcile()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// sameHealth reports whether a node's return-path state is unchanged, so a
+// heartbeat that says nothing new does not trigger a recompile. Agents
+// heartbeat every couple of seconds; recompiling the fabric on each one
+// would be the whole fleet's work for no change.
+func sameHealth(before, after map[string]string) bool {
+	if len(before) != len(after) {
+		return false
+	}
+	for id, state := range before {
+		if after[id] != state {
+			return false
+		}
+	}
+	return true
 }
 
 // operatorOnly writes a refusal and reports false unless the caller holds the
@@ -1466,6 +1577,21 @@ func validateNode(n model.Node) error {
 	if n.CapacityPPS < 0 {
 		return fmt.Errorf("capacity_pps must not be negative, got %d", n.CapacityPPS)
 	}
+	if n.TunnelSrc != "" {
+		// This becomes the local end of every return tunnel the node builds
+		// and the address its customer sessions peer from, so an
+		// unparseable one is refused here rather than failing per tunnel.
+		addr, err := netip.ParseAddr(n.TunnelSrc)
+		if err != nil {
+			return fmt.Errorf("tunnel_src %q is not an IP address: %v", n.TunnelSrc, err)
+		}
+		if !addr.Is4() {
+			return fmt.Errorf("tunnel_src %q is not IPv4; only IPv4 tunnel endpoints are supported", n.TunnelSrc)
+		}
+		if addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() {
+			return fmt.Errorf("tunnel_src %q is not a usable tunnel endpoint", n.TunnelSrc)
+		}
+	}
 	for _, b := range n.Backends {
 		switch b {
 		case model.StageASIC, model.StageFPGA, model.StageZC:
@@ -1488,6 +1614,12 @@ func validatePolicy(p model.Policy) error {
 		return err
 	}
 	if err := validateGames(p); err != nil {
+		return err
+	}
+	if err := validateTunnels(p, protected); err != nil {
+		return err
+	}
+	if err := validateSessions(p, protected); err != nil {
 		return err
 	}
 	if p.PulseFloorPPS < 0 {
@@ -1541,6 +1673,63 @@ func validateSteering(p model.Policy, protected map[string]bool) error {
 				return fmt.Errorf("steering[%d].communities[%d]: %v", i, j, err)
 			}
 		}
+	}
+	return nil
+}
+
+// validateTunnels checks the return paths a policy declares.
+//
+// These compile into interface names, routes and firewall rules on every
+// node carrying the prefixes, so they are checked once here rather than
+// failing on fifty scrubbers.
+func validateTunnels(p model.Policy, protected map[string]bool) error {
+	seen := map[string]bool{}
+	// A prefix delivered over two tunnels has no answer to "which return
+	// path is authoritative", and the announcement logic would have to pick
+	// one. Backup paths are not modelled, so this is refused rather than
+	// resolved arbitrarily.
+	carrier := map[string]string{}
+	for i, t := range p.Tunnels {
+		if seen[t.ID] {
+			return fmt.Errorf("tunnels[%d]: duplicate tunnel id %q", i, t.ID)
+		}
+		seen[t.ID] = true
+		if err := tunnel.Validate(t, protected); err != nil {
+			return fmt.Errorf("tunnels[%d]: %v", i, err)
+		}
+		for _, prefix := range t.Prefixes {
+			if other, taken := carrier[prefix]; taken {
+				return fmt.Errorf("tunnels[%d] (%s): %q is already delivered over tunnel %q; a prefix has one return path",
+					i, t.ID, prefix, other)
+			}
+			carrier[prefix] = t.ID
+		}
+	}
+	return nil
+}
+
+// validateSessions checks the customer peerings a policy declares. They are
+// written into a routing daemon's configuration on the nodes that terminate
+// them, so an unvouched-for value is refused here.
+func validateSessions(p model.Policy, protected map[string]bool) error {
+	seen := map[string]bool{}
+	peers := map[string]string{}
+	for i, sess := range p.Sessions {
+		if seen[sess.ID] {
+			return fmt.Errorf("sessions[%d]: duplicate session id %q", i, sess.ID)
+		}
+		seen[sess.ID] = true
+		if err := bgp.ValidateSession(sess, protected); err != nil {
+			return fmt.Errorf("sessions[%d]: %v", i, err)
+		}
+		// Two sessions to the same peer address would compile to two BGP
+		// protocols dialling one router, which the far end rejects and the
+		// operator reads as a flapping session.
+		if other, taken := peers[sess.PeerIP]; taken {
+			return fmt.Errorf("sessions[%d] (%s): peer %s is already configured by session %q",
+				i, sess.ID, sess.PeerIP, other)
+		}
+		peers[sess.PeerIP] = sess.ID
 	}
 	return nil
 }

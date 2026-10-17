@@ -316,3 +316,71 @@ func AnnouncementFamilies(plan []model.Announcement) []metrics.Family {
 	}
 	return []metrics.Family{announced, prepends}
 }
+
+// TunnelFamilies renders a node's return paths as metrics.
+//
+// The state series is the one that matters operationally. A node announcing a
+// prefix whose return tunnel is down attracts the customer's traffic and
+// drops all of it, which looks like a successful scrub from every other
+// angle: the datapath counters are healthy, the announcements are up, and the
+// customer is offline. This is where that shows.
+func TunnelFamilies(nodeID, name, region string, tunnels []model.NodeTunnel, reported []model.TunnelStatus) []metrics.Family {
+	state := make(map[string]string, len(reported))
+	for _, r := range reported {
+		state[r.TunnelID] = r.State
+	}
+
+	up := metrics.Family{
+		Name: "scrubline_tunnel_up", Type: metrics.Gauge,
+		Help: "1 when a return tunnel is reported carrying traffic, 0 when it is reported down. A tunnel that has never reported is absent from this series rather than reading 0, because no news is not the same as bad news.",
+	}
+	required := metrics.Family{
+		Name: "scrubline_tunnel_required", Type: metrics.Gauge,
+		Help: "1 when a return tunnel must be confirmed up before its prefixes are announced from this node.",
+	}
+	reportedAt := metrics.Family{
+		Name: "scrubline_tunnel_reported", Type: metrics.Gauge,
+		Help: "1 when the local provisioner has said anything at all about this tunnel. Zero across the fleet means nothing is reporting, so the control plane cannot tell a healthy return path from a dead one.",
+	}
+	mtu := metrics.Family{
+		Name: "scrubline_tunnel_mtu_bytes", Type: metrics.Gauge,
+		Help: "The tunnel's MTU, after the encapsulation's overhead is taken off the path.",
+	}
+	clamp := metrics.Family{
+		Name: "scrubline_tunnel_mss_clamp_bytes", Type: metrics.Gauge,
+		Help: "The TCP MSS traffic into this tunnel is clamped to. Without it, a customer whose path drops the ICMP that path-MTU discovery needs sees TCP hang on anything larger than a handshake.",
+	}
+	prefixes := metrics.Family{
+		Name: "scrubline_tunnel_prefixes", Type: metrics.Gauge,
+		Help: "Protected prefixes delivered over this tunnel from this node.",
+	}
+
+	for _, t := range tunnels {
+		labels := []metrics.Label{
+			{Name: "node", Value: nodeID},
+			{Name: "name", Value: name},
+			{Name: "region", Value: region},
+			{Name: "tunnel", Value: t.ID},
+			{Name: "remote", Value: t.Remote},
+		}
+		switch state[t.ID] {
+		case model.TunnelUp:
+			up.Samples = append(up.Samples, metrics.Sample{Labels: labels, Value: 1})
+			reportedAt.Samples = append(reportedAt.Samples, metrics.Sample{Labels: labels, Value: 1})
+		case model.TunnelDown:
+			up.Samples = append(up.Samples, metrics.Sample{Labels: labels, Value: 0})
+			reportedAt.Samples = append(reportedAt.Samples, metrics.Sample{Labels: labels, Value: 1})
+		default:
+			// Deliberately no scrubline_tunnel_up sample. Publishing 0 here
+			// would be indistinguishable from a confirmed failure, and an
+			// alert on it would fire across any fleet that has not wired a
+			// provisioner up yet.
+			reportedAt.Samples = append(reportedAt.Samples, metrics.Sample{Labels: labels, Value: 0})
+		}
+		required.Samples = append(required.Samples, metrics.Sample{Labels: labels, Value: boolValue(t.Required)})
+		mtu.Samples = append(mtu.Samples, metrics.Sample{Labels: labels, Value: float64(t.MTU)})
+		clamp.Samples = append(clamp.Samples, metrics.Sample{Labels: labels, Value: float64(t.MSSClamp)})
+		prefixes.Samples = append(prefixes.Samples, metrics.Sample{Labels: labels, Value: float64(len(t.Prefixes))})
+	}
+	return []metrics.Family{up, required, reportedAt, mtu, clamp, prefixes}
+}

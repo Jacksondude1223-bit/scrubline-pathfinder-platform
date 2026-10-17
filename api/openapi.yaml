@@ -299,9 +299,16 @@ paths:
                 $ref: '#/components/schemas/Error'
         '401': *id002
         '403': *id003
-      description: A node may heartbeat only for itself. The body is optional; an agent that sends none
+      description: 'A node may heartbeat only for itself. The body is optional; an agent that sends none
         still heartbeats. Counters are keyed to the node the path names and labelled from the record the
         control plane already holds, so a report cannot claim to be another node.
+
+
+        `tunnels` is what this node''s provisioner says about its return paths. It rides the heartbeat
+        rather than having an endpoint of its own because it has to arrive as often as liveness does:
+        a tunnel that went down between two polls is a prefix being black-holed until the next one. A
+        tunnel reported down withdraws its prefixes from this node immediately, and the fabric recompiles
+        on the change rather than waiting for the next scheduled pass.'
       parameters: &id005
       - name: id
         in: path
@@ -317,6 +324,10 @@ paths:
               properties:
                 stats:
                   $ref: '#/components/schemas/Stats'
+                tunnels:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/TunnelStatus'
   /v1/nodes/{id}/program:
     get:
       summary: What a node installs
@@ -1148,6 +1159,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GameFilter'
+        tunnels:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tunnel'
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
         pulse_floor_pps:
           type: integer
           minimum: 0
@@ -1194,6 +1213,14 @@ components:
         advertise:
           type: string
           description: Address peers reach this node on; its host becomes the BGP next hop.
+        tunnel_src:
+          type: string
+          example: 192.0.2.1
+          description: 'Local address this node builds customer return tunnels from, and peers customer
+            sessions from. Per node rather than per tunnel because the fabric is anycast: every node carrying
+            a prefix needs its own tunnel to the one customer endpoint, and they cannot share a source.
+            A node without one is withdrawn from any prefix that has a return path, rather than attracting
+            traffic it could not deliver.'
         last_seen:
           type: string
           format: date-time
@@ -1322,6 +1349,14 @@ components:
           type: string
         pulse_floor_pps:
           type: integer
+        tunnels:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeTunnel'
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
         compiled_at:
           type: string
           format: date-time
@@ -1668,6 +1703,202 @@ components:
           additionalProperties:
             type: string
           description: Tenant id to credential hash. Hashes only, for the same reason node_tokens are.
+    Tunnel:
+      type: object
+      required:
+      - id
+      - remote
+      - prefixes
+      description: 'The return path for a set of protected prefixes: where scrubbed traffic goes once
+        it is clean. This is the half of a scrubbing service BGP cannot do — announcing a prefix pulls
+        the traffic in, and it then cannot be routed back the ordinary way, because as far as the internet
+        is concerned the scrubbers are that prefix now. One Tunnel describes one customer endpoint; the
+        fabric is anycast, so it compiles to one tunnel per node carrying the prefixes, all to the same
+        remote.'
+      properties:
+        id:
+          type: string
+          example: northwind
+          description: 'Becomes an interface name, so it is lowercase letters, digits and dashes, and
+            at most 11 characters: the kernel truncates a name over its limit rather than refusing it,
+            and two tunnels truncating to one name is one tunnel.'
+        prefixes:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: Which protected prefixes ride this tunnel. Each must be one the policy protects,
+            and a prefix belongs to at most one tunnel — backup paths are not modelled, so two would leave
+            no answer to which return path is authoritative.
+        type:
+          type: string
+          enum:
+          - gre
+          - ipip
+          description: GRE unless the customer's edge cannot do it. ipip is lighter but carries no key,
+            so it cannot demultiplex several tunnels between the same pair of addresses.
+        remote:
+          type: string
+          example: 198.51.100.1
+          description: 'The customer''s tunnel endpoint. The local end is each node''s own tunnel_src.
+            IPv4 only: the MTU arithmetic here is IPv4''s, and a v6 endpoint would compile a tunnel wrong
+            by twenty bytes.'
+        mtu:
+          type: integer
+          description: 'Zero derives it from a 1500-byte path less this encapsulation''s overhead: 1476
+            for GRE, 1472 with a key, 1480 for ipip. A value that does not fit is refused with the one
+            that does.'
+        mss_clamp:
+          type: integer
+          description: TCP MSS to clamp inbound traffic to. Zero derives it from the MTU. Without clamping,
+            a customer whose path drops the ICMP that path-MTU discovery needs sees TCP complete its handshake
+            and then hang — the classic way a working tunnel still looks broken.
+        key:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: Demultiplexes several GRE tunnels between the same two addresses. Not available
+            on ipip, and costs four bytes of MTU.
+        required:
+          type: boolean
+          description: 'Makes a confirmed-up tunnel a precondition for announcing these prefixes from
+            a node. Off by default: a fabric whose provisioner reports nothing would otherwise announce
+            nothing at all and give no hint why. On, for operators whose tunnels report reliably and who
+            would rather drop traffic than black-hole it.'
+        comment:
+          type: string
+    Session:
+      type: object
+      required:
+      - id
+      - peer_ip
+      - peer_as
+      - prefixes
+      description: 'A BGP peering with a customer, for customers who announce their own prefixes rather
+        than having them typed into a policy. What the session may carry is still declared here: a route
+        learned from a customer does not add itself to the protected set, or a peer that leaked a supernet
+        would have the fabric announcing address space it was never asked to protect.'
+      properties:
+        id:
+          type: string
+          description: Lowercase letters, digits, dashes and underscores. Becomes the peering's name in
+            the rendered configuration.
+        peer_ip:
+          type: string
+          example: 198.51.100.1
+        peer_as:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+        local_as:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: The AS the fabric peers from. Zero takes the node's own; a session with neither
+            is refused rather than coming up announcing from whatever the daemon happened to hold.
+        prefixes:
+          type: array
+          items:
+            type: string
+          minItems: 1
+          description: What the session accepts, each one the policy protects. The rendered filter admits
+            these and anything more specific inside them, because customers de-aggregate under attack
+            and a filter that refused that would drop the announcement when it mattered most.
+        max_prefixes:
+          type: integer
+          minimum: 0
+          description: Tears the session down past this many accepted routes. Zero derives a limit with
+            headroom over the filter — a backstop against a leak, not an inventory.
+        password:
+          type: string
+          description: 'TCP-MD5 secret, shipped only to the nodes terminating this session. Printable
+            ASCII without spaces, quotes or backslashes: it is written into a routing daemon''s configuration,
+            so a value that could close its string is refused rather than quoted.'
+        multihop:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: TTL for a peer that is not directly attached.
+        passive:
+          type: boolean
+          description: Wait for the customer to connect rather than dialling them.
+        nodes:
+          type: array
+          items:
+            type: string
+          description: Node ids or names that terminate this session.
+        regions:
+          type: array
+          items:
+            type: string
+          description: 'Regions that terminate it. Empty nodes and regions means every node, which is
+            rarely wanted: a customer peers where they have a path, not with the whole fabric.'
+        comment:
+          type: string
+    NodeTunnel:
+      type: object
+      description: One node's instance of a policy Tunnel, with the local end filled in and the derived
+        values resolved, so the agent renders configuration rather than recomputing policy.
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum:
+          - gre
+          - ipip
+        local:
+          type: string
+          description: This node's tunnel_src.
+        remote:
+          type: string
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: The tunnel's prefixes that this node actually carries.
+        mtu:
+          type: integer
+        mss_clamp:
+          type: integer
+        key:
+          type: integer
+        required:
+          type: boolean
+        interface:
+          type: string
+          example: scr-northwind
+          description: The link name this compiles to, inside the kernel's 15-character limit.
+        comment:
+          type: string
+    TunnelStatus:
+      type: object
+      required:
+      - tunnel_id
+      - state
+      description: What a node's provisioner says about one return path. Nodes attach these to the heartbeat
+        they already send, because a tunnel that went down between two polls is a prefix being black-holed
+        until the next one.
+      properties:
+        tunnel_id:
+          type: string
+        state:
+          type: string
+          enum:
+          - up
+          - down
+          - unknown
+          description: 'A tunnel reported down withdraws its prefixes from that node. One that has never
+            reported does not: absence of a report usually means nothing is reporting, and inferring failure
+            from silence would blank the fabric of any operator who has not wired a provisioner up yet.
+            Set required on the tunnel to reverse that judgement.'
+        detail:
+          type: string
+          description: Free text from the provisioner, carried through unchanged.
+        reported_at:
+          type: string
+          format: date-time
+          description: 'Stamped by the control plane, not the node: the fleet''s clocks are not synchronised.'
     Tenant:
       type: object
       required:

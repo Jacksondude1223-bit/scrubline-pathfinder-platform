@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pipeline"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/telemetry"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/transport"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/tunnel"
 )
 
 const (
@@ -49,6 +51,7 @@ func main() {
 	advertise := flag.String("advertise", "", "address other components use to reach this node (default: -listen, or hostname:port when -listen is a wildcard)")
 	localAS := flag.Int("local-as", 0, "AS this node's BGP speaker announces from; required for AS-path prepends")
 	bgpNextHop := flag.String("bgp-next-hop", "", "next hop to advertise with, when it differs from the address peers reach this node on")
+	tunnelSrc := flag.String("tunnel-src", "", "local address this node builds customer return tunnels from, and peers customer BGP sessions from; without it this node cannot carry a tunnelled prefix")
 	certFile := flag.String("tls-cert", "", "TLS certificate for this agent's local API")
 	keyFile := flag.String("tls-key", "", "TLS key for this agent's local API")
 	caFile := flag.String("ca", "", "PEM bundle to verify the control plane against; empty uses the system roots")
@@ -97,9 +100,16 @@ func main() {
 		log.Printf("warning: -listen %s is a wildcard; advertising %s. Set -advertise to the address peers should dial.", *listen, advertised)
 	}
 
+	if *tunnelSrc != "" {
+		if _, err := netip.ParseAddr(*tunnelSrc); err != nil {
+			log.Fatalf("-tunnel-src %q is not an IP address: %v", *tunnelSrc, err)
+		}
+	}
+
 	desired := model.Node{
 		Name: *name, Region: *region, CapacityGbps: *capacity, CapacityPPS: *capacityPPS, Advertise: advertised,
-		Backends: []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC},
+		TunnelSrc: *tunnelSrc,
+		Backends:  []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC},
 	}
 
 	var node model.Node
@@ -130,7 +140,16 @@ func main() {
 	// /metrics serve it, and the speaker beside this agent consumes it.
 	var steering atomic.Pointer[steeringPlan]
 	steering.Store(&steeringPlan{})
-	go poll(*apiURL, enrollToken, creds, node, desired, pipe, &steering, *localAS, *bgpNextHop)
+	// Where this node sends what it has scrubbed, and who it peers with.
+	// Held beside the steering plan for the same reason: the agent compiles
+	// and serves it, something else on the box makes it so.
+	var delivery atomic.Pointer[deliveryPlan]
+	delivery.Store(&deliveryPlan{})
+	// What the local provisioner says about those tunnels. It rides the
+	// heartbeat, because a return path that went down is a prefix being
+	// black-holed until the control plane hears about it.
+	health := &tunnelHealth{}
+	go poll(*apiURL, enrollToken, creds, node, desired, pipe, &steering, &delivery, health, *localAS, *bgpNextHop)
 
 	mux := http.NewServeMux()
 	// /health stays open for liveness probes; it carries no policy detail.
@@ -151,6 +170,8 @@ func main() {
 		var buf bytes.Buffer
 		families := telemetry.Families([]telemetry.Report{report(node, pipe)}, time.Time{})
 		families = append(families, telemetry.AnnouncementFamilies(steering.Load().Announcements)...)
+		families = append(families, telemetry.TunnelFamilies(node.ID, node.Name, node.Region,
+			delivery.Load().Tunnels, health.get())...)
 		if err := metrics.Write(&buf, families); err != nil {
 			log.Printf("rendering metrics: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
@@ -187,6 +208,88 @@ func main() {
 			"announcements": plan.Announcements,
 			"exabgp":        plan.Commands,
 			"error":         plan.Err,
+		})
+	})
+	// /tunnels is where whatever provisions interfaces on this box picks up
+	// the return paths it should be holding open. Scrubline does not create
+	// interfaces, the same way it does not speak BGP: it compiles the
+	// intent and serves it, so what the fabric wants can be read and diffed
+	// rather than inferred from the state of a machine.
+	mux.HandleFunc("/tunnels", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, localToken) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			plan := delivery.Load()
+			if r.URL.Query().Get("format") == "iproute2" {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				for _, line := range plan.Commands {
+					_, _ = io.WriteString(w, line+"\n")
+				}
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"node":     node.ID,
+				"tunnels":  plan.Tunnels,
+				"iproute2": plan.Commands,
+				"status":   health.get(),
+				"error":    plan.TunnelErr,
+			})
+		case http.MethodPost:
+			// The provisioner reports what it actually managed to build. A
+			// tunnel reported down withdraws its prefixes from this node,
+			// so this is the one write the agent accepts.
+			var body struct {
+				Tunnels []model.TunnelStatus `json:"tunnels"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			for i, st := range body.Tunnels {
+				if st.TunnelID == "" {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("tunnels[%d]: tunnel_id required", i)})
+					return
+				}
+				if err := tunnel.ValidateStatus(st.State); err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("tunnels[%d] (%s): %v", i, st.TunnelID, err)})
+					return
+				}
+			}
+			health.set(body.Tunnels)
+			writeJSON(w, http.StatusOK, map[string]any{"accepted": len(body.Tunnels)})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET or POST required"})
+		}
+	})
+	// /sessions is the customer peerings this node terminates, for the BGP
+	// daemon that runs them.
+	mux.HandleFunc("/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, localToken) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+			return
+		}
+		plan := delivery.Load()
+		if r.URL.Query().Get("format") == "bird" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			for _, line := range plan.SessionConfig {
+				_, _ = io.WriteString(w, line+"\n")
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"node":     node.ID,
+			"sessions": plan.Sessions,
+			"bird":     plan.SessionConfig,
+			"error":    plan.SessionErr,
 		})
 	})
 	// /decide reveals what the policy does with a given flow, so it takes the
@@ -262,6 +365,64 @@ type steeringPlan struct {
 	Err           string               `json:"error,omitempty"`
 }
 
+// deliveryPlan is where this node sends what it has scrubbed, and who it
+// peers with, together with their rendered forms. The errors are surfaced
+// rather than swallowed for the same reason the steering plan's is: a return
+// path that could not be rendered means this node may be attracting traffic
+// it cannot deliver.
+type deliveryPlan struct {
+	Tunnels       []model.NodeTunnel `json:"tunnels"`
+	Commands      []string           `json:"iproute2"`
+	TunnelErr     string             `json:"tunnel_error,omitempty"`
+	Sessions      []model.Session    `json:"sessions"`
+	SessionConfig []string           `json:"bird"`
+	SessionErr    string             `json:"session_error,omitempty"`
+}
+
+// renderDelivery turns the program's tunnels and sessions into the config the
+// things beside this agent consume.
+func renderDelivery(prog model.Program, node model.Node, localAS int) *deliveryPlan {
+	plan := &deliveryPlan{Tunnels: prog.Tunnels, Sessions: prog.Sessions}
+	commands, err := tunnel.Commands(prog.Tunnels)
+	if err != nil {
+		plan.TunnelErr = err.Error()
+	} else {
+		plan.Commands = commands
+	}
+	if len(prog.Sessions) > 0 {
+		config, err := bgp.SessionConfig(prog.Sessions, node, localAS)
+		if err != nil {
+			plan.SessionErr = err.Error()
+		} else {
+			plan.SessionConfig = config
+		}
+	}
+	return plan
+}
+
+// tunnelHealth is what the local provisioner last reported about this node's
+// return paths. It is read on every heartbeat and written by whatever builds
+// the tunnels, so it is guarded rather than swapped: the set is small and a
+// partial report is worse than a slightly stale one.
+type tunnelHealth struct {
+	mu       sync.RWMutex
+	reported []model.TunnelStatus
+}
+
+func (h *tunnelHealth) get() []model.TunnelStatus {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return append([]model.TunnelStatus(nil), h.reported...)
+}
+
+func (h *tunnelHealth) set(statuses []model.TunnelStatus) {
+	cp := append([]model.TunnelStatus(nil), statuses...)
+	sort.Slice(cp, func(i, j int) bool { return cp[i].TunnelID < cp[j].TunnelID })
+	h.mu.Lock()
+	h.reported = cp
+	h.mu.Unlock()
+}
+
 // renderSteering turns the program's announcements into speaker commands,
 // substituting the operator's next hop when one was given.
 func renderSteering(prog model.Program, localAS int, nextHop string) *steeringPlan {
@@ -302,7 +463,7 @@ func (c *credentials) set(token string) {
 	c.mu.Unlock()
 }
 
-func poll(apiURL, enrollToken string, creds *credentials, node model.Node, desired model.Node, pipe *pipeline.Pipeline, steering *atomic.Pointer[steeringPlan], localAS int, nextHop string) {
+func poll(apiURL, enrollToken string, creds *credentials, node model.Node, desired model.Node, pipe *pipeline.Pipeline, steering *atomic.Pointer[steeringPlan], delivery *atomic.Pointer[deliveryPlan], health *tunnelHealth, localAS int, nextHop string) {
 	id := node.ID
 	var lastPolicy string
 	var lastVersion int
@@ -314,7 +475,7 @@ func poll(apiURL, enrollToken string, creds *credentials, node model.Node, desir
 		// The heartbeat carries this node's counters. It is the one call the
 		// agent already makes every poll, so the control plane gets a fleet
 		// view without a second round trip.
-		if err := heartbeat(apiURL, creds.get(), id, pipe.Stats()); err != nil {
+		if err := heartbeat(apiURL, creds.get(), id, pipe.Stats(), health.get()); err != nil {
 			log.Printf("heartbeat: %v", err)
 			// A control plane that restarted has no record of this node, and a
 			// rotated or revoked credential is rejected rather than ignored.
@@ -352,6 +513,20 @@ func poll(apiURL, enrollToken string, creds *credentials, node model.Node, desir
 				for _, line := range plan.Commands {
 					log.Printf("bgp: %s", line)
 				}
+			}
+
+			d := renderDelivery(prog, node, localAS)
+			delivery.Store(d)
+			if d.TunnelErr != "" {
+				// The control plane withdraws a prefix whose return path is
+				// down; it cannot know about one that would not even render.
+				log.Printf("return tunnels for %s could not be rendered: %s", id, d.TunnelErr)
+			}
+			if d.SessionErr != "" {
+				log.Printf("customer sessions for %s could not be rendered: %s", id, d.SessionErr)
+			}
+			if len(d.Tunnels) > 0 {
+				log.Printf("return paths: %d tunnel(s) for %d customer session(s)", len(d.Tunnels), len(d.Sessions))
 			}
 		}
 
@@ -406,10 +581,11 @@ func register(apiURL, enrollToken string, node model.Node) (model.Node, string, 
 	return out.Node, out.Token, nil
 }
 
-func heartbeat(apiURL, token, id string, stats pipeline.Stats) error {
+func heartbeat(apiURL, token, id string, stats pipeline.Stats, tunnels []model.TunnelStatus) error {
 	body, err := json.Marshal(struct {
-		Stats pipeline.Stats `json:"stats"`
-	}{Stats: stats})
+		Stats   pipeline.Stats       `json:"stats"`
+		Tunnels []model.TunnelStatus `json:"tunnels,omitempty"`
+	}{Stats: stats, Tunnels: tunnels})
 	if err != nil {
 		return err
 	}
