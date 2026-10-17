@@ -16,6 +16,12 @@ import (
 
 // snapshotVersion guards the on-disk format. A file written by a newer build
 // is refused rather than half-understood.
+//
+// Adding an optional field does not bump it. A field the old build has never
+// heard of is ignored on read, and its absence reads as empty on the new
+// build, so both directions are understood exactly. Bumping for an additive
+// change would instead refuse every existing file and leave an upgraded
+// control plane unable to start on the state it already owns.
 const snapshotVersion = 1
 
 // Snapshot is the durable half of the control plane.
@@ -41,6 +47,11 @@ type Snapshot struct {
 	LastPolicyID string            `json:"last_policy_id"`
 	Samples      []ml.Sample       `json:"samples"`
 	Model        ml.Model          `json:"model"`
+	// Tenants and their credentials are durable for the same reason nodes'
+	// are: a customer must not lose access to their own analytics because
+	// the control plane restarted.
+	Tenants      []model.Tenant    `json:"tenants,omitempty"`
+	TenantTokens map[string]string `json:"tenant_tokens,omitempty"`
 }
 
 // Open builds a store backed by a file, loading it if it already exists. An
@@ -109,6 +120,17 @@ func (s *Store) load(snap Snapshot) {
 		s.nodeTokens[nodeID] = hash
 		s.tokenNodes[hash] = nodeID
 	}
+	s.tenants = make(map[string]*model.Tenant, len(snap.Tenants))
+	for _, t := range snap.Tenants {
+		cp := t
+		s.tenants[cp.ID] = &cp
+	}
+	s.tenantTokens = make(map[string]string, len(snap.TenantTokens))
+	s.tokenTenants = make(map[string]string, len(snap.TenantTokens))
+	for tenantID, hash := range snap.TenantTokens {
+		s.tenantTokens[tenantID] = hash
+		s.tokenTenants[hash] = tenantID
+	}
 	// Derived state starts empty and is recompiled once the fleet checks in.
 	s.programs = map[string]*model.Program{}
 	s.plan = nil
@@ -134,6 +156,8 @@ func (s *Store) snapshotLocked() Snapshot {
 		NodeTokens:   make(map[string]string, len(s.nodeTokens)),
 		Nodes:        make([]model.Node, 0, len(s.nodes)),
 		Policies:     make([]model.Policy, 0, len(s.policies)),
+		Tenants:      make([]model.Tenant, 0, len(s.tenants)),
+		TenantTokens: make(map[string]string, len(s.tenantTokens)),
 	}
 	for _, n := range s.nodes {
 		cp := *n
@@ -151,8 +175,15 @@ func (s *Store) snapshotLocked() Snapshot {
 	for id, hash := range s.nodeTokens {
 		snap.NodeTokens[id] = hash
 	}
+	for _, t := range s.tenants {
+		snap.Tenants = append(snap.Tenants, *t)
+	}
+	for id, hash := range s.tenantTokens {
+		snap.TenantTokens[id] = hash
+	}
 	sortNodes(snap.Nodes)
 	sortPolicies(snap.Policies)
+	sortTenants(snap.Tenants)
 	return snap
 }
 

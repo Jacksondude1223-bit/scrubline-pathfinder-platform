@@ -2,8 +2,10 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -273,5 +275,100 @@ func TestSnapshotIsStable(t *testing.T) {
 		if string(again) != string(first) {
 			t.Fatal("the snapshot is not byte-stable across calls")
 		}
+	}
+}
+
+// A customer must not lose access to their own analytics because the control
+// plane restarted, so tenants and their credential hashes are durable.
+func TestTenantsSurviveARestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("opening the store: %v", err)
+	}
+	saved, err := first.SaveTenant(model.Tenant{Name: "Northwind", Prefixes: []string{"203.0.113.0/24"}})
+	if err != nil {
+		t.Fatalf("saving the tenant: %v", err)
+	}
+	token, err := first.IssueTenantToken(saved.ID)
+	if err != nil {
+		t.Fatalf("issuing the credential: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopening the store: %v", err)
+	}
+	back, ok := second.TenantForToken(token)
+	if !ok {
+		t.Fatal("the credential stopped working across a restart")
+	}
+	if back.ID != saved.ID || len(back.Prefixes) != 1 || back.Prefixes[0] != "203.0.113.0/24" {
+		t.Fatalf("expected the entitlement to come back intact, got %+v", back)
+	}
+
+	// Only the hash is written. A dump of the state file must not hand
+	// anyone a working credential.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the state file: %v", err)
+	}
+	if strings.Contains(string(raw), token) {
+		t.Fatal("the state file holds the plaintext credential")
+	}
+}
+
+// Issuing again rotates: the previous credential stops working the moment a
+// new one is handed out.
+func TestIssuingATenantCredentialRotatesIt(t *testing.T) {
+	s := New()
+	saved, err := s.SaveTenant(model.Tenant{Name: "Northwind"})
+	if err != nil {
+		t.Fatalf("saving the tenant: %v", err)
+	}
+	first, err := s.IssueTenantToken(saved.ID)
+	if err != nil {
+		t.Fatalf("issuing: %v", err)
+	}
+	second, err := s.IssueTenantToken(saved.ID)
+	if err != nil {
+		t.Fatalf("reissuing: %v", err)
+	}
+	if _, ok := s.TenantForToken(first); ok {
+		t.Fatal("the rotated-out credential still works")
+	}
+	if _, ok := s.TenantForToken(second); !ok {
+		t.Fatal("the fresh credential does not work")
+	}
+}
+
+// Deleting a tenant takes their credential with it. One that outlived its
+// tenant would authenticate to an empty entitlement rather than to nothing.
+func TestDeletingATenantRevokesTheirCredential(t *testing.T) {
+	s := New()
+	saved, err := s.SaveTenant(model.Tenant{Name: "Northwind", Prefixes: []string{"203.0.113.0/24"}})
+	if err != nil {
+		t.Fatalf("saving the tenant: %v", err)
+	}
+	token, err := s.IssueTenantToken(saved.ID)
+	if err != nil {
+		t.Fatalf("issuing: %v", err)
+	}
+	removed, err := s.DeleteTenant(saved.ID)
+	if err != nil || !removed {
+		t.Fatalf("deleting the tenant: removed=%v err=%v", removed, err)
+	}
+	if _, ok := s.TenantForToken(token); ok {
+		t.Fatal("the credential outlived the tenant it belonged to")
+	}
+}
+
+// A credential cannot be minted for a customer who does not exist.
+func TestIssuingForAnUnknownTenantIsRefused(t *testing.T) {
+	s := New()
+	if _, err := s.IssueTenantToken("ten-nope"); !errors.Is(err, ErrUnknownTenant) {
+		t.Fatalf("expected ErrUnknownTenant, got %v", err)
 	}
 }

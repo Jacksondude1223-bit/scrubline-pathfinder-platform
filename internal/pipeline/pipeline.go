@@ -107,6 +107,75 @@ type loadBucket struct {
 	dropped uint64
 }
 
+// loadWindow is a rolling per-second ring of offered and dropped volume. The
+// node keeps one for itself and one per protected prefix; they are the same
+// measurement over different scopes, so they are the same code.
+type loadWindow [loadWindowSeconds]loadBucket
+
+// observe folds one decision into the window.
+func (w *loadWindow) observe(now time.Time, pps uint64, dropped bool) {
+	sec := now.Unix()
+	// One modulo plus a predictable branch, rather than two modulos, on a
+	// path that runs for every decision.
+	idx := sec % loadWindowSeconds
+	if idx < 0 {
+		idx += loadWindowSeconds
+	}
+	b := &w[idx]
+	if b.second != sec {
+		*b = loadBucket{second: sec}
+	}
+	b.offered += pps
+	if dropped {
+		b.dropped += pps
+	}
+}
+
+// rates averages the window, skipping buckets left behind by a quiet stretch.
+func (w *loadWindow) rates(now time.Time) (offered, dropped uint64) {
+	sec := now.Unix()
+	oldest := sec - loadWindowSeconds + 1
+	var o, d uint64
+	for _, b := range w {
+		if b.second < oldest || b.second > sec {
+			continue
+		}
+		o += b.offered
+		d += b.dropped
+	}
+	return o / loadWindowSeconds, d / loadWindowSeconds
+}
+
+// prefixLoad is one protected prefix's own traffic accounting: the same
+// per-second ring the node keeps for itself, plus cumulative totals.
+//
+// The node-wide numbers cannot answer a customer's question. A scrubber
+// carries many prefixes at once, so "this node is dropping 400k pps" says
+// nothing about whether any of it was aimed at the prefix someone is paying
+// to have protected. These are keyed by prefix, and the key space is the
+// program's protected list, so the table is bounded by policy rather than by
+// traffic.
+type prefixLoad struct {
+	window loadWindow
+	// Cumulative since this prefix was first seen. The control plane deltas
+	// these into its own history, so they only ever have to count up.
+	flows        uint64
+	flowsDropped uint64
+	offered      uint64
+	dropped      uint64
+}
+
+// observe folds one decision into the prefix's window and its totals.
+func (l *prefixLoad) observe(now time.Time, pps uint64, dropped bool) {
+	l.window.observe(now, pps, dropped)
+	l.flows++
+	l.offered += pps
+	if dropped {
+		l.flowsDropped++
+		l.dropped += pps
+	}
+}
+
 // compiledMatch is a model.Match with its CIDRs parsed and its string fields
 // folded once, at Load time. Matching used to parse the rule's CIDR text on
 // every rule for every flow, which cost more than the comparison itself.
@@ -245,7 +314,12 @@ type compiledProgram struct {
 	prefixes []netip.Prefix
 	// prefixText is the same prefixes as written, for keying measurements
 	// without formatting one per packet.
-	prefixText     []string
+	prefixText []string
+	// loads is each prefix's accounting, resolved once here rather than
+	// looked up by name per packet. Same reason a compiled rule carries a
+	// pointer to its counters: hashing a CIDR string on the decision path
+	// costs more than the accounting it is reaching.
+	loads          []*prefixLoad
 	asic, fpga, zc []compiledRule
 }
 
@@ -326,7 +400,10 @@ type Pipeline struct {
 	// flag up through the gaps between bursts.
 	pulses *pulse.Detector
 	// load is the rolling per-second window behind the offered-load average.
-	load [loadWindowSeconds]loadBucket
+	load loadWindow
+	// prefixLoads is the same window kept per protected prefix, which is what
+	// a customer's view of their own traffic is built from.
+	prefixLoads map[string]*prefixLoad
 	// lastSweep throttles reclaiming the rate table to once per window, so a
 	// flood of fresh source addresses cannot make every packet pay for a full
 	// scan of the table.
@@ -336,7 +413,12 @@ type Pipeline struct {
 }
 
 func New(p model.Program) *Pipeline {
-	pipe := &Pipeline{program: p, buckets: map[bucketID]*bucket{}, now: time.Now}
+	pipe := &Pipeline{
+		program:     p,
+		buckets:     map[bucketID]*bucket{},
+		prefixLoads: map[string]*prefixLoad{},
+		now:         time.Now,
+	}
 	compiled := compileProgram(p)
 	pipe.attachStats(compiled)
 	pipe.compiled = compiled
@@ -362,6 +444,14 @@ func (p *Pipeline) loadPulse(prog model.Program) {
 		live[cidr] = struct{}{}
 	}
 	p.pulses.Forget(live)
+	// A prefix this node no longer carries keeps no accounting. Leaving it
+	// would report a customer's traffic from a scrubber that stopped seeing
+	// any of it.
+	for cidr := range p.prefixLoads {
+		if _, still := live[cidr]; !still {
+			delete(p.prefixLoads, cidr)
+		}
+	}
 }
 
 // loadGames installs the program's game filters. A filter that does not
@@ -423,6 +513,22 @@ func (p *Pipeline) attachStats(cp *compiledProgram) {
 	wire(cp.fpga, model.StageFPGA)
 	wire(cp.zc, model.StageZC)
 	p.stats = next
+
+	// Per-prefix accounting outlives a reprogram the same way rule counters
+	// do: the map is the durable side, and the compiled program only holds
+	// pointers into it.
+	if p.prefixLoads == nil {
+		p.prefixLoads = map[string]*prefixLoad{}
+	}
+	cp.loads = make([]*prefixLoad, len(cp.prefixText))
+	for i, cidr := range cp.prefixText {
+		l, ok := p.prefixLoads[cidr]
+		if !ok {
+			l = &prefixLoad{}
+			p.prefixLoads[cidr] = l
+		}
+		cp.loads[i] = l
+	}
 }
 
 // clock reads the pipeline's time source, tolerating a zero-value Pipeline.
@@ -488,7 +594,7 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	pps := nonNegative(pf.pps)
 
 	p.counters.decisions.Add(1)
-	prefix, owned := cp.owns(pf)
+	owner, owned := cp.owns(pf)
 	if !owned {
 		// Traffic for a prefix this node does not carry. Counted separately: a
 		// rising number here means the steering layer and the fabric disagree
@@ -502,52 +608,29 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	// prefix it is aimed at. A mean over ten seconds would average the
 	// burst away, which is the blindness a pulse attack is paying for.
 	if p.pulses != nil {
-		p.pulses.Observe(prefix, pps)
+		p.pulses.Observe(cp.prefixText[owner], pps)
 	}
 
 	d, decidedBy := p.evaluate(cp, pf, f, now)
 	// Every outcome is recorded in one place, so no return path can forget a
 	// counter.
 	p.record(d, decidedBy, pf)
-	p.observeLoad(now, pps, d.Action == model.ActionDrop || d.Action == model.ActionChallenge)
+	mitigated := d.Action == model.ActionDrop || d.Action == model.ActionChallenge
+	p.observeLoad(now, pps, mitigated)
+	cp.loads[owner].observe(now, pps, mitigated)
 	return d
 }
 
-// observeLoad folds one decision into the rolling window. Callers hold p.mu.
+// observeLoad folds one decision into the node-wide rolling window. Callers
+// hold p.mu.
 func (p *Pipeline) observeLoad(now time.Time, pps uint64, dropped bool) {
-	sec := now.Unix()
-	// One modulo plus a predictable branch, rather than two modulos, on a
-	// path that runs for every decision.
-	idx := sec % loadWindowSeconds
-	if idx < 0 {
-		idx += loadWindowSeconds
-	}
-	b := &p.load[idx]
-	if b.second != sec {
-		*b = loadBucket{second: sec}
-	}
-	b.offered += pps
-	if dropped {
-		b.dropped += pps
-	}
+	p.load.observe(now, pps, dropped)
 }
 
-// loadRates averages the window into a per-second offered and dropped rate.
-// Buckets outside the window are skipped, so a node that has gone quiet
-// reports load falling away rather than holding its last peak. Callers hold
-// p.mu.
+// loadRates reports the node's offered and dropped packet rates over the load
+// window. Callers hold p.mu.
 func (p *Pipeline) loadRates(now time.Time) (offered, dropped uint64) {
-	sec := now.Unix()
-	oldest := sec - loadWindowSeconds + 1
-	var o, d uint64
-	for _, b := range p.load {
-		if b.second < oldest || b.second > sec {
-			continue
-		}
-		o += b.offered
-		d += b.dropped
-	}
-	return o / loadWindowSeconds, d / loadWindowSeconds
+	return p.load.rates(now)
 }
 
 // evaluate walks the three stages and returns the decision together with the
@@ -727,8 +810,10 @@ type Stats struct {
 	Stages    []StageStats `json:"stages"`
 	Rules     []RuleStats  `json:"rules"`
 	Games     []GameStats  `json:"games"`
-	Pulse     []PulseStats `json:"pulse"`
-	ML        MLStats      `json:"ml"`
+	// Prefixes is the per-customer view: one row for each protected prefix
+	// this node carries.
+	Prefixes []PrefixStats `json:"prefixes"`
+	ML       MLStats       `json:"ml"`
 	// Pulsing is true while any protected prefix is under a recognised
 	// burst train, and PulsePeakPPS is the heaviest burst seen across them.
 	// The peak is the number that matters: a pulse attack's whole point is
@@ -769,9 +854,31 @@ type RuleStats struct {
 	PPSDropped uint64      `json:"pps_dropped"`
 }
 
-// PulseStats is the shape of traffic aimed at one protected prefix.
-type PulseStats struct {
-	Prefix    string  `json:"prefix"`
+// PrefixStats is everything this node knows about the traffic aimed at one
+// protected prefix: how much arrived, how much was scrubbed, and what shape
+// it had.
+//
+// It is reported per prefix rather than per node because that is the unit a
+// customer buys. A scrubber carries many prefixes, so its own totals say
+// nothing about whether any particular one was attacked.
+type PrefixStats struct {
+	Prefix string `json:"prefix"`
+	// Flows and FlowsDropped count decisions for this prefix. Offered and
+	// Dropped weight those by the rate each flow reported, which is the
+	// volume measure the rest of the datapath uses.
+	//
+	// All four are cumulative since the node started carrying the prefix:
+	// the control plane deltas them into its own history, and a counter that
+	// only counts up survives a report being missed.
+	Flows        uint64 `json:"flows"`
+	FlowsDropped uint64 `json:"flows_dropped"`
+	Offered      uint64 `json:"offered"`
+	Dropped      uint64 `json:"dropped"`
+	// OfferedPPS and DroppedPPS are moving averages over the same load
+	// window the node-wide pair uses, so they can be read as rates now.
+	OfferedPPS uint64 `json:"offered_pps"`
+	DroppedPPS uint64 `json:"dropped_pps"`
+	// The rest is the pulse detector's reading of this prefix's traffic.
 	Pulsing   bool    `json:"pulsing"`
 	PeakPPS   uint64  `json:"peak_pps"`
 	MeanPPS   uint64  `json:"mean_pps"`
@@ -854,15 +961,31 @@ func (p *Pipeline) Stats() Stats {
 	if p.games != nil {
 		out.GameSessions, out.GameSessionsMax = p.games.Sessions()
 	}
+	// One row per prefix, whether the accounting or the pulse detector knows
+	// about it: a prefix that has only ever been quiet still belongs in a
+	// customer's view, reading zero.
+	seen := map[string]bool{}
 	if p.pulses != nil {
 		for _, prefix := range p.pulses.Keys() {
+			seen[prefix] = true
+		}
+	}
+	for prefix := range p.prefixLoads {
+		seen[prefix] = true
+	}
+	now := p.clock()
+	for prefix := range seen {
+		row := PrefixStats{Prefix: prefix}
+		if l, ok := p.prefixLoads[prefix]; ok {
+			row.Flows, row.FlowsDropped = l.flows, l.flowsDropped
+			row.Offered, row.Dropped = l.offered, l.dropped
+			row.OfferedPPS, row.DroppedPPS = l.window.rates(now)
+		}
+		if p.pulses != nil {
 			a := p.pulses.Assess(prefix)
-			out.Pulse = append(out.Pulse, PulseStats{
-				Prefix: prefix, Pulsing: a.Pulsing,
-				PeakPPS: a.PeakPPS, MeanPPS: a.MeanPPS,
-				Crest: a.Crest, DutyCycle: a.DutyCycle, Bursts: a.Bursts,
-				HeldFor: a.HeldFor.Seconds(),
-			})
+			row.Pulsing, row.PeakPPS, row.MeanPPS = a.Pulsing, a.PeakPPS, a.MeanPPS
+			row.Crest, row.DutyCycle, row.Bursts = a.Crest, a.DutyCycle, a.Bursts
+			row.HeldFor = a.HeldFor.Seconds()
 			if a.Pulsing {
 				out.Pulsing = true
 				if a.PeakPPS > out.PulsePeakPPS {
@@ -870,8 +993,9 @@ func (p *Pipeline) Stats() Stats {
 				}
 			}
 		}
-		sort.Slice(out.Pulse, func(i, j int) bool { return out.Pulse[i].Prefix < out.Pulse[j].Prefix })
+		out.Prefixes = append(out.Prefixes, row)
 	}
+	sort.Slice(out.Prefixes, func(i, j int) bool { return out.Prefixes[i].Prefix < out.Prefixes[j].Prefix })
 	sort.Slice(out.Rules, func(i, j int) bool { return out.Rules[i].RuleID < out.Rules[j].RuleID })
 	sort.Slice(out.Games, func(i, j int) bool { return out.Games[i].FilterID < out.Games[j].FilterID })
 	return out
@@ -918,19 +1042,21 @@ func (p *Pipeline) reclaim(now time.Time) bool {
 	return len(p.buckets) < maxBuckets
 }
 
-// owns reports whether a flow is for a prefix this node carries, and which
-// one. The prefix is how pulse measurement is keyed: an attack aimed at one
-// customer is the unit that matters.
-func (cp *compiledProgram) owns(f parsedFlow) (string, bool) {
+// owns reports whether a flow is for a prefix this node carries, and the
+// index of that prefix. The index rather than the text: it reaches both the
+// prefix's name and its accounting without hashing a CIDR string per packet.
+// An attack aimed at one customer is the unit that matters, so this is the
+// key every per-customer measurement is taken under.
+func (cp *compiledProgram) owns(f parsedFlow) (int, bool) {
 	if !f.dstOK {
-		return "", false
+		return -1, false
 	}
 	for i, pfx := range cp.prefixes {
 		if pfx.Contains(f.dst) {
-			return cp.prefixText[i], true
+			return i, true
 		}
 	}
-	return "", false
+	return -1, false
 }
 
 // ruleOf recovers the rule ID from a bucket key. Rule IDs are validated to

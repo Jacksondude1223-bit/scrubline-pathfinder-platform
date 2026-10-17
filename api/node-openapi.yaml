@@ -36,8 +36,9 @@ paths:
   /metrics:
     get:
       summary: Prometheus exposition for this node's datapath
-      description: Per-rule hits, per-stage verdicts, game filter counters, pulse shape and the steering
-        posture. It names rule ids and traffic volumes, so it takes the token.
+      description: Per-rule hits, per-stage verdicts, game filter counters, per-prefix traffic and pulse
+        shape, and the steering posture. It names rule ids, customer prefixes and traffic volumes, so
+        it takes the token.
       responses:
         '200':
           description: Exposition in the Prometheus text format.

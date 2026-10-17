@@ -177,6 +177,30 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		Name: "scrubline_pulse_hold_seconds", Type: metrics.Gauge,
 		Help: "How much longer the pulse flag stands without another burst. While this is above zero, mitigation does not disengage.",
 	}
+	prefixOfferedPPS := metrics.Family{
+		Name: "scrubline_prefix_offered_pps", Type: metrics.Gauge,
+		Help: "Packet rate arriving for one protected prefix at this node, averaged over the load window. The node-wide rate cannot answer this: a scrubber carries many prefixes at once.",
+	}
+	prefixDroppedPPS := metrics.Family{
+		Name: "scrubline_prefix_dropped_pps", Type: metrics.Gauge,
+		Help: "Packet rate being scrubbed for one protected prefix at this node, averaged over the load window.",
+	}
+	prefixFlows := metrics.Family{
+		Name: "scrubline_prefix_flows_total", Type: metrics.Counter,
+		Help: "Flows decided for one protected prefix.",
+	}
+	prefixFlowsDropped := metrics.Family{
+		Name: "scrubline_prefix_flows_dropped_total", Type: metrics.Counter,
+		Help: "Flows dropped or challenged for one protected prefix.",
+	}
+	prefixOffered := metrics.Family{
+		Name: "scrubline_prefix_offered_total", Type: metrics.Counter,
+		Help: "Sum of the per-flow rates reported on flows arriving for one protected prefix. A volume weighting of the flow count, not a packet counter.",
+	}
+	prefixDropped := metrics.Family{
+		Name: "scrubline_prefix_dropped_total", Type: metrics.Counter,
+		Help: "Sum of the per-flow rates reported on flows scrubbed for one protected prefix.",
+	}
 	age := metrics.Family{
 		Name: "scrubline_report_age_seconds", Type: metrics.Gauge,
 		Help: "Seconds since this node last reported its counters.",
@@ -205,8 +229,14 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		}
 		gameSessions.Samples = append(gameSessions.Samples, metrics.Sample{Labels: id, Value: float64(s.GameSessions)})
 		gameSessionsMax.Samples = append(gameSessionsMax.Samples, metrics.Sample{Labels: id, Value: float64(s.GameSessionsMax)})
-		for _, ps := range s.Pulse {
+		for _, ps := range s.Prefixes {
 			labels := with(id, metrics.Label{Name: "prefix", Value: ps.Prefix})
+			prefixOfferedPPS.Samples = append(prefixOfferedPPS.Samples, metrics.Sample{Labels: labels, Value: float64(ps.OfferedPPS)})
+			prefixDroppedPPS.Samples = append(prefixDroppedPPS.Samples, metrics.Sample{Labels: labels, Value: float64(ps.DroppedPPS)})
+			prefixFlows.Samples = append(prefixFlows.Samples, metrics.Sample{Labels: labels, Value: float64(ps.Flows)})
+			prefixFlowsDropped.Samples = append(prefixFlowsDropped.Samples, metrics.Sample{Labels: labels, Value: float64(ps.FlowsDropped)})
+			prefixOffered.Samples = append(prefixOffered.Samples, metrics.Sample{Labels: labels, Value: float64(ps.Offered)})
+			prefixDropped.Samples = append(prefixDropped.Samples, metrics.Sample{Labels: labels, Value: float64(ps.Dropped)})
 			pulsing.Samples = append(pulsing.Samples, metrics.Sample{Labels: labels, Value: boolValue(ps.Pulsing)})
 			pulsePeak.Samples = append(pulsePeak.Samples, metrics.Sample{Labels: labels, Value: float64(ps.PeakPPS)})
 			pulseMean.Samples = append(pulseMean.Samples, metrics.Sample{Labels: labels, Value: float64(ps.MeanPPS)})
@@ -251,6 +281,8 @@ func Families(reports []Report, now time.Time) []metrics.Family {
 		buckets, bucketsMax, offeredPPS, droppedPPSRate,
 		gameInspected, gameDropped, gameChallenged, gameUninspectable, gameDroppedPPS,
 		gameSessions, gameSessionsMax,
+		prefixOfferedPPS, prefixDroppedPPS,
+		prefixFlows, prefixFlowsDropped, prefixOffered, prefixDropped,
 		pulsing, pulsePeak, pulseMean, pulseCrest, pulseDuty, pulseBursts, pulseHold,
 		age,
 	}
