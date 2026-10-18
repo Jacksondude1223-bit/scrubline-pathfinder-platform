@@ -316,3 +316,145 @@ func AnnouncementFamilies(plan []model.Announcement) []metrics.Family {
 	}
 	return []metrics.Family{announced, prepends}
 }
+
+// TunnelFamilies renders a node's return paths as metrics.
+//
+// The state series is the one that matters operationally. A node announcing a
+// prefix whose return tunnel is down attracts the customer's traffic and
+// drops all of it, which looks like a successful scrub from every other
+// angle: the datapath counters are healthy, the announcements are up, and the
+// customer is offline. This is where that shows.
+func TunnelFamilies(nodeID, name, region string, tunnels []model.NodeTunnel, reported []model.TunnelStatus) []metrics.Family {
+	state := make(map[string]string, len(reported))
+	for _, r := range reported {
+		state[r.TunnelID] = r.State
+	}
+
+	up := metrics.Family{
+		Name: "scrubline_tunnel_up", Type: metrics.Gauge,
+		Help: "1 when a return tunnel is reported carrying traffic, 0 when it is reported down. A tunnel that has never reported is absent from this series rather than reading 0, because no news is not the same as bad news.",
+	}
+	required := metrics.Family{
+		Name: "scrubline_tunnel_required", Type: metrics.Gauge,
+		Help: "1 when a return tunnel must be confirmed up before its prefixes are announced from this node.",
+	}
+	reportedAt := metrics.Family{
+		Name: "scrubline_tunnel_reported", Type: metrics.Gauge,
+		Help: "1 when the local provisioner has said anything at all about this tunnel. Zero across the fleet means nothing is reporting, so the control plane cannot tell a healthy return path from a dead one.",
+	}
+	mtu := metrics.Family{
+		Name: "scrubline_tunnel_mtu_bytes", Type: metrics.Gauge,
+		Help: "The tunnel's MTU, after the encapsulation's overhead is taken off the path.",
+	}
+	clamp := metrics.Family{
+		Name: "scrubline_tunnel_mss_clamp_bytes", Type: metrics.Gauge,
+		Help: "The TCP MSS traffic into this tunnel is clamped to. Without it, a customer whose path drops the ICMP that path-MTU discovery needs sees TCP hang on anything larger than a handshake.",
+	}
+	prefixes := metrics.Family{
+		Name: "scrubline_tunnel_prefixes", Type: metrics.Gauge,
+		Help: "Protected prefixes delivered over this tunnel from this node.",
+	}
+
+	for _, t := range tunnels {
+		labels := []metrics.Label{
+			{Name: "node", Value: nodeID},
+			{Name: "name", Value: name},
+			{Name: "region", Value: region},
+			{Name: "tunnel", Value: t.ID},
+			{Name: "remote", Value: t.Remote},
+		}
+		switch state[t.ID] {
+		case model.TunnelUp:
+			up.Samples = append(up.Samples, metrics.Sample{Labels: labels, Value: 1})
+			reportedAt.Samples = append(reportedAt.Samples, metrics.Sample{Labels: labels, Value: 1})
+		case model.TunnelDown:
+			up.Samples = append(up.Samples, metrics.Sample{Labels: labels, Value: 0})
+			reportedAt.Samples = append(reportedAt.Samples, metrics.Sample{Labels: labels, Value: 1})
+		default:
+			// Deliberately no scrubline_tunnel_up sample. Publishing 0 here
+			// would be indistinguishable from a confirmed failure, and an
+			// alert on it would fire across any fleet that has not wired a
+			// provisioner up yet.
+			reportedAt.Samples = append(reportedAt.Samples, metrics.Sample{Labels: labels, Value: 0})
+		}
+		required.Samples = append(required.Samples, metrics.Sample{Labels: labels, Value: boolValue(t.Required)})
+		mtu.Samples = append(mtu.Samples, metrics.Sample{Labels: labels, Value: float64(t.MTU)})
+		clamp.Samples = append(clamp.Samples, metrics.Sample{Labels: labels, Value: float64(t.MSSClamp)})
+		prefixes.Samples = append(prefixes.Samples, metrics.Sample{Labels: labels, Value: float64(len(t.Prefixes))})
+	}
+	return []metrics.Family{up, required, reportedAt, mtu, clamp, prefixes}
+}
+
+// ReputationFamilies renders the two-tier source cache.
+//
+// The shielded series is the one to alert on. It counts stateless signals
+// that landed on a source which had already proved itself, and the cache
+// refused to act on them — so a rising value is either somebody spoofing a
+// real player's address to get them banned, or a verified client genuinely
+// misbehaving. Either way it is an operator's call, not the datapath's.
+func ReputationFamilies(reports []Report) []metrics.Family {
+	tracked := metrics.Family{
+		Name: "scrubline_reputation_tracked", Type: metrics.Gauge,
+		Help: "Source addresses the reputation cache is holding.",
+	}
+	trackedMax := metrics.Family{
+		Name: "scrubline_reputation_tracked_max", Type: metrics.Gauge,
+		Help: "Bound on the reputation table. At the bound a source takes the ordinary path, so this costs an optimisation rather than a protection.",
+	}
+	trusted := metrics.Family{
+		Name: "scrubline_reputation_trusted", Type: metrics.Gauge,
+		Help: "Sources currently taking the short path because they cleared a protocol gate.",
+	}
+	penalised := metrics.Family{
+		Name: "scrubline_reputation_penalised", Type: metrics.Gauge,
+		Help: "Sources currently in the penalty box.",
+	}
+	fastPassed := metrics.Family{
+		Name: "scrubline_reputation_fast_passed_total", Type: metrics.Counter,
+		Help: "Packets taken off the slow path because their source was already verified.",
+	}
+	boxed := metrics.Family{
+		Name: "scrubline_reputation_boxed_total", Type: metrics.Counter,
+		Help: "Packets dropped at the top of the pipeline because their source is in the penalty box. This is the load the rest of the stages did not have to carry.",
+	}
+	promotions := metrics.Family{
+		Name: "scrubline_reputation_promotions_total", Type: metrics.Counter,
+		Help: "Sources that cleared a gate and entered the trusted tier.",
+	}
+	demotions := metrics.Family{
+		Name: "scrubline_reputation_demotions_total", Type: metrics.Counter,
+		Help: "Sources that accumulated enough strikes to be boxed. Counted even when the penalty box is off, which is how it is sized before being switched on.",
+	}
+	strikes := metrics.Family{
+		Name: "scrubline_reputation_strikes_total", Type: metrics.Counter,
+		Help: "Failures recorded against a source.",
+	}
+	shielded := metrics.Family{
+		Name: "scrubline_reputation_shielded_total", Type: metrics.Counter,
+		Help: "Strikes that landed on an already-verified source and were not acted on. Source addresses are attacker-controlled, so acting on one would let anyone get a real player banned. A rising value is a spoofing attempt or a misbehaving verified client, and both want a human.",
+	}
+	full := metrics.Family{
+		Name: "scrubline_reputation_full_total", Type: metrics.Counter,
+		Help: "Sources the reputation table had no room for.",
+	}
+
+	for _, r := range reports {
+		id := r.identity()
+		s := r.Stats.Reputation
+		tracked.Samples = append(tracked.Samples, metrics.Sample{Labels: id, Value: float64(s.Tracked)})
+		trackedMax.Samples = append(trackedMax.Samples, metrics.Sample{Labels: id, Value: float64(s.Max)})
+		trusted.Samples = append(trusted.Samples, metrics.Sample{Labels: id, Value: float64(s.Trusted)})
+		penalised.Samples = append(penalised.Samples, metrics.Sample{Labels: id, Value: float64(s.Penalised)})
+		fastPassed.Samples = append(fastPassed.Samples, metrics.Sample{Labels: id, Value: float64(s.FastPassed)})
+		boxed.Samples = append(boxed.Samples, metrics.Sample{Labels: id, Value: float64(s.Boxed)})
+		promotions.Samples = append(promotions.Samples, metrics.Sample{Labels: id, Value: float64(s.Promotions)})
+		demotions.Samples = append(demotions.Samples, metrics.Sample{Labels: id, Value: float64(s.Demotions)})
+		strikes.Samples = append(strikes.Samples, metrics.Sample{Labels: id, Value: float64(s.Strikes)})
+		shielded.Samples = append(shielded.Samples, metrics.Sample{Labels: id, Value: float64(s.Shielded)})
+		full.Samples = append(full.Samples, metrics.Sample{Labels: id, Value: float64(s.Full)})
+	}
+	return []metrics.Family{
+		tracked, trackedMax, trusted, penalised,
+		fastPassed, boxed, promotions, demotions, strikes, shielded, full,
+	}
+}

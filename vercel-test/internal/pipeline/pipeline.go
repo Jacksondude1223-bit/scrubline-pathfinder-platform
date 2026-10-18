@@ -14,6 +14,7 @@ import (
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/pulse"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/reputation"
 )
 
 const (
@@ -89,6 +90,14 @@ func (b *bucket) idle(now time.Time) bool {
 	}
 	return true
 }
+
+// Reasons that appear on a hot path are precomputed. Formatting one per
+// packet cost more than the work it was describing.
+const (
+	reasonMLPass   = "PF_RING ZC ml pass"
+	reasonFastPass = "verified source, fast path"
+	reasonBoxed    = "source is in the penalty box"
+)
 
 // bucketID keys the per-source rate table. A struct key costs no allocation,
 // where joining the two into a string cost one on every packet that reached
@@ -408,6 +417,14 @@ type Pipeline struct {
 	// flood of fresh source addresses cannot make every packet pay for a full
 	// scan of the table.
 	lastSweep time.Time
+	// reputation remembers what a source already proved, so a verified
+	// client is not re-derived per packet and a repeat offender is dropped
+	// before it walks every stage. Guarded by p.mu like the rest.
+	reputation *reputation.Cache
+	// features is the classifier's scratch buffer, reused per decision
+	// rather than allocated. Callers hold p.mu, which the whole decision
+	// path already does.
+	features [ml.FeatureCount]float64
 	// now is swapped out in tests; production always uses the wall clock.
 	now func() time.Time
 }
@@ -417,6 +434,7 @@ func New(p model.Program) *Pipeline {
 		program:     p,
 		buckets:     map[bucketID]*bucket{},
 		prefixLoads: map[string]*prefixLoad{},
+		reputation:  reputation.New(),
 		now:         time.Now,
 	}
 	compiled := compileProgram(p)
@@ -424,6 +442,7 @@ func New(p model.Program) *Pipeline {
 	pipe.compiled = compiled
 	pipe.loadGames(p)
 	pipe.loadPulse(p)
+	pipe.loadReputation(p)
 	return pipe
 }
 
@@ -558,8 +577,31 @@ func (p *Pipeline) Load(prog model.Program) {
 	p.attachStats(compiled)
 	p.loadGames(prog)
 	p.loadPulse(prog)
+	p.loadReputation(prog)
 	p.program = prog
 	p.compiled = compiled
+}
+
+// loadReputation applies the policy's cache settings. Callers hold p.mu, or
+// hold the pipeline alone.
+func (p *Pipeline) loadReputation(prog model.Program) {
+	if p.reputation == nil {
+		p.reputation = reputation.New()
+		if p.now != nil {
+			p.reputation.SetClock(p.clock)
+		}
+	}
+	cfg := reputation.Config{FastPassProof: reputation.ProofChallenge}
+	if r := prog.Reputation; r != nil {
+		cfg.Boxing = r.PenaltyBox
+		switch r.FastPass {
+		case "handshake":
+			cfg.FastPassProof = reputation.ProofHandshake
+		case "off":
+			cfg.NoFastPass = true
+		}
+	}
+	p.reputation.Configure(cfg)
 }
 
 // Program identifies the program currently installed, so a caller that polls
@@ -611,6 +653,37 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 		p.pulses.Observe(cp.prefixText[owner], pps)
 	}
 
+	// Before anything else: a source already known bad is dropped here
+	// rather than walking every stage to reach the same verdict. During an
+	// attack most of the packets are the attacker's, so this is where the
+	// headroom comes from.
+	switch p.reputation.Check(pf.srcIP, now) {
+	case reputation.Penalised:
+		d := model.Decision{Action: model.ActionDrop, Stage: model.StageASIC, Reason: reasonBoxed}
+		p.record(d, nil, pf)
+		p.observeLoad(now, pps, true)
+		cp.loads[owner].observe(now, pps, true)
+		return d
+	case reputation.Trusted:
+		// A verified client skips the gate and the classifier: it has
+		// already been challenged, and scoring it again tells us what the
+		// challenge established. It does not skip the behavioural cap, nor
+		// the signature check.
+		//
+		// The cap, because it is the only thing bounding what a verified
+		// source can send — without it, clearing one challenge would be
+		// the whole attack. The signature, because the source address on a
+		// packet is written by whoever sent it: skipping it would make
+		// spoofing a verified player's address a way to have junk
+		// forwarded.
+		d := p.evaluateTrusted(cp, pf, f, now)
+		p.record(d, nil, pf)
+		mitigated := d.Action == model.ActionDrop
+		p.observeLoad(now, pps, mitigated)
+		cp.loads[owner].observe(now, pps, mitigated)
+		return d
+	}
+
 	d, decidedBy := p.evaluate(cp, pf, f, now)
 	// Every outcome is recorded in one place, so no return path can forget a
 	// counter.
@@ -619,6 +692,102 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	p.observeLoad(now, pps, mitigated)
 	cp.loads[owner].observe(now, pps, mitigated)
 	return d
+}
+
+// evaluateTrusted is the path a verified source takes: the ASIC and FPGA
+// stages still apply, because an operator's explicit drop outranks anything
+// a source has proved, and the ZC behavioural cap still applies. What it
+// skips is the work whose answer the gate already gave — signature
+// validation and classification.
+//
+// Callers hold p.mu.
+func (p *Pipeline) evaluateTrusted(cp *compiledProgram, pf parsedFlow, f model.Flow, now time.Time) model.Decision {
+	for i := range cp.asic {
+		acl := &cp.asic[i]
+		if !acl.match.matches(pf) {
+			continue
+		}
+		if acl.action == model.ActionDrop {
+			p.seen(acl.stats, pf)
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageASIC, RuleID: acl.ruleID, Reason: "TCAM ACL drop"}
+		}
+		if acl.action == model.ActionPermit {
+			break
+		}
+	}
+	for i := range cp.fpga {
+		row := &cp.fpga[i]
+		if !row.match.matches(pf) {
+			continue
+		}
+		if row.action == model.ActionDrop {
+			p.seen(row.stats, pf)
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageFPGA, RuleID: row.ruleID, Reason: "FPGA drop"}
+		}
+		if row.limit > 0 && p.overRate(now, row.ruleID, row.limit, pf) {
+			p.seen(row.stats, pf)
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageFPGA, RuleID: row.ruleID,
+				Reason: fmt.Sprintf("FPGA meter %d pps exceeded", row.limit)}
+		}
+		break
+	}
+	// Still shaped like the protocol its port speaks? This is the cheap half
+	// of the filter — lengths and magic bytes, no session state — and it is
+	// what stops a spoofed address laundering junk through the fast path.
+	if p.games != nil && p.gameBindings > 0 {
+		res := p.games.Validate(gamefilter.Flow{
+			SrcIP: pf.srcIP, DstIP: f.DstIP, Proto: pf.proto, DPort: pf.dport,
+			Payload: f.Payload, HasPayload: f.Payload != nil,
+		})
+		if res.Verdict == gamefilter.VerdictDrop {
+			if fs := p.gameStats[res.FilterID]; fs != nil {
+				fs.inspected.Add(1)
+				fs.dropped.Add(1)
+				fs.ppsDropped.Add(nonNegative(pf.pps))
+			}
+			// Strike is shielded for a trusted source, which is the point:
+			// the junk is dropped, and the player whose address it claimed
+			// is not punished for it.
+			p.reputation.Strike(pf.srcIP, now)
+			return model.Decision{
+				Action: model.ActionDrop, Stage: model.StageZC, Filter: res.FilterID,
+				Reason: fmt.Sprintf("game filter %s: %s", res.Profile, res.Reason),
+			}
+		}
+	}
+
+	for i := range cp.zc {
+		zc := &cp.zc[i]
+		if !zc.match.matches(pf) {
+			continue
+		}
+		if zc.action == model.ActionDrop {
+			p.seen(zc.stats, pf)
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC drop"}
+		}
+		if zc.limit > 0 && p.overRate(now, zc.ruleID, zc.limit, pf) {
+			p.seen(zc.stats, pf)
+			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID,
+				Reason: fmt.Sprintf("PF_RING ZC behavioral cap %d pps exceeded", zc.limit)}
+		}
+		break
+	}
+	return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, Reason: reasonFastPass}
+}
+
+// proofOf maps the gate a source cleared onto what that actually proves.
+func proofOf(gate gamefilter.GateKind) reputation.Proof {
+	switch gate {
+	case gamefilter.GateChallenge:
+		// The source echoed a value it could only have learned from a reply
+		// sent to that address, so the address answers for itself.
+		return reputation.ProofChallenge
+	case gamefilter.GateHandshake:
+		// An opening sequence can be sent blind, so this says the source
+		// speaks the protocol, not that the address is real.
+		return reputation.ProofHandshake
+	}
+	return reputation.ProofNone
 }
 
 // observeLoad folds one decision into the node-wide rolling window. Callers
@@ -698,17 +867,27 @@ func (p *Pipeline) evaluate(cp *compiledProgram, pf parsedFlow, f model.Flow, no
 		// rate_limit and inspect both reach the ZC inspect path: the behavioral
 		// cap first, then the classifier.
 		if zc.limit > 0 && p.overRate(now, zc.ruleID, zc.limit, pf) {
+			p.reputation.Strike(pf.srcIP, now)
 			return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC behavioral cap %d pps exceeded", zc.limit)}, zc.stats
 		}
 		if p.model.Ready {
-			score := ml.Score(p.model, f)
+			// Scored into a reusable buffer: Features allocated a slice per
+			// packet, which the classifier paid on everything it looked at.
+			score := ml.ScoreInto(p.model, f, p.features[:])
 			p.counters.mlScored.Add(1)
 			if score >= p.model.Threshold {
 				p.counters.mlDrops.Add(1)
+				p.reputation.Strike(pf.srcIP, now)
+				// A drop is rare and worth explaining precisely, so this one
+				// keeps its formatted reason.
 				return model.Decision{Action: model.ActionDrop, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC ml score %.2f", score), Score: score}, zc.stats
 			}
 			p.counters.mlPasses.Add(1)
-			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: fmt.Sprintf("PF_RING ZC ml pass %.2f", score), Score: score}, zc.stats
+			// A pass is the common case — every packet of every real
+			// player — and formatting the score into a sentence cost more
+			// than scoring it did. The number is already on the decision as
+			// Score, so the text does not need to carry it too.
+			return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: reasonMLPass, Score: score}, zc.stats
 		}
 		return model.Decision{Action: model.ActionPermit, Stage: model.StageZC, RuleID: zc.ruleID, Reason: "PF_RING ZC inspect pass"}, zc.stats
 	}
@@ -737,12 +916,24 @@ func (p *Pipeline) inspectGame(pf parsedFlow, f model.Flow) (model.Decision, boo
 		fs.inspected.Add(1)
 	}
 
+	// A source that just cleared a gate has proved something worth
+	// remembering, so the next packet from it does not have to establish it
+	// again.
+	if res.Cleared != "" {
+		p.reputation.Promote(pf.srcIP, proofOf(res.Cleared), p.clock())
+	}
+
 	switch res.Verdict {
 	case gamefilter.VerdictDrop:
 		if fs != nil {
 			fs.dropped.Add(1)
 			fs.ppsDropped.Add(nonNegative(pf.pps))
 		}
+		// A source failing the protocol its port speaks is the clearest
+		// signal the filter produces. Strike is a no-op against a trusted
+		// source: see internal/reputation on why a spoofable signal must
+		// not be able to box one.
+		p.reputation.Strike(pf.srcIP, p.clock())
 		return model.Decision{
 			Action: model.ActionDrop, Stage: model.StageZC, Filter: res.FilterID,
 			Reason: fmt.Sprintf("game filter %s: %s", res.Profile, res.Reason),
@@ -824,6 +1015,10 @@ type Stats struct {
 	// its bound. At the bound it is admitting without tracking.
 	GameSessions    int `json:"game_sessions"`
 	GameSessionsMax int `json:"game_sessions_max"`
+	// Reputation is the two-tier source cache: who is taking the short
+	// path, who is in the penalty box, and how often a spoofable signal
+	// landed on a source that had already proved itself.
+	Reputation reputation.Stats `json:"reputation"`
 	// RateBuckets is the size of the per-source rate table. It is bounded, and
 	// sitting at the bound means the behavioral cap is no longer tracking
 	// every source.
@@ -961,6 +1156,7 @@ func (p *Pipeline) Stats() Stats {
 	if p.games != nil {
 		out.GameSessions, out.GameSessionsMax = p.games.Sessions()
 	}
+	out.Reputation = p.reputation.Stats()
 	// One row per prefix, whether the accounting or the pulse detector knows
 	// about it: a prefix that has only ever been quiet still belongs in a
 	// customer's view, reading zero.
@@ -999,6 +1195,29 @@ func (p *Pipeline) Stats() Stats {
 	sort.Slice(out.Rules, func(i, j int) bool { return out.Rules[i].RuleID < out.Rules[j].RuleID })
 	sort.Slice(out.Games, func(i, j int) bool { return out.Games[i].FilterID < out.Games[j].FilterID })
 	return out
+}
+
+// Reputation reports what the cache is holding, and a page of the sources in
+// it. It is an operator's view, not a hot path.
+func (p *Pipeline) Reputation(limit int) (reputation.Stats, []model.SourceReputation) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reputation.Stats(), p.reputation.Sources(limit)
+}
+
+// Release takes sources out of the penalty box and reports how many were in
+// it. It is how an operator clears a false positive: a source cannot promote
+// itself out, so without this a bad call would stand for the whole penalty.
+func (p *Pipeline) Release(sources []string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	freed := 0
+	for _, src := range sources {
+		if p.reputation.Release(src) {
+			freed++
+		}
+	}
+	return freed
 }
 
 // overRate accumulates the source's packet rate inside the current one-second

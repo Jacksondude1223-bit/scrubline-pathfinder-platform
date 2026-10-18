@@ -49,6 +49,50 @@ jobs:
         # filter engines, all of which are written for concurrent use.
         run: go test -race ./...
 
+  snapshot:
+    name: Vercel snapshot builds and matches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # vercel-test/ is a self-contained copy of the control plane in its own
+      # module, so the job above does not see it: go build, vet and test all
+      # run on the root module alone. It went three feature commits stale
+      # before anyone noticed, which is what this catches.
+      #
+      # Guarded on the folder existing, because it is meant to be deleted
+      # when the deployment test is done. Removing it removes this check
+      # rather than breaking CI.
+      - name: Build and test the snapshot
+        run: |
+          if [ ! -d vercel-test ]; then
+            echo "no vercel-test/ folder; nothing to check"
+            exit 0
+          fi
+          cd vercel-test
+          go build ./...
+          go vet ./...
+          go test ./...
+
+      - name: Snapshot is in step with the source
+        run: |
+          if [ ! -d vercel-test ]; then
+            exit 0
+          fi
+          ./vercel-test/sync.sh >/dev/null
+          drift=$(git status --porcelain vercel-test/internal)
+          if [ -n "$drift" ]; then
+            echo "vercel-test/internal is behind the source. Run ./vercel-test/sync.sh and commit:"
+            echo "$drift"
+            exit 1
+          fi
+          echo "snapshot matches the source"
+
   spec:
     name: API spec matches the code
     runs-on: ubuntu-latest
