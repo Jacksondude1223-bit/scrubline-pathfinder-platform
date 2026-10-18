@@ -3,7 +3,8 @@
 This folder is a self-contained Rust Vercel Function using the same API and
 pipeline modules as the native application. Set the Vercel project Root Directory
 to `vercel-test`, select Framework Preset **Other**, and clear the old Go build
-command override. `vercel.json` rewrites requests to `api/control.rs`, following
+command override. `vercel.json` explicitly selects the official `@vercel/rust`
+function builder and rewrites requests to `api/control.rs`, following
 [Vercel's Rust Axum template](https://github.com/vercel/examples/tree/main/rust/axum).
 
 Set `SCRUBLINE_API_TOKEN` and `SCRUBLINE_ENROLL_TOKEN` to distinct values. The API
@@ -27,3 +28,8 @@ The sync script refreshes `src/`, dependencies, and the pinned toolchain from th
 root package. It preserves the Vercel handler and configuration. Commit the
 refreshed source before deploying. CI checks source drift, formatting, lint,
 tests, and release compilation without requiring Go.
+
+The explicit Rust builder bypasses the static-site build path. Do not add a
+`buildCommand` running Cargo: that can select `@vercel/static-build` and fail with
+`STATIC_BUILD_NO_OUT_DIR` after successful compilation. The Rust builder compiles
+and packages the function itself; no `public` output directory is required.

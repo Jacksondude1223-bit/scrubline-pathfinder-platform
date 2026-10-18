@@ -7,5 +7,10 @@
       "destination": "/api/control"
     }
   ],
-  "buildCommand": "cargo build --locked --release --bin control"
+  "builds": [
+    {
+      "src": "api/control.rs",
+      "use": "@vercel/rust"
+    }
+  ]
 }
