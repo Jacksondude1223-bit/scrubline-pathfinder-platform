@@ -107,7 +107,16 @@ pub fn validate_session(s: &Session, protected: Option<&HashSet<String>>) -> Res
     {
         return Err("session id must be 1..48 lowercase letters, digits, dashes and underscores, starting with a letter or digit".into());
     }
-    s.peer_ip.parse::<IpAddr>().map_err(|e| e.to_string())?;
+    // Sessions peer from the node's IPv4 tunnel_src and render a BIRD ipv4 channel, so an IPv6
+    // peer or prefix would produce a configuration BIRD refuses to load.
+    if !s
+        .peer_ip
+        .parse::<IpAddr>()
+        .map_err(|e| e.to_string())?
+        .is_ipv4()
+    {
+        return Err("peer_ip must be IPv4: sessions peer from the node's IPv4 tunnel_src".into());
+    }
     if s.peer_as <= 0 || s.peer_as > u32::MAX as i64 {
         return Err("peer_as is not a usable AS number".into());
     }
@@ -128,6 +137,11 @@ pub fn validate_session(s: &Session, protected: Option<&HashSet<String>>) -> Res
             return Err(format!(
                 "prefix {prefix} has host bits set; write it as {}",
                 p.trunc()
+            ));
+        }
+        if !matches!(p, IpNet::V4(_)) {
+            return Err(format!(
+                "prefix {prefix} is not IPv4; a session carries an ipv4 channel only"
             ));
         }
         if !seen.insert(prefix) {

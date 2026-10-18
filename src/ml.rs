@@ -47,13 +47,20 @@ pub fn validate_sample(s: &Sample) -> Result<()> {
     }
     validate_flow(&s.flow)
 }
+// Scored per flow on the ZC stage and per sample per epoch in training, so it must not allocate.
 pub fn features(f: &Flow) -> [f64; FEATURE_COUNT] {
-    let proto = f.proto.to_ascii_lowercase();
+    let proto = |name: &str| {
+        if f.proto.eq_ignore_ascii_case(name) {
+            1.0
+        } else {
+            0.0
+        }
+    };
     [
         (f.pps.clamp(0, i32::MAX as i64) as f64).ln_1p() / 12.0,
-        if proto == "tcp" { 1.0 } else { 0.0 },
-        if proto == "udp" { 1.0 } else { 0.0 },
-        if proto == "icmp" { 1.0 } else { 0.0 },
+        proto("tcp"),
+        proto("udp"),
+        proto("icmp"),
         if f.flags.eq_ignore_ascii_case("syn") {
             1.0
         } else {

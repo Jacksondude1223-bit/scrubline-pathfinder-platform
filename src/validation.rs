@@ -43,11 +43,15 @@ pub fn policy(p: &Policy) -> Result<()> {
     if p.name.is_empty() || p.protected.is_empty() {
         return Err("name and protected prefixes required".into());
     }
-    let protected: HashSet<_> = p.protected.iter().cloned().collect();
+    let mut protected = HashSet::new();
     for prefix in &p.protected {
         prefix
             .parse::<IpNet>()
             .map_err(|e| format!("protected prefix {prefix:?}: {e}"))?;
+        // A repeat would be announced, enforced and attributed twice per node.
+        if !protected.insert(prefix.clone()) {
+            return Err(format!("duplicate protected prefix {prefix}"));
+        }
     }
     unique(p.steering.iter().map(|s| s.prefix.as_str()), "steering")?;
     for s in &p.steering {
@@ -86,8 +90,17 @@ pub fn policy(p: &Policy) -> Result<()> {
     }
     unique(p.sessions.iter().map(|s| s.id.as_str()), "sessions")?;
     let mut peers = HashSet::new();
+    let mut protocols = HashSet::new();
     for s in &p.sessions {
         bgp::validate_session(s, Some(&protected))?;
+        // BIRD names each session from its id with dashes folded to underscores, and a duplicate
+        // protocol name makes BIRD reject the node's whole session configuration.
+        if !protocols.insert(s.id.replace('-', "_")) {
+            return Err(format!(
+                "session id {:?} renders to the same BIRD protocol as another session",
+                s.id
+            ));
+        }
         if !peers.insert(&s.peer_ip) {
             return Err("duplicate session peer".into());
         }

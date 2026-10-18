@@ -1,6 +1,6 @@
 use pathfinder::{
     ml,
-    model::{Flow, Program},
+    model::{Flow, Match, Program, ZCEntry},
     pipeline::Pipeline,
     state::{Egress, Pulse, Reputation},
 };
@@ -109,4 +109,66 @@ fn untrusted_state_tables_stay_bounded() {
         e.grace("p", &format!("client-{i}"), 500, now);
     }
     assert_eq!(e.stats(now)["clients"], 65536);
+}
+#[test]
+fn trusted_sources_stay_capped_behind_observe_only_rules() {
+    let now = 1767225600000;
+    let rule = |id: &str, action: &str, priority, pps| ZCEntry {
+        cluster: "zc:n".into(),
+        priority,
+        r#match: Match::default(),
+        action: action.into(),
+        pps,
+        rule_id: id.into(),
+    };
+    let mut pipe = Pipeline::new(Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        zc: vec![
+            rule("observe", "count", 1, 0),
+            rule("cap", "inspect", 2, 100),
+        ],
+        ..Default::default()
+    });
+    pipe.reputation.promote("192.0.2.9", 3, now);
+    let flow = Flow {
+        src_ip: "192.0.2.9".into(),
+        dst_ip: "203.0.113.10".into(),
+        proto: "udp".into(),
+        pps: 80,
+        ..Default::default()
+    };
+    assert_eq!(pipe.decide(&flow, now).reason, "verified source, fast path");
+    let d = pipe.decide(&flow, now + 1);
+    assert_eq!((d.action.as_str(), d.rule_id.as_str()), ("drop", "cap"));
+    let stats = pipe.stats(now + 1);
+    let observe = stats["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["rule_id"] == "observe")
+        .unwrap()
+        .clone();
+    assert_eq!(observe["matches"], 2);
+}
+#[test]
+fn reloading_without_a_pulse_floor_restores_the_default() {
+    let start = 1767225600000;
+    let program = |floor| Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        pulse_floor_pps: floor,
+        ..Default::default()
+    };
+    let mut pipe = Pipeline::new(program(50000));
+    pipe.load(program(0));
+    let burst = Flow {
+        src_ip: "192.0.2.9".into(),
+        dst_ip: "203.0.113.10".into(),
+        proto: "udp".into(),
+        pps: 20000,
+        ..Default::default()
+    };
+    for i in 0..3 {
+        pipe.decide(&burst, start + i * 1000);
+    }
+    assert_eq!(pipe.stats(start + 2000)["pulsing"], true);
 }

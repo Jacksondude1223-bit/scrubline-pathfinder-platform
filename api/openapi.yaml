@@ -1147,6 +1147,7 @@ components:
           items:
             type: string
           minItems: 1
+          uniqueItems: true
         rules:
           type: array
           items:
@@ -1937,9 +1938,11 @@ components:
         id:
           type: string
           description: Lowercase letters, digits, dashes and underscores. Becomes the peering's name in
-            the rendered configuration.
+            the rendered configuration, with dashes folded to underscores, so two ids that differ only
+            in that are refused.
         peer_ip:
           type: string
+          description: IPv4. The session peers from the node's IPv4 tunnel_src.
           example: 198.51.100.1
         peer_as:
           type: integer
@@ -1956,7 +1959,8 @@ components:
           items:
             type: string
           minItems: 1
-          description: What the session accepts, each one the policy protects. The rendered filter admits
+          description: What the session accepts, each one an IPv4 prefix the policy protects, since the
+            rendered configuration carries an ipv4 channel only. The rendered filter admits
             these and anything more specific inside them, because customers de-aggregate under attack
             and a filter that refused that would drop the announcement when it mattered most.
         max_prefixes:

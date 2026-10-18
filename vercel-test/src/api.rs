@@ -30,15 +30,31 @@ type Answer<T = Value> = std::result::Result<T, Error>;
 fn bad(e: impl ToString) -> Error {
     (400, e.to_string())
 }
+// The API contract answers 503 for a write that could not be made durable: the change was rolled
+// back, which is what a caller needs to know to retry it.
 fn failed(e: impl ToString) -> Error {
     eprintln!("state operation failed: {}", e.to_string());
-    (500, "could not persist control-plane state".into())
+    (503, "could not persist control-plane state".into())
 }
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Answer<T> {
     serde_json::from_slice(body).map_err(bad)
 }
 fn value<T: Serialize>(v: T) -> Value {
     serde_json::to_value(v).expect("validated wire value")
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Training {
+    epochs: i64,
+    lr: f64,
+    threshold: f64,
+    #[serde(skip)]
+    samples: Vec<ml::Sample>,
+}
+impl Training {
+    fn fit(&self) -> Answer<ml::Model> {
+        ml::train(&self.samples, self.epochs, self.lr, self.threshold).map_err(bad)
+    }
 }
 #[derive(Clone)]
 struct Who {
@@ -171,6 +187,31 @@ impl Api {
         } else {
             Ok(())
         }
+    }
+    /// Validates a training request and copies the training set out, so the fit can run without
+    /// the control-plane lock.
+    fn training(&self, who: &Who, body: &[u8]) -> Answer<Training> {
+        who.operator()?;
+        self.writable()?;
+        let mut t: Training = if body.is_empty() {
+            Training::default()
+        } else {
+            parse(body)?
+        };
+        if self.store.data.samples.len() < 2 {
+            return Err(bad("need at least two labeled samples"));
+        }
+        t.samples = self.store.data.samples.clone();
+        Ok(t)
+    }
+    fn install(&mut self, m: ml::Model) -> Answer {
+        self.store
+            .transaction(|d| {
+                d.model = m.clone();
+                Ok(())
+            })
+            .map_err(failed)?;
+        Ok(value(m))
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
@@ -321,7 +362,8 @@ impl Api {
                     if e.contains("different live node") {
                         (409, e)
                     } else {
-                        failed(e)
+                        eprintln!("registration failed: {e}");
+                        (500, "could not issue a node credential".into())
                     }
                 })?;
                 self.reconcile(now, false).map_err(failed)?;
@@ -473,32 +515,9 @@ impl Api {
                 Ok(json!({"stored":stored}))
             }
             ("POST", ["ml", "train"]) => {
-                who.operator()?;
-                self.writable()?;
-                #[derive(Deserialize, Default)]
-                #[serde(default)]
-                struct Train {
-                    epochs: i64,
-                    lr: f64,
-                    threshold: f64,
-                }
-                let t: Train = if body.is_empty() {
-                    Train::default()
-                } else {
-                    parse(body)?
-                };
-                if self.store.data.samples.len() < 2 {
-                    return Err(bad("need at least two labeled samples"));
-                }
-                let m = ml::train(&self.store.data.samples, t.epochs, t.lr, t.threshold)
-                    .map_err(bad)?;
-                self.store
-                    .transaction(|d| {
-                        d.model = m.clone();
-                        Ok(())
-                    })
-                    .map_err(failed)?;
-                Ok(value(m))
+                // handler() serves this route through train(), which fits outside the lock.
+                let m = self.training(&who, body)?.fit()?;
+                self.install(m)
             }
             ("GET", ["ml", "model"]) => {
                 if who.role != "operator" && who.role != "node" {
@@ -747,10 +766,14 @@ pub fn duration_string(ms: i64) -> String {
     }
 }
 
+// The lock can be held across a durable write, so it is only ever waited on from the blocking
+// pool: waiting on it from an async handler parks one of the runtime's two worker threads.
 async fn health(State(s): State<Shared>) -> Json<Value> {
-    let a = s.lock().unwrap();
+    let mode = tokio::task::spawn_blocking(move || s.lock().unwrap().mode.clone())
+        .await
+        .unwrap_or_default();
     Json(
-        json!({"status":"ok","product":"scrubline-cloud","datapath":"asic-tcam+fpga+pfring-zc+ml","mode":a.mode}),
+        json!({"status":"ok","product":"scrubline-cloud","datapath":"asic-tcam+fpga+pfring-zc+ml","mode":mode}),
     )
 }
 fn response(result: Answer) -> Response {
@@ -784,15 +807,21 @@ async fn handler(
         })
         .unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || {
-        let mut a = s.lock().unwrap();
-        let result = a.dispatch(
-            method.as_str(),
-            uri.path(),
-            &query,
-            &headers,
-            &body,
-            Utc::now(),
-        );
+        let (mut a, result) = if method == Method::POST && uri.path() == "/v1/ml/train" {
+            let result = train(&s, &headers, &body);
+            (s.lock().unwrap(), result)
+        } else {
+            let mut a = s.lock().unwrap();
+            let result = a.dispatch(
+                method.as_str(),
+                uri.path(),
+                &query,
+                &headers,
+                &body,
+                Utc::now(),
+            );
+            (a, result)
+        };
         let code = result.as_ref().map(|_| 200).unwrap_or_else(|e| e.0);
         let route = route_label(uri.path());
         *a.requests.entry((route, code)).or_default() += 1;
@@ -800,6 +829,17 @@ async fn handler(
     })
     .await;
     response(result.unwrap_or_else(|_| Err((500, "request worker failed".into()))))
+}
+/// Fitting a full training set takes seconds. Holding the lock for that long stalls every
+/// heartbeat and program fetch behind it, so only reading the set and storing the model take it.
+fn train(s: &Shared, headers: &HeaderMap, body: &[u8]) -> Answer {
+    let job = {
+        let a = s.lock().unwrap();
+        let who = a.auth(headers)?;
+        a.training(&who, body)?
+    };
+    let m = job.fit()?;
+    s.lock().unwrap().install(m)
 }
 fn route_label(path: &str) -> String {
     let parts: Vec<_> = path
@@ -832,15 +872,22 @@ fn route_label(path: &str) -> String {
     }
 }
 async fn metrics_handler(State(s): State<Shared>, method: Method, headers: HeaderMap) -> Response {
-    let a = s.lock().unwrap();
-    if let Err(e) = a.auth(&headers).and_then(|w| w.operator()) {
-        return response(Err(e));
-    }
-    if method != Method::GET {
-        return response(Err((405, "GET required".into())));
-    }
-    match a.metrics() {
-        Ok(text) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], text).into_response(),
-        Err(e) => response(Err(failed(e))),
-    }
+    tokio::task::spawn_blocking(move || {
+        let a = s.lock().unwrap();
+        if let Err(e) = a.auth(&headers).and_then(|w| w.operator()) {
+            return response(Err(e));
+        }
+        if method != Method::GET {
+            return response(Err((405, "GET required".into())));
+        }
+        match a.metrics() {
+            Ok(text) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], text).into_response(),
+            Err(e) => {
+                eprintln!("metrics: {e}");
+                response(Err((500, "could not render metrics".into())))
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| response(Err((500, "request worker failed".into()))))
 }

@@ -133,6 +133,12 @@ pub struct Collector {
     rule_counters: HashMap<(String, String, bool), [u64; 5]>,
     nodes: HashMap<String, i64>,
 }
+// History is kept per minute, so a window shorter than one still covers the current bucket. Without
+// the floor the bucket range runs backwards, and a reversed BTreeMap range panics while the request
+// holds the control-plane lock, poisoning it for every caller after.
+fn minutes(span: i64) -> i64 {
+    (span / 60000).max(1)
+}
 fn delta(a: u64, b: u64) -> u64 {
     if b < a {
         b
@@ -341,7 +347,7 @@ impl Collector {
         let mut nodes = 0;
         let mut under = false;
         if let Some(s) = self.series.get(p) {
-            let first = now / 60000 - span / 60000 + 1;
+            let first = now / 60000 - minutes(span) + 1;
             for (_, b) in s.ring.range(first..=now / 60000) {
                 for (i, c) in count.iter_mut().enumerate() {
                     *c = (*c).saturating_add(b.counts[i]);
@@ -361,7 +367,7 @@ impl Collector {
     pub fn points(&self, p: &str, span: i64, step: i64, now: i64) -> Vec<Value> {
         let per = (step / 60000).max(1);
         let last = now / 60000;
-        let first = last - span.clamp(1, 86400000) / 60000 + 1;
+        let first = last - minutes(span.clamp(1, 86400000)) + 1;
         let first = first - first.rem_euclid(per);
         let mut out = Vec::new();
         let mut start = first;
