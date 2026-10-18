@@ -1,5 +1,7 @@
 # Scrubline Cloud
 
+> **Rust migration:** The native Rust CLI and core libraries are available on this branch. The API, node runtime, traffic generator, and Vercel snapshot still run Go. See [the migration status](docs/rust-migration.md) for build commands and the remaining cutover work.
+
 Distributed denial-of-service scrubbing for SecNov. Multi-node, API-controlled, and built on ASIC/TCAM ACLs, FPGA meters, and PF_RING ZC. This is the cloud fabric, not the XDP host filter.
 
 Attack traffic is steered onto scrubbing nodes by anycast. Each node drops in hardware first, then meters in the FPGA, then hands residual flows to a PF_RING ZC userspace inspect path. Clean traffic goes back to the customer's own edge over a GRE or IPIP tunnel, because once the scrubbers announce a prefix there is no ordinary route back to it. The control API compiles one policy into all three datapath programs, the fabric's BGP posture, the return paths, and any BGP sessions the customer peers over.
@@ -910,3 +912,4 @@ go run ./cmd/scrubctl ml-train
 
 The node agent also takes `-local-as`, `-bgp-next-hop` and `-capacity-pps` for
 steering; see [Steering](#steering).
+

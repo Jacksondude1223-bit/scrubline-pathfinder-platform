@@ -8,3 +8,5 @@ dist/
 *.test
 .env
 .DS_Store
+
+target/

@@ -112,3 +112,29 @@ jobs:
         # against the server's dispatch switch in both directions. A spec that
         # has drifted from the implementation is worse than no spec.
         run: make spec-check
+
+  rust:
+    name: Rust migration compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go reference fixtures stay current
+        run: |
+          make rust-reference
+          git diff --exit-code -- tests/fixtures/go-reference.json
+      - name: Rust format and lint
+        run: make rust-check
+      - name: Rust compatibility and CLI tests
+        run: make rust-test
+      - name: Build native Rust CLI
+        run: make rust-build
+      - name: Rust CLI against the Go API
+        run: |
+          go build -o target/go-reference-api ./cmd/scrub-api
+          python3 scripts/rust-cli-e2e.py
