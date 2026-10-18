@@ -64,12 +64,36 @@ type Policy struct {
 	// deployment — set it from what the protected service actually carries.
 	// Zero takes the platform default.
 	PulseFloorPPS int `json:"pulse_floor_pps,omitempty"`
+	// Reputation tunes the two-tier source cache: who gets the short path,
+	// and whether repeat offenders are dropped at the top of the pipeline.
+	Reputation *ReputationPolicy `json:"reputation,omitempty"`
 	// ChallengeSecret keys the cookies the challenge gate mints. The control
 	// plane generates it and ships it to every node, because under anycast a
 	// cookie minted by one scrubber has to verify on another.
 	ChallengeSecret string    `json:"challenge_secret,omitempty"`
 	UpdatedAt       time.Time `json:"updated_at"`
 	Version         int       `json:"version"`
+}
+
+// ReputationPolicy tunes what the datapath remembers about a source.
+type ReputationPolicy struct {
+	// FastPass is the weakest proof that earns the short path: "challenge",
+	// "handshake", or "off".
+	//
+	// It defaults to "challenge", the stricter reading. Answering a
+	// challenge means echoing a value that could only have come from a
+	// reply to that address, so the address answers for itself; completing
+	// a handshake can be done blind, which means a spoofer can clear it for
+	// any address. Widening this to "handshake" is reasonable for a
+	// protocol that defines no challenge, and it is a deliberate decision
+	// rather than a default.
+	FastPass string `json:"fast_pass,omitempty"`
+	// PenaltyBox drops sources that keep failing, at the top of the
+	// pipeline, instead of letting them walk every stage to the same
+	// verdict. Off by default: it is an escalation of consequence beyond
+	// what one packet earned, so it is rolled out deliberately. With it
+	// off, strikes and would-be demotions are still counted and exposed.
+	PenaltyBox bool `json:"penalty_box,omitempty"`
 }
 
 // Steering overrides the default anycast posture for one protected prefix.
@@ -208,7 +232,8 @@ type Program struct {
 	ChallengeSecret string       `json:"challenge_secret,omitempty"`
 	// PulseFloorPPS is how loud a burst must be before it counts toward a
 	// pulse train. Zero takes the platform default.
-	PulseFloorPPS int `json:"pulse_floor_pps,omitempty"`
+	PulseFloorPPS int               `json:"pulse_floor_pps,omitempty"`
+	Reputation    *ReputationPolicy `json:"reputation,omitempty"`
 	// Tunnels are this node's own return paths: one per customer endpoint
 	// whose prefixes this node carries, sourced from this node's address.
 	Tunnels []NodeTunnel `json:"tunnels,omitempty"`
@@ -392,6 +417,25 @@ type TunnelStatus struct {
 	// through to the operator unchanged.
 	Detail     string    `json:"detail,omitempty"`
 	ReportedAt time.Time `json:"reported_at,omitempty"`
+}
+
+// SourceReputation is what the datapath remembers about one source address.
+// It is a debugging view for an operator asking who is in the penalty box,
+// not something the hot path reads.
+type SourceReputation struct {
+	Source string `json:"source"`
+	// State is "trusted", "penalised", or "tracked" for a source that is
+	// neither but has history worth keeping.
+	State string `json:"state"`
+	// Proof is what the source demonstrated: "challenge" is an echoed cookie
+	// and so proves the address answers for itself; "handshake" only proves
+	// the source speaks the protocol, since an opening sequence can be sent
+	// blind.
+	Proof     string  `json:"proof"`
+	ExpiresIn float64 `json:"expires_in_seconds,omitempty"`
+	// Level is how far up the penalty ladder this source has climbed.
+	Level   int `json:"level,omitempty"`
+	Strikes int `json:"strikes,omitempty"`
 }
 
 // AnnounceState is whether a node offers a prefix to its upstreams.

@@ -375,6 +375,9 @@ work":
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
 - `scrubline_prefix_offered_pps{node,prefix}` and `scrubline_prefix_dropped_pps{node,prefix}` — the same rates broken down by the protected prefix the traffic was aimed at. The node-wide pair cannot answer "which customer is being attacked": a scrubber carries many prefixes at once.
 - `scrubline_prefix_flows_total{node,prefix}`, `scrubline_prefix_flows_dropped_total{...}`, `scrubline_prefix_offered_total{...}` and `scrubline_prefix_dropped_total{...}` — the cumulative per-prefix counters the customer-facing analytics are deltaed from.
+- `scrubline_reputation_trusted{node}` and `scrubline_reputation_penalised{node}` — how many sources are on the short path and how many are in the box.
+- `scrubline_reputation_boxed_total{node}` — packets dropped at the top of the pipeline, which is the load the rest of the stages did not have to carry.
+- `scrubline_reputation_shielded_total{node}` — strikes that landed on an already-verified source and were not acted on. Alert on this: it is a spoofing attempt against a real player, or a verified client misbehaving.
 - `scrubline_tunnel_up{node,tunnel,remote}` — 1 when a return path is reported carrying traffic, 0 when reported down. A never-reported tunnel is **absent**, not zero: `scrubline_tunnel_reported` is how you tell "nothing is reporting" from "it is broken".
 - `scrubline_tunnel_mtu_bytes{node,tunnel}` and `scrubline_tunnel_mss_clamp_bytes{...}` — the derived encapsulation numbers, so a hung-TCP complaint can be checked against them rather than guessed at.
 - `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
@@ -393,6 +396,104 @@ the published model's holdout metrics, and
 curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      http://127.0.0.1:8080/metrics
 curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/metrics
 ```
+
+## Source reputation
+
+Two tiers, pulling in opposite directions, both keyed on what a source has
+already proved.
+
+**A verified client takes a shorter path.** Once a source has cleared a
+protocol gate, re-challenging it and re-scoring it per packet tells you what
+the gate already established, so it skips both. Measured on an admitted A2S
+client: **980 → 695 ns per packet**.
+
+It does **not** skip two things:
+
+- **The behavioural cap.** It is the only thing bounding what a verified
+  source can send. Without it, clearing one challenge would be the whole
+  attack — and the cap costs about four nanoseconds, so there was never
+  anything to save.
+- **The signature check.** The source address on a packet is written by
+  whoever sent it, so skipping this would make spoofing a verified player's
+  address a way to have junk forwarded. It is the cheap half of the filter:
+  lengths and magic bytes, no session state.
+
+**A repeat offender is dropped at the top.** Four failures inside thirty
+seconds and a source goes into a penalty box — a minute, then ten, then an
+hour — and is dropped before it walks any stage. During an attack most of the
+packets are the attacker's, so this is where headroom comes from: **1389 →
+203 ns per packet, and the allocations go to zero**.
+
+The escalation decays after an hour of clean time, measured from the *end* of
+the last penalty rather than the last strike — otherwise serving a sentence
+counts as good behaviour and the longest penalty decays itself the moment it
+expires.
+
+```json
+"reputation": {"fast_pass": "challenge", "penalty_box": true}
+```
+
+Both default off-ish: `penalty_box` is off unless asked for, and `fast_pass`
+defaults to the stricter `challenge`. With the box off, strikes and would-be
+demotions are still counted, which is how you size it before switching it on.
+
+### A trusted source cannot be demoted
+
+This is the part worth being careful about. The obvious design — anything
+that trips a check goes in the box — turns the box into a weapon. Source
+addresses in a UDP flood are written by the attacker, so anyone could send a
+packet claiming to be a real player and have that player banned. The
+mitigation becomes a better denial of service than the attack.
+
+So demotion applies only to sources that are not currently trusted. Strikes
+against a trusted source are counted as `shielded` and not acted on: the junk
+is still dropped by the signature check, and the player whose address it
+claimed stays online. `scrubline_reputation_shielded_total` rising means
+either a spoofing attempt or a verified client genuinely misbehaving, and
+both want a human rather than an automatic ban.
+
+That is not a loophole for an abusive verified client: trust never skips the
+rate cap, so the worst one can do is use its full allowance.
+
+### Not all proof is equal
+
+Answering a challenge means echoing a value that could only have come from a
+reply sent to that address — the address answers for itself. Completing a
+handshake can be done blind, so a spoofer can clear it for any address.
+
+`fast_pass` therefore defaults to `challenge`. Widening it to `handshake` is
+reasonable for a protocol that defines no challenge (RakNet does not), but it
+is a decision, not a default.
+
+### Two-stage table admission
+
+Unverified sources used to occupy the same 65 536-slot session table as
+connected players, on the strength of one opening packet — and those entries
+were never read to decide anything. A flood of openers filled the table, and
+once full the filter admits without tracking, so a flood of addresses that
+completed nothing pushed real players off the protected path. Measured: 24 577
+junk entries, from sources that never finished a handshake.
+
+Sources part-way through a gate now live in a small ring instead. Eviction is
+overwriting the oldest slot — no scan, no decision about who to drop — so a
+flood churns its own entries and never reaches the sessions of people who
+actually connected. The same flood now leaves exactly one entry in the
+session table: the player.
+
+### Clearing a false positive
+
+A boxed source cannot promote itself out — it is dropped before it reaches a
+gate. That is only defensible if an operator can, so the agent serves the
+list and the way back:
+
+```sh
+curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" node:9091/reputation
+curl -X POST -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" node:9091/reputation \
+  -d '{"release":["198.51.100.9"]}'
+```
+
+Releasing leaves the escalation level alone: the next offence should not start
+from scratch because this one was forgiven.
 
 ## Return paths
 

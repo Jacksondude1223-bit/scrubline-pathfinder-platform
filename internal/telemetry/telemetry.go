@@ -384,3 +384,77 @@ func TunnelFamilies(nodeID, name, region string, tunnels []model.NodeTunnel, rep
 	}
 	return []metrics.Family{up, required, reportedAt, mtu, clamp, prefixes}
 }
+
+// ReputationFamilies renders the two-tier source cache.
+//
+// The shielded series is the one to alert on. It counts stateless signals
+// that landed on a source which had already proved itself, and the cache
+// refused to act on them — so a rising value is either somebody spoofing a
+// real player's address to get them banned, or a verified client genuinely
+// misbehaving. Either way it is an operator's call, not the datapath's.
+func ReputationFamilies(reports []Report) []metrics.Family {
+	tracked := metrics.Family{
+		Name: "scrubline_reputation_tracked", Type: metrics.Gauge,
+		Help: "Source addresses the reputation cache is holding.",
+	}
+	trackedMax := metrics.Family{
+		Name: "scrubline_reputation_tracked_max", Type: metrics.Gauge,
+		Help: "Bound on the reputation table. At the bound a source takes the ordinary path, so this costs an optimisation rather than a protection.",
+	}
+	trusted := metrics.Family{
+		Name: "scrubline_reputation_trusted", Type: metrics.Gauge,
+		Help: "Sources currently taking the short path because they cleared a protocol gate.",
+	}
+	penalised := metrics.Family{
+		Name: "scrubline_reputation_penalised", Type: metrics.Gauge,
+		Help: "Sources currently in the penalty box.",
+	}
+	fastPassed := metrics.Family{
+		Name: "scrubline_reputation_fast_passed_total", Type: metrics.Counter,
+		Help: "Packets taken off the slow path because their source was already verified.",
+	}
+	boxed := metrics.Family{
+		Name: "scrubline_reputation_boxed_total", Type: metrics.Counter,
+		Help: "Packets dropped at the top of the pipeline because their source is in the penalty box. This is the load the rest of the stages did not have to carry.",
+	}
+	promotions := metrics.Family{
+		Name: "scrubline_reputation_promotions_total", Type: metrics.Counter,
+		Help: "Sources that cleared a gate and entered the trusted tier.",
+	}
+	demotions := metrics.Family{
+		Name: "scrubline_reputation_demotions_total", Type: metrics.Counter,
+		Help: "Sources that accumulated enough strikes to be boxed. Counted even when the penalty box is off, which is how it is sized before being switched on.",
+	}
+	strikes := metrics.Family{
+		Name: "scrubline_reputation_strikes_total", Type: metrics.Counter,
+		Help: "Failures recorded against a source.",
+	}
+	shielded := metrics.Family{
+		Name: "scrubline_reputation_shielded_total", Type: metrics.Counter,
+		Help: "Strikes that landed on an already-verified source and were not acted on. Source addresses are attacker-controlled, so acting on one would let anyone get a real player banned. A rising value is a spoofing attempt or a misbehaving verified client, and both want a human.",
+	}
+	full := metrics.Family{
+		Name: "scrubline_reputation_full_total", Type: metrics.Counter,
+		Help: "Sources the reputation table had no room for.",
+	}
+
+	for _, r := range reports {
+		id := r.identity()
+		s := r.Stats.Reputation
+		tracked.Samples = append(tracked.Samples, metrics.Sample{Labels: id, Value: float64(s.Tracked)})
+		trackedMax.Samples = append(trackedMax.Samples, metrics.Sample{Labels: id, Value: float64(s.Max)})
+		trusted.Samples = append(trusted.Samples, metrics.Sample{Labels: id, Value: float64(s.Trusted)})
+		penalised.Samples = append(penalised.Samples, metrics.Sample{Labels: id, Value: float64(s.Penalised)})
+		fastPassed.Samples = append(fastPassed.Samples, metrics.Sample{Labels: id, Value: float64(s.FastPassed)})
+		boxed.Samples = append(boxed.Samples, metrics.Sample{Labels: id, Value: float64(s.Boxed)})
+		promotions.Samples = append(promotions.Samples, metrics.Sample{Labels: id, Value: float64(s.Promotions)})
+		demotions.Samples = append(demotions.Samples, metrics.Sample{Labels: id, Value: float64(s.Demotions)})
+		strikes.Samples = append(strikes.Samples, metrics.Sample{Labels: id, Value: float64(s.Strikes)})
+		shielded.Samples = append(shielded.Samples, metrics.Sample{Labels: id, Value: float64(s.Shielded)})
+		full.Samples = append(full.Samples, metrics.Sample{Labels: id, Value: float64(s.Full)})
+	}
+	return []metrics.Family{
+		tracked, trackedMax, trusted, penalised,
+		fastPassed, boxed, promotions, demotions, strikes, shielded, full,
+	}
+}

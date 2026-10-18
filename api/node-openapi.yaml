@@ -37,8 +37,8 @@ paths:
     get:
       summary: Prometheus exposition for this node's datapath
       description: Per-rule hits, per-stage verdicts, game filter counters, per-prefix traffic and pulse
-        shape, and the steering posture. It names rule ids, customer prefixes and traffic volumes, so
-        it takes the token.
+        shape, the reputation tiers, and the steering posture. It names rule ids, customer prefixes and
+        traffic volumes, so it takes the token.
       responses:
         '200':
           description: Exposition in the Prometheus text format.
@@ -274,6 +274,98 @@ paths:
                 $ref: '#/components/schemas/Error'
         '405':
           description: Only GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /reputation:
+    get:
+      summary: What this node remembers about sources
+      description: 'Two tiers. A source that cleared a protocol gate takes a shorter path for a while:
+        it skips the gate and the classifier, because clearing the gate already established what they
+        would say. It does not skip the behavioural cap or the signature check — the cap because it is
+        the only thing bounding what a verified source can send, and the signature because the source
+        address on a packet is written by whoever sent it.
+
+
+        A source that keeps failing goes the other way, into a penalty box with an escalating term, and
+        is dropped at the top of the pipeline rather than walking every stage to the same verdict. During
+        an attack most of the packets are the attacker''s, so that is where the headroom comes from.'
+      parameters:
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 100
+        description: How many sources to list. Penalised ones come first.
+      responses:
+        '200':
+          description: The cache's counters and a page of the sources in it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node:
+                    type: string
+                  stats:
+                    $ref: '#/components/schemas/ReputationStats'
+                  sources:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SourceReputation'
+        '400':
+          description: limit is not a positive number.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Take sources out of the penalty box
+      description: 'How an operator clears a false positive. A boxed source cannot promote itself out
+        — it is dropped before it reaches a gate — so without this a bad call would stand for the whole
+        penalty.
+
+
+        The escalation level is left alone: the next offence should not start from scratch because this
+        one was forgiven.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                release:
+                  type: array
+                  items:
+                    type: string
+                  description: Source addresses to free.
+      responses:
+        '200':
+          description: How many of them were actually in the box.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  released:
+                    type: integer
+        '400':
+          description: No sources given, or a malformed body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid token.
           content:
             application/json:
               schema:
@@ -593,3 +685,66 @@ components:
           type: string
           format: date-time
           description: 'Stamped by the control plane, not the node: the fleet''s clocks are not synchronised.'
+    ReputationStats:
+      type: object
+      description: The two-tier source cache's counters.
+      properties:
+        tracked:
+          type: integer
+        max:
+          type: integer
+          description: At the bound a source takes the ordinary path, so this costs an optimisation rather
+            than a protection.
+        trusted:
+          type: integer
+        penalised:
+          type: integer
+        fast_passed:
+          type: integer
+          description: Packets taken off the slow path because their source was already verified.
+        boxed:
+          type: integer
+          description: 'Packets dropped at the top because their source is in the box: the load the rest
+            of the stages did not carry.'
+        promotions:
+          type: integer
+        demotions:
+          type: integer
+        strikes:
+          type: integer
+        shielded:
+          type: integer
+          description: Strikes that landed on an already-verified source and were not acted on. Source
+            addresses are attacker-controlled, so acting on one would let anyone get a real player banned.
+            A rising value is a spoofing attempt or a misbehaving verified client, and both want a human.
+        full:
+          type: integer
+    SourceReputation:
+      type: object
+      description: What the datapath remembers about one source address.
+      properties:
+        source:
+          type: string
+        state:
+          type: string
+          enum:
+          - trusted
+          - penalised
+          - tracked
+        proof:
+          type: string
+          enum:
+          - challenge
+          - handshake
+          - none
+          description: challenge proves the address answers for itself; handshake only proves the source
+            speaks the protocol, since an opening sequence can be sent blind.
+        expires_in_seconds:
+          type: number
+        level:
+          type: integer
+          description: 'How far up the penalty ladder this source has climbed: 1 minute, then 10, then
+            an hour. It decays after an hour of clean time measured from the end of the last penalty,
+            so time served does not count as good behaviour.'
+        strikes:
+          type: integer

@@ -1159,6 +1159,8 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GameFilter'
+        reputation:
+          $ref: '#/components/schemas/ReputationPolicy'
         tunnels:
           type: array
           items:
@@ -1349,6 +1351,8 @@ components:
           type: string
         pulse_floor_pps:
           type: integer
+        reputation:
+          $ref: '#/components/schemas/ReputationPolicy'
         tunnels:
           type: array
           items:
@@ -1620,6 +1624,8 @@ components:
           type: integer
         game_sessions_max:
           type: integer
+        reputation:
+          $ref: '#/components/schemas/ReputationStats'
         rate_buckets:
           type: integer
         rate_buckets_max:
@@ -1703,6 +1709,62 @@ components:
           additionalProperties:
             type: string
           description: Tenant id to credential hash. Hashes only, for the same reason node_tokens are.
+    ReputationPolicy:
+      type: object
+      description: 'Tunes the two-tier source cache: who gets the short path, and whether repeat offenders
+        are dropped at the top of the pipeline.'
+      properties:
+        fast_pass:
+          type: string
+          enum:
+          - challenge
+          - handshake
+          - 'off'
+          description: 'The weakest proof that earns the short path. Defaults to challenge, the stricter
+            reading: answering one means echoing a value that could only have come from a reply to that
+            address, so the address answers for itself, while a handshake can be sent blind and a spoofer
+            can clear it for any address. Widening to handshake is reasonable for a protocol that defines
+            no challenge, and is a deliberate decision rather than a default.'
+        penalty_box:
+          type: boolean
+          description: 'Drop sources that keep failing, at the top of the pipeline, rather than letting
+            them walk every stage to the same verdict. Off by default: it is an escalation of consequence
+            beyond what one packet earned. With it off, strikes and would-be demotions are still counted
+            and exposed, which is how it is sized before being switched on.'
+    ReputationStats:
+      type: object
+      description: The two-tier source cache's counters.
+      properties:
+        tracked:
+          type: integer
+        max:
+          type: integer
+          description: At the bound a source takes the ordinary path, so this costs an optimisation rather
+            than a protection.
+        trusted:
+          type: integer
+        penalised:
+          type: integer
+        fast_passed:
+          type: integer
+          description: Packets taken off the slow path because their source was already verified.
+        boxed:
+          type: integer
+          description: 'Packets dropped at the top because their source is in the box: the load the rest
+            of the stages did not carry.'
+        promotions:
+          type: integer
+        demotions:
+          type: integer
+        strikes:
+          type: integer
+        shielded:
+          type: integer
+          description: Strikes that landed on an already-verified source and were not acted on. Source
+            addresses are attacker-controlled, so acting on one would let anyone get a real player banned.
+            A rising value is a spoofing attempt or a misbehaving verified client, and both want a human.
+        full:
+          type: integer
     Tunnel:
       type: object
       required:

@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -170,6 +171,7 @@ func main() {
 		var buf bytes.Buffer
 		families := telemetry.Families([]telemetry.Report{report(node, pipe)}, time.Time{})
 		families = append(families, telemetry.AnnouncementFamilies(steering.Load().Announcements)...)
+		families = append(families, telemetry.ReputationFamilies([]telemetry.Report{report(node, pipe)})...)
 		families = append(families, telemetry.TunnelFamilies(node.ID, node.Name, node.Region,
 			delivery.Load().Tunnels, health.get())...)
 		if err := metrics.Write(&buf, families); err != nil {
@@ -291,6 +293,50 @@ func main() {
 			"bird":     plan.SessionConfig,
 			"error":    plan.SessionErr,
 		})
+	})
+	// /reputation is what the datapath remembers about sources, and the way
+	// back out of the penalty box.
+	//
+	// The box exists so repeat offenders are shed cheaply, and a source
+	// cannot promote itself out of one — which is only defensible if an
+	// operator can. A false positive nobody can clear is a customer off the
+	// air for the length of the penalty.
+	mux.HandleFunc("/reputation", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, localToken) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			limit := 100
+			if raw := r.URL.Query().Get("limit"); raw != "" {
+				n, err := strconv.Atoi(raw)
+				if err != nil || n <= 0 {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be a positive number"})
+					return
+				}
+				limit = n
+			}
+			stats, sources := pipe.Reputation(limit)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"node": node.ID, "stats": stats, "sources": sources,
+			})
+		case http.MethodPost:
+			var body struct {
+				Release []string `json:"release"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			if len(body.Release) == 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "release requires at least one source address"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"released": pipe.Release(body.Release)})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET or POST required"})
+		}
 	})
 	// /decide reveals what the policy does with a given flow, so it takes the
 	// same bearer token as the control API.

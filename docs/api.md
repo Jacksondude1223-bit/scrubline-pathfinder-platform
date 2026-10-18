@@ -27,7 +27,7 @@ else's datacentre, so it never holds one that can change the fabric.
 | `SCRUBLINE_ENROLL_TOKEN` | node agents | `POST /v1/nodes/register`, and nothing else |
 | node credential | one scrubber | its own heartbeat, program and counters, plus `GET /v1/ml/model` |
 | tenant credential | one protected customer | `GET /v1/analytics/*`, for their own prefixes only |
-| `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/metrics`, `/bgp`, `/tunnels`, `/sessions` |
+| `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/metrics`, `/bgp`, `/tunnels`, `/sessions`, `/reputation` |
 
 A node credential is issued at registration, scoped to that node, 256 bits,
 kept only as a hash, and rotated whenever the node enrols again. A tenant
@@ -544,6 +544,84 @@ Sessions are scoped with `nodes` or `regions` — a customer peers where they
 have a path, not with the whole fabric. Leaving both empty means everywhere,
 which is rarely what anyone wants.
 
+### 10. Source reputation
+
+Two tiers, both keyed on what a source has already proved.
+
+```json
+"reputation": {"fast_pass": "challenge", "penalty_box": true}
+```
+
+`penalty_box` is off unless asked for; `fast_pass` defaults to `challenge`.
+Walking a real A2S client through it:
+
+```console
+# 1. An unverified query is challenged.
+{"action":"challenge","reason":"game filter a2s: unverified source challenged"}
+
+# 2. It echoes the cookie back and is admitted.
+{"action":"permit","reason":"PF_RING ZC inspect pass"}
+
+# 3. Every packet after that takes the short path.
+{"action":"permit","reason":"verified source, fast path"}
+```
+
+The short path skips the gate and the classifier, because clearing the gate
+already established what they would say. **980 → 695 ns per packet.**
+
+It does not skip the behavioural cap or the signature check — so junk
+spoofing that verified address is still dropped, and the real player is
+unaffected:
+
+```console
+# Junk claiming to be the verified player.
+{"action":"drop","reason":"game filter a2s: packet carries none of this protocol's magic sequences"}
+
+# The real player, immediately after.
+{"action":"permit","reason":"verified source, fast path"}
+```
+
+That is the property worth testing in your own deployment. Source addresses
+are attacker-controlled, so a penalty box that acted on them would let anyone
+get a real player banned. Strikes against a trusted source are counted as
+`shielded` and not acted on.
+
+#### The penalty box
+
+Four failures inside thirty seconds and an unverified source is boxed — a
+minute, then ten, then an hour — and dropped at the top of the pipeline:
+
+```console
+{"action":"drop","reason":"source is in the penalty box"}
+```
+
+**1389 → 203 ns per packet, and the allocations go to zero.** During an
+attack most of the packets are the attacker's, which is where the headroom
+comes from.
+
+The escalation decays after an hour of clean time measured from the *end* of
+the last penalty, not the last strike — otherwise serving a sentence counts
+as good behaviour.
+
+#### Seeing it, and undoing it
+
+```console
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/reputation
+{"node":"node-…","stats":{"tracked":2,"trusted":1,"penalised":1,"fast_passed":3,
+ "boxed":1,"promotions":1,"demotions":1,"strikes":11,"shielded":10,"full":0},
+ "sources":[{"source":"198.51.100.9","state":"penalised","proof":"none",
+             "expires_in_seconds":59.2,"level":1}, …]}
+
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/reputation \
+    -d '{"release":["198.51.100.9"]}'
+{"released":1}
+```
+
+A boxed source cannot promote itself out — it is dropped before it reaches a
+gate — so this is the only way back, and it is an operator's call. The
+escalation level survives a release: the next offence should not start from
+scratch because this one was forgiven.
+
 ## The node agent
 
 ```console
@@ -596,6 +674,17 @@ in `Stats` are moving averages over `load_window_seconds`, not totals.
 its mean under the watermark on purpose, so `offered_pps` can read zero on a
 node being knocked over. `pulsing`, `pulse_peak_pps` and the `pulse` array are
 the real picture.
+
+**A verified source skips the gate and the classifier, never the rate cap or
+the signature check.** The cap is what bounds a verified source — without it,
+clearing one challenge would be the whole attack — and it costs about four
+nanoseconds, so there was nothing to save. The signature check stays because
+the source address on a packet is written by whoever sent it.
+
+**A trusted source is never put in the penalty box.** Acting on a stateless
+signal would let anyone get a real player banned by spoofing their address.
+Those strikes are counted as `shielded` instead; the junk is still dropped,
+the player stays online. Alert on `scrubline_reputation_shielded_total`.
 
 **A prefix has exactly one return path.** Two tunnels carrying one prefix is
 refused: backup paths are not modelled, so there would be no answer to which

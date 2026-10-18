@@ -537,7 +537,9 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var buf bytes.Buffer
-	families := append(s.controlFamilies(), telemetry.Families(s.Store.Reports(), s.clock())...)
+	reports := s.Store.Reports()
+	families := append(s.controlFamilies(), telemetry.Families(reports, s.clock())...)
+	families = append(families, telemetry.ReputationFamilies(reports)...)
 	if err := metrics.Write(&buf, families); err != nil {
 		log.Printf("api: rendering metrics failed: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
@@ -1621,6 +1623,13 @@ func validatePolicy(p model.Policy) error {
 	}
 	if err := validateSessions(p, protected); err != nil {
 		return err
+	}
+	if r := p.Reputation; r != nil {
+		switch r.FastPass {
+		case "", "challenge", "handshake", "off":
+		default:
+			return fmt.Errorf("reputation.fast_pass %q must be \"challenge\", \"handshake\" or \"off\"", r.FastPass)
+		}
 	}
 	if p.PulseFloorPPS < 0 {
 		return fmt.Errorf("pulse_floor_pps must not be negative, got %d", p.PulseFloorPPS)

@@ -47,6 +47,14 @@ type Result struct {
 	// Reply is the packet the datapath should send back to the source, for
 	// profiles whose protocol defines a challenge. Empty otherwise.
 	Reply []byte
+	// Cleared names the gate kind a source just got through, and is set
+	// only on the packet that clears it. It is how the datapath learns a
+	// source has proved something worth remembering.
+	//
+	// Which gate matters: answering a challenge means echoing a value that
+	// could only have come from a reply to that address, so the address
+	// answers for itself. Completing a handshake can be done blind.
+	Cleared GateKind
 }
 
 // Magic is a byte sequence that must appear at a fixed offset.
