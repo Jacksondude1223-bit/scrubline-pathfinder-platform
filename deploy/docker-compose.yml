@@ -1,3 +1,9 @@
+# A single-host demo fabric: a control plane, three scrubbers, a seeder that
+# deploys a policy and onboards two customers, and a generator that drives
+# traffic through the nodes so the analytics have something to report.
+#
+# Credentials come from the environment. deploy/.env.example has a set for
+# local use; copy it to deploy/.env and compose will pick it up.
 services:
   api:
     build:
@@ -6,8 +12,12 @@ services:
     environment:
       SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
+    # Bound to loopback on purpose. Exposing this on a routable address means
+    # exposing a control plane that is running without TLS, so put a tunnel or
+    # a terminating proxy in front rather than changing this to 0.0.0.0.
+    # deploy/README.md has both routes.
     ports:
-      - "8080:8080"
+      - "${BIND_ADDR:-127.0.0.1}:8080:8080"
     # -insecure is for this single-host demo only. The compose network is not
     # loopback, so without it the control plane refuses to serve in the clear.
     # In a deployment, mount a certificate and pass -tls-cert/-tls-key.
@@ -15,7 +25,7 @@ services:
     volumes:
       - api-state:/var/lib/scrubline
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:8080/health"]
       interval: 2s
       timeout: 2s
       retries: 15
@@ -35,13 +45,19 @@ services:
     environment:
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
       SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
-    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-a", "-advertise", "node-a:9091", "-region", "iad", "-capacity", "100", "-listen", "0.0.0.0:9091"]
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-a", "-advertise", "node-a:9091", "-tunnel-src", "192.0.2.1", "-local-as", "65000", "-region", "iad", "-capacity", "100", "-capacity-pps", "4000000", "-listen", "0.0.0.0:9091"]
     ports:
-      - "9091:9091"
+      - "${BIND_ADDR:-127.0.0.1}:9091:9091"
     depends_on:
       api:
         condition: service_healthy
     restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:9091/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
 
   node-b:
     build:
@@ -50,13 +66,19 @@ services:
     environment:
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
       SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
-    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-b", "-advertise", "node-b:9091", "-region", "fra", "-capacity", "80", "-listen", "0.0.0.0:9091"]
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-b", "-advertise", "node-b:9091", "-tunnel-src", "192.0.2.2", "-local-as", "65000", "-region", "fra", "-capacity", "80", "-capacity-pps", "3000000", "-listen", "0.0.0.0:9091"]
     ports:
-      - "9092:9091"
+      - "${BIND_ADDR:-127.0.0.1}:9092:9091"
     depends_on:
       api:
         condition: service_healthy
     restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:9091/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
 
   node-c:
     build:
@@ -65,12 +87,55 @@ services:
     environment:
       SCRUBLINE_ENROLL_TOKEN: ${SCRUBLINE_ENROLL_TOKEN:?set SCRUBLINE_ENROLL_TOKEN in the environment}
       SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
-    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-c", "-advertise", "node-c:9091", "-region", "sin", "-capacity", "40", "-listen", "0.0.0.0:9091"]
+    command: ["scrub-node", "-insecure", "-api", "http://api:8080", "-name", "scrub-c", "-advertise", "node-c:9091", "-tunnel-src", "192.0.2.3", "-local-as", "65000", "-region", "sin", "-capacity", "40", "-capacity-pps", "1500000", "-listen", "0.0.0.0:9091"]
     ports:
-      - "9093:9091"
+      - "${BIND_ADDR:-127.0.0.1}:9093:9091"
     depends_on:
       api:
         condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-o", "/dev/null", "http://127.0.0.1:9091/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+  # Runs once and exits. It deploys the policy and onboards the two customers,
+  # then prints their credentials — "docker compose logs seed" brings them back
+  # if the startup output has scrolled away.
+  seed:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      SCRUBLINE_API_TOKEN: ${SCRUBLINE_API_TOKEN:?set SCRUBLINE_API_TOKEN in the environment}
+      PUBLIC_URL: ${PUBLIC_URL:-http://127.0.0.1:8080}
+    entrypoint: ["seed.sh"]
+    volumes:
+      - api-state:/var/lib/scrubline
+    depends_on:
+      api:
+        condition: service_healthy
+      node-a:
+        condition: service_healthy
+    restart: "no"
+
+  # Without this the whole stack comes up reporting zeros, which is not
+  # distinguishable from a stack that is broken. It posts flow records to each
+  # agent's /decide, which runs them through the real pipeline; the counters
+  # that produces ride the heartbeat and surface as analytics.
+  traffic:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      SCRUBLINE_NODE_API_TOKEN: ${SCRUBLINE_NODE_API_TOKEN:?set SCRUBLINE_NODE_API_TOKEN in the environment}
+    entrypoint: ["scrub-traffic"]
+    command: ["-nodes", "http://node-a:9091,http://node-b:9091,http://node-c:9091"]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
     restart: on-failure
 
 volumes:

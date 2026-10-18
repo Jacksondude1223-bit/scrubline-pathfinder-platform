@@ -119,7 +119,8 @@ type Event struct {
 	Seconds float64    `json:"seconds"`
 	// PeakPPS is the heaviest rate measured against the prefix during the
 	// event, summed across the fleet. PeakDroppedPPS is how much of that was
-	// being scrubbed at the worst moment.
+	// being scrubbed at the worst moment. Both are offered-side measurements
+	// of the same traffic, so the first is never below the second.
 	PeakPPS        uint64 `json:"peak_pps"`
 	PeakDroppedPPS uint64 `json:"peak_dropped_pps"`
 	// Dropped is the volume scrubbed over the whole event, weighted by the
@@ -152,6 +153,12 @@ type Point struct {
 	// PeakPPS, OfferedPPS and DroppedPPS are the heaviest fleet-wide rates
 	// seen inside the interval, not averages over it: an average is exactly
 	// what a burst attack is shaped to hide.
+	//
+	// PeakPPS is the higher of two measurements of the same offered traffic:
+	// the burst detector's sub-second peak, and the load window's rate. They
+	// are taken over different spans and either can be the larger, so the
+	// headline peak is the larger — and is never below OfferedPPS or
+	// DroppedPPS, which would read as scrubbing more than arrived.
 	PeakPPS    uint64 `json:"peak_pps"`
 	OfferedPPS uint64 `json:"offered_pps"`
 	DroppedPPS uint64 `json:"dropped_pps"`
@@ -505,6 +512,16 @@ func (s *series) fleet(now time.Time) (offeredPPS, droppedPPS, peakPPS uint64, p
 // decides whether an attack is running. Callers hold c.mu.
 func (s *series) judgeLocked(prefix string, now time.Time) {
 	offeredPPS, droppedPPS, peakPPS, pulsing, _ := s.fleet(now)
+
+	// The burst detector's peak and the load window's rate measure the same
+	// offered traffic over different spans, and either can be the larger: a
+	// sub-second burst is invisible to a ten-second average, and steady heavy
+	// traffic has no burst shape to find. The headline peak is whichever
+	// found more, which also keeps it from reading below the rate being
+	// scrubbed — a prefix cannot have less arrive than was dropped.
+	if offeredPPS > peakPPS {
+		peakPPS = offeredPPS
+	}
 
 	b := s.bucketLocked(now)
 	// The heaviest reading inside the interval, not the latest: an attack

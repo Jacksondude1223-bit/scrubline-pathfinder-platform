@@ -1,0 +1,104 @@
+{
+  "id": "managed-protection",
+  "name": "managed protection",
+  "protected": [
+    "203.0.113.0/24",
+    "198.51.100.0/24"
+  ],
+  "pulse_floor_pps": 50000,
+  "rules": [
+    {
+      "id": "dns-reflection",
+      "stage": "asic",
+      "action": "drop",
+      "priority": 100,
+      "match": {
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "udp",
+        "sport": 53
+      },
+      "comment": "TCAM ACL: reflected DNS answers nobody asked for, dropped before they leave the ASIC"
+    },
+    {
+      "id": "syn-meter",
+      "stage": "fpga",
+      "action": "rate_limit",
+      "pps": 50000,
+      "priority": 200,
+      "match": {
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "tcp",
+        "tcp_flags": "syn"
+      },
+      "comment": "FPGA meter: line-rate SYN cap on the game estate"
+    },
+    {
+      "id": "game-traffic",
+      "stage": "zc",
+      "action": "inspect",
+      "pps": 200000,
+      "priority": 300,
+      "match": {
+        "dst_cidr": "203.0.113.0/24",
+        "proto": "udp",
+        "dport": 19132
+      },
+      "comment": "PF_RING ZC: per-source behavioural cap on the game port"
+    },
+    {
+      "id": "web-inspect",
+      "stage": "zc",
+      "action": "inspect",
+      "pps": 100000,
+      "priority": 400,
+      "match": {
+        "dst_cidr": "198.51.100.0/24",
+        "proto": "tcp",
+        "dport": 443
+      },
+      "comment": "PF_RING ZC: the second customer, who is not under attack"
+    }
+  ],
+  "games": [
+    {
+      "id": "bedrock-19132",
+      "dst_cidr": "203.0.113.0/24",
+      "proto": "udp",
+      "dport": 19132,
+      "profile": "raknet",
+      "comment": "junk on the game port dies, and a source must finish the RakNet handshake before it can send gameplay"
+    }
+  ],
+  "tunnels": [
+    {
+      "id": "northwind",
+      "remote": "198.18.0.9",
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "key": 42,
+      "comment": "Northwind return path: scrubbed game traffic goes back here"
+    },
+    {
+      "id": "contoso",
+      "type": "ipip",
+      "remote": "198.18.0.10",
+      "prefixes": [
+        "198.51.100.0/24"
+      ],
+      "comment": "Contoso has no GRE on their edge, so ipip"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "northwind",
+      "peer_ip": "198.18.0.9",
+      "peer_as": 64512,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "multihop": 2,
+      "comment": "Northwind announces its own prefix to the fabric"
+    }
+  ]
+}

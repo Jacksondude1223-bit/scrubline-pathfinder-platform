@@ -75,7 +75,17 @@ func ValidateSample(s Sample) error {
 	return ValidateFlow(s.Flow)
 }
 
+// Features returns a flow's feature vector. Callers on the datapath should
+// use FeaturesInto instead: this allocates, and it is called per packet.
 func Features(f model.Flow) []float64 {
+	out := make([]float64, FeatureCount)
+	FeaturesInto(f, out)
+	return out
+}
+
+// FeaturesInto writes a flow's features into out, which must hold
+// FeatureCount values.
+func FeaturesInto(f model.Flow, out []float64) {
 	proto := strings.ToLower(f.Proto)
 	syn := 0.0
 	if strings.EqualFold(f.Flags, "syn") {
@@ -84,15 +94,13 @@ func Features(f model.Flow) []float64 {
 	// Clamp before the log: Log1p of anything below -1 is NaN, and a NaN here
 	// spreads through every weight and then through every JSON response.
 	pps := math.Log1p(float64(clampInt(f.PPS, 0, math.MaxInt32))) / 12
-	return []float64{
-		pps,
-		boolFloat(proto == "tcp"),
-		boolFloat(proto == "udp"),
-		boolFloat(proto == "icmp"),
-		syn,
-		float64(clampInt(f.DPort, 0, MaxPort)) / MaxPort,
-		float64(clampInt(f.SPort, 0, MaxPort)) / MaxPort,
-	}
+	out[0] = pps
+	out[1] = boolFloat(proto == "tcp")
+	out[2] = boolFloat(proto == "udp")
+	out[3] = boolFloat(proto == "icmp")
+	out[4] = syn
+	out[5] = float64(clampInt(f.DPort, 0, MaxPort)) / MaxPort
+	out[6] = float64(clampInt(f.SPort, 0, MaxPort)) / MaxPort
 }
 
 // Train fits the logistic model. It returns an error when the sample set cannot
@@ -227,10 +235,27 @@ func checkFinite(m Model) error {
 }
 
 func Score(m Model, f model.Flow) float64 {
+	var scratch [FeatureCount]float64
+	return ScoreInto(m, f, scratch[:])
+}
+
+// ScoreInto scores a flow using a caller-supplied buffer for the features.
+//
+// Features returns a fresh slice, which on the datapath meant an allocation
+// for every packet the classifier looked at — one of the three the admitted
+// path was paying. The buffer has to hold FeatureCount values; anything else
+// falls back to allocating, because scoring against a short buffer would
+// silently drop features and change the verdict.
+func ScoreInto(m Model, f model.Flow, buf []float64) float64 {
 	if !m.Ready || len(m.Weights) != FeatureCount {
 		return 0
 	}
-	s := sigmoid(dot(m.Weights, Features(f)) + m.Bias)
+	features := buf
+	if len(features) != FeatureCount {
+		features = make([]float64, FeatureCount)
+	}
+	FeaturesInto(f, features)
+	s := sigmoid(dot(m.Weights, features) + m.Bias)
 	if math.IsNaN(s) {
 		return 0
 	}

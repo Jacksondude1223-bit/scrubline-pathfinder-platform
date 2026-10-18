@@ -1,10 +1,11 @@
-.PHONY: build test bench certs spec-check demo
+.PHONY: build test bench certs spec-check demo up down logs creds
 
 build:
 	mkdir -p bin
 	go build -o bin/scrub-api ./cmd/scrub-api
 	go build -o bin/scrub-node ./cmd/scrub-node
 	go build -o bin/scrubctl ./cmd/scrubctl
+	go build -o bin/scrub-traffic ./cmd/scrub-traffic
 
 # -race is the cheap safety net for the Pipeline and Store, both of which are
 # written for concurrent use.
@@ -43,3 +44,32 @@ demo: build
 	  sleep 0.2; \
 	done; \
 	./scripts/demo.sh
+
+# A demo fabric in containers: control plane, three scrubbers, a seeded policy
+# with two customers, and traffic driven through the datapath so the analytics
+# have something real to report. deploy/README.md covers exposing it on a URL.
+COMPOSE = docker compose -f deploy/docker-compose.yml
+
+up: deploy/.env
+	$(COMPOSE) up --build -d
+	@echo "  seeding the fabric and onboarding the demo customers..."
+	@$(COMPOSE) wait seed >/dev/null 2>&1 || true
+	@$(MAKE) --no-print-directory creds
+	@echo "  control plane: http://127.0.0.1:8080   (make creds, make logs, make down)"
+	@echo "  a public URL: see deploy/README.md — do not just bind this to 0.0.0.0"
+
+# Compose reads deploy/.env on its own; this only stops the first run failing
+# on three unset variables with nothing saying where they come from.
+deploy/.env:
+	@echo "deploy/.env is missing. Copying the example — change the tokens before exposing this." >&2
+	cp deploy/.env.example deploy/.env
+
+down:
+	$(COMPOSE) down
+
+logs:
+	$(COMPOSE) logs -f
+
+creds:
+	@$(COMPOSE) logs --no-log-prefix seed 2>/dev/null | sed -n '/seeded:/,$$p' | grep . \
+	  || echo "  the seeder has not finished yet; try 'make logs' or run 'make creds' again"

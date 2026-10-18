@@ -11,6 +11,11 @@ The specs are the contract — schemas, status codes and which credential reache
 what. This page is the guide: how the pieces fit, and the behaviours that
 surprise people. Every response below is copied from a real run.
 
+To try these against something live rather than reading them, `make up` brings
+up a seeded fabric with traffic running through it and prints two customers'
+credentials; [`deploy/README.md`](../deploy/README.md) covers putting it on a
+URL you can reach from elsewhere.
+
 ## Credentials
 
 Three secrets, three blast radii. A scrubbing node sits at the edge in someone
@@ -22,7 +27,7 @@ else's datacentre, so it never holds one that can change the fabric.
 | `SCRUBLINE_ENROLL_TOKEN` | node agents | `POST /v1/nodes/register`, and nothing else |
 | node credential | one scrubber | its own heartbeat, program and counters, plus `GET /v1/ml/model` |
 | tenant credential | one protected customer | `GET /v1/analytics/*`, for their own prefixes only |
-| `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/metrics`, `/bgp` |
+| `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/metrics`, `/bgp`, `/tunnels`, `/sessions`, `/reputation` |
 
 A node credential is issued at registration, scoped to that node, 256 bits,
 kept only as a hash, and rotated whenever the node enrols again. A tenant
@@ -391,6 +396,232 @@ scrubline_prefix_offered_pps{node="…",name="edge-fra",region="eu-central",pref
 scrubline_prefix_dropped_pps{node="…",name="edge-lhr",region="us-east",prefix="203.0.113.0/24"} 910000
 ```
 
+### 9. Getting the clean traffic back
+
+BGP attracts the customer's traffic to the fabric. It cannot send it back:
+once the scrubbers are announcing the prefix, a normal route toward it comes
+straight back to the scrubbers. Clean traffic is encapsulated to the
+customer's own edge instead, and that return path is declared in the policy:
+
+```json
+{
+  "name": "delivered protection",
+  "protected": ["203.0.113.0/24"],
+  "tunnels": [{
+    "id": "northwind",
+    "remote": "198.51.100.1",
+    "prefixes": ["203.0.113.0/24"],
+    "key": 42
+  }],
+  "sessions": [{
+    "id": "northwind",
+    "peer_ip": "198.51.100.1", "peer_as": 64512,
+    "prefixes": ["203.0.113.0/24"],
+    "password": "s3cret-md5", "multihop": 2
+  }]
+}
+```
+
+Nodes need somewhere to source a tunnel from, which is per node, not per
+tunnel — register them with `tunnel_src`, or start the agent with
+`-tunnel-src`.
+
+#### One tunnel per node, not one per customer
+
+The fabric is anycast: every eligible node announces every protected prefix.
+So a return path fans out rather than being assigned. Ten scrubbers
+protecting one customer is ten tunnels to that customer's one endpoint, each
+from a different source address. That is the cost of not pinning a prefix to
+one box.
+
+```console
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-a:9091/tunnels?format=iproute2'
+# Northwind primary return path
+ip link add scr-northwind type gre local 192.0.2.1 remote 198.18.0.9 key 42
+ip link set scr-northwind mtu 1472 up
+ip route replace 203.0.113.0/24 dev scr-northwind
+nft add rule inet scrubline forward oifname "scr-northwind" tcp flags syn tcp option maxseg size set 1432
+
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-b:9091/tunnels?format=iproute2'
+# Northwind primary return path
+ip link add scr-northwind type gre local 192.0.2.2 remote 198.18.0.9 key 42
+...
+```
+
+Same customer endpoint, different local end. As with `/bgp`, **nothing here
+is executed** — the agent compiles the configuration and serves it to whatever
+provisions interfaces on that box.
+
+#### The MTU and the clamp are not decoration
+
+| Encapsulation | Overhead | MTU | MSS clamp |
+| --- | --- | --- | --- |
+| GRE | 24 | 1476 | 1436 |
+| GRE with a key | 28 | 1472 | 1432 |
+| IPIP | 20 | 1480 | 1440 |
+
+Both are derived unless you set them, and an MTU that does not fit the
+encapsulation is refused with the largest one that does. The clamp is the
+part people skip: a tunnel with a correct MTU still hangs for any customer
+whose path drops the ICMP that path-MTU discovery depends on. The handshake
+completes, the first full-size segment does not, and the connection sits
+there looking like a scrubbing fault.
+
+#### A dead return path withdraws the prefix
+
+This is the failure worth designing for. A node announcing a prefix it cannot
+deliver attracts the customer's traffic and drops all of it — and it looks
+healthy from every other angle: the datapath counters are fine, the
+announcements are up, the customer is simply offline.
+
+So whatever provisions the tunnels reports back, and that reaches the plan:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" http://node-a:9091/tunnels \
+    -d '{"tunnels":[{"tunnel_id":"northwind","state":"down","detail":"peer unreachable"}]}'
+{"accepted":1}
+```
+
+The agent forwards it on its next heartbeat and the fabric recompiles:
+
+```console
+$ scrubctl bgp
+PREFIX           NODE      REGION  STATE     PREPENDS  WHY
+198.51.100.0/24  edge-lhr  lhr     announce  0         anycast member at full preference
+198.51.100.0/24  edge-fra  fra     announce  0         anycast member at full preference
+203.0.113.0/24   edge-lhr  lhr     withdraw  -         return tunnel northwind is down
+203.0.113.0/24   edge-fra  fra     announce  0         anycast member at full preference
+```
+
+One node withdrawn, one prefix, named cause. The other customer on the same
+node is untouched, and the rest of the fabric picks the traffic up — this is
+a shed, not an outage. It comes back when the tunnel does.
+
+**Silence is not treated as failure.** A tunnel that has never reported does
+not withdraw anything: absence of a report usually means nothing is reporting,
+and inferring failure from silence would blank the fabric of anyone who has
+not wired a provisioner up yet. `"required": true` on the tunnel reverses that
+judgement for operators who would rather drop traffic than black-hole it.
+
+`scrubline_tunnel_up` follows the same rule — a never-reported tunnel is
+**absent** from that series rather than reading `0`, so an alert on it does
+not fire across a fleet that simply is not reporting.
+`scrubline_tunnel_reported` is how you tell the two apart.
+
+#### Customer sessions
+
+For customers who announce their own prefixes rather than having them typed
+into a policy. Rendered as BIRD, not as the ExaBGP commands `/bgp` serves:
+announcing is an imperative act, which is what a command pipe is for, while
+peering is a standing configuration with a filter and a limit on it.
+
+```console
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-a:9091/sessions?format=bird'
+protocol bgp cust_northwind {
+    description "Northwind Games edge";
+    local 192.0.2.1 as 65000;
+    neighbor 198.18.0.9 as 64512;
+    password "s3cret-md5";
+    multihop 2;
+    ipv4 {
+        import filter { if net ~ [ 203.0.113.0/24+ ] then accept; reject; };
+        import limit 8 action restart;
+        export none;
+    };
+}
+```
+
+The filter admits the policy's prefixes and anything more specific inside
+them, because customers de-aggregate under attack and a filter that refused
+that would drop the announcement at the moment it mattered most.
+
+**Routes learned from a customer do not add themselves to the protected set.**
+The policy still decides what the fabric defends. A peer that leaked a
+supernet would otherwise have you announcing address space nobody asked you
+to protect, on the say-so of the peer.
+
+Sessions are scoped with `nodes` or `regions` — a customer peers where they
+have a path, not with the whole fabric. Leaving both empty means everywhere,
+which is rarely what anyone wants.
+
+### 10. Source reputation
+
+Two tiers, both keyed on what a source has already proved.
+
+```json
+"reputation": {"fast_pass": "challenge", "penalty_box": true}
+```
+
+`penalty_box` is off unless asked for; `fast_pass` defaults to `challenge`.
+Walking a real A2S client through it:
+
+```console
+# 1. An unverified query is challenged.
+{"action":"challenge","reason":"game filter a2s: unverified source challenged"}
+
+# 2. It echoes the cookie back and is admitted.
+{"action":"permit","reason":"PF_RING ZC inspect pass"}
+
+# 3. Every packet after that takes the short path.
+{"action":"permit","reason":"verified source, fast path"}
+```
+
+The short path skips the gate and the classifier, because clearing the gate
+already established what they would say. **980 → 695 ns per packet.**
+
+It does not skip the behavioural cap or the signature check — so junk
+spoofing that verified address is still dropped, and the real player is
+unaffected:
+
+```console
+# Junk claiming to be the verified player.
+{"action":"drop","reason":"game filter a2s: packet carries none of this protocol's magic sequences"}
+
+# The real player, immediately after.
+{"action":"permit","reason":"verified source, fast path"}
+```
+
+That is the property worth testing in your own deployment. Source addresses
+are attacker-controlled, so a penalty box that acted on them would let anyone
+get a real player banned. Strikes against a trusted source are counted as
+`shielded` and not acted on.
+
+#### The penalty box
+
+Four failures inside thirty seconds and an unverified source is boxed — a
+minute, then ten, then an hour — and dropped at the top of the pipeline:
+
+```console
+{"action":"drop","reason":"source is in the penalty box"}
+```
+
+**1389 → 203 ns per packet, and the allocations go to zero.** During an
+attack most of the packets are the attacker's, which is where the headroom
+comes from.
+
+The escalation decays after an hour of clean time measured from the *end* of
+the last penalty, not the last strike — otherwise serving a sentence counts
+as good behaviour.
+
+#### Seeing it, and undoing it
+
+```console
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/reputation
+{"node":"node-…","stats":{"tracked":2,"trusted":1,"penalised":1,"fast_passed":3,
+ "boxed":1,"promotions":1,"demotions":1,"strikes":11,"shielded":10,"full":0},
+ "sources":[{"source":"198.51.100.9","state":"penalised","proof":"none",
+             "expires_in_seconds":59.2,"level":1}, …]}
+
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/reputation \
+    -d '{"release":["198.51.100.9"]}'
+{"released":1}
+```
+
+A boxed source cannot promote itself out — it is dropped before it reaches a
+gate — so this is the only way back, and it is an operator's call. The
+escalation level survives a release: the next offence should not start from
+scratch because this one was forgiven.
+
 ## The node agent
 
 ```console
@@ -443,6 +674,26 @@ in `Stats` are moving averages over `load_window_seconds`, not totals.
 its mean under the watermark on purpose, so `offered_pps` can read zero on a
 node being knocked over. `pulsing`, `pulse_peak_pps` and the `pulse` array are
 the real picture.
+
+**A verified source skips the gate and the classifier, never the rate cap or
+the signature check.** The cap is what bounds a verified source — without it,
+clearing one challenge would be the whole attack — and it costs about four
+nanoseconds, so there was nothing to save. The signature check stays because
+the source address on a packet is written by whoever sent it.
+
+**A trusted source is never put in the penalty box.** Acting on a stateless
+signal would let anyone get a real player banned by spoofing their address.
+Those strikes are counted as `shielded` instead; the junk is still dropped,
+the player stays online. Alert on `scrubline_reputation_shielded_total`.
+
+**A prefix has exactly one return path.** Two tunnels carrying one prefix is
+refused: backup paths are not modelled, so there would be no answer to which
+one is authoritative. Redundancy comes from the fabric — other nodes keep
+announcing when one node's tunnel dies.
+
+**Tunnel ids are interface names.** At most 11 characters, lowercase, and the
+limit is enforced rather than left to the kernel, which truncates a long name
+silently — two tunnels truncating to the same name is one tunnel.
 
 **`403` is not `404`.** An endpoint you cannot reach says so. The one
 deliberate exception is an analytics prefix a credential is not entitled to:
