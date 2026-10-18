@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/egress"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/gamefilter"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
@@ -97,6 +98,7 @@ const (
 	reasonMLPass   = "PF_RING ZC ml pass"
 	reasonFastPass = "verified source, fast path"
 	reasonBoxed    = "source is in the penalty box"
+	reasonLockdown = "no return traffic confirms this source while the prefix is under attack"
 )
 
 // bucketID keys the per-source rate table. A struct key costs no allocation,
@@ -316,6 +318,12 @@ type counters struct {
 	mlScored     atomic.Uint64
 	mlDrops      atomic.Uint64
 	mlPasses     atomic.Uint64
+	// returnSeen counts replies the protected service sent back through
+	// this node; returnConfirmed counts the clients that vouched for.
+	// lockedDown counts ingress held back for want of one.
+	returnSeen      atomic.Uint64
+	returnConfirmed atomic.Uint64
+	lockedDown      atomic.Uint64
 }
 
 // compiledProgram is the per-flow form of a model.Program.
@@ -361,6 +369,10 @@ type parsedFlow struct {
 	dport, sport int
 	pps          int
 	srcIP        string
+	// dstIP is the destination as written. Only the return path keys on it,
+	// so it is filled in the same place srcIP is rather than formatted
+	// later.
+	dstIP string
 }
 
 func parseFlow(f model.Flow) parsedFlow {
@@ -371,6 +383,7 @@ func parseFlow(f model.Flow) parsedFlow {
 		sport: f.SPort,
 		pps:   f.PPS,
 		srcIP: f.SrcIP,
+		dstIP: f.DstIP,
 	}
 	pf.src, pf.srcOK = parseAddr(f.SrcIP)
 	pf.dst, pf.dstOK = parseAddr(f.DstIP)
@@ -421,6 +434,15 @@ type Pipeline struct {
 	// client is not re-derived per packet and a repeat offender is dropped
 	// before it walks every stage. Guarded by p.mu like the rest.
 	reputation *reputation.Cache
+	// egress confirms clients by what the protected service sends back to
+	// them, which is the one signal here an attacker cannot forge from the
+	// ingress side. Guarded by p.mu like the rest.
+	egress *egress.Tracker
+	// lockdown is the policy's posture for unconfirmed sources while a
+	// prefix is under attack, resolved at load time.
+	lockdown    string
+	lockdownPPS int
+	grace       time.Duration
 	// features is the classifier's scratch buffer, reused per decision
 	// rather than allocated. Callers hold p.mu, which the whole decision
 	// path already does.
@@ -435,6 +457,7 @@ func New(p model.Program) *Pipeline {
 		buckets:     map[bucketID]*bucket{},
 		prefixLoads: map[string]*prefixLoad{},
 		reputation:  reputation.New(),
+		egress:      egress.New(),
 		now:         time.Now,
 	}
 	compiled := compileProgram(p)
@@ -443,6 +466,7 @@ func New(p model.Program) *Pipeline {
 	pipe.loadGames(p)
 	pipe.loadPulse(p)
 	pipe.loadReputation(p)
+	pipe.loadEgress(p)
 	return pipe
 }
 
@@ -578,6 +602,7 @@ func (p *Pipeline) Load(prog model.Program) {
 	p.loadGames(prog)
 	p.loadPulse(prog)
 	p.loadReputation(prog)
+	p.loadEgress(prog)
 	p.program = prog
 	p.compiled = compiled
 }
@@ -587,21 +612,91 @@ func (p *Pipeline) Load(prog model.Program) {
 func (p *Pipeline) loadReputation(prog model.Program) {
 	if p.reputation == nil {
 		p.reputation = reputation.New()
-		if p.now != nil {
-			p.reputation.SetClock(p.clock)
-		}
 	}
+	// Bound every time, not only on creation. New builds the cache in the
+	// struct literal, so a guard here meant the cache kept its own wall
+	// clock while the pipeline ran on another — invisible in production,
+	// where they are the same, and wrong everywhere else. p.clock reads
+	// p.now on each call, so this follows a later swap.
+	p.reputation.SetClock(p.clock)
 	cfg := reputation.Config{FastPassProof: reputation.ProofChallenge}
 	if r := prog.Reputation; r != nil {
 		cfg.Boxing = r.PenaltyBox
 		switch r.FastPass {
 		case "handshake":
 			cfg.FastPassProof = reputation.ProofHandshake
+		case "egress":
+			cfg.FastPassProof = reputation.ProofEgress
 		case "off":
 			cfg.NoFastPass = true
 		}
 	}
 	p.reputation.Configure(cfg)
+}
+
+// loadEgress applies the policy's return-path settings and forgets prefixes
+// the node no longer carries. Callers hold p.mu, or hold the pipeline alone.
+func (p *Pipeline) loadEgress(prog model.Program) {
+	if p.egress == nil {
+		p.egress = egress.New()
+	}
+	p.egress.SetClock(p.clock)
+	p.lockdown = "off"
+	p.lockdownPPS = egress.DefaultLockdownPPS
+	p.grace = egress.DefaultGrace
+	if e := prog.Egress; e != nil {
+		switch e.Lockdown {
+		case "limit", "drop":
+			p.lockdown = e.Lockdown
+		}
+		if e.LockdownPPS > 0 {
+			p.lockdownPPS = e.LockdownPPS
+		}
+		if e.GraceMillis > 0 {
+			p.grace = time.Duration(e.GraceMillis) * time.Millisecond
+		}
+	}
+	live := make(map[string]struct{}, len(prog.Prefixes))
+	for _, cidr := range prog.Prefixes {
+		live[cidr] = struct{}{}
+	}
+	p.egress.Forget(live)
+}
+
+// ObserveReturn records traffic the protected service sent back to a client.
+//
+// It is a separate entry point rather than a direction flag on Decide,
+// because a reply is not being judged — nothing about it is permitted or
+// dropped here. It is evidence, and the only evidence this fabric has that
+// an attacker cannot write himself: the origin chose to answer.
+func (p *Pipeline) ObserveReturn(f model.Flow) {
+	pf := parseFlow(f)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cp := p.compiled
+	if cp == nil {
+		return
+	}
+	// The reply's source is the protected address, and its destination is
+	// the client being vouched for.
+	owner, owned := cp.ownsSource(pf)
+	if !owned {
+		return
+	}
+	now := p.clock()
+	packets := int(nonNegative(pf.pps))
+	if packets <= 0 {
+		packets = 1
+	}
+	p.counters.returnSeen.Add(1)
+	if p.egress.Return(cp.prefixText[owner], pf.dstIP, packets, now) {
+		// The service has been answering this address at length. Record it
+		// where the fast path can see it; whether that earns the short path
+		// is the policy's call, since this is weaker evidence than a
+		// challenge.
+		p.reputation.Promote(pf.dstIP, reputation.ProofEgress, now)
+		p.counters.returnConfirmed.Add(1)
+	}
 }
 
 // Program identifies the program currently installed, so a caller that polls
@@ -652,6 +747,12 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	if p.pulses != nil {
 		p.pulses.Observe(cp.prefixText[owner], pps)
 	}
+	// Only lockdown reads this, and only lockdown pays for it. It is what
+	// separates "the return path is not visible here" from "this prefix is
+	// idle": the first must stand lockdown down, the second says nothing.
+	if p.lockdown != "off" && p.lockdown != "" {
+		p.egress.Ingress(cp.prefixText[owner], now)
+	}
 
 	// Before anything else: a source already known bad is dropped here
 	// rather than walking every stage to reach the same verdict. During an
@@ -684,6 +785,18 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 		return d
 	}
 
+	// Lockdown: while this prefix is under a recognised attack, a source the
+	// protected service has never answered is held back. It is the one
+	// filter here that needs no protocol knowledge — it asks the origin,
+	// not the packet.
+	if d, held := p.lockedOut(cp, owner, pf, now); held {
+		p.record(d, nil, pf)
+		mitigated := d.Action == model.ActionDrop
+		p.observeLoad(now, pps, mitigated)
+		cp.loads[owner].observe(now, pps, mitigated)
+		return d
+	}
+
 	d, decidedBy := p.evaluate(cp, pf, f, now)
 	// Every outcome is recorded in one place, so no return path can forget a
 	// counter.
@@ -693,6 +806,62 @@ func (p *Pipeline) Decide(f model.Flow) model.Decision {
 	cp.loads[owner].observe(now, pps, mitigated)
 	return d
 }
+
+// lockedOut decides whether a source is held back for want of return
+// traffic, and reports the decision when it is.
+//
+// Four things have to line up, and each one is a way this does not fire:
+// the operator asked for it, the prefix is actually under attack, this node
+// can see the return path at all, and the source has neither proved itself
+// nor been answered by the origin — and is past the grace it was given to
+// become one of those. Callers hold p.mu.
+func (p *Pipeline) lockedOut(cp *compiledProgram, owner int, pf parsedFlow, now time.Time) (model.Decision, bool) {
+	if p.lockdown != "limit" && p.lockdown != "drop" {
+		return model.Decision{}, false
+	}
+	prefix := cp.prefixText[owner]
+	if p.pulses == nil || !p.pulses.Assess(prefix).Pulsing {
+		// Not under attack. Lockdown is a posture for a bad moment, not a
+		// standing policy: it holds back clients that have done nothing
+		// wrong beyond being new.
+		return model.Decision{}, false
+	}
+	if p.egress.Visibility(prefix, now) != egress.Visible {
+		// Direct server return, or this node is simply not on the return
+		// path. Nothing here can confirm anybody, and holding back every
+		// client because of that would be the outage the attacker wanted.
+		return model.Decision{}, false
+	}
+	if p.egress.Confirmed(prefix, pf.srcIP, now) {
+		return model.Decision{}, false
+	}
+	if p.egress.InGrace(prefix, pf.srcIP, p.grace, now) {
+		// New. Give the origin a chance to answer it before deciding it is
+		// not a client.
+		return model.Decision{}, false
+	}
+
+	p.counters.lockedDown.Add(1)
+	if p.lockdown == "drop" {
+		return model.Decision{
+			Action: model.ActionDrop, Stage: model.StageZC, Reason: reasonLockdown,
+		}, true
+	}
+	// "limit" is the default shape for a reason: an unconfirmed source is
+	// held to a trickle rather than silenced, so a legitimate client the
+	// origin has not got around to answering is slowed, not cut off.
+	if p.overRate(now, lockdownRule, p.lockdownPPS, pf) {
+		return model.Decision{
+			Action: model.ActionDrop, Stage: model.StageZC, Reason: reasonLockdown,
+		}, true
+	}
+	return model.Decision{}, false
+}
+
+// lockdownRule keys the lockdown cap in the per-source rate table. It is not
+// a policy rule, so it takes a name no policy can collide with: rule IDs are
+// validated to exclude the separator this uses.
+const lockdownRule = "|lockdown"
 
 // evaluateTrusted is the path a verified source takes: the ASIC and FPGA
 // stages still apply, because an operator's explicit drop outranks anything
@@ -1019,6 +1188,9 @@ type Stats struct {
 	// path, who is in the penalty box, and how often a spoofable signal
 	// landed on a source that had already proved itself.
 	Reputation reputation.Stats `json:"reputation"`
+	// Egress is the return path: what the protected service has been
+	// answering, and whether this node can see it at all.
+	Egress EgressStats `json:"egress"`
 	// RateBuckets is the size of the per-source rate table. It is bounded, and
 	// sitting at the bound means the behavioral cap is no longer tracking
 	// every source.
@@ -1030,6 +1202,26 @@ type Stats struct {
 	OfferedPPS        uint64 `json:"offered_pps"`
 	DroppedPPS        uint64 `json:"dropped_pps"`
 	LoadWindowSeconds int    `json:"load_window_seconds"`
+}
+
+// EgressStats is the return-path picture one node holds.
+type EgressStats struct {
+	egress.Stats
+	// Seen and Confirmed count replies observed and the clients they
+	// vouched for. LockedDown counts ingress held back for want of one.
+	Seen       uint64 `json:"seen"`
+	Promoted   uint64 `json:"promoted"`
+	LockedDown uint64 `json:"locked_down"`
+	// Lockdown is the posture in force: "off", "limit" or "drop".
+	Lockdown string `json:"lockdown"`
+	// PrefixStates is the per-prefix return-path picture, including which
+	// look like direct server return.
+	//
+	// Named apart from the embedded Stats.Prefixes count on purpose: both
+	// marshalled to "prefixes", and Go resolves that in favour of the outer
+	// field, so the count vanished from the wire without anything
+	// complaining.
+	PrefixStates []egress.PrefixState `json:"prefix_states,omitempty"`
 }
 
 type StageStats struct {
@@ -1157,6 +1349,17 @@ func (p *Pipeline) Stats() Stats {
 		out.GameSessions, out.GameSessionsMax = p.games.Sessions()
 	}
 	out.Reputation = p.reputation.Stats()
+	out.Egress = EgressStats{
+		Stats:        p.egress.Stats(),
+		Seen:         p.counters.returnSeen.Load(),
+		Promoted:     p.counters.returnConfirmed.Load(),
+		LockedDown:   p.counters.lockedDown.Load(),
+		Lockdown:     p.lockdown,
+		PrefixStates: p.egress.Prefixes(),
+	}
+	if out.Egress.Lockdown == "" {
+		out.Egress.Lockdown = "off"
+	}
 	// One row per prefix, whether the accounting or the pulse detector knows
 	// about it: a prefix that has only ever been quiet still belongs in a
 	// customer's view, reading zero.
@@ -1272,6 +1475,21 @@ func (cp *compiledProgram) owns(f parsedFlow) (int, bool) {
 	}
 	for i, pfx := range cp.prefixes {
 		if pfx.Contains(f.dst) {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// ownsSource is owns for a packet travelling the other way: a reply from the
+// protected service has the customer's address as its source, not its
+// destination.
+func (cp *compiledProgram) ownsSource(f parsedFlow) (int, bool) {
+	if !f.srcOK {
+		return -1, false
+	}
+	for i, pfx := range cp.prefixes {
+		if pfx.Contains(f.src) {
 			return i, true
 		}
 	}

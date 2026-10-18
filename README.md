@@ -375,6 +375,8 @@ work":
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
 - `scrubline_prefix_offered_pps{node,prefix}` and `scrubline_prefix_dropped_pps{node,prefix}` — the same rates broken down by the protected prefix the traffic was aimed at. The node-wide pair cannot answer "which customer is being attacked": a scrubber carries many prefixes at once.
 - `scrubline_prefix_flows_total{node,prefix}`, `scrubline_prefix_flows_dropped_total{...}`, `scrubline_prefix_offered_total{...}` and `scrubline_prefix_dropped_total{...}` — the cumulative per-prefix counters the customer-facing analytics are deltaed from.
+- `scrubline_egress_visibility{node,prefix,state}` — whether this node sees a prefix's return path. `asymmetric` means the return-traffic layer is standing down for it.
+- `scrubline_egress_confirmed{node}` and `scrubline_egress_locked_down_total{node}` — clients the origin has vouched for, and ingress held back for want of one.
 - `scrubline_reputation_trusted{node}` and `scrubline_reputation_penalised{node}` — how many sources are on the short path and how many are in the box.
 - `scrubline_reputation_boxed_total{node}` — packets dropped at the top of the pipeline, which is the load the rest of the stages did not have to carry.
 - `scrubline_reputation_shielded_total{node}` — strikes that landed on an already-verified source and were not acted on. Alert on this: it is a spoofing attempt against a real player, or a verified client misbehaving.
@@ -494,6 +496,80 @@ curl -X POST -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" node:9091/repu
 
 Releasing leaves the escalation level alone: the next offence should not start
 from scratch because this one was forgiven.
+
+## Return-traffic confirmation
+
+Every other gate here reasons about the packets arriving, which is the hard
+direction: a source address on an inbound packet is written by whoever sent
+it, so proving anything about it needs a round trip the attacker cannot fake.
+That only works for protocols that define a challenge.
+
+Return traffic is different evidence and needs no protocol knowledge at all.
+If the origin is sending a stream of packets to an address, the service has
+decided that address is a peer worth answering — whatever it speaks, whatever
+its handshake looks like. That works for a game nobody has written a
+dissector for.
+
+Confirmation is **ten packets across at least three 250 ms ticks**. Distinct
+ticks rather than a count, because a burst of replies in one instant is what
+an origin sends when it is bouncing errors at a flood; a conversation is
+spread out. The datapath reports replies to the agent's `/egress`, which is a
+separate endpoint from `/decide` because a reply is not being judged —
+nothing about it is permitted or dropped. It is evidence.
+
+### It is weaker than a challenge, and the order matters
+
+| Proof | What it establishes |
+| --- | --- |
+| `handshake` | the source speaks the protocol — but an opening sequence can be sent blind |
+| `egress` | the service treats this address as a client — but an attacker can arrange that by spoofing a victim's address into a service that replies to anything |
+| `challenge` | the address can receive, because it echoed something only a reply could have taught it |
+
+So `fast_pass` still defaults to `challenge`. Setting it to `egress` is a
+deliberate widening, and the right one for a protocol with no challenge to
+issue:
+
+```json
+"reputation": {"fast_pass": "egress"}
+```
+
+### Lockdown
+
+While a prefix is under a recognised attack, a source the origin has never
+answered can be held back:
+
+```json
+"egress": {"lockdown": "limit", "lockdown_pps": 500, "grace_millis": 500}
+```
+
+Four things have to line up, and each is a way it does not fire: the operator
+asked for it, the prefix is actually pulsing, this node can see the return
+path, and the source has neither proved itself nor been answered — and is
+past its grace.
+
+**The grace window is not a nicety.** Without it lockdown is a trap with no
+exit: a new client is unconfirmed, so it is held back, so its packets never
+reach the origin, so the origin never answers, so it is never confirmed.
+Every new source gets 500 ms in which the origin can vouch for it.
+
+`limit` is the mode to reach for: an unconfirmed source is held to a trickle
+rather than silenced, so a client the origin has not got round to answering
+is slowed, not cut off. It is off by default either way — during an attack it
+holds back clients whose only fault is being new, and that is a deployment's
+call.
+
+### Asymmetric paths
+
+Some deployments never route the return path through the scrubber at all:
+with direct server return the origin answers the client straight out. A
+prefix showing ingress and no replies is recognised as asymmetric, and
+everything depending on return traffic stops applying to it. Reading "we
+cannot see the replies" as "nobody is confirmed" would hold back every real
+player on the service — the outage the attacker wanted.
+
+`scrubline_egress_visibility{prefix,state}` is worth a dashboard panel: a
+prefix reading `asymmetric` is one where this whole layer is not running,
+which is correct, and is not something to discover mid-incident.
 
 ## Return paths
 

@@ -1161,6 +1161,8 @@ components:
             $ref: '#/components/schemas/GameFilter'
         reputation:
           $ref: '#/components/schemas/ReputationPolicy'
+        egress:
+          $ref: '#/components/schemas/EgressPolicy'
         tunnels:
           type: array
           items:
@@ -1353,6 +1355,8 @@ components:
           type: integer
         reputation:
           $ref: '#/components/schemas/ReputationPolicy'
+        egress:
+          $ref: '#/components/schemas/EgressPolicy'
         tunnels:
           type: array
           items:
@@ -1626,6 +1630,8 @@ components:
           type: integer
         reputation:
           $ref: '#/components/schemas/ReputationStats'
+        egress:
+          $ref: '#/components/schemas/EgressStats'
         rate_buckets:
           type: integer
         rate_buckets_max:
@@ -1718,6 +1724,7 @@ components:
           type: string
           enum:
           - challenge
+          - egress
           - handshake
           - 'off'
           description: 'The weakest proof that earns the short path. Defaults to challenge, the stricter
@@ -1731,6 +1738,92 @@ components:
             them walk every stage to the same verdict. Off by default: it is an escalation of consequence
             beyond what one packet earned. With it off, strikes and would-be demotions are still counted
             and exposed, which is how it is sized before being switched on.'
+    EgressPolicy:
+      type: object
+      description: What the fabric does with the return path it can see. Watching what the origin sends
+        back is the one confirmation that needs no protocol knowledge — whatever the service speaks, if
+        it is answering an address at length it considers that address a client — and the only signal
+        here an attacker cannot forge from the ingress side.
+      properties:
+        lockdown:
+          type: string
+          enum:
+          - 'off'
+          - limit
+          - drop
+          description: 'What happens to an unconfirmed source while a prefix is under a recognised attack.
+            Off by default: under lockdown a client that has proved nothing is held back, and a brand-new
+            legitimate client has by definition proved nothing yet, so this trades joinability during
+            an attack for a protocol-agnostic filter. limit holds it to a trickle; drop silences it. Never
+            applies to a prefix whose return path is not visible.'
+        lockdown_pps:
+          type: integer
+          minimum: 0
+          description: The cap an unconfirmed source is held to in limit mode. Zero takes the platform
+            default.
+        grace_millis:
+          type: integer
+          minimum: 0
+          description: 'How long a source this node has not seen before is left alone under lockdown.
+            Zero takes the platform default of 500ms. Without it lockdown cannot be escaped: a new client
+            is unconfirmed, so it is held back, so its packets never reach the origin, so the origin never
+            answers, so it is never confirmed.'
+    EgressPrefixState:
+      type: object
+      properties:
+        prefix:
+          type: string
+        visibility:
+          type: string
+          enum:
+          - visible
+          - asymmetric
+          - unknown
+          description: asymmetric means this prefix carries ingress but no replies come back through this
+            node — direct server return, or the node is off the return path. Everything depending on return
+            traffic stands down for it, because reading an absence of replies as 'nobody is confirmed'
+            would hold back every real client.
+        clients:
+          type: integer
+        confirmed:
+          type: integer
+    EgressStats:
+      type: object
+      description: The return-path picture one node holds.
+      properties:
+        prefixes:
+          type: integer
+        clients:
+          type: integer
+        clients_max:
+          type: integer
+        confirmed:
+          type: integer
+        promotions:
+          type: integer
+        full:
+          type: integer
+        asymmetric:
+          type: integer
+          description: Prefixes whose return path is not visible here.
+        seen:
+          type: integer
+          description: Replies observed travelling back through this node.
+        promoted:
+          type: integer
+        locked_down:
+          type: integer
+          description: Ingress held back for want of a confirmation.
+        lockdown:
+          type: string
+          enum:
+          - 'off'
+          - limit
+          - drop
+        prefix_states:
+          type: array
+          items:
+            $ref: '#/components/schemas/EgressPrefixState'
     ReputationStats:
       type: object
       description: The two-tier source cache's counters.

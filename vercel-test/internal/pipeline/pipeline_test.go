@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/compiler"
+	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/egress"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/ml"
 	"github.com/Jacksondude1223-bit/scrubline-cloud-scrub/internal/model"
 )
@@ -1346,5 +1348,307 @@ func TestTheFastPathStillDropsMalformedTraffic(t *testing.T) {
 	// And the real player still gets through.
 	if d := p.Decide(a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'})); d.Action != model.ActionPermit {
 		t.Fatalf("the real player was blocked: %+v", d)
+	}
+}
+
+// --- egress: return-traffic confirmation -----------------------------------
+
+// egressProgram protects one prefix with a UDP inspect rule and no game
+// filter, which is the case egress confirmation exists for: a protocol
+// nobody has written a dissector for.
+func egressProgram(lockdown string) model.Program {
+	prog := model.Program{
+		PolicyID: "pol-1", Version: 1,
+		Prefixes:      []string{"203.0.113.0/24"},
+		PulseFloorPPS: 1000,
+		ZC: []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect,
+			RuleID: "zc", Match: model.Match{Proto: "udp"}}},
+	}
+	if lockdown != "" {
+		prog.Egress = &model.EgressPolicy{Lockdown: lockdown, LockdownPPS: 100}
+	}
+	return prog
+}
+
+func clientFlow(src string, pps int) model.Flow {
+	return model.Flow{SrcIP: src, DstIP: "203.0.113.10", Proto: "udp", DPort: 30000, PPS: pps}
+}
+
+func replyFlow(dst string, pps int) model.Flow {
+	return model.Flow{SrcIP: "203.0.113.10", DstIP: dst, Proto: "udp", SPort: 30000, PPS: pps}
+}
+
+// confirmViaEgress walks a client to confirmation by sustained return
+// traffic from the origin.
+func confirmViaEgress(p *Pipeline, advance func(time.Duration), client string) {
+	for i := 0; i < 4; i++ {
+		p.ObserveReturn(replyFlow(client, 10))
+		advance(250 * time.Millisecond)
+	}
+}
+
+// A client the origin keeps answering is verified, with no protocol
+// knowledge involved.
+func TestReturnTrafficConfirmsAClient(t *testing.T) {
+	prog := egressProgram("")
+	prog.Reputation = &model.ReputationPolicy{FastPass: "egress"}
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	// Seed the prefix so it is compiled, then confirm by return traffic.
+	p.Decide(clientFlow("192.0.2.50", 1))
+	confirmViaEgress(p, advance, "192.0.2.50")
+
+	if d := p.Decide(clientFlow("192.0.2.50", 1)); d.Reason != reasonFastPass {
+		t.Fatalf("expected the confirmed client on the fast path, got %+v", d)
+	}
+	s := p.Stats().Egress
+	if s.Promoted != 1 || s.Confirmed != 1 {
+		t.Fatalf("expected one promotion and one confirmed client, got %+v", s)
+	}
+}
+
+// Return traffic is weaker evidence than a challenge, so it does not earn
+// the fast path unless a policy says so.
+func TestEgressDoesNotFastPassUnlessAsked(t *testing.T) {
+	p := New(egressProgram(""))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	p.Decide(clientFlow("192.0.2.50", 1))
+	confirmViaEgress(p, advance, "192.0.2.50")
+	if d := p.Decide(clientFlow("192.0.2.50", 1)); d.Reason == reasonFastPass {
+		t.Fatal("return traffic earned the fast path at the default setting")
+	}
+}
+
+// Replies to an address outside the protected prefixes are not evidence
+// about anything this node carries.
+func TestReturnTrafficFromAnotherPrefixIsIgnored(t *testing.T) {
+	p := New(egressProgram(""))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	p.Decide(clientFlow("192.0.2.50", 1))
+
+	// Spread across enough ticks that this would confirm the client if the
+	// replies were attributed to a prefix this node carries.
+	for i := 0; i < 6; i++ {
+		p.ObserveReturn(model.Flow{SrcIP: "198.18.0.1", DstIP: "192.0.2.50", Proto: "udp", PPS: 10})
+		clock = clock.Add(250 * time.Millisecond)
+	}
+	if got := p.Stats().Egress.Confirmed; got != 0 {
+		t.Fatalf("a reply from an unprotected source confirmed a client: %d", got)
+	}
+	if got := p.Stats().Egress.Seen; got != 0 {
+		t.Fatalf("a reply from an unprotected source was counted: %d", got)
+	}
+}
+
+// Lockdown holds back a source the origin has never answered, but only
+// while the prefix is actually under attack.
+func TestLockdownOnlyAppliesUnderAttack(t *testing.T) {
+	p := New(egressProgram("drop"))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	// Make the return path visible, so lockdown is not skipped for that.
+	p.ObserveReturn(replyFlow("192.0.2.1", 1))
+
+	// Quiet prefix: an unknown source is not held back, even once it is
+	// well past the grace a new source gets.
+	stranger := clientFlow("198.51.100.9", 1)
+	p.Decide(stranger)
+	clock = clock.Add(time.Second)
+	if d := p.Decide(stranger); d.Action == model.ActionDrop {
+		t.Fatalf("a source was locked out while the prefix was quiet: %+v", d)
+	}
+	if got := p.Stats().Egress.LockedDown; got != 0 {
+		t.Fatalf("lockdown fired on a quiet prefix %d times", got)
+	}
+}
+
+// Under attack, an unconfirmed source past its grace is held back and a
+// confirmed one is not.
+func TestLockdownHoldsBackTheUnconfirmed(t *testing.T) {
+	p := New(egressProgram("drop"))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	// A real client the origin is answering.
+	p.Decide(clientFlow("192.0.2.50", 1))
+	confirmViaEgress(p, advance, "192.0.2.50")
+
+	// Put the prefix under a recognised burst train.
+	for i := 0; i < 4; i++ {
+		p.Decide(clientFlow("198.51.100.1", 400_000))
+		advance(10 * time.Second)
+	}
+	if !p.Stats().Pulsing {
+		t.Fatal("expected the prefix recognised as under attack")
+	}
+	// Keep the return path visible through the attack.
+	p.ObserveReturn(replyFlow("192.0.2.50", 10))
+
+	// A stranger, past its grace.
+	stranger := clientFlow("198.51.100.9", 1)
+	p.Decide(stranger)
+	advance(time.Second)
+	d := p.Decide(stranger)
+	if d.Action != model.ActionDrop || d.Reason != reasonLockdown {
+		t.Fatalf("expected the unconfirmed stranger held back, got %+v", d)
+	}
+	// The confirmed client keeps playing — and past its grace, so it is the
+	// confirmation carrying it and not the benefit of the doubt.
+	player := clientFlow("192.0.2.50", 1)
+	p.Decide(player)
+	advance(time.Second)
+	if d := p.Decide(player); d.Action == model.ActionDrop {
+		t.Fatalf("a confirmed client was locked out: %+v", d)
+	}
+}
+
+// Without a grace window lockdown is a trap with no exit: a new client is
+// unconfirmed, so it is dropped, so the origin never sees it, so it is
+// never confirmed.
+func TestANewClientGetsThroughLockdownLongEnoughToBeConfirmed(t *testing.T) {
+	p := New(egressProgram("drop"))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	p.ObserveReturn(replyFlow("192.0.2.1", 1))
+	for i := 0; i < 4; i++ {
+		p.Decide(clientFlow("198.51.100.1", 400_000))
+		advance(10 * time.Second)
+	}
+	p.ObserveReturn(replyFlow("192.0.2.1", 10))
+
+	// A brand-new client arrives mid-attack. Its first packets must get
+	// through, or the origin can never vouch for it.
+	newcomer := clientFlow("192.0.2.77", 1)
+	if d := p.Decide(newcomer); d.Action == model.ActionDrop {
+		t.Fatalf("a brand-new client was dropped before the origin could answer: %+v", d)
+	}
+	// The origin answers it, and it is confirmed from then on.
+	confirmViaEgress(p, advance, "192.0.2.77")
+	if d := p.Decide(newcomer); d.Action == model.ActionDrop {
+		t.Fatalf("a client the origin answered was still locked out: %+v", d)
+	}
+}
+
+// With direct server return there is nothing to confirm against. Holding
+// back every client because the replies are invisible would be the outage
+// the attacker wanted.
+func TestLockdownStandsDownWhenTheReturnPathIsInvisible(t *testing.T) {
+	p := New(egressProgram("drop"))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	// Under attack, and no reply has ever been seen for this prefix.
+	for i := 0; i < 4; i++ {
+		p.Decide(clientFlow("198.51.100.1", 400_000))
+		advance(10 * time.Second)
+	}
+	if !p.Stats().Pulsing {
+		t.Fatal("expected the prefix recognised as under attack")
+	}
+
+	stranger := clientFlow("198.51.100.9", 1)
+	p.Decide(stranger)
+	advance(time.Second)
+	if d := p.Decide(stranger); d.Reason == reasonLockdown {
+		t.Fatal("lockdown fired on a prefix whose return path is not visible")
+	}
+	if got := p.Stats().Egress.Asymmetric; got != 1 {
+		t.Fatalf("expected the prefix recognised as asymmetric, got %d", got)
+	}
+}
+
+// Lockdown is off unless a policy asks for it.
+func TestLockdownIsOffByDefault(t *testing.T) {
+	p := New(egressProgram(""))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	p.ObserveReturn(replyFlow("192.0.2.1", 1))
+	for i := 0; i < 4; i++ {
+		p.Decide(clientFlow("198.51.100.1", 400_000))
+		advance(10 * time.Second)
+	}
+	stranger := clientFlow("198.51.100.9", 1)
+	p.Decide(stranger)
+	advance(time.Second)
+	if d := p.Decide(stranger); d.Reason == reasonLockdown {
+		t.Fatal("lockdown fired without a policy asking for it")
+	}
+	if got := p.Stats().Egress.Lockdown; got != "off" {
+		t.Fatalf("expected the posture reported as off, got %q", got)
+	}
+}
+
+// "limit" holds an unconfirmed source to a trickle rather than silencing
+// it, which is why it is the shape to reach for first.
+func TestLimitModeCapsRatherThanSilences(t *testing.T) {
+	p := New(egressProgram("limit"))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	advance := func(d time.Duration) { clock = clock.Add(d) }
+
+	p.ObserveReturn(replyFlow("192.0.2.1", 1))
+	for i := 0; i < 4; i++ {
+		p.Decide(clientFlow("198.51.100.1", 400_000))
+		advance(10 * time.Second)
+	}
+	p.ObserveReturn(replyFlow("192.0.2.1", 10))
+
+	// Past its grace, under the cap: still passes.
+	stranger := clientFlow("198.51.100.9", 10)
+	p.Decide(stranger)
+	advance(time.Second)
+	if d := p.Decide(stranger); d.Action == model.ActionDrop {
+		t.Fatalf("a quiet unconfirmed source was silenced under limit mode: %+v", d)
+	}
+	// Over the cap: held back.
+	loud := clientFlow("198.51.100.8", 100_000)
+	p.Decide(loud)
+	advance(time.Second)
+	var held bool
+	for i := 0; i < 4; i++ {
+		if d := p.Decide(loud); d.Reason == reasonLockdown {
+			held = true
+			break
+		}
+	}
+	if !held {
+		t.Fatal("a loud unconfirmed source was not capped under limit mode")
+	}
+}
+
+// EgressStats embeds the tracker's own counters and adds a per-prefix list.
+// Both wanted the key "prefixes", and Go resolves that in favour of the
+// outer field — so the prefix count silently vanished from every report.
+func TestEgressStatsDoesNotShadowACounter(t *testing.T) {
+	raw, err := json.Marshal(EgressStats{
+		Stats:        egress.Stats{Prefixes: 7, Clients: 3},
+		PrefixStates: []egress.PrefixState{{Prefix: "203.0.113.0/24"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got, ok := out["prefixes"].(float64); !ok || got != 7 {
+		t.Fatalf("the prefix count did not survive marshalling: %s", raw)
+	}
+	if _, ok := out["prefix_states"].([]any); !ok {
+		t.Fatalf("the per-prefix list did not survive marshalling: %s", raw)
 	}
 }

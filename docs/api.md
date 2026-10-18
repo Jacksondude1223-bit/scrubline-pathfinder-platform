@@ -27,7 +27,7 @@ else's datacentre, so it never holds one that can change the fabric.
 | `SCRUBLINE_ENROLL_TOKEN` | node agents | `POST /v1/nodes/register`, and nothing else |
 | node credential | one scrubber | its own heartbeat, program and counters, plus `GET /v1/ml/model` |
 | tenant credential | one protected customer | `GET /v1/analytics/*`, for their own prefixes only |
-| `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/metrics`, `/bgp`, `/tunnels`, `/sessions`, `/reputation` |
+| `SCRUBLINE_NODE_API_TOKEN` | the agent and its scraper | that agent's `/decide`, `/egress`, `/metrics`, `/bgp`, `/tunnels`, `/sessions`, `/reputation` |
 
 A node credential is issued at registration, scoped to that node, 256 bits,
 kept only as a hash, and rotated whenever the node enrols again. A tenant
@@ -622,6 +622,63 @@ gate — so this is the only way back, and it is an operator's call. The
 escalation level survives a release: the next offence should not start from
 scratch because this one was forgiven.
 
+### 11. Return-traffic confirmation
+
+Every other gate reasons about inbound packets, where the source address is
+written by whoever sent it. Return traffic is the other direction, and it
+needs no protocol knowledge: if the origin is answering an address at length,
+the service considers it a client.
+
+The datapath reports replies separately from decisions, because a reply is
+not being judged:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/egress \
+    -d '{"src_ip":"203.0.113.10","dst_ip":"192.0.2.50","proto":"udp","sport":30000,"pps":10}'
+{"observed":true}
+```
+
+The flow is the reply: source is the protected address, destination is the
+client. Ten packets across three 250 ms ticks confirms it — distinct ticks
+rather than a count, because a burst in one instant is an origin bouncing
+errors at a flood.
+
+```console
+# Before the origin has answered, with no dissector for this protocol:
+{"action":"permit","reason":"PF_RING ZC inspect pass"}
+
+# After sustained replies, with "fast_pass":"egress":
+{"action":"permit","reason":"verified source, fast path"}
+```
+
+#### Lockdown
+
+```json
+"egress": {"lockdown": "limit", "lockdown_pps": 500, "grace_millis": 500}
+```
+
+While the prefix is pulsing, a source the origin has never answered is held
+back — but only once it is past its grace:
+
+```console
+# A stranger arrives mid-attack. Its first packets get through.
+{"action":"permit","reason":"PF_RING ZC inspect pass"}
+
+# A second later, unconfirmed and out of grace:
+{"action":"drop","reason":"no return traffic confirms this source while the prefix is under attack"}
+```
+
+Meanwhile the confirmed client keeps playing throughout.
+
+The grace is load-bearing. Without it lockdown cannot be escaped: a new
+client is unconfirmed, so it is held back, so its packets never reach the
+origin, so the origin never answers. `limit` is the safer mode — an
+unconfirmed source is capped rather than silenced.
+
+**It never fires on a prefix whose return path is not visible.** With direct
+server return there are no replies to see, and treating that as "nobody is
+confirmed" would hold back every real player.
+
 ## The node agent
 
 ```console
@@ -674,6 +731,21 @@ in `Stats` are moving averages over `load_window_seconds`, not totals.
 its mean under the watermark on purpose, so `offered_pps` can read zero on a
 node being knocked over. `pulsing`, `pulse_peak_pps` and the `pulse` array are
 the real picture.
+
+**Return traffic confirms a client, and it is weaker than a challenge.** The
+order is handshake < egress < challenge: a handshake can be sent blind, a
+challenge proves the address can receive, and return traffic proves the
+service treats the address as a client — which an attacker can arrange by
+spoofing a victim's address into a service that replies to anything.
+
+**Lockdown needs a grace window or it is a trap with no exit.** An unconfirmed
+client is held back, so its packets never reach the origin, so the origin
+never answers, so it is never confirmed. Every new source gets 500 ms.
+
+**Lockdown never fires on a prefix whose return path is invisible.** With
+direct server return there is nothing to confirm against, and holding back
+every client because of that is the outage the attacker wanted. Watch
+`scrubline_egress_visibility`.
 
 **A verified source skips the gate and the classifier, never the rate cap or
 the signature check.** The cap is what bounds a verified source — without it,

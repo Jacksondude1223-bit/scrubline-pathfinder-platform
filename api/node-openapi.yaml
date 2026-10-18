@@ -278,6 +278,56 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /egress:
+    post:
+      summary: Report traffic the protected service sent back to a client
+      description: 'A separate endpoint from /decide because a reply is not being judged — nothing about
+        it is permitted or dropped. It is evidence, and the only evidence this fabric has that an attacker
+        cannot write himself: the origin chose to answer that address.
+
+
+        Sustained return traffic to a client confirms it, with no protocol knowledge involved. That is
+        the strongest signal available for a protocol with no challenge to issue — and still weaker than
+        a challenge, because an attacker can arrange it by spoofing a victim''s address into a service
+        that replies to anything.
+
+
+        The flow is the reply: its source is the protected address and its destination is the client.
+        A reply whose source is not a prefix this node carries is ignored.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Flow'
+      responses:
+        '200':
+          description: Recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  observed:
+                    type: boolean
+        '400':
+          description: The flow will not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '405':
+          description: Only POST.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /reputation:
     get:
       summary: What this node remembers about sources

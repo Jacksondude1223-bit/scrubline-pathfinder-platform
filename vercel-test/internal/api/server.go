@@ -540,6 +540,7 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	reports := s.Store.Reports()
 	families := append(s.controlFamilies(), telemetry.Families(reports, s.clock())...)
 	families = append(families, telemetry.ReputationFamilies(reports)...)
+	families = append(families, telemetry.EgressFamilies(reports)...)
 	if err := metrics.Write(&buf, families); err != nil {
 		log.Printf("api: rendering metrics failed: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to render metrics"})
@@ -1626,9 +1627,28 @@ func validatePolicy(p model.Policy) error {
 	}
 	if r := p.Reputation; r != nil {
 		switch r.FastPass {
-		case "", "challenge", "handshake", "off":
+		case "", "challenge", "egress", "handshake", "off":
 		default:
-			return fmt.Errorf("reputation.fast_pass %q must be \"challenge\", \"handshake\" or \"off\"", r.FastPass)
+			return fmt.Errorf("reputation.fast_pass %q must be \"challenge\", \"egress\", \"handshake\" or \"off\"", r.FastPass)
+		}
+	}
+	if e := p.Egress; e != nil {
+		switch e.Lockdown {
+		case "", "off", "limit", "drop":
+		default:
+			return fmt.Errorf("egress.lockdown %q must be \"off\", \"limit\" or \"drop\"", e.Lockdown)
+		}
+		if e.LockdownPPS < 0 {
+			return fmt.Errorf("egress.lockdown_pps must not be negative, got %d", e.LockdownPPS)
+		}
+		if e.GraceMillis < 0 {
+			return fmt.Errorf("egress.grace_millis must not be negative, got %d", e.GraceMillis)
+		}
+		// Lockdown with no grace is a trap with no exit: an unconfirmed
+		// source is held back, so its packets never reach the origin, so
+		// the origin never answers, so it is never confirmed.
+		if e.Lockdown == "drop" && e.GraceMillis != 0 && e.GraceMillis < 50 {
+			return fmt.Errorf("egress.grace_millis %d is too short to let the origin answer; a dropping lockdown needs at least 50ms", e.GraceMillis)
 		}
 	}
 	if p.PulseFloorPPS < 0 {

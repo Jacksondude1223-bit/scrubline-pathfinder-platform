@@ -172,6 +172,7 @@ func main() {
 		families := telemetry.Families([]telemetry.Report{report(node, pipe)}, time.Time{})
 		families = append(families, telemetry.AnnouncementFamilies(steering.Load().Announcements)...)
 		families = append(families, telemetry.ReputationFamilies([]telemetry.Report{report(node, pipe)})...)
+		families = append(families, telemetry.EgressFamilies([]telemetry.Report{report(node, pipe)})...)
 		families = append(families, telemetry.TunnelFamilies(node.ID, node.Name, node.Region,
 			delivery.Load().Tunnels, health.get())...)
 		if err := metrics.Write(&buf, families); err != nil {
@@ -293,6 +294,34 @@ func main() {
 			"bird":     plan.SessionConfig,
 			"error":    plan.SessionErr,
 		})
+	})
+	// /egress is where the datapath reports what the protected service sent
+	// back to a client.
+	//
+	// It is a separate endpoint from /decide because a reply is not being
+	// judged — nothing about it is permitted or dropped. It is the one
+	// piece of evidence this fabric has that an attacker cannot write
+	// himself: the origin chose to answer that address.
+	mux.HandleFunc("/egress", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, localToken) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid bearer token"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		var f model.Flow
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&f); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := ml.ValidateFlow(f); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		pipe.ObserveReturn(f)
+		writeJSON(w, http.StatusOK, map[string]any{"observed": true})
 	})
 	// /reputation is what the datapath remembers about sources, and the way
 	// back out of the penalty box.
