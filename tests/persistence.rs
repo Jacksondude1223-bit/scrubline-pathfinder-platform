@@ -135,3 +135,34 @@ fn policy_validation_rejects_unenforceable_configurations() {
     });
     assert!(validation::policy(&p).is_err());
 }
+#[test]
+fn policy_validation_rejects_configurations_that_render_broken() {
+    let base = Policy {
+        name: "test".into(),
+        protected: vec!["203.0.113.0/24".into(), "2001:db8::/32".into()],
+        ..Default::default()
+    };
+    validation::policy(&base).unwrap();
+    let mut p = base.clone();
+    p.protected.push("203.0.113.0/24".into());
+    assert!(validation::policy(&p).is_err());
+    let session = |id: &str, peer: &str, prefix: &str| pathfinder::model::Session {
+        id: id.into(),
+        peer_ip: peer.into(),
+        peer_as: 64512,
+        prefixes: vec![prefix.into()],
+        ..Default::default()
+    };
+    let mut p = base.clone();
+    p.sessions = vec![session("peer", "192.0.2.9", "203.0.113.0/24")];
+    validation::policy(&p).unwrap();
+    p.sessions = vec![session("peer", "2001:db8::9", "203.0.113.0/24")];
+    assert!(validation::policy(&p).is_err());
+    p.sessions = vec![session("peer", "192.0.2.9", "2001:db8::/32")];
+    assert!(validation::policy(&p).is_err());
+    p.sessions = vec![
+        session("peer-a", "192.0.2.9", "203.0.113.0/24"),
+        session("peer_a", "192.0.2.10", "203.0.113.0/24"),
+    ];
+    assert!(validation::policy(&p).is_err());
+}

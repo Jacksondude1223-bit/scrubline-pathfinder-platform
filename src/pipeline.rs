@@ -169,9 +169,8 @@ impl Pipeline {
         }
         self.pulses.forget(&live);
         self.egress.forget(&live);
-        if program.pulse_floor_pps > 0 {
-            self.pulses.floor = program.pulse_floor_pps as u64;
-        }
+        // Zero is the platform default, so a policy that drops its floor must clear the old one.
+        self.pulses.floor = program.pulse_floor_pps.max(0) as u64;
         self.rules = [
             program
                 .asic
@@ -377,8 +376,11 @@ impl Pipeline {
                 }
                 let r = self.rules[stage][i].clone();
                 if trusted {
+                    // Trust skips the challenge and the classifier, nothing else. A count is still
+                    // observe-only and the behavioural cap still applies, so a match that decides
+                    // nothing must not end the stage and hide the rules behind it.
+                    self.seen(&r.id, f);
                     if r.action == "drop" {
-                        self.seen(&r.id, f);
                         return (
                             decision(
                                 "drop",
@@ -389,14 +391,10 @@ impl Pipeline {
                             None,
                         );
                     }
-                    if stage == 0 {
-                        if r.action == "permit" {
-                            break;
-                        }
-                        continue;
+                    if r.action == "permit" {
+                        break;
                     }
                     if r.limit > 0 && self.over_rate(&r.id, r.limit, f, now) {
-                        self.seen(&r.id, f);
                         return (
                             decision(
                                 "drop",
@@ -411,7 +409,12 @@ impl Pipeline {
                             None,
                         );
                     }
-                    break;
+                    // A ZC inspect or rate_limit that passes its cap ends evaluation, as it does
+                    // for everyone else; the classifier it would have consulted next is skipped.
+                    if stage == 2 && r.action != "count" {
+                        break;
+                    }
+                    continue;
                 }
                 self.seen(&r.id, f);
                 let id = Some(r.id.clone());

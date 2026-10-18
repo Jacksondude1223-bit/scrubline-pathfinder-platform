@@ -1,7 +1,8 @@
 use pathfinder::{
     api::{Api, Shared},
+    model::zero_time,
     runtime::{self, Flags},
-    store::{Snapshot, Store},
+    store::{self, Snapshot, Store},
     Result,
 };
 use std::{
@@ -68,14 +69,28 @@ async fn run() -> Result<()> {
                 }
                 match client.get(&url).bearer_auth(&token).send().await {
                     Ok(r) if r.status().is_success() => match r.json::<Snapshot>().await {
-                        Ok(snap) => {
-                            let mut a = state.lock().unwrap();
-                            if a.mode == "replica" && last != Some(snap.saved_at) {
-                                let saved = snap.saved_at;
-                                if let Err(e) = a.store.load_snapshot(snap) {
-                                    eprintln!("replica state: {e}");
-                                } else {
-                                    last = Some(saved);
+                        Ok(mut snap) => {
+                            // The primary stamps saved_at on every read, so it cannot say whether
+                            // anything changed. Compare the content instead, or every poll
+                            // rewrites and fsyncs the whole state file, training set included.
+                            snap.saved_at = zero_time();
+                            let digest = serde_json::to_string(&snap)
+                                .map(|raw| store::hash(&raw))
+                                .unwrap_or_default();
+                            if last.as_ref() != Some(&digest) {
+                                let shared = state.clone();
+                                let loaded = tokio::task::spawn_blocking(move || {
+                                    let mut a = shared.lock().unwrap();
+                                    if a.mode != "replica" {
+                                        return Ok(());
+                                    }
+                                    a.store.load_snapshot(snap)
+                                })
+                                .await;
+                                match loaded {
+                                    Ok(Ok(())) => last = Some(digest),
+                                    Ok(Err(e)) => eprintln!("replica state: {e}"),
+                                    Err(e) => eprintln!("replica worker: {e}"),
                                 }
                             }
                         }
