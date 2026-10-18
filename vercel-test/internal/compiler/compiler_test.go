@@ -36,7 +36,7 @@ func TestEveryLiveNodeAnnouncesEveryPrefix(t *testing.T) {
 	nodes := []model.Node{ready("node-a", "a", "iad", 100), ready("node-b", "b", "fra", 100), ready("node-c", "c", "sin", 100)}
 	policy := policyFor("203.0.113.0/24", "198.51.100.0/24")
 
-	plan := Plan(policy, nodes, nil)
+	plan := Plan(policy, nodes, nil, nil)
 	if len(plan) != len(policy.Protected)*len(nodes) {
 		t.Fatalf("expected every node to announce every prefix, got %d rows", len(plan))
 	}
@@ -57,7 +57,7 @@ func TestCapacityIsWeightedWithPrepends(t *testing.T) {
 		ready("node-half", "half", "fra", 200),
 		ready("node-quarter", "quarter", "sin", 100),
 	}
-	plan := Plan(policyFor("203.0.113.0/24"), nodes, nil)
+	plan := Plan(policyFor("203.0.113.0/24"), nodes, nil, nil)
 	for id, want := range map[string]int{"node-big": 0, "node-half": 1, "node-quarter": 2} {
 		if got := rowFor(t, plan, "203.0.113.0/24", id).Prepends; got != want {
 			t.Fatalf("%s: expected %d prepends, got %d", id, want, got)
@@ -69,7 +69,7 @@ func TestCapacityIsWeightedWithPrepends(t *testing.T) {
 // apart, and a very long path invites filtering.
 func TestPrependsAreBounded(t *testing.T) {
 	nodes := []model.Node{ready("node-big", "big", "iad", 1e9), ready("node-tiny", "tiny", "sin", 1)}
-	got := rowFor(t, Plan(policyFor("203.0.113.0/24"), nodes, nil), "203.0.113.0/24", "node-tiny").Prepends
+	got := rowFor(t, Plan(policyFor("203.0.113.0/24"), nodes, nil, nil), "203.0.113.0/24", "node-tiny").Prepends
 	if got != MaxPrepends {
 		t.Fatalf("expected padding clamped to %d, got %d", MaxPrepends, got)
 	}
@@ -84,7 +84,7 @@ func TestBogusCapacityShedsTrafficRatherThanAttractingIt(t *testing.T) {
 			ready("node-a", "a", "iad", 100),
 			ready("node-evil", "evil", "sin", bogus),
 		}
-		plan := Plan(policyFor("203.0.113.0/24"), nodes, nil)
+		plan := Plan(policyFor("203.0.113.0/24"), nodes, nil, nil)
 		evil := rowFor(t, plan, "203.0.113.0/24", "node-evil")
 		good := rowFor(t, plan, "203.0.113.0/24", "node-a")
 		if evil.Prepends <= good.Prepends {
@@ -104,7 +104,7 @@ func TestStaleNodesAreWithdrawn(t *testing.T) {
 		ready("node-a", "a", "iad", 100),
 		{ID: "node-dead", Name: "dead", Region: "sin", CapacityGbps: 100, Status: model.NodeStale},
 	}
-	plan := Plan(policyFor("203.0.113.0/24"), nodes, nil)
+	plan := Plan(policyFor("203.0.113.0/24"), nodes, nil, nil)
 
 	dead := rowFor(t, plan, "203.0.113.0/24", "node-dead")
 	if dead.State != model.StateWithdraw {
@@ -125,7 +125,7 @@ func TestRegionPinningExcludesNodesEntirely(t *testing.T) {
 	policy := policyFor("203.0.113.0/24", "198.51.100.0/24")
 	policy.Steering = []model.Steering{{Prefix: "203.0.113.0/24", Regions: []string{"FRA"}}}
 
-	plan := Plan(policy, nodes, nil)
+	plan := Plan(policy, nodes, nil, nil)
 	for _, a := range plan {
 		if a.Prefix == "203.0.113.0/24" && a.NodeID == "node-us" {
 			t.Fatalf("a pinned prefix was announced outside its regions: %+v", a)
@@ -148,7 +148,7 @@ func TestRegionPinningExcludesNodesEntirely(t *testing.T) {
 func TestWithdrawnNodesStillEnforce(t *testing.T) {
 	dead := model.Node{ID: "node-dead", Name: "dead", Region: "sin", CapacityGbps: 100, Status: model.NodeStale}
 	policy := policyFor("203.0.113.0/24")
-	if got := rowFor(t, Plan(policy, []model.Node{dead}, nil), "203.0.113.0/24", "node-dead").State; got != model.StateWithdraw {
+	if got := rowFor(t, Plan(policy, []model.Node{dead}, nil, nil), "203.0.113.0/24", "node-dead").State; got != model.StateWithdraw {
 		t.Fatalf("expected a withdrawal, got %q", got)
 	}
 	if got := EnforcedPrefixes(policy, dead); len(got) != 1 {
@@ -160,7 +160,7 @@ func TestSteeringCommunitiesRideOnTheAnnouncement(t *testing.T) {
 	nodes := []model.Node{ready("node-a", "a", "iad", 100)}
 	policy := policyFor("203.0.113.0/24")
 	policy.Steering = []model.Steering{{Prefix: "203.0.113.0/24", Communities: []string{"65000:100", "no-export"}}}
-	got := rowFor(t, Plan(policy, nodes, nil), "203.0.113.0/24", "node-a")
+	got := rowFor(t, Plan(policy, nodes, nil, nil), "203.0.113.0/24", "node-a")
 	if !reflect.DeepEqual(got.Communities, []string{"65000:100", "no-export"}) {
 		t.Fatalf("unexpected communities %v", got.Communities)
 	}
@@ -170,11 +170,11 @@ func TestSteeringCommunitiesRideOnTheAnnouncement(t *testing.T) {
 func TestNextHopComesFromTheAdvertisedAddress(t *testing.T) {
 	n := ready("node-a", "a", "iad", 100)
 	n.Advertise = "198.51.100.7:9091"
-	if got := rowFor(t, Plan(policyFor("203.0.113.0/24"), []model.Node{n}, nil), "203.0.113.0/24", "node-a").NextHop; got != "198.51.100.7" {
+	if got := rowFor(t, Plan(policyFor("203.0.113.0/24"), []model.Node{n}, nil, nil), "203.0.113.0/24", "node-a").NextHop; got != "198.51.100.7" {
 		t.Fatalf("expected the advertised host as next hop, got %q", got)
 	}
 	bare := ready("node-b", "b", "iad", 100)
-	if got := rowFor(t, Plan(policyFor("203.0.113.0/24"), []model.Node{bare}, nil), "203.0.113.0/24", "node-b").NextHop; got != "" {
+	if got := rowFor(t, Plan(policyFor("203.0.113.0/24"), []model.Node{bare}, nil, nil), "203.0.113.0/24", "node-b").NextHop; got != "" {
 		t.Fatalf("a node that advertised nothing should carry no next hop, got %q", got)
 	}
 }
@@ -182,9 +182,9 @@ func TestNextHopComesFromTheAdvertisedAddress(t *testing.T) {
 func TestPlanIsDeterministic(t *testing.T) {
 	nodes := []model.Node{ready("node-b", "b", "fra", 80), ready("node-a", "a", "iad", 100)}
 	policy := policyFor("203.0.113.0/24", "198.51.100.0/24")
-	first := Plan(policy, nodes, nil)
+	first := Plan(policy, nodes, nil, nil)
 	for i := 0; i < 20; i++ {
-		if got := Plan(policy, nodes, nil); !reflect.DeepEqual(got, first) {
+		if got := Plan(policy, nodes, nil, nil); !reflect.DeepEqual(got, first) {
 			t.Fatalf("plan is not stable: %+v then %+v", first, got)
 		}
 	}
@@ -195,7 +195,7 @@ func TestPlanIsDeterministic(t *testing.T) {
 }
 
 func TestPlanWithNoNodes(t *testing.T) {
-	if got := Plan(policyFor("203.0.113.0/24"), nil, nil); len(got) != 0 {
+	if got := Plan(policyFor("203.0.113.0/24"), nil, nil, nil); len(got) != 0 {
 		t.Fatalf("expected an empty plan without nodes, got %+v", got)
 	}
 }
@@ -209,7 +209,7 @@ func TestCompileEmitsEmptyPrefixListNotNil(t *testing.T) {
 		Rules:     []model.Rule{{ID: "r", Stage: model.StageASIC, Action: model.ActionDrop}},
 	}
 	nodes := []model.Node{{ID: "node-a", Name: "a", CapacityGbps: 10}, {ID: "node-b", Name: "b", CapacityGbps: 10}}
-	assigned := Plan(policy, nodes, nil)
+	assigned := Plan(policy, nodes, nil, nil)
 	progs := Compile(policy, nodes, assigned)
 	if len(progs) != len(nodes) {
 		t.Fatalf("expected a program per node, got %d", len(progs))
@@ -232,7 +232,7 @@ func TestCompileSortsACLByPriority(t *testing.T) {
 		},
 	}
 	nodes := []model.Node{{ID: "node-a", Name: "a", CapacityGbps: 10}}
-	progs := Compile(policy, nodes, Plan(policy, nodes, nil))
+	progs := Compile(policy, nodes, Plan(policy, nodes, nil, nil))
 	acl := progs["node-a"].ASIC
 	for i := 1; i < len(acl); i++ {
 		if acl[i-1].Priority > acl[i].Priority {
@@ -252,7 +252,7 @@ func TestCompileRoutesRulesToTheirStage(t *testing.T) {
 		},
 	}
 	nodes := []model.Node{{ID: "node-a", Name: "scrub-a", CapacityGbps: 10}}
-	prog := Compile(policy, nodes, Plan(policy, nodes, nil))["node-a"]
+	prog := Compile(policy, nodes, Plan(policy, nodes, nil, nil))["node-a"]
 	if len(prog.ASIC) != 1 || len(prog.FPGA) != 1 || len(prog.ZC) != 1 {
 		t.Fatalf("expected one entry per stage, got asic=%d fpga=%d zc=%d", len(prog.ASIC), len(prog.FPGA), len(prog.ZC))
 	}
@@ -284,7 +284,7 @@ func TestCompileHonorsAdvertisedBackends(t *testing.T) {
 		{ID: "full", Name: "full", Backends: []model.Stage{model.StageASIC, model.StageFPGA, model.StageZC}},
 		{ID: "unset", Name: "unset"},
 	}
-	progs := Compile(policy, nodes, Plan(policy, nodes, nil))
+	progs := Compile(policy, nodes, Plan(policy, nodes, nil, nil))
 
 	zcOnly := progs["zc-only"]
 	if len(zcOnly.ASIC) != 0 || len(zcOnly.FPGA) != 0 {
@@ -317,7 +317,7 @@ func TestCompileOrdersEveryStageByPriority(t *testing.T) {
 		},
 	}
 	nodes := []model.Node{{ID: "n", Name: "n"}}
-	prog := Compile(policy, nodes, Plan(policy, nodes, nil))["n"]
+	prog := Compile(policy, nodes, Plan(policy, nodes, nil, nil))["n"]
 	if prog.ASIC[0].RuleID != "a-early" {
 		t.Fatalf("asic out of priority order: %s first", prog.ASIC[0].RuleID)
 	}
@@ -342,7 +342,7 @@ func TestCompileIsStableForEqualPriorities(t *testing.T) {
 	}
 	policy := model.Policy{ID: "pol-1", Version: 1, Protected: []string{"203.0.113.0/24"}, Rules: rules}
 	nodes := []model.Node{{ID: "n1", Name: "n1"}, {ID: "n2", Name: "n2"}}
-	assigned := Plan(policy, nodes, nil)
+	assigned := Plan(policy, nodes, nil, nil)
 
 	order := func(p *model.Program) []string {
 		var ids []string
@@ -384,13 +384,13 @@ func TestSurvivorsReweightWhenTheLargestNodeGoesStale(t *testing.T) {
 	small := ready("node-small", "small", "sin", 100)
 	policy := policyFor("203.0.113.0/24")
 
-	full := Plan(policy, []model.Node{big, mid, small}, nil)
+	full := Plan(policy, []model.Node{big, mid, small}, nil, nil)
 	if got := rowFor(t, full, "203.0.113.0/24", "node-mid").Prepends; got != 1 {
 		t.Fatalf("with the big node up, mid should carry 1 prepend, got %d", got)
 	}
 
 	big.Status = model.NodeStale
-	degraded := Plan(policy, []model.Node{big, mid, small}, nil)
+	degraded := Plan(policy, []model.Node{big, mid, small}, nil, nil)
 	if got := rowFor(t, degraded, "203.0.113.0/24", "node-mid").Prepends; got != 0 {
 		t.Fatalf("mid is now the largest announcing node and should be unpadded, got %d", got)
 	}
@@ -404,12 +404,12 @@ func TestSheddingAddsToTheCapacityBaseline(t *testing.T) {
 	nodes := []model.Node{ready("node-big", "big", "iad", 400), ready("node-small", "small", "sin", 100)}
 	policy := policyFor("203.0.113.0/24")
 
-	base := Plan(policy, nodes, nil)
+	base := Plan(policy, nodes, nil, nil)
 	if got := rowFor(t, base, "203.0.113.0/24", "node-small").Prepends; got != 2 {
 		t.Fatalf("capacity baseline should be 2, got %d", got)
 	}
 
-	shed := Plan(policy, nodes, map[string]int{"node-small": 2, "node-big": 1})
+	shed := Plan(policy, nodes, map[string]int{"node-small": 2, "node-big": 1}, nil)
 	if got := rowFor(t, shed, "203.0.113.0/24", "node-small").Prepends; got != 4 {
 		t.Fatalf("expected baseline 2 plus 2 shedding, got %d", got)
 	}
@@ -425,7 +425,7 @@ func TestSheddingAddsToTheCapacityBaseline(t *testing.T) {
 // Total padding stays bounded however saturated a node is.
 func TestSheddingCannotPushPaddingPastTheBound(t *testing.T) {
 	nodes := []model.Node{ready("node-big", "big", "iad", 1e9), ready("node-tiny", "tiny", "sin", 1)}
-	plan := Plan(policyFor("203.0.113.0/24"), nodes, map[string]int{"node-tiny": 99})
+	plan := Plan(policyFor("203.0.113.0/24"), nodes, map[string]int{"node-tiny": 99}, nil)
 	if got := rowFor(t, plan, "203.0.113.0/24", "node-tiny").Prepends; got != MaxPrepends {
 		t.Fatalf("expected padding clamped to %d, got %d", MaxPrepends, got)
 	}
@@ -435,7 +435,7 @@ func TestSheddingCannotPushPaddingPastTheBound(t *testing.T) {
 // share on its neighbours and can cascade.
 func TestSheddingNeverWithdrawsANode(t *testing.T) {
 	nodes := []model.Node{ready("node-a", "a", "iad", 100)}
-	plan := Plan(policyFor("203.0.113.0/24"), nodes, map[string]int{"node-a": 99})
+	plan := Plan(policyFor("203.0.113.0/24"), nodes, map[string]int{"node-a": 99}, nil)
 	if got := rowFor(t, plan, "203.0.113.0/24", "node-a").State; got != model.StateAnnounce {
 		t.Fatalf("load must never withdraw a node, got state %q", got)
 	}
@@ -444,9 +444,196 @@ func TestSheddingNeverWithdrawsANode(t *testing.T) {
 // A withdrawn node carries no padding: there is no announcement to pad.
 func TestSheddingIsIgnoredForWithdrawnNodes(t *testing.T) {
 	dead := model.Node{ID: "node-dead", Name: "dead", Region: "sin", CapacityGbps: 100, Status: model.NodeStale}
-	plan := Plan(policyFor("203.0.113.0/24"), []model.Node{dead}, map[string]int{"node-dead": 3})
+	plan := Plan(policyFor("203.0.113.0/24"), []model.Node{dead}, map[string]int{"node-dead": 3}, nil)
 	got := rowFor(t, plan, "203.0.113.0/24", "node-dead")
 	if got.State != model.StateWithdraw || got.Prepends != 0 {
 		t.Fatalf("unexpected row for a stale node: %+v", got)
+	}
+}
+
+// --- return paths and customer sessions -----------------------------------
+
+func tunnelPolicy() model.Policy {
+	p := policyFor("203.0.113.0/24")
+	p.Tunnels = []model.Tunnel{{
+		ID: "northwind", Remote: "198.51.100.1", Prefixes: []string{"203.0.113.0/24"},
+	}}
+	return p
+}
+
+func tunnelNode(id, name, region, src string) model.Node {
+	n := ready(id, name, region, 100)
+	n.TunnelSrc = src
+	return n
+}
+
+// Anycast means the tunnel fans out: every node carrying the prefix builds
+// its own return path to the one customer endpoint, from its own address.
+func TestEveryNodeCarryingAPrefixBuildsItsOwnTunnel(t *testing.T) {
+	policy := tunnelPolicy()
+	nodes := []model.Node{
+		tunnelNode("node-a", "a", "iad", "192.0.2.1"),
+		tunnelNode("node-b", "b", "fra", "192.0.2.2"),
+		tunnelNode("node-c", "c", "sin", "192.0.2.3"),
+	}
+	progs := Compile(policy, nodes, Plan(policy, nodes, nil, nil))
+
+	locals := map[string]bool{}
+	for _, n := range nodes {
+		prog := progs[n.ID]
+		if len(prog.Tunnels) != 1 {
+			t.Fatalf("%s: expected one return tunnel, got %d", n.ID, len(prog.Tunnels))
+		}
+		tn := prog.Tunnels[0]
+		if tn.Remote != "198.51.100.1" {
+			t.Fatalf("%s: expected the one customer endpoint, got %q", n.ID, tn.Remote)
+		}
+		if tn.Local != n.TunnelSrc {
+			t.Fatalf("%s: expected the node's own source, got %q", n.ID, tn.Local)
+		}
+		if locals[tn.Local] {
+			t.Fatalf("%s: two nodes compiled the same local endpoint %q", n.ID, tn.Local)
+		}
+		locals[tn.Local] = true
+		if tn.Interface != "scr-northwind" || tn.MTU != 1476 || tn.MSSClamp != 1436 {
+			t.Fatalf("%s: unexpected derived tunnel: %+v", n.ID, tn)
+		}
+	}
+}
+
+// A node that carries none of a tunnel's prefixes has no reason to hold it
+// open. Regional steering is the usual way that happens.
+func TestANodeOutsideTheRegionBuildsNoTunnel(t *testing.T) {
+	policy := tunnelPolicy()
+	policy.Steering = []model.Steering{{Prefix: "203.0.113.0/24", Regions: []string{"iad"}}}
+	nodes := []model.Node{
+		tunnelNode("node-a", "a", "iad", "192.0.2.1"),
+		tunnelNode("node-b", "b", "fra", "192.0.2.2"),
+	}
+	progs := Compile(policy, nodes, Plan(policy, nodes, nil, nil))
+
+	if len(progs["node-a"].Tunnels) != 1 {
+		t.Fatal("the in-region node should carry the tunnel")
+	}
+	if len(progs["node-b"].Tunnels) != 0 {
+		t.Fatalf("a node outside the region built a tunnel it has no traffic for: %+v", progs["node-b"].Tunnels)
+	}
+}
+
+// A node that cannot build the return path must not be attracting the
+// traffic. Announcing a prefix you cannot deliver is worse than not
+// announcing it: BGP hands over the customer's traffic and it is dropped.
+func TestANodeWithNoTunnelSourceIsWithdrawn(t *testing.T) {
+	policy := tunnelPolicy()
+	nodes := []model.Node{
+		tunnelNode("node-a", "a", "iad", "192.0.2.1"),
+		ready("node-b", "b", "fra", 100), // no tunnel_src
+	}
+	plan := Plan(policy, nodes, nil, nil)
+
+	if got := rowFor(t, plan, "203.0.113.0/24", "node-a").State; got != model.StateAnnounce {
+		t.Fatalf("the node that can deliver should announce, got %q", got)
+	}
+	row := rowFor(t, plan, "203.0.113.0/24", "node-b")
+	if row.State != model.StateWithdraw {
+		t.Fatalf("a node with no return path should be withdrawn, got %q", row.State)
+	}
+	if !strings.Contains(row.Reason, "tunnel_src") {
+		t.Fatalf("expected the reason to say why, got %q", row.Reason)
+	}
+}
+
+// A tunnel reported down withdraws its prefixes from that node, and only
+// that node: the rest of the fabric picks the traffic up.
+func TestAReportedDownTunnelWithdrawsOnlyThatNode(t *testing.T) {
+	policy := tunnelPolicy()
+	nodes := []model.Node{
+		tunnelNode("node-a", "a", "iad", "192.0.2.1"),
+		tunnelNode("node-b", "b", "fra", "192.0.2.2"),
+	}
+	health := TunnelHealth{"node-a": {"northwind": model.TunnelDown}}
+	plan := Plan(policy, nodes, nil, health)
+
+	down := rowFor(t, plan, "203.0.113.0/24", "node-a")
+	if down.State != model.StateWithdraw {
+		t.Fatalf("expected the node with the dead tunnel withdrawn, got %q", down.State)
+	}
+	if !strings.Contains(down.Reason, "down") {
+		t.Fatalf("expected the reason to name the tunnel state, got %q", down.Reason)
+	}
+	if got := rowFor(t, plan, "203.0.113.0/24", "node-b").State; got != model.StateAnnounce {
+		t.Fatalf("the healthy node should keep announcing, got %q", got)
+	}
+}
+
+// Silence is not bad news. A fabric whose provisioner reports nothing should
+// still carry traffic rather than blanking itself.
+func TestAnUnreportedTunnelDoesNotWithdraw(t *testing.T) {
+	policy := tunnelPolicy()
+	nodes := []model.Node{tunnelNode("node-a", "a", "iad", "192.0.2.1")}
+
+	if got := rowFor(t, Plan(policy, nodes, nil, nil), "203.0.113.0/24", "node-a").State; got != model.StateAnnounce {
+		t.Fatalf("an unreported tunnel withdrew the prefix, got %q", got)
+	}
+
+	// Unless the operator asked for the opposite, which is the fail-closed
+	// posture for a fabric whose tunnels do report.
+	policy.Tunnels[0].Required = true
+	row := rowFor(t, Plan(policy, nodes, nil, nil), "203.0.113.0/24", "node-a")
+	if row.State != model.StateWithdraw {
+		t.Fatalf("a required tunnel with no report should withdraw, got %q", row.State)
+	}
+	if got := rowFor(t, Plan(policy, nodes, nil, TunnelHealth{"node-a": {"northwind": model.TunnelUp}}),
+		"203.0.113.0/24", "node-a").State; got != model.StateAnnounce {
+		t.Fatalf("a required tunnel reported up should announce, got %q", got)
+	}
+}
+
+// Liveness is reported first: a node that is not answering is already
+// withdrawn, and the state of its tunnels is not the useful thing to say.
+func TestLivenessIsReportedBeforeTheReturnPath(t *testing.T) {
+	policy := tunnelPolicy()
+	dead := tunnelNode("node-a", "a", "iad", "192.0.2.1")
+	dead.Status = model.NodeStale
+	health := TunnelHealth{"node-a": {"northwind": model.TunnelDown}}
+
+	row := rowFor(t, Plan(policy, []model.Node{dead}, nil, health), "203.0.113.0/24", "node-a")
+	if row.State != model.StateWithdraw {
+		t.Fatalf("expected a withdrawal, got %q", row.State)
+	}
+	if !strings.Contains(row.Reason, "heartbeat") {
+		t.Fatalf("expected the liveness reason, got %q", row.Reason)
+	}
+}
+
+// A prefix with no declared return path is delivered some other way, and
+// that is not the compiler's business to guess at.
+func TestAPrefixWithNoTunnelIsUnaffected(t *testing.T) {
+	policy := policyFor("203.0.113.0/24")
+	nodes := []model.Node{ready("node-a", "a", "iad", 100)}
+	if got := rowFor(t, Plan(policy, nodes, nil, nil), "203.0.113.0/24", "node-a").State; got != model.StateAnnounce {
+		t.Fatalf("a prefix with no tunnel should be unaffected, got %q", got)
+	}
+}
+
+// A customer peers where they have a path, so sessions compile only onto the
+// nodes that terminate them.
+func TestSessionsCompileOntoTheirOwnNodes(t *testing.T) {
+	policy := tunnelPolicy()
+	policy.Sessions = []model.Session{{
+		ID: "northwind", PeerIP: "198.51.100.1", PeerAS: 64512,
+		Prefixes: []string{"203.0.113.0/24"}, Regions: []string{"iad"},
+	}}
+	nodes := []model.Node{
+		tunnelNode("node-a", "a", "iad", "192.0.2.1"),
+		tunnelNode("node-b", "b", "fra", "192.0.2.2"),
+	}
+	progs := Compile(policy, nodes, Plan(policy, nodes, nil, nil))
+
+	if len(progs["node-a"].Sessions) != 1 {
+		t.Fatalf("expected the in-region node to terminate the session, got %+v", progs["node-a"].Sessions)
+	}
+	if len(progs["node-b"].Sessions) != 0 {
+		t.Fatalf("a node outside the session's regions terminated it: %+v", progs["node-b"].Sessions)
 	}
 }

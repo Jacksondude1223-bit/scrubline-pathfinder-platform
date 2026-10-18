@@ -1705,3 +1705,224 @@ func TestReplicaServesAnalyticsButRefusesTenantWrites(t *testing.T) {
 		}
 	}
 }
+
+// --- return paths and customer sessions -----------------------------------
+
+const tunnelPolicyJSON = `{
+  "name":"delivered","protected":["203.0.113.0/24"],
+  "tunnels":[{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],
+              "comment":"Northwind primary"}],
+  "sessions":[{"id":"northwind","peer_ip":"198.51.100.1","peer_as":64512,
+               "prefixes":["203.0.113.0/24"]}]}`
+
+// tunnelFabric brings up two scrubbers that can build return paths, with a
+// policy that declares one.
+func tunnelFabric(t *testing.T) (h http.Handler, nodeA, tokenA, nodeB, tokenB string) {
+	t.Helper()
+	h = newTestServer()
+	nodeA, tokenA = enroll(t, h, `{"name":"edge-lhr","region":"lhr","capacity_gbps":100,"tunnel_src":"192.0.2.1"}`)
+	nodeB, tokenB = enroll(t, h, `{"name":"edge-fra","region":"fra","capacity_gbps":100,"tunnel_src":"192.0.2.2"}`)
+	saved := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", tunnelPolicyJSON), http.StatusOK)
+	id, _ := saved["id"].(string)
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies/"+id+"/deploy", ""), http.StatusOK)
+	return h, nodeA, tokenA, nodeB, tokenB
+}
+
+// stateFor reads one node's announcement state for a prefix out of the fabric.
+func stateFor(t *testing.T, h http.Handler, nodeID, prefix string) (string, string) {
+	t.Helper()
+	for _, row := range fabricPlan(t, h) {
+		if row["node_id"] == nodeID && row["prefix"] == prefix {
+			state, _ := row["state"].(string)
+			reason, _ := row["reason"].(string)
+			return state, reason
+		}
+	}
+	t.Fatalf("no announcement for %s / %s", nodeID, prefix)
+	return "", ""
+}
+
+// Anycast means the return path fans out: each node carrying the prefix gets
+// its own tunnel to the one customer endpoint, sourced from its own address.
+func TestEachNodeGetsItsOwnReturnTunnel(t *testing.T) {
+	h, nodeA, tokenA, nodeB, tokenB := tunnelFabric(t)
+
+	for _, c := range []struct{ id, token, wantLocal string }{
+		{nodeA, tokenA, "192.0.2.1"},
+		{nodeB, tokenB, "192.0.2.2"},
+	} {
+		prog := requireJSON(t, doAs(t, h, c.token, http.MethodGet, "/v1/nodes/"+c.id+"/program", ""), http.StatusOK)
+		tunnels, _ := prog["tunnels"].([]any)
+		if len(tunnels) != 1 {
+			t.Fatalf("%s: expected one return tunnel, got %v", c.id, prog["tunnels"])
+		}
+		tn, _ := tunnels[0].(map[string]any)
+		if tn["local"] != c.wantLocal {
+			t.Fatalf("%s: expected local %s, got %v", c.id, c.wantLocal, tn["local"])
+		}
+		if tn["remote"] != "198.51.100.1" {
+			t.Fatalf("%s: expected the one customer endpoint, got %v", c.id, tn["remote"])
+		}
+		// The derived values the agent renders config from.
+		if tn["interface"] != "scr-northwind" || tn["mtu"].(float64) != 1476 || tn["mss_clamp"].(float64) != 1436 {
+			t.Fatalf("%s: unexpected derived tunnel %v", c.id, tn)
+		}
+		sessions, _ := prog["sessions"].([]any)
+		if len(sessions) != 1 {
+			t.Fatalf("%s: expected the customer session, got %v", c.id, prog["sessions"])
+		}
+	}
+}
+
+// The headline behaviour: a node that says its return path is down stops
+// being sent the customer's traffic. Announcing a prefix you cannot deliver
+// black-holes the customer, which looks healthy from every other angle.
+func TestAReportedDownTunnelWithdrawsThePrefix(t *testing.T) {
+	h, nodeA, tokenA, nodeB, _ := tunnelFabric(t)
+
+	if state, _ := stateFor(t, h, nodeA, "203.0.113.0/24"); state != "announce" {
+		t.Fatalf("expected the prefix announced to begin with, got %q", state)
+	}
+
+	// The provisioner on node A reports the tunnel down.
+	down := `{"tunnels":[{"tunnel_id":"northwind","state":"down","detail":"peer unreachable"}]}`
+	requireJSON(t, doAs(t, h, tokenA, http.MethodPost, "/v1/nodes/"+nodeA+"/heartbeat", down), http.StatusOK)
+
+	state, reason := stateFor(t, h, nodeA, "203.0.113.0/24")
+	if state != "withdraw" {
+		t.Fatalf("a node with a dead return path kept announcing: %q", state)
+	}
+	if !strings.Contains(reason, "down") {
+		t.Fatalf("expected the reason to name the return path, got %q", reason)
+	}
+	// The rest of the fabric picks the traffic up; this is not an outage.
+	if state, _ := stateFor(t, h, nodeB, "203.0.113.0/24"); state != "announce" {
+		t.Fatalf("the healthy node stopped announcing too: %q", state)
+	}
+
+	// And it comes back when the tunnel does.
+	up := `{"tunnels":[{"tunnel_id":"northwind","state":"up"}]}`
+	requireJSON(t, doAs(t, h, tokenA, http.MethodPost, "/v1/nodes/"+nodeA+"/heartbeat", up), http.StatusOK)
+	if state, _ := stateFor(t, h, nodeA, "203.0.113.0/24"); state != "announce" {
+		t.Fatalf("the prefix did not come back when the tunnel did: %q", state)
+	}
+}
+
+// A node that cannot source a tunnel at all must not attract the traffic.
+func TestANodeWithoutATunnelSourceIsWithdrawn(t *testing.T) {
+	h := newTestServer()
+	withSrc, _ := enroll(t, h, `{"name":"edge-lhr","region":"lhr","capacity_gbps":100,"tunnel_src":"192.0.2.1"}`)
+	without, _ := enroll(t, h, `{"name":"edge-fra","region":"fra","capacity_gbps":100}`)
+	saved := requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", tunnelPolicyJSON), http.StatusOK)
+	id, _ := saved["id"].(string)
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies/"+id+"/deploy", ""), http.StatusOK)
+
+	if state, _ := stateFor(t, h, withSrc, "203.0.113.0/24"); state != "announce" {
+		t.Fatalf("the node that can deliver should announce, got %q", state)
+	}
+	state, reason := stateFor(t, h, without, "203.0.113.0/24")
+	if state != "withdraw" {
+		t.Fatalf("a node with no tunnel source kept announcing: %q", state)
+	}
+	if !strings.Contains(reason, "tunnel_src") {
+		t.Fatalf("expected the reason to say why, got %q", reason)
+	}
+}
+
+// A node may only report its own tunnels, like every other thing it reports.
+func TestANodeCannotReportAnotherNodesTunnels(t *testing.T) {
+	h, nodeA, _, nodeB, tokenB := tunnelFabric(t)
+	down := `{"tunnels":[{"tunnel_id":"northwind","state":"down"}]}`
+
+	if rec := doAs(t, h, tokenB, http.MethodPost, "/v1/nodes/"+nodeA+"/heartbeat", down); rec.Code != http.StatusForbidden {
+		t.Fatalf("one node reported another's tunnels: %d %s", rec.Code, rec.Body.String())
+	}
+	// Its own is fine, and only affects itself.
+	requireJSON(t, doAs(t, h, tokenB, http.MethodPost, "/v1/nodes/"+nodeB+"/heartbeat", down), http.StatusOK)
+	if state, _ := stateFor(t, h, nodeA, "203.0.113.0/24"); state != "announce" {
+		t.Fatalf("node A was withdrawn by node B's report: %q", state)
+	}
+}
+
+// A malformed status is refused rather than recorded as some third thing.
+func TestAMalformedTunnelStatusIsRefused(t *testing.T) {
+	h, nodeA, tokenA, _, _ := tunnelFabric(t)
+	for _, body := range []string{
+		`{"tunnels":[{"tunnel_id":"northwind","state":"flapping"}]}`,
+		`{"tunnels":[{"state":"up"}]}`,
+	} {
+		if rec := doAs(t, h, tokenA, http.MethodPost, "/v1/nodes/"+nodeA+"/heartbeat", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected %s to be refused, got %d", body, rec.Code)
+		}
+	}
+	// And the prefix is untouched by the attempt.
+	if state, _ := stateFor(t, h, nodeA, "203.0.113.0/24"); state != "announce" {
+		t.Fatalf("a refused report changed the fabric: %q", state)
+	}
+}
+
+// Policies carrying tunnels and sessions are validated at the edge, because
+// they compile into interface names, routes and routing-daemon config on
+// every node that carries the prefix.
+func TestTunnelAndSessionPoliciesAreValidated(t *testing.T) {
+	h := newTestServer()
+	bad := []struct{ name, policy string }{
+		{"tunnel for an unprotected prefix", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"a","remote":"198.51.100.1","prefixes":["198.18.0.0/24"]}]}`},
+		{"tunnel id too long for an interface", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"northwind-primary","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}]}`},
+		{"tunnel id that is not a link name", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"a;b","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}]}`},
+		{"remote that is not an address", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"a","remote":"198.51.100.1; reboot","prefixes":["203.0.113.0/24"]}]}`},
+		{"mtu that cannot fit the encapsulation", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"a","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"mtu":1500}]}`},
+		{"two tunnels for one prefix", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"a","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]},
+		             {"id":"b","remote":"198.51.100.2","prefixes":["203.0.113.0/24"]}]}`},
+		{"ipip with a key", `{"name":"p","protected":["203.0.113.0/24"],
+		  "tunnels":[{"id":"a","type":"ipip","key":7,"remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}]}`},
+		{"session for an unprotected prefix", `{"name":"p","protected":["203.0.113.0/24"],
+		  "sessions":[{"id":"a","peer_ip":"198.51.100.1","peer_as":64512,"prefixes":["198.18.0.0/24"]}]}`},
+		{"session password that escapes the config", `{"name":"p","protected":["203.0.113.0/24"],
+		  "sessions":[{"id":"a","peer_ip":"198.51.100.1","peer_as":64512,"prefixes":["203.0.113.0/24"],
+		               "password":"x\"; } protocol bgp evil {"}]}`},
+		{"two sessions to one peer", `{"name":"p","protected":["203.0.113.0/24"],
+		  "sessions":[{"id":"a","peer_ip":"198.51.100.1","peer_as":64512,"prefixes":["203.0.113.0/24"]},
+		              {"id":"b","peer_ip":"198.51.100.1","peer_as":64513,"prefixes":["203.0.113.0/24"]}]}`},
+	}
+	for _, c := range bad {
+		t.Run(c.name, func(t *testing.T) {
+			if rec := do(t, h, http.MethodPost, "/v1/policies", c.policy); rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected %s to be refused, got %d %s", c.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+	// And a sound one is accepted.
+	requireJSON(t, do(t, h, http.MethodPost, "/v1/policies", tunnelPolicyJSON), http.StatusOK)
+}
+
+// A tunnel source that is not usable is refused at registration rather than
+// failing once per tunnel on a node nobody is watching.
+func TestTunnelSourceIsValidatedAtRegistration(t *testing.T) {
+	h := newTestServer()
+	for _, src := range []string{"not-an-ip", "127.0.0.1", "0.0.0.0", "2001:db8::1"} {
+		body := fmt.Sprintf(`{"name":"edge","region":"lhr","tunnel_src":%q}`, src)
+		if rec := doAs(t, h, testEnrollToken, http.MethodPost, "/v1/nodes/register", body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected tunnel_src %q to be refused, got %d %s", src, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// A customer's own credential must not expose the fabric's delivery plumbing:
+// peer addresses, AS numbers and session secrets are not theirs to read.
+func TestATenantCannotReadDeliveryConfig(t *testing.T) {
+	h, nodeA, _, _, _ := tunnelFabric(t)
+	_, tenantToken := onboard(t, h, `{"name":"Northwind","prefixes":["203.0.113.0/24"]}`)
+
+	for _, path := range []string{"/v1/fabric", "/v1/policies", "/v1/nodes/" + nodeA + "/program"} {
+		if rec := doAs(t, h, tenantToken, http.MethodGet, path, ""); rec.Code != http.StatusForbidden {
+			t.Fatalf("a tenant read %s: %d %s", path, rec.Code, rec.Body.String())
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ func TestThreeStageDropPath(t *testing.T) {
 		},
 	}
 	nodes := []model.Node{{ID: "node-a", Name: "scrub-a", CapacityGbps: 100, Status: model.NodeReady}}
-	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil))
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil, nil))
 	pipe := New(*progs["node-a"])
 
 	acl := pipe.Decide(model.Flow{SrcIP: "198.51.100.9", DstIP: "203.0.113.10", Proto: "udp", DPort: 19132, PPS: 10})
@@ -52,7 +53,7 @@ func TestEveryNodeEnforcesEveryPrefix(t *testing.T) {
 	policy := model.Policy{ID: "pol-1", Version: 1, Protected: []string{
 		"203.0.113.0/24", "203.0.114.0/24", "203.0.115.0/24",
 	}}
-	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil))
+	progs := compiler.Compile(policy, nodes, compiler.Plan(policy, nodes, nil, nil))
 
 	flow := model.Flow{SrcIP: "198.51.100.1", DstIP: "203.0.114.9", Proto: "udp", PPS: 10}
 	for _, n := range nodes {
@@ -1108,5 +1109,242 @@ func TestPipelinePrefixRatesDecay(t *testing.T) {
 	// deltas its history from.
 	if got := p.Stats().Prefixes[0].Offered; got != uint64(loadWindowSeconds)*20_000 {
 		t.Fatalf("expected the cumulative total to stand, got %d", got)
+	}
+}
+
+// --- reputation: fast pass and penalty box ---------------------------------
+
+// a2sProgram binds the challenge-gated profile, which is the one that proves
+// a return path and so earns a fast pass by default.
+func a2sProgram(box bool) model.Program {
+	return model.Program{
+		PolicyID: "pol-1", Version: 1,
+		Prefixes: []string{"203.0.113.0/24"},
+		Games: []model.GameFilter{{
+			ID: "query", DstCIDR: "203.0.113.0/24", Proto: "udp", DPort: 27015, Profile: "a2s",
+		}},
+		ChallengeSecret: "0011223344556677",
+		Reputation:      &model.ReputationPolicy{PenaltyBox: box},
+		ZC: []model.ZCEntry{{Cluster: "zc:a", Action: model.ActionInspect, PPS: 1000,
+			RuleID: "zc", Match: model.Match{Proto: "udp"}}},
+	}
+}
+
+func a2sFlow(src string, payload []byte) model.Flow {
+	return model.Flow{SrcIP: src, DstIP: "203.0.113.10", Proto: "udp", DPort: 27015, PPS: 1, Payload: payload}
+}
+
+// verify walks a source through the A2S challenge and returns it admitted.
+func verify(t *testing.T, p *Pipeline, src string) {
+	t.Helper()
+	d := p.Decide(a2sFlow(src, []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'}))
+	if d.Action != model.ActionChallenge {
+		t.Fatalf("expected a challenge, got %+v", d)
+	}
+	cookie := d.Reply[len(d.Reply)-4:]
+	echo := append([]byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'}, cookie...)
+	if d := p.Decide(a2sFlow(src, echo)); d.Action != model.ActionPermit {
+		t.Fatalf("expected the answered challenge to admit, got %+v", d)
+	}
+}
+
+// A source that answered the challenge takes the short path afterwards.
+func TestAnsweringTheChallengeEarnsTheFastPath(t *testing.T) {
+	p := New(a2sProgram(false))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	verify(t, p, "192.0.2.50")
+
+	d := p.Decide(a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'}))
+	if d.Action != model.ActionPermit {
+		t.Fatalf("a verified source was not admitted: %+v", d)
+	}
+	if d.Reason != reasonFastPass {
+		t.Fatalf("expected the fast path, got %q", d.Reason)
+	}
+	if got := p.Stats().Reputation.FastPassed; got == 0 {
+		t.Fatal("the fast pass was not counted")
+	}
+
+	// It lapses, and the source goes back through the full path.
+	clock = clock.Add(6 * time.Minute)
+	if d := p.Decide(a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'})); d.Reason == reasonFastPass {
+		t.Fatal("the fast path outlived its TTL")
+	}
+}
+
+// The fast path skips the stateless checks, never the behavioural cap. If a
+// verified source could send without limit, clearing one challenge would be
+// the whole attack.
+func TestTheFastPathStillHonoursTheRateCap(t *testing.T) {
+	p := New(a2sProgram(false))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	verify(t, p, "192.0.2.50")
+
+	// Well over the 1000 pps cap on the ZC rule, from a verified source.
+	flood := a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'})
+	flood.PPS = 50_000
+	var dropped bool
+	for i := 0; i < 5; i++ {
+		if d := p.Decide(flood); d.Action == model.ActionDrop {
+			dropped = true
+			if !strings.Contains(d.Reason, "cap") {
+				t.Fatalf("expected the behavioural cap to be the reason, got %q", d.Reason)
+			}
+			break
+		}
+	}
+	if !dropped {
+		t.Fatal("a verified source sent 50x its cap without being limited")
+	}
+}
+
+// An operator's explicit drop outranks anything a source has proved.
+func TestTheFastPathDoesNotOverrideAnOperatorDrop(t *testing.T) {
+	prog := a2sProgram(false)
+	p := New(prog)
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	verify(t, p, "192.0.2.50")
+
+	// The operator blocks that source after it was verified.
+	next := prog
+	next.ASIC = []model.ACLEntry{{
+		Action: model.ActionDrop, RuleID: "blocked",
+		Match: model.Match{SrcCIDR: "192.0.2.50/32", DstCIDR: "203.0.113.0/24"},
+	}}
+	p.Load(next)
+
+	d := p.Decide(a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'}))
+	if d.Action != model.ActionDrop {
+		t.Fatalf("a verified source walked past an explicit drop: %+v", d)
+	}
+}
+
+// A source that keeps failing is dropped at the top of the pipeline instead
+// of walking every stage to the same verdict.
+func TestARepeatOffenderIsDroppedAtTheTop(t *testing.T) {
+	p := New(a2sProgram(true))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	junk := a2sFlow("198.51.100.9", []byte{0x00, 0x01, 0x02, 0x03, 0x04})
+	for i := 0; i < 8; i++ {
+		p.Decide(junk)
+	}
+	d := p.Decide(junk)
+	if d.Action != model.ActionDrop || d.Reason != reasonBoxed {
+		t.Fatalf("expected the source boxed at the top, got %+v", d)
+	}
+	if got := p.Stats().Reputation.Boxed; got == 0 {
+		t.Fatal("the boxed drop was not counted")
+	}
+
+	// It serves its minute and comes back.
+	clock = clock.Add(2 * time.Minute)
+	if d := p.Decide(junk); d.Reason == reasonBoxed {
+		t.Fatal("the penalty outlived its term")
+	}
+}
+
+// The penalty box is off unless a policy asks for it, so nothing starts
+// dropping on an upgrade.
+func TestThePenaltyBoxIsOffByDefault(t *testing.T) {
+	p := New(a2sProgram(false))
+	junk := a2sFlow("198.51.100.9", []byte{0x00, 0x01, 0x02, 0x03, 0x04})
+	for i := 0; i < 20; i++ {
+		if d := p.Decide(junk); d.Reason == reasonBoxed {
+			t.Fatal("a source was boxed without the policy asking for it")
+		}
+	}
+	// But the demotion is counted, so it can be sized before being enabled.
+	if got := p.Stats().Reputation.Demotions; got == 0 {
+		t.Fatal("expected the would-be demotion recorded in observe mode")
+	}
+}
+
+// The one that matters: an attacker spoofing a verified player's address
+// must not be able to get that player boxed.
+func TestSpoofedTrafficCannotBoxAVerifiedPlayer(t *testing.T) {
+	p := New(a2sProgram(true))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	verify(t, p, "192.0.2.50")
+
+	// An attacker floods junk claiming to be the player.
+	junk := a2sFlow("192.0.2.50", []byte{0x00, 0x01, 0x02, 0x03, 0x04})
+	for i := 0; i < 40; i++ {
+		p.Decide(junk)
+	}
+
+	d := p.Decide(a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'}))
+	if d.Action == model.ActionDrop {
+		t.Fatalf("a real player was knocked offline by traffic claiming their address: %+v", d)
+	}
+	if got := p.Stats().Reputation.Shielded; got == 0 {
+		t.Fatal("expected the shielded strikes to be counted so an operator can see this")
+	}
+}
+
+// Completing a handshake can be done blind, so by default it does not earn
+// the fast path — a policy has to widen it deliberately.
+func TestHandshakeDoesNotFastPassUnlessAsked(t *testing.T) {
+	prog := gameProgram(false)
+	prog.ZC[0].PPS = 0
+	p := New(prog)
+	p.Decide(gameFlow(append([]byte{0x07}, bedrockMagic...)))
+	if d := p.Decide(gameFlow([]byte{0x84, 0x01})); d.Reason == reasonFastPass {
+		t.Fatal("a handshake earned the fast path by default")
+	}
+
+	prog.Reputation = &model.ReputationPolicy{FastPass: "handshake"}
+	wide := New(prog)
+	wide.Decide(gameFlow(append([]byte{0x07}, bedrockMagic...)))
+	if d := wide.Decide(gameFlow([]byte{0x84, 0x01})); d.Reason != reasonFastPass {
+		t.Fatalf("an operator who opted in did not get the fast path: %+v", d)
+	}
+}
+
+// Boxed traffic is still measured. It arrived, so it is load, and a customer
+// whose attack is being shed early should still see it in their analytics.
+func TestBoxedTrafficIsStillAccounted(t *testing.T) {
+	p := New(a2sProgram(true))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+
+	junk := a2sFlow("198.51.100.9", []byte{0x00, 0x01, 0x02, 0x03, 0x04})
+	junk.PPS = 100
+	for i := 0; i < 12; i++ {
+		p.Decide(junk)
+	}
+	row := p.Stats().Prefixes[0]
+	if row.Flows != 12 || row.FlowsDropped == 0 {
+		t.Fatalf("expected boxed traffic counted against the prefix, got %+v", row)
+	}
+	if row.Dropped == 0 {
+		t.Fatalf("expected the boxed volume counted as scrubbed, got %+v", row)
+	}
+}
+
+// Junk claiming a verified source's address is still dropped. The fast path
+// skips the gate, not the question of whether this looks like the protocol
+// at all — otherwise spoofing a player's address would launder traffic
+// straight through.
+func TestTheFastPathStillDropsMalformedTraffic(t *testing.T) {
+	p := New(a2sProgram(true))
+	clock := time.Unix(1_700_000_000, 0)
+	p.now = func() time.Time { return clock }
+	verify(t, p, "192.0.2.50")
+
+	// A2S requires a four-byte 0xFFFFFFFF header; this has none.
+	junk := a2sFlow("192.0.2.50", []byte{0x00, 0x01, 0x02, 0x03, 0x04})
+	d := p.Decide(junk)
+	if d.Action != model.ActionDrop {
+		t.Fatalf("junk was forwarded on a verified source's fast path: %+v", d)
+	}
+	// And the real player still gets through.
+	if d := p.Decide(a2sFlow("192.0.2.50", []byte{0xFF, 0xFF, 0xFF, 0xFF, 'T'})); d.Action != model.ActionPermit {
+		t.Fatalf("the real player was blocked: %+v", d)
 	}
 }

@@ -135,6 +135,7 @@ func (s *Store) load(snap Snapshot) {
 	s.programs = map[string]*model.Program{}
 	s.plan = nil
 	s.reports = map[string]telemetry.Report{}
+	s.tunnels = map[string][]model.TunnelStatus{}
 }
 
 // Snapshot copies the durable state out. Callers hold nothing; this takes the

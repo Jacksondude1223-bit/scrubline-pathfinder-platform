@@ -1,6 +1,8 @@
 # Temporary Vercel API test
 
-Self-contained snapshot of the real control-plane API at commit aeee294cfcf5a33cf5ab5d9719d5ffd44b7a9e73. Everything needed to build is inside this folder. The original commands, source, and deployment configuration are unchanged.
+Self-contained snapshot of the real control-plane API at commit abf05ab791e4ad1da0449bae57f0d27319de3133. Everything needed to build is inside this folder. The original commands, source, and deployment configuration are unchanged.
+
+The copy does not track the parent repository on its own, and it had already fallen three feature commits behind once. `./sync.sh` refreshes it; see [Resync](#resync).
 
 ## Deploy
 
@@ -31,7 +33,9 @@ Registration returns a node credential once. Use it for that node's heartbeat an
 ## Limits
 
 - This is the real API implementation with its original validation and authentication, using a disposable in-memory store. There is no shared database. Cold starts, redeployments, and scaling can lose state or route requests to a different empty instance. A saved policy or registered node can therefore disappear between calls. Use Sandbox or the normal container deployment for reliable multi-request lifecycle tests.
-- Only the control-plane API runs. The separate node-agent `/decide`, `/metrics`, and `/bgp` API is not included.
+- Only the control-plane API runs. The separate node-agent API — `/decide`, `/metrics`, `/bgp`, `/tunnels`, `/sessions`, `/reputation` — is not included.
+- Policies carrying `tunnels`, `sessions` or `reputation` are accepted, validated and compiled into programs here, which is what makes their validation testable. Nothing renders or enforces them: return tunnels are rendered by the node agent, customer peerings are configured by it, and the reputation tiers live in its datapath. A policy that compiles cleanly here says the control plane is happy with it, not that a scrubber would do anything with it.
+- A return tunnel reported down withdraws its prefixes from a node, and the report arrives on a node heartbeat. With no agent running, nothing reports, and nothing is withdrawn on that basis.
 - The continuous fabric reconciliation loop is not started. Explicit policy deployment still compiles programs; periodic membership/load reconciliation is not exercised here.
 - The test header `X-Scrubline-Test-Mode: ephemeral-memory` identifies every response. Responses are marked `Cache-Control: no-store`.
 - Authentication, 200/400/401/403/404/409 responses and policy evaluation can be inspected here. Durable-write failure responses cannot be tested with this in-memory store.
@@ -43,6 +47,21 @@ go test ./...
 SCRUBLINE_API_TOKEN=local-operator SCRUBLINE_ENROLL_TOKEN=local-enroll PORT=3000 go run .
 ```
 
+## Resync
+
+```sh
+./sync.sh
+go test ./...
+```
+
+It copies the control plane's current source over `internal/`, deriving the
+package list from the imports rather than from a list written down here — the
+set moves, and two packages appeared the last time this was refreshed. Run it
+from a clean checkout of the parent repo, then commit the result.
+
+Nothing outside `internal/` is touched, so `main.go`, `vercel.json` and this
+file survive a resync.
+
 ## Remove afterward
 
-Delete the entire `vercel-test/` folder and disable/delete the temporary Vercel deployment or restore the project's Root Directory. Nothing outside this folder needs reverting. The copied source does not automatically track future changes in the parent repo.
+Delete the entire `vercel-test/` folder and disable/delete the temporary Vercel deployment or restore the project's Root Directory. Nothing outside this folder needs reverting.

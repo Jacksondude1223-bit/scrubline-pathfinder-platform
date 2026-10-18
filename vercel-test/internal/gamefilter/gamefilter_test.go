@@ -355,3 +355,86 @@ func TestZeroValueEngineDoesNotPanic(t *testing.T) {
 		t.Fatalf("a zero-value engine should pass everything, got %+v", got)
 	}
 }
+
+// A flood of sources that send one opener and never finish used to fill the
+// session table, and once it is full the engine admits without tracking — so
+// the filter stopped protecting the players who had actually connected.
+// Unverified sources belong in the ring, which they churn on their own.
+func TestAnOpenerFloodCannotEvictConnectedPlayers(t *testing.T) {
+	e, _ := newEngine(t, bindTo("raknet", false))
+
+	// A real player completes the handshake.
+	player := flow([]byte{0x07})
+	player.SrcIP = "192.0.2.50"
+	if got := e.Inspect(player); got.Verdict != VerdictPass {
+		t.Fatalf("the player did not get in: %+v", got)
+	}
+
+	// Then far more spoofed sources than either table holds send one opener
+	// each and never come back.
+	opener := []byte{0x01}
+	for i := 0; i < scratchSlots*3; i++ {
+		f := flow(opener)
+		f.SrcIP = fmt.Sprintf("10.%d.%d.%d", i>>16&0xff, i>>8&0xff, i&0xff)
+		e.Inspect(f)
+	}
+
+	sessions, max := e.Sessions()
+	if sessions != 1 {
+		t.Fatalf("expected only the connected player in the session table, got %d of %d", sessions, max)
+	}
+	if got := e.pending.len(); got > scratchSlots {
+		t.Fatalf("the ring grew past its bound: %d", got)
+	}
+
+	// And the player is still tracked, not riding the untracked path.
+	got := e.Inspect(player)
+	if got.Verdict != VerdictPass {
+		t.Fatalf("the connected player was dropped after the flood: %+v", got)
+	}
+	if got.Reason == "session table full, admitting without tracking" {
+		t.Fatal("the flood pushed a connected player onto the untracked path")
+	}
+}
+
+// The ring evicts its own oldest entry rather than scanning or refusing, so
+// a source that is genuinely mid-handshake during a flood may be forgotten —
+// it simply starts again, which is what an opening sequence is for.
+func TestTheRingEvictsItsOldestEntry(t *testing.T) {
+	e, _ := newEngine(t, bindTo("raknet", false))
+	key := func(i int) sessionID {
+		return sessionID{binding: "gf-1", src: fmt.Sprintf("10.0.%d.%d", i>>8, i&0xff)}
+	}
+	now := time.Unix(1_700_000_000, 0).UTC()
+
+	e.pending.note(key(0), now, time.Minute)
+	if !e.pending.seen(key(0), now) {
+		t.Fatal("expected the first source noted")
+	}
+	for i := 1; i <= scratchSlots; i++ {
+		e.pending.note(key(i), now, time.Minute)
+	}
+	if e.pending.seen(key(0), now) {
+		t.Fatal("expected the oldest entry evicted once the ring wrapped")
+	}
+	if got := e.pending.len(); got > scratchSlots {
+		t.Fatalf("the index outgrew the ring: %d", got)
+	}
+	// The newest is still there.
+	if !e.pending.seen(key(scratchSlots), now) {
+		t.Fatal("expected the newest entry kept")
+	}
+}
+
+// Re-noting a source refreshes it rather than consuming another slot.
+func TestRenotingDoesNotConsumeASlot(t *testing.T) {
+	e, _ := newEngine(t, bindTo("raknet", false))
+	k := sessionID{binding: "gf-1", src: "192.0.2.50"}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	for i := 0; i < 100; i++ {
+		e.pending.note(k, now, time.Minute)
+	}
+	if got := e.pending.len(); got != 1 {
+		t.Fatalf("expected one entry, got %d", got)
+	}
+}

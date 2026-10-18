@@ -51,6 +51,10 @@ type Store struct {
 	// reports holds the datapath counters each node last sent with its
 	// heartbeat, keyed by node ID so the map stays bounded by the node set.
 	reports map[string]telemetry.Report
+	// tunnels holds what each node last reported about its return paths.
+	// Like reports it is derived and not durable: a tunnel's state from
+	// before a restart says nothing about whether it carries traffic now.
+	tunnels map[string][]model.TunnelStatus
 	// nodeTokens maps a node to the hash of its current credential, and
 	// tokenNodes maps back from the hash. Only hashes are kept: a dump of
 	// this store must not hand anyone a working credential.
@@ -93,6 +97,7 @@ func New() *Store {
 		policies:   map[string]*model.Policy{},
 		programs:   map[string]*model.Program{},
 		reports:    map[string]telemetry.Report{},
+		tunnels:    map[string][]model.TunnelStatus{},
 		nodeTokens: map[string]string{},
 		tokenNodes: map[string]string{},
 
@@ -388,6 +393,56 @@ func (s *Store) PutReport(nodeID string, stats pipeline.Stats) bool {
 		ReportedAt: s.clock(),
 	}
 	return true
+}
+
+// PutTunnelStatus records what a node says about its return paths. Like a
+// counter report, one from a node the control plane does not know is dropped:
+// without that the map would grow on anything that can reach the endpoint.
+func (s *Store) PutTunnelStatus(nodeID string, statuses []model.TunnelStatus) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.nodes[nodeID]; !ok {
+		return false
+	}
+	if s.tunnels == nil {
+		s.tunnels = map[string][]model.TunnelStatus{}
+	}
+	now := s.clock()
+	cp := make([]model.TunnelStatus, 0, len(statuses))
+	for _, st := range statuses {
+		// The control plane stamps the time, not the node: the fleet's
+		// clocks are not synchronised, and a node with a wrong one would
+		// otherwise decide how old its own report looks.
+		st.ReportedAt = now
+		cp = append(cp, st)
+	}
+	sort.Slice(cp, func(i, j int) bool { return cp[i].TunnelID < cp[j].TunnelID })
+	s.tunnels[nodeID] = cp
+	return true
+}
+
+// TunnelStatus returns one node's last report about its return paths.
+func (s *Store) TunnelStatus(nodeID string) []model.TunnelStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.TunnelStatus(nil), s.tunnels[nodeID]...)
+}
+
+// TunnelHealth is the fleet's return-path state, keyed by node and tunnel.
+// It is what the compiler reads to decide whether a node should still be
+// attracting a prefix it may not be able to deliver.
+func (s *Store) TunnelHealth() map[string]map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]map[string]string, len(s.tunnels))
+	for nodeID, statuses := range s.tunnels {
+		byTunnel := make(map[string]string, len(statuses))
+		for _, st := range statuses {
+			byTunnel[st.TunnelID] = st.State
+		}
+		out[nodeID] = byTunnel
+	}
+	return out
 }
 
 // Report returns one node's last reported counters.
