@@ -49,31 +49,30 @@ for f in ('api/openapi.yaml','api/node-openapi.yaml'):
                 probs.append(f"{f}: {meth} {path} missing id parameter")
     print(f"{f}: {len(d['paths'])} paths, {len(schemas)} schemas")
 
-# The control plane spec must match the dispatch switch exactly.
-src=open('internal/api/server.go').read()
-b=src[src.index('func (s *Server) dispatch'):]; b=b[:b.index('\n}\n')]
+# Read literal route patterns from the Rust dispatch match.
+src=open('src/api.rs').read()
+src=src[src.index('fn dispatch('):src.index('pub fn router(')]
 code=set()
-for l in b.split('\n'):
-    if not l.startswith('\tcase '): continue
-    m=re.search(r'Method(\w+)',l)
-    if not m: continue
-    p=re.search(r'path == "([^"]*)"',l); sp=re.search(r'hasSubpath\(path, "(\w+)", "(\w+)"\)',l)
-    ip=re.search(r'pathHasID\(path, "(\w+)"\)',l)
-    if p: code.add((m.group(1).lower(),'/v1/'+p.group(1)))
-    elif sp: code.add((m.group(1).lower(),f"/v1/{sp.group(1)}/{{id}}/{sp.group(2)}"))
-    elif ip: code.add((m.group(1).lower(),f"/v1/{ip.group(1)}/{{id}}"))
-code |= {('get','/health'),('get','/metrics')}
+for method,terms in re.findall(r'\(\s*"(GET|POST|PUT|DELETE|PATCH)"\s*,\s*\[([^\]]+)\]\s*,?\s*\)',src):
+    parts=[part.strip() for part in terms.split(',') if part.strip()]
+    if any(part not in ('_',) and not part.startswith('"') for part in parts):
+        continue
+    path='/v1/'+'/'.join('{id}' if part=='_' else part.strip('"') for part in parts)
+    code.add((method.lower(),path))
+for operations in re.findall(r'\("GET",\s*\["analytics",\s*kind\]\)\s*if\s*\[([^\]]+)\]\.contains\(kind\)',src):
+    for leaf in re.findall(r'"([^" ]+)"',operations):
+        code.add(('get','/v1/analytics/'+leaf))
+code|={('get','/health'),('get','/metrics')}
 d=yaml.safe_load(open('api/openapi.yaml'))
 doc={(m,p) for p,ops in d['paths'].items() for m in ops if m in ('get','post','put','delete','patch')}
-for i in sorted(code-doc): probs.append(f"in code but undocumented: {i[0].upper()} {i[1]}")
-for i in sorted(doc-code): probs.append(f"documented but not in code: {i[0].upper()} {i[1]}")
-
-# The agent spec must match the agent's mux.
-agent=set(re.findall(r'mux\.HandleFunc\("(/\w*)"', open('cmd/scrub-node/main.go').read()))
+for i in sorted(code-doc): probs.append(f"in Rust but undocumented: {i[0].upper()} {i[1]}")
+for i in sorted(doc-code): probs.append(f"documented but not in Rust: {i[0].upper()} {i[1]}")
+agent=set(re.findall(r'\.route\("(/\w*)"',open('src/node.rs').read()))
 nd=yaml.safe_load(open('api/node-openapi.yaml'))
-for p in sorted(agent - set(nd['paths'])): probs.append(f"agent serves {p} but it is undocumented")
-for p in sorted(set(nd['paths']) - agent): probs.append(f"agent spec documents {p} but it is not served")
-
+for p in sorted(agent-set(nd['paths'])): probs.append(f"agent serves {p} but it is undocumented")
+for p in sorted(set(nd['paths'])-agent): probs.append(f"agent spec documents {p} but it is not served")
 if probs:
-    print("\nPROBLEMS:"); [print("  -",x) for x in probs]; sys.exit(1)
-print("both specs resolve, and every route matches the code")
+    print("\nPROBLEMS:")
+    for problem in probs:print('  -',problem)
+    sys.exit(1)
+print('both specs resolve, and every route matches the Rust implementation')

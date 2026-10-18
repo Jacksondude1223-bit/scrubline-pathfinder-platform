@@ -1,32 +1,17 @@
 #!/bin/sh
-# Refresh this folder's snapshot of the control-plane source from the parent
-# repository.
-#
-# The folder is a self-contained copy so Vercel can build it with its Root
-# Directory set here, which means it does not track the parent and silently
-# goes stale. It did: the first snapshot sat three feature commits behind
-# before anyone noticed. Running this is the whole update.
-#
-# The package list is derived rather than written down. The control plane's
-# imports move — two packages appeared the last time this was resynced — and
-# a hardcoded list would be one more thing to forget.
 set -eu
-
 cd "$(dirname "$0")/.."
-root=$(pwd)
-dest="$root/vercel-test/internal"
-
-module=$(go list -m)
-packages=$(go list -deps ./internal/api ./internal/store |
-	grep "^$module/internal/" |
-	sed "s|^$module/internal/||" |
-	sort -u)
-
-rm -rf "$dest"
-for pkg in $packages; do
-	mkdir -p "$dest/$pkg"
-	cp "$root/internal/$pkg"/*.go "$dest/$pkg/"
-done
-
-echo "synced $(echo "$packages" | wc -l | tr -d ' ') packages from $(git rev-parse --short HEAD)"
-echo "$packages" | sed 's/^/  /'
+python3 - <<'PY'
+from pathlib import Path
+import shutil
+root=Path.cwd();target=root/'vercel-test'
+shutil.rmtree(target/'src',ignore_errors=True)
+(target/'src').mkdir(parents=True,exist_ok=True)
+for source in (root/'src').iterdir():
+    if source.is_file(): shutil.copy2(source,target/'src'/source.name)
+manifest=(root/'Cargo.toml').read_text().replace('name = "scrubline-pathfinder"','name = "scrubline-pathfinder-vercel-test"',1).replace('publish = false','publish = false\nautobins = false',1)
+manifest=manifest.split('\n[[bench]]')[0]
+manifest=manifest.replace('[profile.release]','vercel_runtime = { version = "2.4", features = ["axum"] }\ntower = "0.5"\n\n[[bin]]\nname = "control"\npath = "api/control.rs"\n\n[profile.release]')
+(target/'Cargo.toml').write_text(manifest)
+shutil.copy2(root/'rust-toolchain.toml',target/'rust-toolchain.toml')
+PY

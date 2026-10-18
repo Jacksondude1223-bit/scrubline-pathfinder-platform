@@ -12,6 +12,7 @@ pub struct Sample {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Model {
+    #[serde(deserialize_with = "crate::model::null_default")]
     pub weights: Vec<f64>,
     pub bias: f64,
     pub threshold: f64,

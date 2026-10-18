@@ -1,5 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "framework": "go",
-  "buildCommand": "go build -buildvcs=false -o server ."
+  "framework": null,
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/control"
+    }
+  ],
+  "buildCommand": "cargo build --locked --release --bin control"
 }

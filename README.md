@@ -1,6 +1,6 @@
 # Scrubline Cloud
 
-> **Rust migration:** The native Rust CLI and core libraries are available on this branch. The API, node runtime, traffic generator, and Vercel snapshot still run Go. See [the migration status](docs/rust-migration.md) for build commands and the remaining cutover work.
+> **Rust implementation:** The control plane, node agent, packet-processing pipeline, CLI, demo traffic generator, and Vercel test adapter now run Rust. See [migration notes](docs/rust-migration.md) for compatibility and deployment details.
 
 Distributed denial-of-service scrubbing for SecNov. Multi-node, API-controlled, and built on ASIC/TCAM ACLs, FPGA meters, and PF_RING ZC. This is the cloud fabric, not the XDP host filter.
 
@@ -294,8 +294,8 @@ Hardware programming is represented as compiled programs the node agent pulls. A
 ```sh
 export SCRUBLINE_API_TOKEN=dev-scrubline-token
 export SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll
-go test ./...
-go run ./cmd/scrub-api -addr 127.0.0.1:8080 -state scrubline-state.json
+cargo test --locked --all-targets
+cargo run --release --bin scrub-api -- -addr 127.0.0.1:8080 -state scrubline-state.json
 ```
 
 In other shells (see [Credentials](#credentials); the agent never holds the
@@ -304,11 +304,11 @@ operator token):
 ```sh
 export SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll
 export SCRUBLINE_NODE_API_TOKEN=dev-scrubline-node
-go run ./cmd/scrub-node -name scrub-a -region iad -capacity 100 -listen 127.0.0.1:9091
-go run ./cmd/scrub-node -name scrub-b -region fra -capacity 80 -listen 127.0.0.1:9092
-go run ./cmd/scrub-node -name scrub-c -region sin -capacity 40 -listen 127.0.0.1:9093
+cargo run --release --bin scrub-node -- -name scrub-a -region iad -capacity 100 -listen 127.0.0.1:9091
+cargo run --release --bin scrub-node -- -name scrub-b -region fra -capacity 80 -listen 127.0.0.1:9092
+cargo run --release --bin scrub-node -- -name scrub-c -region sin -capacity 40 -listen 127.0.0.1:9093
 sh scripts/demo.sh
-go run ./cmd/scrubctl fabric
+cargo run --release --bin scrubctl -- fabric
 ```
 
 ### A demo fabric in containers
@@ -856,15 +856,15 @@ Throwaway certificates for trying it locally:
 ```sh
 make certs
 export SCRUBLINE_API_TOKEN=op-secret SCRUBLINE_ENROLL_TOKEN=enroll-secret
-go run ./cmd/scrub-api -addr 127.0.0.1:8080 -tls-cert certs/server.pem -tls-key certs/server-key.pem
+cargo run --release --bin scrub-api -- -addr 127.0.0.1:8080 -tls-cert certs/server.pem -tls-key certs/server-key.pem
 ```
 
 ```sh
 export SCRUBLINE_ENROLL_TOKEN=enroll-secret SCRUBLINE_NODE_API_TOKEN=node-local-secret
-go run ./cmd/scrub-node -api https://127.0.0.1:8080 -ca certs/ca.pem \
+cargo run --release --bin scrub-node -- -api https://127.0.0.1:8080 -ca certs/ca.pem \
   -name scrub-a -region iad -capacity 100 -capacity-pps 100000 \
   -listen 127.0.0.1:9091 -advertise 198.51.100.1:9091 -local-as 65001
-go run ./cmd/scrubctl -api https://127.0.0.1:8080 -ca certs/ca.pem fabric
+cargo run --release --bin scrubctl -- -api https://127.0.0.1:8080 -ca certs/ca.pem fabric
 ```
 
 Listeners carry read, write, header and idle timeouts, so a handful of idle
@@ -906,8 +906,8 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 Example policy: `configs/policy.example.json`. Example training set: `configs/ml.samples.json`.
 
 ```sh
-go run ./cmd/scrubctl ml-load configs/ml.samples.json
-go run ./cmd/scrubctl ml-train
+cargo run --release --bin scrubctl -- ml-load configs/ml.samples.json
+cargo run --release --bin scrubctl -- ml-train
 ```
 
 The node agent also takes `-local-as`, `-bgp-next-hop` and `-capacity-pps` for

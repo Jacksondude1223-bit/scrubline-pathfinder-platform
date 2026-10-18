@@ -1,0 +1,391 @@
+[
+  {
+    "name": "scrubline_decisions_total",
+    "group": "",
+    "path": [
+      "decisions"
+    ]
+  },
+  {
+    "name": "scrubline_unowned_flows_total",
+    "group": "",
+    "path": [
+      "unowned"
+    ]
+  },
+  {
+    "name": "scrubline_ml_scored_total",
+    "group": "",
+    "path": [
+      "ml",
+      "scored"
+    ]
+  },
+  {
+    "name": "scrubline_ml_drops_total",
+    "group": "",
+    "path": [
+      "ml",
+      "drops"
+    ]
+  },
+  {
+    "name": "scrubline_ml_passes_total",
+    "group": "",
+    "path": [
+      "ml",
+      "passes"
+    ]
+  },
+  {
+    "name": "scrubline_ml_model_ready",
+    "group": "",
+    "path": [
+      "ml",
+      "ready"
+    ]
+  },
+  {
+    "name": "scrubline_rate_buckets",
+    "group": "",
+    "path": [
+      "rate_buckets"
+    ]
+  },
+  {
+    "name": "scrubline_offered_pps",
+    "group": "",
+    "path": [
+      "offered_pps"
+    ]
+  },
+  {
+    "name": "scrubline_dropped_pps",
+    "group": "",
+    "path": [
+      "dropped_pps"
+    ]
+  },
+  {
+    "name": "scrubline_rate_buckets_max",
+    "group": "",
+    "path": [
+      "rate_buckets_max"
+    ]
+  },
+  {
+    "name": "scrubline_stage_dropped_total",
+    "group": "stages",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_stage_permitted_total",
+    "group": "stages",
+    "path": [
+      "permitted"
+    ]
+  },
+  {
+    "name": "scrubline_stage_dropped_pps_total",
+    "group": "stages",
+    "path": [
+      "pps_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_stage_permitted_pps_total",
+    "group": "stages",
+    "path": [
+      "pps_permitted"
+    ]
+  },
+  {
+    "name": "scrubline_game_sessions",
+    "group": "",
+    "path": [
+      "game_sessions"
+    ]
+  },
+  {
+    "name": "scrubline_game_sessions_max",
+    "group": "",
+    "path": [
+      "game_sessions_max"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_offered_pps",
+    "group": "prefixes",
+    "path": [
+      "offered_pps"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_dropped_pps",
+    "group": "prefixes",
+    "path": [
+      "dropped_pps"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_flows_total",
+    "group": "prefixes",
+    "path": [
+      "flows"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_flows_dropped_total",
+    "group": "prefixes",
+    "path": [
+      "flows_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_offered_total",
+    "group": "prefixes",
+    "path": [
+      "offered"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_dropped_total",
+    "group": "prefixes",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_active",
+    "group": "prefixes",
+    "path": [
+      "pulsing"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_peak_pps",
+    "group": "prefixes",
+    "path": [
+      "peak_pps"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_mean_pps",
+    "group": "prefixes",
+    "path": [
+      "mean_pps"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_crest",
+    "group": "prefixes",
+    "path": [
+      "crest"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_duty_cycle",
+    "group": "prefixes",
+    "path": [
+      "duty_cycle"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_bursts",
+    "group": "prefixes",
+    "path": [
+      "bursts"
+    ]
+  },
+  {
+    "name": "scrubline_pulse_hold_seconds",
+    "group": "prefixes",
+    "path": [
+      "held_for_seconds"
+    ]
+  },
+  {
+    "name": "scrubline_game_inspected_total",
+    "group": "games",
+    "path": [
+      "inspected"
+    ]
+  },
+  {
+    "name": "scrubline_game_dropped_total",
+    "group": "games",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_game_challenged_total",
+    "group": "games",
+    "path": [
+      "challenged"
+    ]
+  },
+  {
+    "name": "scrubline_game_uninspectable_total",
+    "group": "games",
+    "path": [
+      "uninspectable"
+    ]
+  },
+  {
+    "name": "scrubline_game_dropped_pps_total",
+    "group": "games",
+    "path": [
+      "pps_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_rule_matches_total",
+    "group": "rules",
+    "path": [
+      "matches"
+    ]
+  },
+  {
+    "name": "scrubline_rule_drops_total",
+    "group": "rules",
+    "path": [
+      "drops"
+    ]
+  },
+  {
+    "name": "scrubline_rule_seen_pps_total",
+    "group": "rules",
+    "path": [
+      "pps_seen"
+    ]
+  },
+  {
+    "name": "scrubline_rule_dropped_pps_total",
+    "group": "rules",
+    "path": [
+      "pps_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_tracked",
+    "group": "reputation",
+    "path": [
+      "tracked"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_tracked_max",
+    "group": "reputation",
+    "path": [
+      "max"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_trusted",
+    "group": "reputation",
+    "path": [
+      "trusted"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_penalised",
+    "group": "reputation",
+    "path": [
+      "penalised"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_fast_passed_total",
+    "group": "reputation",
+    "path": [
+      "fast_passed"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_boxed_total",
+    "group": "reputation",
+    "path": [
+      "boxed"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_promotions_total",
+    "group": "reputation",
+    "path": [
+      "promotions"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_demotions_total",
+    "group": "reputation",
+    "path": [
+      "demotions"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_strikes_total",
+    "group": "reputation",
+    "path": [
+      "strikes"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_shielded_total",
+    "group": "reputation",
+    "path": [
+      "shielded"
+    ]
+  },
+  {
+    "name": "scrubline_reputation_full_total",
+    "group": "reputation",
+    "path": [
+      "full"
+    ]
+  },
+  {
+    "name": "scrubline_egress_return_packets_total",
+    "group": "egress",
+    "path": [
+      "seen"
+    ]
+  },
+  {
+    "name": "scrubline_egress_confirmed_total",
+    "group": "egress",
+    "path": [
+      "promoted"
+    ]
+  },
+  {
+    "name": "scrubline_egress_confirmed",
+    "group": "egress",
+    "path": [
+      "confirmed"
+    ]
+  },
+  {
+    "name": "scrubline_egress_clients",
+    "group": "egress",
+    "path": [
+      "clients"
+    ]
+  },
+  {
+    "name": "scrubline_egress_clients_max",
+    "group": "egress",
+    "path": [
+      "clients_max"
+    ]
+  },
+  {
+    "name": "scrubline_egress_locked_down_total",
+    "group": "egress",
+    "path": [
+      "locked_down"
+    ]
+  }
+]

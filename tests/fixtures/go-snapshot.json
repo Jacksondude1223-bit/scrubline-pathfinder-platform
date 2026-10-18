@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "saved_at": "2026-01-01T00:00:00Z",
+  "seq": 1,
+  "nodes": [
+    {
+      "id": "node-7726fe1be9396ee3",
+      "name": "snapshot-node",
+      "region": "us",
+      "capacity_gbps": 100,
+      "backends": [
+        "asic",
+        "fpga",
+        "zc"
+      ],
+      "last_seen": "0001-01-01T00:00:00Z",
+      "status": "stale",
+      "tunnel_src": "192.0.2.1"
+    }
+  ],
+  "node_tokens": {
+    "node-7726fe1be9396ee3": "d49d4f512066aa0666156c01b6fad5f846926ee99e75f72e8ff050eaf87f9af5"
+  },
+  "policies": [
+    {
+      "id": "pol-1",
+      "name": "snapshot-policy",
+      "protected": [
+        "203.0.113.0/24"
+      ],
+      "rules": [
+        {
+          "id": "r",
+          "stage": "asic",
+          "action": "drop",
+          "match": {}
+        }
+      ],
+      "updated_at": "2026-01-01T00:00:00Z",
+      "version": 1
+    }
+  ],
+  "last_policy_id": "pol-1",
+  "samples": null,
+  "model": {
+    "weights": null,
+    "bias": 0,
+    "threshold": 0,
+    "epochs": 0,
+    "loss": 0,
+    "accuracy": 0,
+    "precision": 0,
+    "recall": 0,
+    "validation": 0,
+    "samples": 0,
+    "ready": false
+  },
+  "tenants": [
+    {
+      "id": "ten-281f421379e994cd",
+      "name": "snapshot-tenant",
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "tenant_tokens": {
+    "ten-281f421379e994cd": "b5daefa23c20737f7d30695651c4f7e8478144c096d188b7bee198638a2be92b"
+  }
+}

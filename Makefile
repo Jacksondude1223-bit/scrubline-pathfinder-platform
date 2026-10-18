@@ -1,29 +1,21 @@
 .PHONY: build test bench certs spec-check demo up down logs creds
 
 build:
+	cargo build --locked --release --bins
 	mkdir -p bin
-	go build -o bin/scrub-api ./cmd/scrub-api
-	go build -o bin/scrub-node ./cmd/scrub-node
-	go build -o bin/scrubctl ./cmd/scrubctl
-	go build -o bin/scrub-traffic ./cmd/scrub-traffic
+	cp target/release/scrub-api target/release/scrub-node target/release/scrubctl target/release/scrub-traffic bin/
 
-# -race is the cheap safety net for the Pipeline and Store, both of which are
-# written for concurrent use.
 test:
-	go test -race ./...
+	cargo test --locked --all-targets
 
-# Throwaway CA and server certificate for trying TLS locally. Not for deployment.
 certs:
-	go run scripts/gen-dev-certs.go -dir certs -host 127.0.0.1,localhost
+	sh scripts/gen-dev-certs.sh -dir certs -host 127.0.0.1,localhost
 
-# Checks the OpenAPI specs resolve, and that the routes they document match the
-# dispatch switch in both directions: a spec that drifts from the code is worse
-# than none.
 spec-check:
 	python3 scripts/spec-check.py
 
 bench:
-	go test -run xxx -bench . -benchmem ./internal/pipeline/
+	cargo bench --locked --bench pipeline
 
 # Each recipe line runs in its own shell, so a backgrounded server started on one
 # line cannot be reached by "kill %1" on the next: the API was left running and
@@ -74,18 +66,18 @@ creds:
 	@$(COMPOSE) logs --no-log-prefix seed 2>/dev/null | sed -n '/seeded:/,$$p' | grep . \
 	  || echo "  the seeder has not finished yet; try 'make logs' or run 'make creds' again"
 
-.PHONY: rust-build rust-test rust-check rust-reference
+.PHONY: rust-build rust-test rust-check runtime-test snapshot-check
 
-# Rust migration targets run separately until both servers have native replacements.
-rust-build:
-	cargo build --locked --release --bin scrubctl
-
-rust-test:
-	cargo test --locked --all-targets
-
+rust-build: build
+rust-test: test
 rust-check:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
 
-rust-reference:
-	go run ./scripts/rust-reference > tests/fixtures/go-reference.json
+runtime-test:
+	cargo build --locked --bins
+	python3 scripts/runtime-e2e.py
+
+snapshot-check:
+	sh vercel-test/sync.sh
+	cargo check --locked --manifest-path vercel-test/Cargo.toml
