@@ -73,3 +73,19 @@ logs:
 creds:
 	@$(COMPOSE) logs --no-log-prefix seed 2>/dev/null | sed -n '/seeded:/,$$p' | grep . \
 	  || echo "  the seeder has not finished yet; try 'make logs' or run 'make creds' again"
+
+.PHONY: rust-build rust-test rust-check rust-reference
+
+# Rust migration targets run separately until both servers have native replacements.
+rust-build:
+	cargo build --locked --release --bin scrubctl
+
+rust-test:
+	cargo test --locked --all-targets
+
+rust-check:
+	cargo fmt --all -- --check
+	cargo clippy --locked --all-targets -- -D warnings
+
+rust-reference:
+	go run ./scripts/rust-reference > tests/fixtures/go-reference.json
