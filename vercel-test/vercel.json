@@ -4,8 +4,13 @@
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "/api/control"
+      "destination": "/api/control.rs"
     }
   ],
-  "buildCommand": "cargo build --locked --release --bin control"
+  "builds": [
+    {
+      "src": "api/control.rs",
+      "use": "@vercel/rust"
+    }
+  ]
 }
