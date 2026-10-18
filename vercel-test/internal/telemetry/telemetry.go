@@ -458,3 +458,78 @@ func ReputationFamilies(reports []Report) []metrics.Family {
 		fastPassed, boxed, promotions, demotions, strikes, shielded, full,
 	}
 }
+
+// EgressFamilies renders the return path: what the protected service has
+// been answering, and whether this node can see it at all.
+//
+// The visibility series is the one worth a dashboard panel. Everything that
+// depends on return traffic stands down for a prefix whose replies this node
+// never sees, so a prefix reading asymmetric is one where that whole layer of
+// protection is not running — which is correct, and is not something to
+// discover during an incident.
+func EgressFamilies(reports []Report) []metrics.Family {
+	seen := metrics.Family{
+		Name: "scrubline_egress_return_packets_total", Type: metrics.Counter,
+		Help: "Replies from a protected service observed travelling back through this node.",
+	}
+	confirmed := metrics.Family{
+		Name: "scrubline_egress_confirmed_total", Type: metrics.Counter,
+		Help: "Clients confirmed by sustained return traffic. The service answered them at length, which is the one confirmation here needing no protocol knowledge and the only one an attacker cannot forge from the ingress side.",
+	}
+	live := metrics.Family{
+		Name: "scrubline_egress_confirmed", Type: metrics.Gauge,
+		Help: "Clients currently carrying a return-traffic confirmation.",
+	}
+	clients := metrics.Family{
+		Name: "scrubline_egress_clients", Type: metrics.Gauge,
+		Help: "Client addresses the return-path tracker is holding.",
+	}
+	clientsMax := metrics.Family{
+		Name: "scrubline_egress_clients_max", Type: metrics.Gauge,
+		Help: "Bound on that table. At the bound a client is simply not confirmed, and under lockdown is not granted grace either.",
+	}
+	lockedDown := metrics.Family{
+		Name: "scrubline_egress_locked_down_total", Type: metrics.Counter,
+		Help: "Ingress held back because no return traffic confirmed its source while the prefix was under attack.",
+	}
+	lockdown := metrics.Family{
+		Name: "scrubline_egress_lockdown", Type: metrics.Gauge,
+		Help: "1 when this node is configured to hold back unconfirmed sources during an attack, by mode. A node with every mode at 0 is not running this layer.",
+	}
+	visibility := metrics.Family{
+		Name: "scrubline_egress_visibility", Type: metrics.Gauge,
+		Help: "1 for the return path this node sees for a prefix. asymmetric means replies are not routed through here — direct server return, or this node is off the return path — and everything depending on return traffic stands down for that prefix.",
+	}
+
+	for _, r := range reports {
+		id := r.identity()
+		e := r.Stats.Egress
+		seen.Samples = append(seen.Samples, metrics.Sample{Labels: id, Value: float64(e.Seen)})
+		confirmed.Samples = append(confirmed.Samples, metrics.Sample{Labels: id, Value: float64(e.Promoted)})
+		live.Samples = append(live.Samples, metrics.Sample{Labels: id, Value: float64(e.Confirmed)})
+		clients.Samples = append(clients.Samples, metrics.Sample{Labels: id, Value: float64(e.Clients)})
+		clientsMax.Samples = append(clientsMax.Samples, metrics.Sample{Labels: id, Value: float64(e.ClientsMax)})
+		lockedDown.Samples = append(lockedDown.Samples, metrics.Sample{Labels: id, Value: float64(e.LockedDown)})
+		mode := e.Lockdown
+		if mode == "" {
+			mode = "off"
+		}
+		for _, candidate := range []string{"off", "limit", "drop"} {
+			lockdown.Samples = append(lockdown.Samples, metrics.Sample{
+				Labels: with(id, metrics.Label{Name: "mode", Value: candidate}),
+				Value:  boolValue(candidate == mode),
+			})
+		}
+		for _, row := range e.PrefixStates {
+			visibility.Samples = append(visibility.Samples, metrics.Sample{
+				Labels: with(id,
+					metrics.Label{Name: "prefix", Value: row.Prefix},
+					metrics.Label{Name: "state", Value: row.Visibility}),
+				Value: 1,
+			})
+		}
+	}
+	return []metrics.Family{
+		seen, confirmed, live, clients, clientsMax, lockedDown, lockdown, visibility,
+	}
+}

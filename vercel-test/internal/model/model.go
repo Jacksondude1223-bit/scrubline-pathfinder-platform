@@ -67,6 +67,8 @@ type Policy struct {
 	// Reputation tunes the two-tier source cache: who gets the short path,
 	// and whether repeat offenders are dropped at the top of the pipeline.
 	Reputation *ReputationPolicy `json:"reputation,omitempty"`
+	// Egress decides what the fabric does with the return path it can see.
+	Egress *EgressPolicy `json:"egress,omitempty"`
 	// ChallengeSecret keys the cookies the challenge gate mints. The control
 	// plane generates it and ships it to every node, because under anycast a
 	// cookie minted by one scrubber has to verify on another.
@@ -77,8 +79,8 @@ type Policy struct {
 
 // ReputationPolicy tunes what the datapath remembers about a source.
 type ReputationPolicy struct {
-	// FastPass is the weakest proof that earns the short path: "challenge",
-	// "handshake", or "off".
+	// FastPass is the weakest proof that earns the short path:
+	// "challenge", "egress", "handshake", or "off".
 	//
 	// It defaults to "challenge", the stricter reading. Answering a
 	// challenge means echoing a value that could only have come from a
@@ -86,7 +88,11 @@ type ReputationPolicy struct {
 	// a handshake can be done blind, which means a spoofer can clear it for
 	// any address. Widening this to "handshake" is reasonable for a
 	// protocol that defines no challenge, and it is a deliberate decision
-	// rather than a default.
+	// rather than a default. So is "egress", which admits a client the
+	// protected service has been answering — the strongest evidence
+	// available for a protocol with no challenge to issue, and still short
+	// of one, because an attacker can arrange it by spoofing a victim's
+	// address into a service that replies to anything.
 	FastPass string `json:"fast_pass,omitempty"`
 	// PenaltyBox drops sources that keep failing, at the top of the
 	// pipeline, instead of letting them walk every stage to the same
@@ -94,6 +100,39 @@ type ReputationPolicy struct {
 	// what one packet earned, so it is rolled out deliberately. With it
 	// off, strikes and would-be demotions are still counted and exposed.
 	PenaltyBox bool `json:"penalty_box,omitempty"`
+}
+
+// EgressPolicy decides what the fabric does with the return path it can see.
+//
+// Watching what the origin sends back is the one confirmation that needs no
+// protocol knowledge: whatever the service speaks, if it is answering an
+// address at length then it considers that address a client. It is also the
+// only signal here that an attacker cannot forge from the ingress side.
+type EgressPolicy struct {
+	// Lockdown is what happens to an unconfirmed source while a prefix is
+	// under a recognised attack: "off", "limit" or "drop".
+	//
+	// Off by default. Under lockdown a client that has proved nothing is
+	// held back, and a brand-new legitimate client has by definition proved
+	// nothing yet — so this trades joinability during an attack for a
+	// cheaper, protocol-agnostic filter, and that is a deployment's call
+	// rather than a default.
+	//
+	// It never applies to a prefix whose return path is not visible. With
+	// direct server return there is nothing to confirm against, and reading
+	// that as "nobody is confirmed" would hold back every real player.
+	Lockdown string `json:"lockdown,omitempty"`
+	// LockdownPPS is the cap an unconfirmed source is held to in "limit"
+	// mode. Zero takes the platform default.
+	LockdownPPS int `json:"lockdown_pps,omitempty"`
+	// GraceMillis is how long a source the node has not seen before is left
+	// alone under lockdown. Zero takes the platform default.
+	//
+	// Without it lockdown cannot be escaped: a new client is unconfirmed, so
+	// it is held back, so its packets do not reach the origin, so the origin
+	// never answers, so it is never confirmed. The grace is the window in
+	// which that loop is broken.
+	GraceMillis int `json:"grace_millis,omitempty"`
 }
 
 // Steering overrides the default anycast posture for one protected prefix.
@@ -234,6 +273,7 @@ type Program struct {
 	// pulse train. Zero takes the platform default.
 	PulseFloorPPS int               `json:"pulse_floor_pps,omitempty"`
 	Reputation    *ReputationPolicy `json:"reputation,omitempty"`
+	Egress        *EgressPolicy     `json:"egress,omitempty"`
 	// Tunnels are this node's own return paths: one per customer endpoint
 	// whose prefixes this node carries, sourced from this node's address.
 	Tunnels []NodeTunnel `json:"tunnels,omitempty"`

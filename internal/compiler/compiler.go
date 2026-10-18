@@ -241,6 +241,7 @@ func Compile(policy model.Policy, nodes []model.Node, plan []model.Announcement)
 			ChallengeSecret: policy.ChallengeSecret,
 			PulseFloorPPS:   policy.PulseFloorPPS,
 			Reputation:      policy.Reputation,
+			Egress:          policy.Egress,
 			// Where this node sends what it has scrubbed, and which
 			// customers it peers with. Both are per node: the tunnels
 			// because every node carrying a prefix needs its own, the

@@ -85,6 +85,17 @@ const (
 	// so it is evidence the source speaks the protocol, not evidence that
 	// the address is real.
 	ProofHandshake
+	// ProofEgress is sustained return traffic from the protected service to
+	// this address. The service itself decided the address was a peer worth
+	// answering, which no amount of forged ingress can arrange — but it can
+	// be arranged by spoofing a victim's address into a service that replies
+	// to anything, so it says "the service treats this as a client" rather
+	// than "this address is real".
+	//
+	// Above a handshake because an attacker controls the handshake and not
+	// the origin's behaviour; below a challenge because a challenge proves
+	// the address can receive.
+	ProofEgress
 	// ProofChallenge is an echoed cookie. The source could only have learned
 	// it from a reply, so the address answers for itself.
 	ProofChallenge
@@ -94,6 +105,8 @@ func (p Proof) String() string {
 	switch p {
 	case ProofHandshake:
 		return "handshake"
+	case ProofEgress:
+		return "egress"
 	case ProofChallenge:
 		return "challenge"
 	default:
