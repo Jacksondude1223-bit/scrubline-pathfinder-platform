@@ -1,140 +1,83 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
-
-# A second push to a branch makes the first run's answer irrelevant.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
-
 permissions:
   contents: read
-
 jobs:
-  go:
-    name: build, vet and test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          # Tracks the module rather than pinning a version here, so the two
-          # cannot drift apart.
-          go-version-file: go.mod
-          cache: true
-
-      - name: Build
-        run: go build ./...
-
-      - name: gofmt
-        # gofmt reports by printing filenames and exits 0 either way, so the
-        # output is what has to be checked.
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt'd:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: go vet
-        run: go vet ./...
-
-      - name: Test
-        # -race is the cheap safety net for the Pipeline, the Store and the
-        # filter engines, all of which are written for concurrent use.
-        run: go test -race ./...
-
-  snapshot:
-    name: Vercel snapshot builds and matches
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      # vercel-test/ is a self-contained copy of the control plane in its own
-      # module, so the job above does not see it: go build, vet and test all
-      # run on the root module alone. It went three feature commits stale
-      # before anyone noticed, which is what this catches.
-      #
-      # Guarded on the folder existing, because it is meant to be deleted
-      # when the deployment test is done. Removing it removes this check
-      # rather than breaking CI.
-      - name: Build and test the snapshot
-        run: |
-          if [ ! -d vercel-test ]; then
-            echo "no vercel-test/ folder; nothing to check"
-            exit 0
-          fi
-          cd vercel-test
-          go build ./...
-          go vet ./...
-          go test ./...
-
-      - name: Snapshot is in step with the source
-        run: |
-          if [ ! -d vercel-test ]; then
-            exit 0
-          fi
-          ./vercel-test/sync.sh >/dev/null
-          drift=$(git status --porcelain vercel-test/internal)
-          if [ -n "$drift" ]; then
-            echo "vercel-test/internal is behind the source. Run ./vercel-test/sync.sh and commit:"
-            echo "$drift"
-            exit 1
-          fi
-          echo "snapshot matches the source"
-
-  spec:
-    name: API spec matches the code
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-
-      - name: Install PyYAML
-        run: python3 -m pip install --disable-pip-version-check --quiet PyYAML
-
-      - name: Check the specs
-        # Resolves every $ref and security scheme, requires a summary and
-        # responses on every operation, and compares the documented routes
-        # against the server's dispatch switch in both directions. A spec that
-        # has drifted from the implementation is worse than no spec.
-        run: make spec-check
-
   rust:
-    name: Rust migration compatibility
+    name: Rust build and compatibility
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt, clippy
-      - uses: actions/setup-go@v5
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Build release binaries
+        run: cargo build --locked --release --bins
+      - name: Native process integration
+        env:
+          PATHFINDER_BIN_DIR: target/release
+        run: python3 scripts/runtime-e2e.py
+      - name: All CLI commands
+        run: python3 scripts/rust-cli-e2e.py
+  snapshot:
+    name: Vercel Rust snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
         with:
-          go-version-file: go.mod
-      - name: Go reference fixtures stay current
+          components: rustfmt, clippy
+      - name: Snapshot source matches
         run: |
-          make rust-reference
-          git diff --exit-code -- tests/fixtures/go-reference.json
-      - name: Rust format and lint
-        run: make rust-check
-      - name: Rust compatibility and CLI tests
-        run: make rust-test
-      - name: Build native Rust CLI
-        run: make rust-build
-      - name: Rust CLI against the Go API
+          sh vercel-test/sync.sh
+          git diff --exit-code -- vercel-test/src vercel-test/Cargo.toml vercel-test/rust-toolchain.toml
+      - name: Snapshot format and lint
         run: |
-          go build -o target/go-reference-api ./cmd/scrub-api
-          python3 scripts/rust-cli-e2e.py
+          cargo fmt --manifest-path vercel-test/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path vercel-test/Cargo.toml --all-targets -- -D warnings
+      - name: Snapshot behavior
+        run: cargo test --locked --manifest-path vercel-test/Cargo.toml
+      - name: Build Vercel adapter
+        run: cargo build --locked --release --manifest-path vercel-test/Cargo.toml
+  spec:
+    name: OpenAPI contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: python3 -m pip install --disable-pip-version-check --quiet PyYAML
+      - run: python3 scripts/spec-check.py
+  containers:
+    name: Rust container fabric
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start fabric
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml up --build -d
+      - name: Check control plane and nodes
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health && curl -fsS http://127.0.0.1:9091/health && curl -fsS http://127.0.0.1:9092/health && curl -fsS http://127.0.0.1:9093/health; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml logs api node-a node-b node-c
+      - name: Clean up
+        if: always()
+        run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml down -v

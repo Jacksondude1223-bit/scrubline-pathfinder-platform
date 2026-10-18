@@ -33,7 +33,7 @@ services:
 
   # Each node listens on 9091 inside its own container, so the three differ only
   # in the published host port, matching the single-host example in the README.
-  # /decide on a node takes the same bearer token as the control API; /health is
+  # /decide on a node takes SCRUBLINE_NODE_API_TOKEN; /health is
   # open so the container healthcheck and any probe can reach it.
   #
   # Plain depends_on only waits for the container to start, not for the API to
@@ -140,3 +140,4 @@ services:
 
 volumes:
   api-state:
+

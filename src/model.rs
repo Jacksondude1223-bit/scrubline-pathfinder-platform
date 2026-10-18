@@ -7,7 +7,7 @@ pub type AnnounceState = String;
 fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
 }
-fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+pub fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de> + Default,
@@ -225,26 +225,21 @@ impl Default for Tenant {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
 #[serde(default)]
 pub struct Flow {
-    #[serde(deserialize_with = "null_default")]
     pub src_ip: String,
-    #[serde(deserialize_with = "null_default")]
     pub dst_ip: String,
-    #[serde(deserialize_with = "null_default")]
     pub proto: String,
-    #[serde(deserialize_with = "null_default")]
     pub sport: i64,
-    #[serde(deserialize_with = "null_default")]
     pub dport: i64,
     #[serde(skip_serializing_if = "is_zero")]
-    #[serde(deserialize_with = "null_default")]
     pub flags: String,
-    #[serde(deserialize_with = "null_default")]
     pub pps: i64,
     #[serde(with = "base64_bytes", skip_serializing_if = "is_zero")]
     pub payload: Vec<u8>,
+    #[serde(skip)]
+    pub has_payload: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -619,4 +614,51 @@ fn null_time<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<DateTime<Utc>, D::Error> {
     Ok(Option::<DateTime<Utc>>::deserialize(d)?.unwrap_or_else(zero_time))
+}
+
+impl<'de> Deserialize<'de> for Flow {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Wire {
+            #[serde(deserialize_with = "null_default")]
+            src_ip: String,
+            #[serde(deserialize_with = "null_default")]
+            dst_ip: String,
+            #[serde(deserialize_with = "null_default")]
+            proto: String,
+            #[serde(deserialize_with = "null_default")]
+            sport: i64,
+            #[serde(deserialize_with = "null_default")]
+            dport: i64,
+            #[serde(deserialize_with = "null_default")]
+            flags: String,
+            #[serde(deserialize_with = "null_default")]
+            pps: i64,
+            payload: Option<String>,
+        }
+        use base64::Engine;
+        let w = Wire::deserialize(d)?;
+        let has_payload = w.payload.is_some();
+        let payload = w
+            .payload
+            .map(|p| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(p)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Self {
+            src_ip: w.src_ip,
+            dst_ip: w.dst_ip,
+            proto: w.proto,
+            sport: w.sport,
+            dport: w.dport,
+            flags: w.flags,
+            pps: w.pps,
+            payload,
+            has_payload,
+        })
+    }
 }

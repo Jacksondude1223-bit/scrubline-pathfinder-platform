@@ -1,4 +1,4 @@
-"""Exercise every Rust scrubctl command against an isolated Go reference API."""
+"""Exercise every Rust scrubctl command against the native Rust API."""
 import json
 import os
 import pathlib
@@ -19,7 +19,7 @@ env = dict(
     SCRUBLINE_ENROLL_TOKEN="rust-migration-e2e-enroll",
 )
 reference_api = ROOT / os.environ.get(
-    "PATHFINDER_REFERENCE_API", "target/go-reference-api"
+    "PATHFINDER_REFERENCE_API", "target/release/scrub-api"
 )
 
 
@@ -113,7 +113,7 @@ with tempfile.TemporaryFile() as log:
             }))
             decision = json.loads(ctl("decide", node["node"]["id"], str(flow)))
             assert "action" in decision, decision
-        print("All 16 Rust scrubctl commands succeeded against the Go API")
+        print("All 16 Rust scrubctl commands succeeded against the Rust API")
     finally:
         api.terminate()
         api.wait(timeout=10)

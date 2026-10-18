@@ -1,0 +1,6088 @@
+[
+  {
+    "name": "rate windows and stage precedence",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": [
+        {
+          "table": "",
+          "priority": 0,
+          "match": {
+            "proto": "udp"
+          },
+          "meter_pps": 1000,
+          "action": "rate_limit",
+          "rule_id": "meter"
+        }
+      ],
+      "zc": [
+        {
+          "cluster": "",
+          "priority": 0,
+          "match": {},
+          "action": "inspect",
+          "pps": 200,
+          "rule_id": "behavior"
+        }
+      ],
+      "announcements": null,
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "zc",
+          "rule_id": "behavior",
+          "reason": "PF_RING ZC inspect pass"
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 0,
+              "offered": 80,
+              "dropped": 0,
+              "offered_pps": 8,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600100,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "zc",
+          "rule_id": "behavior",
+          "reason": "PF_RING ZC inspect pass"
+        },
+        "stats": {
+          "decisions": 2,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 2,
+              "pps_dropped": 0,
+              "pps_permitted": 160
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 2,
+              "drops": 0,
+              "pps_seen": 160,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 2,
+              "drops": 0,
+              "pps_seen": 160,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 2,
+              "flows_dropped": 0,
+              "offered": 160,
+              "dropped": 0,
+              "offered_pps": 16,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 16,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600200,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "rule_id": "behavior",
+          "reason": "PF_RING ZC behavioral cap 200 pps exceeded"
+        },
+        "stats": {
+          "decisions": 3,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 2,
+              "pps_dropped": 80,
+              "pps_permitted": 160
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 3,
+              "drops": 1,
+              "pps_seen": 240,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 3,
+              "drops": 0,
+              "pps_seen": 240,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 3,
+              "flows_dropped": 1,
+              "offered": 240,
+              "dropped": 80,
+              "offered_pps": 24,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 24,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225601000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "zc",
+          "rule_id": "behavior",
+          "reason": "PF_RING ZC inspect pass"
+        },
+        "stats": {
+          "decisions": 4,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 3,
+              "pps_dropped": 80,
+              "pps_permitted": 240
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 4,
+              "drops": 1,
+              "pps_seen": 320,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 4,
+              "drops": 0,
+              "pps_seen": 320,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 4,
+              "flows_dropped": 1,
+              "offered": 320,
+              "dropped": 80,
+              "offered_pps": 32,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 240,
+              "mean_pps": 1,
+              "crest": 240,
+              "duty_cycle": 0.008333333333333333,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 32,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225601100,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 53,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "asic",
+          "rule_id": "acl",
+          "reason": "TCAM ACL drop"
+        },
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 3,
+              "pps_dropped": 80,
+              "pps_permitted": 240
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 1,
+              "pps_seen": 80,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 4,
+              "drops": 1,
+              "pps_seen": 320,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 4,
+              "drops": 0,
+              "pps_seen": 320,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 2,
+              "offered": 400,
+              "dropped": 160,
+              "offered_pps": 40,
+              "dropped_pps": 16,
+              "pulsing": false,
+              "peak_pps": 240,
+              "mean_pps": 1,
+              "crest": 240,
+              "duty_cycle": 0.008333333333333333,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 40,
+          "dropped_pps": 16,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225601200,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 1500
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "fpga",
+          "rule_id": "meter",
+          "reason": "FPGA meter 1000 pps exceeded"
+        },
+        "stats": {
+          "decisions": 6,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 1500,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 3,
+              "pps_dropped": 80,
+              "pps_permitted": 240
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 1,
+              "pps_seen": 80,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 4,
+              "drops": 1,
+              "pps_seen": 320,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 5,
+              "drops": 1,
+              "pps_seen": 1820,
+              "pps_dropped": 1500
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 6,
+              "flows_dropped": 3,
+              "offered": 1900,
+              "dropped": 1660,
+              "offered_pps": 190,
+              "dropped_pps": 166,
+              "pulsing": false,
+              "peak_pps": 240,
+              "mean_pps": 1,
+              "crest": 240,
+              "duty_cycle": 0.008333333333333333,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 190,
+          "dropped_pps": 166,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225601300,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "198.51.100.1",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "prefix not assigned to this node"
+        },
+        "stats": {
+          "decisions": 7,
+          "unowned": 1,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 1500,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 3,
+              "pps_dropped": 80,
+              "pps_permitted": 240
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 1,
+              "pps_seen": 80,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 4,
+              "drops": 1,
+              "pps_seen": 320,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 5,
+              "drops": 1,
+              "pps_seen": 1820,
+              "pps_dropped": 1500
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 6,
+              "flows_dropped": 3,
+              "offered": 1900,
+              "dropped": 1660,
+              "offered_pps": 190,
+              "dropped_pps": 166,
+              "pulsing": false,
+              "peak_pps": 1660,
+              "mean_pps": 7,
+              "crest": 237.14285714285714,
+              "duty_cycle": 0.008333333333333333,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 198,
+          "dropped_pps": 166,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225612000,
+        "stats": {
+          "decisions": 7,
+          "unowned": 1,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 1500,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 3,
+              "pps_dropped": 80,
+              "pps_permitted": 240
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 1,
+              "pps_seen": 80,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 4,
+              "drops": 1,
+              "pps_seen": 320,
+              "pps_dropped": 80
+            },
+            {
+              "rule_id": "meter",
+              "stage": "fpga",
+              "matches": 5,
+              "drops": 1,
+              "pps_seen": 1820,
+              "pps_dropped": 1500
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 6,
+              "flows_dropped": 3,
+              "offered": 1900,
+              "dropped": 1660,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 1660,
+              "mean_pps": 7,
+              "crest": 237.14285714285714,
+              "duty_cycle": 0.008333333333333333,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 1,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  },
+  {
+    "name": "handshake fast path and penalty box",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": null,
+      "zc": null,
+      "announcements": null,
+      "games": [
+        {
+          "id": "game",
+          "proto": "udp",
+          "dport": 19132,
+          "profile": "raknet"
+        }
+      ],
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "reputation": {
+        "fast_pass": "handshake",
+        "penalty_box": true
+      },
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "AQ=="
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 1,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 0,
+              "offered": 80,
+              "dropped": 0,
+              "offered_pps": 8,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600001,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Bw=="
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 2,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 2,
+              "pps_dropped": 0,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 2,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 2,
+              "flows_dropped": 0,
+              "offered": 160,
+              "dropped": 0,
+              "offered_pps": 16,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 16,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600002,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "zc",
+          "reason": "verified source, fast path"
+        },
+        "stats": {
+          "decisions": 3,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 2,
+              "pps_dropped": 0,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 2,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 3,
+              "flows_dropped": 0,
+              "offered": 240,
+              "dropped": 0,
+              "offered_pps": 24,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 1,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 24,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600003,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 53,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "asic",
+          "rule_id": "acl",
+          "reason": "TCAM ACL drop"
+        },
+        "stats": {
+          "decisions": 4,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 2,
+              "pps_dropped": 80,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 2,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 4,
+              "flows_dropped": 1,
+              "offered": 320,
+              "dropped": 80,
+              "offered_pps": 32,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 2,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 32,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600100,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter raknet: packet id 0x63 from a source that has not completed the handshake",
+          "filter": "game"
+        },
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 2,
+              "pps_dropped": 80,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 1,
+              "pps_dropped": 80,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 3,
+              "dropped": 1,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 80
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 2,
+              "offered": 400,
+              "dropped": 160,
+              "offered_pps": 40,
+              "dropped_pps": 16,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 2,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 40,
+          "dropped_pps": 16,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600101,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter raknet: packet id 0x63 from a source that has not completed the handshake",
+          "filter": "game"
+        },
+        "stats": {
+          "decisions": 6,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 2,
+              "pps_dropped": 80,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 2,
+              "permitted": 1,
+              "pps_dropped": 160,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 4,
+              "dropped": 2,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 160
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 6,
+              "flows_dropped": 3,
+              "offered": 480,
+              "dropped": 240,
+              "offered_pps": 48,
+              "dropped_pps": 24,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 2,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 2,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 48,
+          "dropped_pps": 24,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600102,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter raknet: packet id 0x63 from a source that has not completed the handshake",
+          "filter": "game"
+        },
+        "stats": {
+          "decisions": 7,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 2,
+              "pps_dropped": 80,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 3,
+              "permitted": 1,
+              "pps_dropped": 240,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 5,
+              "dropped": 3,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 240
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 7,
+              "flows_dropped": 4,
+              "offered": 560,
+              "dropped": 320,
+              "offered_pps": 56,
+              "dropped_pps": 32,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 2,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 3,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 56,
+          "dropped_pps": 32,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600103,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter raknet: packet id 0x63 from a source that has not completed the handshake",
+          "filter": "game"
+        },
+        "stats": {
+          "decisions": 8,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 1,
+              "permitted": 2,
+              "pps_dropped": 80,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 4,
+              "permitted": 1,
+              "pps_dropped": 320,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 6,
+              "dropped": 4,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 320
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 8,
+              "flows_dropped": 5,
+              "offered": 640,
+              "dropped": 400,
+              "offered_pps": 64,
+              "dropped_pps": 40,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 1,
+            "fast_passed": 2,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 1,
+            "strikes": 4,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 64,
+          "dropped_pps": 40,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600104,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "asic",
+          "reason": "source is in the penalty box"
+        },
+        "stats": {
+          "decisions": 9,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 2,
+              "permitted": 2,
+              "pps_dropped": 160,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 4,
+              "permitted": 1,
+              "pps_dropped": 320,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 6,
+              "dropped": 4,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 320
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 9,
+              "flows_dropped": 6,
+              "offered": 720,
+              "dropped": 480,
+              "offered_pps": 72,
+              "dropped_pps": 48,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 1,
+            "fast_passed": 2,
+            "boxed": 1,
+            "promotions": 1,
+            "demotions": 1,
+            "strikes": 4,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 72,
+          "dropped_pps": 48,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600105,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "asic",
+          "reason": "source is in the penalty box"
+        },
+        "stats": {
+          "decisions": 10,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 3,
+              "permitted": 2,
+              "pps_dropped": 240,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 4,
+              "permitted": 1,
+              "pps_dropped": 320,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 6,
+              "dropped": 4,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 320
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 10,
+              "flows_dropped": 7,
+              "offered": 800,
+              "dropped": 560,
+              "offered_pps": 80,
+              "dropped_pps": 56,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 1,
+            "fast_passed": 2,
+            "boxed": 2,
+            "promotions": 1,
+            "demotions": 1,
+            "strikes": 4,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 80,
+          "dropped_pps": 56,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225661000,
+        "flow": {
+          "src_ip": "192.0.2.99",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter raknet: packet id 0x63 from a source that has not completed the handshake",
+          "filter": "game"
+        },
+        "stats": {
+          "decisions": 11,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 3,
+              "permitted": 2,
+              "pps_dropped": 240,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 5,
+              "permitted": 1,
+              "pps_dropped": 400,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 7,
+              "dropped": 5,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 400
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 11,
+              "flows_dropped": 8,
+              "offered": 880,
+              "dropped": 640,
+              "offered_pps": 8,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 2,
+            "boxed": 2,
+            "promotions": 1,
+            "demotions": 1,
+            "strikes": 5,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767226000000,
+        "stats": {
+          "decisions": 11,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 3,
+              "permitted": 2,
+              "pps_dropped": 240,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 5,
+              "permitted": 1,
+              "pps_dropped": 400,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 7,
+              "dropped": 5,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 400
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 11,
+              "flows_dropped": 8,
+              "offered": 880,
+              "dropped": 640,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 2,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 2,
+            "boxed": 2,
+            "promotions": 1,
+            "demotions": 1,
+            "strikes": 5,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  },
+  {
+    "name": "HMAC query challenge",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": null,
+      "zc": null,
+      "announcements": null,
+      "games": [
+        {
+          "id": "query",
+          "proto": "udp",
+          "dport": 27015,
+          "profile": "a2s"
+        }
+      ],
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 27015,
+          "pps": 80,
+          "payload": "/////1Q="
+        },
+        "decision": {
+          "action": "challenge",
+          "stage": "zc",
+          "reason": "game filter a2s: unverified source challenged",
+          "filter": "query",
+          "reply": "/////0HULeGQ"
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "query",
+              "profile": "a2s",
+              "inspected": 1,
+              "dropped": 0,
+              "challenged": 1,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 1,
+              "offered": 80,
+              "dropped": 80,
+              "offered_pps": 8,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600001,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 27015,
+          "pps": 80,
+          "payload": "/////1TULeGQ"
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 2,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "query",
+              "profile": "a2s",
+              "inspected": 2,
+              "dropped": 0,
+              "challenged": 1,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 2,
+              "flows_dropped": 1,
+              "offered": 160,
+              "dropped": 80,
+              "offered_pps": 16,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 16,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600002,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 27015,
+          "pps": 80,
+          "payload": "/////1TULeGQ"
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "zc",
+          "reason": "verified source, fast path"
+        },
+        "stats": {
+          "decisions": 3,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 1,
+              "pps_dropped": 80,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "query",
+              "profile": "a2s",
+              "inspected": 2,
+              "dropped": 0,
+              "challenged": 1,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 3,
+              "flows_dropped": 1,
+              "offered": 240,
+              "dropped": 80,
+              "offered_pps": 24,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 1,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 24,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600003,
+        "flow": {
+          "src_ip": "192.0.2.77",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 27015,
+          "pps": 80,
+          "payload": "/////1TULeGQ"
+        },
+        "decision": {
+          "action": "challenge",
+          "stage": "zc",
+          "reason": "game filter a2s: unverified source challenged",
+          "filter": "query",
+          "reply": "/////0E7bf/A"
+        },
+        "stats": {
+          "decisions": 4,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 2,
+              "permitted": 1,
+              "pps_dropped": 160,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "query",
+              "profile": "a2s",
+              "inspected": 3,
+              "dropped": 0,
+              "challenged": 2,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 4,
+              "flows_dropped": 2,
+              "offered": 320,
+              "dropped": 160,
+              "offered_pps": 32,
+              "dropped_pps": 16,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 1,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 32,
+          "dropped_pps": 16,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225721000,
+        "stats": {
+          "decisions": 4,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 2,
+              "permitted": 1,
+              "pps_dropped": 160,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "query",
+              "profile": "a2s",
+              "inspected": 3,
+              "dropped": 0,
+              "challenged": 2,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 4,
+              "flows_dropped": 2,
+              "offered": 320,
+              "dropped": 160,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 1,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225840001,
+        "flow": {
+          "src_ip": "192.0.2.77",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 27015,
+          "pps": 80,
+          "payload": "/////1TULeGQ"
+        },
+        "decision": {
+          "action": "challenge",
+          "stage": "zc",
+          "reason": "game filter a2s: unverified source challenged",
+          "filter": "query",
+          "reply": "/////0HPOkp9"
+        },
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 3,
+              "permitted": 1,
+              "pps_dropped": 240,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "query",
+              "profile": "a2s",
+              "inspected": 4,
+              "dropped": 0,
+              "challenged": 3,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 3,
+              "offered": 400,
+              "dropped": 240,
+              "offered_pps": 8,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 1,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  },
+  {
+    "name": "custom framing and missing payload",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": null,
+      "zc": null,
+      "announcements": null,
+      "games": [
+        {
+          "id": "custom",
+          "dport": 19132,
+          "custom": {
+            "min_len": 2,
+            "max_len": 4,
+            "packet_ids": [
+              1,
+              2
+            ],
+            "magic": [
+              {
+                "offset": 1,
+                "hex": "ab"
+              }
+            ],
+            "gate": "handshake",
+            "opener_ids": [
+              1
+            ],
+            "complete_ids": [
+              2
+            ]
+          }
+        }
+      ],
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "reputation": {
+        "fast_pass": "handshake",
+        "penalty_box": true
+      },
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 1,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 0,
+              "offered": 80,
+              "dropped": 0,
+              "offered_pps": 8,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600001,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "AQ=="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter custom: packet is 1 bytes, shorter than the 2 this protocol allows",
+          "filter": "custom"
+        },
+        "stats": {
+          "decisions": 2,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 80,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 2,
+              "dropped": 1,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 80
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 2,
+              "flows_dropped": 1,
+              "offered": 160,
+              "dropped": 80,
+              "offered_pps": 16,
+              "dropped_pps": 8,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 1,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 16,
+          "dropped_pps": 8,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600002,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "A6s="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter custom: packet id 0x03 is not one this protocol sends",
+          "filter": "custom"
+        },
+        "stats": {
+          "decisions": 3,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 2,
+              "permitted": 0,
+              "pps_dropped": 160,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 3,
+              "dropped": 2,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 160
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 3,
+              "flows_dropped": 2,
+              "offered": 240,
+              "dropped": 160,
+              "offered_pps": 24,
+              "dropped_pps": 16,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 2,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 24,
+          "dropped_pps": 16,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600003,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "AQA="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter custom: packet carries none of this protocol's magic sequences",
+          "filter": "custom"
+        },
+        "stats": {
+          "decisions": 4,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 3,
+              "permitted": 0,
+              "pps_dropped": 240,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 4,
+              "dropped": 3,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 240
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 4,
+              "flows_dropped": 3,
+              "offered": 320,
+              "dropped": 240,
+              "offered_pps": 32,
+              "dropped_pps": 24,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 3,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 32,
+          "dropped_pps": 24,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600004,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Aas="
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 2,
+              "pps_dropped": 0,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 3,
+              "permitted": 0,
+              "pps_dropped": 240,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 5,
+              "dropped": 3,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 240
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 3,
+              "offered": 400,
+              "dropped": 240,
+              "offered_pps": 40,
+              "dropped_pps": 24,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 3,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 40,
+          "dropped_pps": 24,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600005,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Aqs="
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 6,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 3,
+              "pps_dropped": 0,
+              "pps_permitted": 240
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 3,
+              "permitted": 0,
+              "pps_dropped": 240,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 6,
+              "dropped": 3,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 240
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 6,
+              "flows_dropped": 3,
+              "offered": 480,
+              "dropped": 240,
+              "offered_pps": 48,
+              "dropped_pps": 24,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 3,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 48,
+          "dropped_pps": 24,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600006,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "AasAAAA="
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "game filter custom: packet is 5 bytes, longer than the 4 this protocol allows",
+          "filter": "custom"
+        },
+        "stats": {
+          "decisions": 7,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 3,
+              "pps_dropped": 0,
+              "pps_permitted": 240
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 4,
+              "permitted": 0,
+              "pps_dropped": 320,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "custom",
+              "profile": "custom",
+              "inspected": 7,
+              "dropped": 4,
+              "challenged": 0,
+              "uninspectable": 1,
+              "pps_dropped": 320
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 7,
+              "flows_dropped": 4,
+              "offered": 560,
+              "dropped": 320,
+              "offered_pps": 56,
+              "dropped_pps": 32,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 1,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 1,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 4,
+            "shielded": 1,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 56,
+          "dropped_pps": 32,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  },
+  {
+    "name": "observe only",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": null,
+      "zc": null,
+      "announcements": null,
+      "games": [
+        {
+          "id": "game",
+          "proto": "udp",
+          "dport": 19132,
+          "profile": "raknet",
+          "observe": true
+        }
+      ],
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "reputation": {
+        "fast_pass": "handshake",
+        "penalty_box": true
+      },
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80,
+          "payload": "Yw=="
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 1,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 0,
+              "offered": 80,
+              "dropped": 0,
+              "offered_pps": 8,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600001,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 2,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 2,
+              "pps_dropped": 0,
+              "pps_permitted": 160
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": [
+            {
+              "filter_id": "game",
+              "profile": "raknet",
+              "inspected": 2,
+              "dropped": 0,
+              "challenged": 0,
+              "uninspectable": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 2,
+              "flows_dropped": 0,
+              "offered": 160,
+              "dropped": 0,
+              "offered_pps": 16,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 16,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  },
+  {
+    "name": "burst lockdown and return confirmation",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": null,
+      "zc": null,
+      "announcements": null,
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "egress": {
+        "lockdown": "drop",
+        "grace_millis": 500
+      },
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "return": {
+          "src_ip": "203.0.113.4",
+          "dst_ip": "192.0.2.8",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 4
+        },
+        "stats": {
+          "decisions": 0,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 0,
+              "flows_dropped": 0,
+              "offered": 0,
+              "dropped": 0,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 1,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 1,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 1,
+                "confirmed": 0
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600250,
+        "return": {
+          "src_ip": "203.0.113.4",
+          "dst_ip": "192.0.2.8",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 4
+        },
+        "stats": {
+          "decisions": 0,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 0,
+              "flows_dropped": 0,
+              "offered": 0,
+              "dropped": 0,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 1,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 2,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 1,
+                "confirmed": 0
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600500,
+        "return": {
+          "src_ip": "203.0.113.4",
+          "dst_ip": "192.0.2.8",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 4
+        },
+        "stats": {
+          "decisions": 0,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 0,
+              "flows_dropped": 0,
+              "offered": 0,
+              "dropped": 0,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 1,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 0,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 1,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225601000,
+        "flow": {
+          "src_ip": "192.0.2.9",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 100000
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 100000
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 0,
+              "offered": 100000,
+              "dropped": 0,
+              "offered_pps": 10000,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 100000,
+              "mean_pps": 416,
+              "crest": 240.3846153846154,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 1,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 1,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 0,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 1,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 10000,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225602000,
+        "flow": {
+          "src_ip": "192.0.2.9",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 100000
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 2,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 2,
+              "pps_dropped": 0,
+              "pps_permitted": 200000
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 2,
+              "flows_dropped": 0,
+              "offered": 200000,
+              "dropped": 0,
+              "offered_pps": 20000,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 100000,
+              "mean_pps": 833,
+              "crest": 120.04801920768307,
+              "duty_cycle": 0.008333333333333333,
+              "bursts": 2,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 1,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 0,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 1,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 20000,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225603000,
+        "flow": {
+          "src_ip": "192.0.2.9",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 100000
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 3,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 3,
+              "pps_dropped": 0,
+              "pps_permitted": 300000
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 3,
+              "flows_dropped": 0,
+              "offered": 300000,
+              "dropped": 0,
+              "offered_pps": 30000,
+              "dropped_pps": 0,
+              "pulsing": true,
+              "peak_pps": 100000,
+              "mean_pps": 1250,
+              "crest": 80,
+              "duty_cycle": 0.0125,
+              "bursts": 3,
+              "held_for_seconds": 300
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": true,
+          "pulse_peak_pps": 100000,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 2,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 0,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 2,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 30000,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225603700,
+        "flow": {
+          "src_ip": "192.0.2.9",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 100000
+        },
+        "decision": {
+          "action": "drop",
+          "stage": "zc",
+          "reason": "no return traffic confirms this source while the prefix is under attack"
+        },
+        "stats": {
+          "decisions": 4,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 3,
+              "pps_dropped": 0,
+              "pps_permitted": 300000
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 100000,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 4,
+              "flows_dropped": 1,
+              "offered": 400000,
+              "dropped": 100000,
+              "offered_pps": 40000,
+              "dropped_pps": 10000,
+              "pulsing": true,
+              "peak_pps": 100000,
+              "mean_pps": 1666,
+              "crest": 60.024009603841534,
+              "duty_cycle": 0.016666666666666666,
+              "bursts": 4,
+              "held_for_seconds": 300
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": true,
+          "pulse_peak_pps": 100000,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 2,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 1,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 2,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 40000,
+          "dropped_pps": 10000,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225603800,
+        "flow": {
+          "src_ip": "192.0.2.8",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "asic",
+          "reason": "no matching drop rule"
+        },
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 4,
+              "pps_dropped": 0,
+              "pps_permitted": 300080
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 100000,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 1,
+              "offered": 400080,
+              "dropped": 100000,
+              "offered_pps": 40008,
+              "dropped_pps": 10000,
+              "pulsing": true,
+              "peak_pps": 100000,
+              "mean_pps": 1667,
+              "crest": 59.9880023995201,
+              "duty_cycle": 0.020833333333333332,
+              "bursts": 4,
+              "held_for_seconds": 300
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": true,
+          "pulse_peak_pps": 100000,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 2,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 1,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "visible",
+                "clients": 2,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 40008,
+          "dropped_pps": 10000,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225665000,
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 4,
+              "pps_dropped": 0,
+              "pps_permitted": 300080
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 100000,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 1,
+              "offered": 400080,
+              "dropped": 100000,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": true,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 238.8
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": true,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 1,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 2,
+            "clients_max": 65536,
+            "confirmed": 1,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 1,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "unknown",
+                "clients": 2,
+                "confirmed": 1
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767226000000,
+        "stats": {
+          "decisions": 5,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 4,
+              "pps_dropped": 0,
+              "pps_permitted": 300080
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 1,
+              "permitted": 0,
+              "pps_dropped": 100000,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 5,
+              "flows_dropped": 1,
+              "offered": 400080,
+              "dropped": 100000,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": false,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 1,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 1,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 1,
+            "clients": 2,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 1,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 3,
+            "promoted": 1,
+            "locked_down": 1,
+            "lockdown": "drop",
+            "prefix_states": [
+              {
+                "prefix": "203.0.113.0/24",
+                "visibility": "unknown",
+                "clients": 2,
+                "confirmed": 0
+              }
+            ]
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  },
+  {
+    "name": "ML decisions",
+    "program": {
+      "node_id": "n",
+      "policy_id": "p",
+      "version": 1,
+      "prefixes": [
+        "203.0.113.0/24"
+      ],
+      "asic": [
+        {
+          "priority": 0,
+          "action": "drop",
+          "match": {
+            "sport": 53
+          },
+          "rule_id": "acl",
+          "tcam_key": ""
+        }
+      ],
+      "fpga": null,
+      "zc": [
+        {
+          "cluster": "",
+          "priority": 0,
+          "match": {},
+          "action": "inspect",
+          "rule_id": "behavior"
+        }
+      ],
+      "announcements": null,
+      "challenge_secret": "test-secret",
+      "pulse_floor_pps": 10000,
+      "compiled_at": "0001-01-01T00:00:00Z"
+    },
+    "steps": [
+      {
+        "at": 1767225600000,
+        "model": {
+          "weights": [
+            10,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "bias": -3,
+          "threshold": 0.7,
+          "epochs": 0,
+          "loss": 0,
+          "accuracy": 0,
+          "precision": 0,
+          "recall": 0,
+          "validation": 0,
+          "samples": 0,
+          "ready": true
+        },
+        "stats": {
+          "decisions": 0,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 0,
+              "flows_dropped": 0,
+              "offered": 0,
+              "dropped": 0,
+              "offered_pps": 0,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 0,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": true,
+            "scored": 0,
+            "drops": 0,
+            "passes": 0
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 0,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      },
+      {
+        "at": 1767225600000,
+        "flow": {
+          "src_ip": "192.0.2.1",
+          "dst_ip": "203.0.113.4",
+          "proto": "udp",
+          "sport": 1234,
+          "dport": 19132,
+          "pps": 80
+        },
+        "decision": {
+          "action": "permit",
+          "stage": "zc",
+          "rule_id": "behavior",
+          "reason": "PF_RING ZC ml pass",
+          "score": 0.6597187131698313
+        },
+        "stats": {
+          "decisions": 1,
+          "unowned": 0,
+          "stages": [
+            {
+              "stage": "asic",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "fpga",
+              "dropped": 0,
+              "permitted": 0,
+              "pps_dropped": 0,
+              "pps_permitted": 0
+            },
+            {
+              "stage": "zc",
+              "dropped": 0,
+              "permitted": 1,
+              "pps_dropped": 0,
+              "pps_permitted": 80
+            }
+          ],
+          "rules": [
+            {
+              "rule_id": "acl",
+              "stage": "asic",
+              "matches": 0,
+              "drops": 0,
+              "pps_seen": 0,
+              "pps_dropped": 0
+            },
+            {
+              "rule_id": "behavior",
+              "stage": "zc",
+              "matches": 1,
+              "drops": 0,
+              "pps_seen": 80,
+              "pps_dropped": 0
+            }
+          ],
+          "games": null,
+          "prefixes": [
+            {
+              "prefix": "203.0.113.0/24",
+              "flows": 1,
+              "flows_dropped": 0,
+              "offered": 80,
+              "dropped": 0,
+              "offered_pps": 8,
+              "dropped_pps": 0,
+              "pulsing": false,
+              "peak_pps": 80,
+              "mean_pps": 0,
+              "crest": 0,
+              "duty_cycle": 0.004166666666666667,
+              "bursts": 0,
+              "held_for_seconds": 0
+            }
+          ],
+          "ml": {
+            "ready": true,
+            "scored": 1,
+            "drops": 0,
+            "passes": 1
+          },
+          "pulsing": false,
+          "pulse_peak_pps": 0,
+          "game_sessions": 0,
+          "game_sessions_max": 65536,
+          "reputation": {
+            "tracked": 0,
+            "max": 65536,
+            "trusted": 0,
+            "penalised": 0,
+            "fast_passed": 0,
+            "boxed": 0,
+            "promotions": 0,
+            "demotions": 0,
+            "strikes": 0,
+            "shielded": 0,
+            "full": 0
+          },
+          "egress": {
+            "prefixes": 0,
+            "clients": 0,
+            "clients_max": 65536,
+            "confirmed": 0,
+            "promotions": 0,
+            "full": 0,
+            "asymmetric": 0,
+            "seen": 0,
+            "promoted": 0,
+            "locked_down": 0,
+            "lockdown": "off"
+          },
+          "rate_buckets": 0,
+          "rate_buckets_max": 65536,
+          "offered_pps": 8,
+          "dropped_pps": 0,
+          "load_window_seconds": 10
+        }
+      }
+    ]
+  }
+]

@@ -1,1 +1,2 @@
-tests/fixtures/go-reference.json linguist-generated=true
+tests/fixtures/*.json linguist-generated=true
+vercel-test/src/* linguist-generated=true

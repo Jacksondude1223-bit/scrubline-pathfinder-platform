@@ -1,0 +1,330 @@
+{
+  "scrubline_decisions_total": {
+    "kind": "counter",
+    "help": "Flow decisions made by a node's datapath."
+  },
+  "scrubline_unowned_flows_total": {
+    "kind": "counter",
+    "help": "Flows whose destination is not a prefix assigned to this node. A rising value means the steering layer and the fabric disagree about who scrubs what."
+  },
+  "scrubline_stage_dropped_total": {
+    "kind": "counter",
+    "help": "Flows dropped, by the stage that decided."
+  },
+  "scrubline_stage_permitted_total": {
+    "kind": "counter",
+    "help": "Flows permitted, by the stage that decided."
+  },
+  "scrubline_stage_dropped_pps_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on flows dropped at this stage. A volume weighting of the drop count, not a packet counter."
+  },
+  "scrubline_stage_permitted_pps_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on flows permitted at this stage. A volume weighting of the permit count, not a packet counter."
+  },
+  "scrubline_rule_matches_total": {
+    "kind": "counter",
+    "help": "Flows matched by a rule, including rules that left the verdict to a later rule."
+  },
+  "scrubline_rule_drops_total": {
+    "kind": "counter",
+    "help": "Flows dropped by the rule that decided them. A rule with matches and no drops is seeing traffic it is not acting on."
+  },
+  "scrubline_rule_seen_pps_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on flows a rule matched."
+  },
+  "scrubline_rule_dropped_pps_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on flows a rule dropped."
+  },
+  "scrubline_ml_scored_total": {
+    "kind": "counter",
+    "help": "Flows scored by the ZC classifier."
+  },
+  "scrubline_ml_drops_total": {
+    "kind": "counter",
+    "help": "Flows dropped because the classifier scored them at or above the threshold."
+  },
+  "scrubline_ml_passes_total": {
+    "kind": "counter",
+    "help": "Flows the classifier scored below the threshold."
+  },
+  "scrubline_ml_model_ready": {
+    "kind": "gauge",
+    "help": "1 when a fitted classifier is installed on this node's ZC path."
+  },
+  "scrubline_rate_buckets": {
+    "kind": "gauge",
+    "help": "Sources currently tracked by the ZC behavioral cap."
+  },
+  "scrubline_rate_buckets_max": {
+    "kind": "gauge",
+    "help": "Bound on the per-source rate table. At the bound, new sources go untracked and the cap is no longer measuring every source."
+  },
+  "scrubline_offered_pps": {
+    "kind": "gauge",
+    "help": "Packet rate currently offered to a node, averaged over its load window. This is the number load-driven steering reacts to."
+  },
+  "scrubline_dropped_pps": {
+    "kind": "gauge",
+    "help": "Packet rate a node is currently dropping, averaged over its load window."
+  },
+  "scrubline_game_inspected_total": {
+    "kind": "counter",
+    "help": "Packets a game filter looked at."
+  },
+  "scrubline_game_dropped_total": {
+    "kind": "counter",
+    "help": "Packets dropped because they are not the protocol their port speaks."
+  },
+  "scrubline_game_challenged_total": {
+    "kind": "counter",
+    "help": "Sources sent the protocol's own challenge because they had not cleared the gate."
+  },
+  "scrubline_game_uninspectable_total": {
+    "kind": "counter",
+    "help": "Packets a game filter was given no payload for. The filter never drops on these, so a rising value means the datapath is not supplying payloads and the filter is doing nothing."
+  },
+  "scrubline_game_dropped_pps_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on packets a game filter dropped."
+  },
+  "scrubline_game_sessions": {
+    "kind": "gauge",
+    "help": "Sources the game filter is tracking through a gate."
+  },
+  "scrubline_game_sessions_max": {
+    "kind": "gauge",
+    "help": "Bound on the game filter's session table. At the bound it admits without tracking rather than evicting connected players."
+  },
+  "scrubline_pulse_active": {
+    "kind": "gauge",
+    "help": "1 while a protected prefix is under a recognised burst train, including through the quiet stretches between bursts."
+  },
+  "scrubline_pulse_peak_pps": {
+    "kind": "gauge",
+    "help": "Heaviest burst measured against a prefix, at sub-second resolution. This is the number a mean hides: a pulse attack keeps its average under the watermark on purpose."
+  },
+  "scrubline_pulse_mean_pps": {
+    "kind": "gauge",
+    "help": "Mean rate against a prefix over the pulse horizon. Compare with the peak: a wide gap is the attack."
+  },
+  "scrubline_pulse_crest": {
+    "kind": "gauge",
+    "help": "Peak-to-mean ratio of traffic to a prefix. Steady traffic sits near one however heavy it is."
+  },
+  "scrubline_pulse_duty_cycle": {
+    "kind": "gauge",
+    "help": "Share of the pulse horizon a prefix saw any traffic at all. A burst train is quiet most of the time."
+  },
+  "scrubline_pulse_bursts": {
+    "kind": "gauge",
+    "help": "Distinct bursts counted against a prefix in the horizon."
+  },
+  "scrubline_pulse_hold_seconds": {
+    "kind": "gauge",
+    "help": "How much longer the pulse flag stands without another burst. While this is above zero, mitigation does not disengage."
+  },
+  "scrubline_prefix_offered_pps": {
+    "kind": "gauge",
+    "help": "Packet rate arriving for one protected prefix at this node, averaged over the load window. The node-wide rate cannot answer this: a scrubber carries many prefixes at once."
+  },
+  "scrubline_prefix_dropped_pps": {
+    "kind": "gauge",
+    "help": "Packet rate being scrubbed for one protected prefix at this node, averaged over the load window."
+  },
+  "scrubline_prefix_flows_total": {
+    "kind": "counter",
+    "help": "Flows decided for one protected prefix."
+  },
+  "scrubline_prefix_flows_dropped_total": {
+    "kind": "counter",
+    "help": "Flows dropped or challenged for one protected prefix."
+  },
+  "scrubline_prefix_offered_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on flows arriving for one protected prefix. A volume weighting of the flow count, not a packet counter."
+  },
+  "scrubline_prefix_dropped_total": {
+    "kind": "counter",
+    "help": "Sum of the per-flow rates reported on flows scrubbed for one protected prefix."
+  },
+  "scrubline_report_age_seconds": {
+    "kind": "gauge",
+    "help": "Seconds since this node last reported its counters."
+  },
+  "scrubline_bgp_announced": {
+    "kind": "gauge",
+    "help": "1 when a node is advertising a protected prefix, 0 when it is withdrawn. A prefix with no node at 1 is attracting no traffic to the fabric."
+  },
+  "scrubline_bgp_prepends": {
+    "kind": "gauge",
+    "help": "AS-path padding on a node's announcement. Higher means the node is a less attractive path and takes less of the prefix's traffic."
+  },
+  "scrubline_tunnel_up": {
+    "kind": "gauge",
+    "help": "1 when a return tunnel is reported carrying traffic, 0 when it is reported down. A tunnel that has never reported is absent from this series rather than reading 0, because no news is not the same as bad news."
+  },
+  "scrubline_tunnel_required": {
+    "kind": "gauge",
+    "help": "1 when a return tunnel must be confirmed up before its prefixes are announced from this node."
+  },
+  "scrubline_tunnel_reported": {
+    "kind": "gauge",
+    "help": "1 when the local provisioner has said anything at all about this tunnel. Zero across the fleet means nothing is reporting, so the control plane cannot tell a healthy return path from a dead one."
+  },
+  "scrubline_tunnel_mtu_bytes": {
+    "kind": "gauge",
+    "help": "The tunnel's MTU, after the encapsulation's overhead is taken off the path."
+  },
+  "scrubline_tunnel_mss_clamp_bytes": {
+    "kind": "gauge",
+    "help": "The TCP MSS traffic into this tunnel is clamped to. Without it, a customer whose path drops the ICMP that path-MTU discovery needs sees TCP hang on anything larger than a handshake."
+  },
+  "scrubline_tunnel_prefixes": {
+    "kind": "gauge",
+    "help": "Protected prefixes delivered over this tunnel from this node."
+  },
+  "scrubline_reputation_tracked": {
+    "kind": "gauge",
+    "help": "Source addresses the reputation cache is holding."
+  },
+  "scrubline_reputation_tracked_max": {
+    "kind": "gauge",
+    "help": "Bound on the reputation table. At the bound a source takes the ordinary path, so this costs an optimisation rather than a protection."
+  },
+  "scrubline_reputation_trusted": {
+    "kind": "gauge",
+    "help": "Sources currently taking the short path because they cleared a protocol gate."
+  },
+  "scrubline_reputation_penalised": {
+    "kind": "gauge",
+    "help": "Sources currently in the penalty box."
+  },
+  "scrubline_reputation_fast_passed_total": {
+    "kind": "counter",
+    "help": "Packets taken off the slow path because their source was already verified."
+  },
+  "scrubline_reputation_boxed_total": {
+    "kind": "counter",
+    "help": "Packets dropped at the top of the pipeline because their source is in the penalty box. This is the load the rest of the stages did not have to carry."
+  },
+  "scrubline_reputation_promotions_total": {
+    "kind": "counter",
+    "help": "Sources that cleared a gate and entered the trusted tier."
+  },
+  "scrubline_reputation_demotions_total": {
+    "kind": "counter",
+    "help": "Sources that accumulated enough strikes to be boxed. Counted even when the penalty box is off, which is how it is sized before being switched on."
+  },
+  "scrubline_reputation_strikes_total": {
+    "kind": "counter",
+    "help": "Failures recorded against a source."
+  },
+  "scrubline_reputation_shielded_total": {
+    "kind": "counter",
+    "help": "Strikes that landed on an already-verified source and were not acted on. Source addresses are attacker-controlled, so acting on one would let anyone get a real player banned. A rising value is a spoofing attempt or a misbehaving verified client, and both want a human."
+  },
+  "scrubline_reputation_full_total": {
+    "kind": "counter",
+    "help": "Sources the reputation table had no room for."
+  },
+  "scrubline_egress_return_packets_total": {
+    "kind": "counter",
+    "help": "Replies from a protected service observed travelling back through this node."
+  },
+  "scrubline_egress_confirmed_total": {
+    "kind": "counter",
+    "help": "Clients confirmed by sustained return traffic. The service answered them at length, which is the one confirmation here needing no protocol knowledge and the only one an attacker cannot forge from the ingress side."
+  },
+  "scrubline_egress_confirmed": {
+    "kind": "gauge",
+    "help": "Clients currently carrying a return-traffic confirmation."
+  },
+  "scrubline_egress_clients": {
+    "kind": "gauge",
+    "help": "Client addresses the return-path tracker is holding."
+  },
+  "scrubline_egress_clients_max": {
+    "kind": "gauge",
+    "help": "Bound on that table. At the bound a client is simply not confirmed, and under lockdown is not granted grace either."
+  },
+  "scrubline_egress_locked_down_total": {
+    "kind": "counter",
+    "help": "Ingress held back because no return traffic confirmed its source while the prefix was under attack."
+  },
+  "scrubline_egress_lockdown": {
+    "kind": "gauge",
+    "help": "1 when this node is configured to hold back unconfirmed sources during an attack, by mode. A node with every mode at 0 is not running this layer."
+  },
+  "scrubline_egress_visibility": {
+    "kind": "gauge",
+    "help": "1 for the return path this node sees for a prefix. asymmetric means replies are not routed through here \u2014 direct server return, or this node is off the return path \u2014 and everything depending on return traffic stands down for that prefix."
+  },
+  "scrubline_node_prefixes": {
+    "kind": "gauge",
+    "help": "Protected prefixes a node enforces policy on. Zero means the node is enforcing nothing."
+  },
+  "scrubline_nodes": {
+    "kind": "gauge",
+    "help": "Registered nodes by liveness. A stale node is withdrawn from anycast."
+  },
+  "scrubline_policies": {
+    "kind": "gauge",
+    "help": "Policies held by the control plane."
+  },
+  "scrubline_announcements": {
+    "kind": "gauge",
+    "help": "Rows in the fabric's BGP announcement plan."
+  },
+  "scrubline_programs": {
+    "kind": "gauge",
+    "help": "Nodes holding a compiled program."
+  },
+  "scrubline_fabric_recompiles_total": {
+    "kind": "counter",
+    "help": "Fabric recompiles, including those triggered by a node joining, recovering, or going stale."
+  },
+  "scrubline_control_ml_model_ready": {
+    "kind": "gauge",
+    "help": "1 when the control plane is publishing a fitted classifier."
+  },
+  "scrubline_control_ml_samples": {
+    "kind": "gauge",
+    "help": "Labeled samples held for training."
+  },
+  "scrubline_control_ml_validation_samples": {
+    "kind": "gauge",
+    "help": "Samples held out of the fit and scored against. Zero means the set was too small to split."
+  },
+  "scrubline_control_ml_accuracy": {
+    "kind": "gauge",
+    "help": "Holdout accuracy of the published model."
+  },
+  "scrubline_control_ml_precision": {
+    "kind": "gauge",
+    "help": "Holdout precision of the published model. A false positive here is dropped customer traffic."
+  },
+  "scrubline_control_ml_recall": {
+    "kind": "gauge",
+    "help": "Holdout recall of the published model."
+  },
+  "scrubline_steering_escalation": {
+    "kind": "gauge",
+    "help": "Extra AS-path prepends a node carries because of measured load, on top of what its capacity earns it."
+  },
+  "scrubline_steering_load_ratio": {
+    "kind": "gauge",
+    "help": "A node's measured packet rate as a share of its declared packet-rate capacity. Zero when the node declares no capacity to measure against."
+  },
+  "scrubline_node_capacity_pps": {
+    "kind": "gauge",
+    "help": "A node's declared packet-rate ceiling. Zero leaves the node out of load-driven steering."
+  },
+  "scrubline_api_requests_total": {
+    "kind": "counter",
+    "help": "Control-plane API requests by route and response status."
+  }
+}

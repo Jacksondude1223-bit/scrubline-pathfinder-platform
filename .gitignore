@@ -7,3 +7,4 @@
 certs/
 
 /target/
+vercel-test/target/
