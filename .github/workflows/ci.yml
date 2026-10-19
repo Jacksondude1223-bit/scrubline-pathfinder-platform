@@ -40,9 +40,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Snapshot source matches
+        # git diff ignores untracked files, so a module added to src/ but never committed to the
+        # snapshot would pass here and break the Vercel build.
         run: |
           sh vercel-test/sync.sh
-          git diff --exit-code -- vercel-test/src vercel-test/Cargo.toml vercel-test/rust-toolchain.toml
+          drift=$(git status --porcelain -- vercel-test/src vercel-test/Cargo.toml vercel-test/rust-toolchain.toml)
+          if [ -n "$drift" ]; then echo "$drift"; git diff -- vercel-test; exit 1; fi
       - name: Snapshot format and lint
         run: |
           cargo fmt --manifest-path vercel-test/Cargo.toml --all -- --check

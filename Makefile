@@ -62,8 +62,11 @@ down:
 logs:
 	$(COMPOSE) logs -f
 
+# A restarted seeder appends to the same log, and every run rotates the credentials, so only the
+# last banner holds tokens that still work.
 creds:
-	@$(COMPOSE) logs --no-log-prefix seed 2>/dev/null | sed -n '/seeded:/,$$p' | grep . \
+	@$(COMPOSE) logs --no-log-prefix seed 2>/dev/null \
+	  | awk '/seeded:/ {banner = ""; on = 1} on {banner = banner $$0 "\n"} END {printf "%s", banner}' | grep . \
 	  || echo "  the seeder has not finished yet; try 'make logs' or run 'make creds' again"
 
 .PHONY: rust-build rust-test rust-check runtime-test snapshot-check

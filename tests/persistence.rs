@@ -166,3 +166,40 @@ fn policy_validation_rejects_configurations_that_render_broken() {
     ];
     assert!(validation::policy(&p).is_err());
 }
+#[test]
+fn policy_validation_rejects_rules_that_never_match_and_respelled_prefixes() {
+    let rule = |proto: &str, flags: &str| pathfinder::model::Rule {
+        id: "r".into(),
+        stage: "asic".into(),
+        action: "drop".into(),
+        r#match: pathfinder::model::Match {
+            proto: proto.into(),
+            tcp_flags: flags.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut p = Policy {
+        name: "test".into(),
+        protected: vec!["203.0.113.0/24".into()],
+        ..Default::default()
+    };
+    for (proto, flags, ok) in [
+        ("UDP", "", true),
+        ("tcp", "syn,ack", true),
+        ("UPD sport=53 pri=0", "", false),
+        ("6", "", false),
+        ("tcp", "syn ack", false),
+    ] {
+        p.rules = vec![rule(proto, flags)];
+        assert_eq!(validation::policy(&p).is_ok(), ok, "{proto:?} {flags:?}");
+    }
+    p.rules.clear();
+    for protected in [
+        ["2001:db8::/32", "2001:DB8::/32"],
+        ["203.0.113.0/24", "203.0.113.7/24"],
+    ] {
+        p.protected = protected.iter().map(|s| s.to_string()).collect();
+        assert!(validation::policy(&p).is_err(), "{protected:?}");
+    }
+}

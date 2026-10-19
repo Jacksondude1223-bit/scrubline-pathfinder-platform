@@ -250,6 +250,17 @@ impl Engine {
             r.verdict = "drop".into();
             r.reason = e;
         } else if validate_only || b.profile.gate == "none" {
+            // A trusted source skips the gate but is still connected through it. Keep its session
+            // alive, or it expires under the fast path and the source is dropped as a stranger
+            // the moment its trust lapses.
+            if validate_only && b.profile.gate != "none" {
+                let key = (b.id.clone(), f.src_ip.clone());
+                if let Some(until) = self.sessions.get_mut(&key) {
+                    if now <= *until {
+                        *until = now + 120000;
+                    }
+                }
+            }
             r.verdict = "pass".into();
             r.reason = format!("well-formed {}", b.profile.name);
         } else {
@@ -314,10 +325,16 @@ impl Engine {
                         "not a query this protocol challenges, from an unverified source".into();
                 } else {
                     let cookie = self.cookie(f, now);
-                    let valid = f.payload.get(5..9).is_some_and(|v| {
-                        bool::from(v.ct_eq(&cookie))
-                            || bool::from(v.ct_eq(&self.cookie(f, now - 120000)))
-                    });
+                    let previous = self.cookie(f, now - 120000);
+                    let answers =
+                        |v: &[u8]| bool::from(v.ct_eq(&cookie)) || bool::from(v.ct_eq(&previous));
+                    // A2S_PLAYER and A2S_RULES carry the challenge straight after the header byte.
+                    // A real A2S_INFO carries it after its "Source Engine Query" string, so looking
+                    // only after the header challenged every server-browser query forever.
+                    let valid = f.payload.get(5..9).is_some_and(answers)
+                        || f.payload.get(4) == Some(&b'T')
+                            && f.payload.get(5..25) == Some(&b"Source Engine Query\0"[..])
+                            && f.payload.get(25..29).is_some_and(answers);
                     if valid {
                         let tracked = self.admit(key, now);
                         r.verdict = "pass".into();
@@ -336,11 +353,15 @@ impl Engine {
                 }
             }
         }
-        if b.observe && r.verdict != "pass" && (!validate_only || r.verdict == "drop") {
-            r.reason = format!("observe only: would have {} ({})", r.verdict, r.reason);
-            r.verdict = "pass".into();
-            r.reply.clear();
+        if b.observe {
+            // Observing records what the binding would do and acts on nothing: a completion seen
+            // in observe mode must not promote its source past the classifier and the box.
             r.cleared = 0;
+            if r.verdict != "pass" && (!validate_only || r.verdict == "drop") {
+                r.reason = format!("observe only: would have {} ({})", r.verdict, r.reason);
+                r.verdict = "pass".into();
+                r.reply.clear();
+            }
         }
         r
     }

@@ -18,6 +18,20 @@ pub fn default_mtu(t: &Tunnel) -> i64 {
 pub fn mss_for(mtu: i64) -> i64 {
     (mtu - 40).max(0)
 }
+fn carries_v6(prefixes: &[String]) -> bool {
+    prefixes
+        .iter()
+        .any(|p| matches!(p.parse::<IpNet>(), Ok(IpNet::V6(_))))
+}
+// The clamp rule sits in an inet table and rewrites IPv6 SYNs too, whose headers are 60 bytes,
+// so a tunnel carrying any IPv6 prefix clamps to fit those.
+fn clamp_for(t: &Tunnel, mtu: i64) -> i64 {
+    if carries_v6(&t.prefixes) {
+        (mtu - 60).max(0)
+    } else {
+        mss_for(mtu)
+    }
+}
 pub fn validate_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 11
@@ -60,11 +74,14 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
             return Err(format!("prefix {prefix} is not protected"));
         }
     }
+    if t.r#type == "ipip" && carries_v6(&t.prefixes) {
+        return Err("ipip carries IPv4 only; use gre for a tunnel with IPv6 prefixes".into());
+    }
     if t.mtu != 0 && !(576..=default_mtu(t)).contains(&t.mtu) {
         return Err("MTU does not fit the IPv4 path".into());
     }
     let mtu = if t.mtu == 0 { default_mtu(t) } else { t.mtu };
-    if t.mss_clamp != 0 && !(536..=mss_for(mtu)).contains(&t.mss_clamp) {
+    if t.mss_clamp != 0 && !(536..=clamp_for(t, mtu)).contains(&t.mss_clamp) {
         return Err("MSS clamp does not fit the MTU".into());
     }
     Ok(())
@@ -89,7 +106,7 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         prefixes,
         mtu,
         mss_clamp: if t.mss_clamp == 0 {
-            mss_for(mtu)
+            clamp_for(t, mtu)
         } else {
             t.mss_clamp
         },

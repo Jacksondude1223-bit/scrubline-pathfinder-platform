@@ -162,6 +162,10 @@ impl Pipeline {
             .iter()
             .filter_map(|p| p.parse::<IpNet>().ok().map(|net| (p.clone(), net)))
             .collect();
+        // Lookups take the first match, so the most specific prefix has to come first or a /24
+        // inside a protected /22 is counted, pulse-tracked and confirmed under the /22.
+        self.prefixes
+            .sort_by_key(|(_, net)| std::cmp::Reverse(net.prefix_len()));
         let live: HashSet<_> = program.prefixes.iter().cloned().collect();
         self.loads.retain(|p, _| live.contains(p));
         for prefix in &program.prefixes {
@@ -560,12 +564,16 @@ impl Pipeline {
         });
         if let Some(prefix) = prefix {
             self.returns[0] += 1;
-            if self
+            // Every confirmation renews trust, not only the first: a client the origin keeps
+            // answering would otherwise lose its fast path five minutes into the conversation.
+            if let Some(fresh) = self
                 .egress
                 .observe_return(&prefix, &f.dst_ip, f.pps.max(1), now)
             {
                 self.reputation.promote(&f.dst_ip, 2, now);
-                self.returns[1] += 1;
+                if fresh {
+                    self.returns[1] += 1;
+                }
             }
         }
     }

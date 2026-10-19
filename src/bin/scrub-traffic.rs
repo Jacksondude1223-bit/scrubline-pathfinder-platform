@@ -111,7 +111,9 @@ async fn run() -> Result<()> {
         ("protected", "203.0.113.0/24"),
         ("quiet", "198.51.100.0/24"),
         ("game-port", "19132"),
-        ("interval", "200ms"),
+        // Baseline traffic has to leave most 250ms slots quiet, or the burst train never reads as
+        // one: the detector counts every slot with traffic in it toward the duty cycle.
+        ("interval", "1s"),
         ("attack-every", "4m"),
         ("attack-for", "90s"),
         ("burst-every", "7m"),
@@ -166,27 +168,28 @@ async fn run() -> Result<()> {
         let mut r = StdRng::seed_from_u64(seed.wrapping_add(1));
         tokio::time::sleep(Duration::from_secs(20)).await;
         loop {
-            let deadline = tokio::time::Instant::now() + duration;
-            while tokio::time::Instant::now() < deadline {
+            let started = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < started + duration {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 send(&flood, &mut r, &[3, 4]).await;
             }
-            tokio::time::sleep(every).await;
+            // Attacks recur on a period, so "every four minutes" means four minutes apart.
+            tokio::time::sleep_until(started + every).await;
         }
     });
     let bursts = tokio::spawn(async move {
         let mut r = StdRng::seed_from_u64(seed.wrapping_add(2));
         tokio::time::sleep(Duration::from_secs(120)).await;
         loop {
-            let deadline = tokio::time::Instant::now() + burst_for;
-            while tokio::time::Instant::now() < deadline {
+            let started = tokio::time::Instant::now();
+            while tokio::time::Instant::now() < started + burst_for {
                 for _ in 0..4 {
                     send(&g, &mut r, &[5]).await;
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 tokio::time::sleep(Duration::from_secs(18)).await;
             }
-            tokio::time::sleep(burst_every).await;
+            tokio::time::sleep_until(started + burst_every).await;
         }
     });
     stop().await;

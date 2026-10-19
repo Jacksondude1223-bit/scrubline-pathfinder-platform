@@ -33,6 +33,11 @@ async fn run() -> Result<()> {
     if (role == "replica") == f.get("primary").is_empty() {
         return Err("-primary must be provided only for a replica".into());
     }
+    if f.get("state").is_empty() {
+        eprintln!(
+            "warning: no -state file, so policies, node and tenant credentials and the model live in memory and are lost on restart"
+        );
+    }
     let state: Shared = Arc::new(Mutex::new(Api::new(
         Store::open(f.get("state"))?,
         token.clone(),
@@ -64,34 +69,31 @@ async fn run() -> Result<()> {
         tokio::spawn(async move {
             let mut last = None;
             loop {
-                if state.lock().unwrap().mode != "replica" {
-                    break;
+                let shared = state.clone();
+                match tokio::task::spawn_blocking(move || {
+                    shared.lock().map(|a| a.mode == "replica").ok()
+                })
+                .await
+                {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false)) => break,
+                    _ => {
+                        eprintln!("replica: control-plane state is unusable; no longer following");
+                        break;
+                    }
                 }
                 match client.get(&url).bearer_auth(&token).send().await {
-                    Ok(r) if r.status().is_success() => match r.json::<Snapshot>().await {
-                        Ok(mut snap) => {
-                            // The primary stamps saved_at on every read, so it cannot say whether
-                            // anything changed. Compare the content instead, or every poll
-                            // rewrites and fsyncs the whole state file, training set included.
-                            snap.saved_at = zero_time();
-                            let digest = serde_json::to_string(&snap)
-                                .map(|raw| store::hash(&raw))
-                                .unwrap_or_default();
-                            if last.as_ref() != Some(&digest) {
-                                let shared = state.clone();
-                                let loaded = tokio::task::spawn_blocking(move || {
-                                    let mut a = shared.lock().unwrap();
-                                    if a.mode != "replica" {
-                                        return Ok(());
-                                    }
-                                    a.store.load_snapshot(snap)
-                                })
-                                .await;
-                                match loaded {
-                                    Ok(Ok(())) => last = Some(digest),
-                                    Ok(Err(e)) => eprintln!("replica state: {e}"),
-                                    Err(e) => eprintln!("replica worker: {e}"),
-                                }
+                    Ok(r) if r.status().is_success() => match r.bytes().await {
+                        Ok(raw) => {
+                            let shared = state.clone();
+                            let seen = last.clone();
+                            match tokio::task::spawn_blocking(move || follow(&shared, &raw, seen))
+                                .await
+                            {
+                                Ok(Ok(Some(digest))) => last = Some(digest),
+                                Ok(Ok(None)) => {}
+                                Ok(Err(e)) => eprintln!("replica state: {e}"),
+                                Err(e) => eprintln!("replica worker: {e}"),
                             }
                         }
                         Err(e) => eprintln!("replica response: {e}"),
@@ -116,6 +118,28 @@ async fn run() -> Result<()> {
         f.boolean("insecure")?,
     )
     .await
+}
+/// Loads one snapshot from the primary unless it matches the last one loaded, returning the digest
+/// of what it loaded. It decodes and hashes the whole state, training set included, and waits on
+/// the control-plane lock, so it runs on the blocking pool rather than a runtime worker.
+fn follow(state: &Shared, raw: &[u8], last: Option<String>) -> Result<Option<String>> {
+    let mut snap: Snapshot =
+        serde_json::from_slice(raw).map_err(|e| format!("decoding the primary's state: {e}"))?;
+    // The primary stamps saved_at on every read, so it cannot say whether anything changed.
+    // Compare the content instead, or every poll rewrites and fsyncs the whole state file.
+    snap.saved_at = zero_time();
+    let digest = store::hash(&serde_json::to_string(&snap).map_err(|e| e.to_string())?);
+    if last.as_ref() == Some(&digest) {
+        return Ok(None);
+    }
+    let mut a = state
+        .lock()
+        .map_err(|_| "control-plane state is unusable".to_string())?;
+    if a.mode != "replica" {
+        return Ok(None);
+    }
+    a.store.load_snapshot(snap)?;
+    Ok(Some(digest))
 }
 #[tokio::main(worker_threads = 2)]
 async fn main() {

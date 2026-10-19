@@ -2,7 +2,10 @@
 use crate::{bgp, model::*, tunnel};
 use chrono::Utc;
 use ipnet::IpNet;
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
 pub const MAX_PREPENDS: i64 = 5;
 pub type TunnelHealth = HashMap<String, HashMap<String, String>>;
 fn capacity(n: &Node) -> f64 {
@@ -25,11 +28,19 @@ fn next_hop(n: &Node) -> String {
     if let Ok(addr) = n.advertise.parse::<SocketAddr>() {
         return addr.ip().to_string();
     }
-    // SplitHostPort accepts non-IP hosts too; retain that behavior.
-    if n.advertise.matches(':').count() == 1 {
-        return n.advertise.split(':').next().unwrap_or("").into();
+    let host = if n.advertise.matches(':').count() == 1 {
+        n.advertise.split(':').next().unwrap_or("")
+    } else {
+        n.advertise.as_str()
+    };
+    // Only an address can be a next hop. A hostname, which an agent on a wildcard listener
+    // advertises by default, would make the speaker refuse the node's whole plan, so it is left
+    // out the way an empty advertise is.
+    if host.parse::<IpAddr>().is_ok() {
+        host.into()
+    } else {
+        String::new()
     }
-    n.advertise.clone()
 }
 pub fn plan(
     p: &Policy,
@@ -37,13 +48,18 @@ pub fn plan(
     shedding: &HashMap<String, i64>,
     health: &TunnelHealth,
 ) -> Vec<Announcement> {
-    let max = nodes
-        .iter()
-        .filter(|n| n.status != "stale")
-        .map(capacity)
-        .fold(0.0, f64::max);
     let mut out = Vec::new();
     for prefix in &p.protected {
+        // Padding is relative to the largest node actually announcing this prefix. A node outside
+        // its regions, or one that cannot deliver it, is not competing for its traffic, and
+        // counting it would pad every real announcer and spend the shedding budget for nothing.
+        let max = nodes
+            .iter()
+            .filter(|n| {
+                n.status != "stale" && eligible(p, n, prefix) && deliverable(p, n, prefix, health).0
+            })
+            .map(capacity)
+            .fold(0.0, f64::max);
         for n in nodes {
             if !eligible(p, n, prefix) {
                 continue;

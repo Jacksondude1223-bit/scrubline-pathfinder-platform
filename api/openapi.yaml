@@ -101,6 +101,12 @@ paths:
       security: []
       description: 'Open: no credential. It carries no policy detail.'
       responses:
+        '503':
+          description: A request failed so badly that the control-plane state can no longer be used. Restart the process.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '200':
           description: The control plane is up.
           content:
@@ -280,7 +286,7 @@ paths:
                   status:
                     type: string
         '400':
-          description: The body was present but malformed.
+          description: The body was present but malformed, or reported the same tunnel twice.
           content:
             application/json:
               schema:
@@ -1148,6 +1154,8 @@ components:
             type: string
           minItems: 1
           uniqueItems: true
+          description: Network prefixes with no host bits set, each naming a different network. A speaker
+            refuses a route with host bits, so such a prefix would never be announced.
         rules:
           type: array
           items:
@@ -1892,7 +1900,8 @@ components:
           - gre
           - ipip
           description: GRE unless the customer's edge cannot do it. ipip is lighter but carries no key,
-            so it cannot demultiplex several tunnels between the same pair of addresses.
+            so it cannot demultiplex several tunnels between the same pair of addresses, and it carries IPv4
+            only, so a tunnel with an IPv6 prefix must be GRE.
         remote:
           type: string
           example: 198.51.100.1
@@ -1906,7 +1915,8 @@ components:
             that does.'
         mss_clamp:
           type: integer
-          description: TCP MSS to clamp inbound traffic to. Zero derives it from the MTU. Without clamping,
+          description: TCP MSS to clamp inbound traffic to. Zero derives it from the MTU, 40 bytes below
+            it, or 60 when the tunnel carries an IPv6 prefix, since the clamp rewrites both families. Without clamping,
             a customer whose path drops the ICMP that path-MTU discovery needs sees TCP complete its handshake
             and then hang — the classic way a working tunnel still looks broken.
         key:

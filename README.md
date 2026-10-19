@@ -178,7 +178,9 @@ withdraw route 203.0.113.0/24 next-hop 198.51.100.1
 ```
 
 Give the agent `-local-as` so it can pad the path, and `-bgp-next-hop` when the
-address upstreams should route to differs from the one peers reach the node on.
+address upstreams should route to differs from the one peers reach the node on,
+or when `-advertise` is a hostname: only an address can be a next hop, so a
+hostname leaves it off the commands and the agent warns at startup.
 Communities are validated when the policy is saved, not at the speaker: these
 lines are written into a routing daemon's control pipe, so an unchecked value
 would be a command injection into the thing that decides where the internet
@@ -867,8 +869,10 @@ cargo run --release --bin scrub-node -- -api https://127.0.0.1:8080 -ca certs/ca
 cargo run --release --bin scrubctl -- -api https://127.0.0.1:8080 -ca certs/ca.pem fabric
 ```
 
-Listeners carry read, write, header and idle timeouts, so a handful of idle
-connections cannot hold one open.
+Listeners close a connection that sends nothing for 10 seconds after it is
+accepted, take 10 seconds at most over a request's headers, and close one that
+has been idle for two minutes, so a handful of idle connections cannot hold one
+open.
 
 ## API
 

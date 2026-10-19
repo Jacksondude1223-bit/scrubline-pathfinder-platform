@@ -63,8 +63,14 @@ fn apply(l: &mut Level, s: &Sample, now: DateTime<Utc>) {
         return;
     }
     if s.capacity_pps <= 0 {
+        // A node that declares no ceiling is never padded for load, including padding it earned
+        // before it stopped declaring one.
         l.ratio = 0.0;
-        l.reason = "holding: node reports no packet-rate capacity to measure against".into();
+        if l.prepends != 0 {
+            l.prepends = 0;
+            l.changed_at = now;
+        }
+        l.reason = "not padded for load: node reports no packet-rate capacity".into();
         return;
     }
     let measured = if s.pulsing {

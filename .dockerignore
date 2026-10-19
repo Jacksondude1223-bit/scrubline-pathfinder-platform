@@ -6,7 +6,9 @@ bin/
 dist/
 *.exe
 *.test
-.env
+# Patterns here are anchored at the context root, so .env alone misses deploy/.env, where the
+# operator token lives.
+**/.env
 .DS_Store
 
 target/

@@ -25,10 +25,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 use subtle::ConstantTimeEq;
-type Error = (u16, String);
+// A string becomes {"error": ...}; an object is sent as the whole body, for the few answers the
+// contract gives more than a message.
+type Error = (u16, Value);
 type Answer<T = Value> = std::result::Result<T, Error>;
 fn bad(e: impl ToString) -> Error {
-    (400, e.to_string())
+    (400, e.to_string().into())
 }
 // The API contract answers 503 for a write that could not be made durable: the change was rolled
 // back, which is what a caller needs to know to retry it.
@@ -360,7 +362,7 @@ impl Api {
                 validation::node(&n).map_err(bad)?;
                 let (n, token) = self.store.register(n, now).map_err(|e| {
                     if e.contains("different live node") {
-                        (409, e)
+                        (409, e.into())
                     } else {
                         eprintln!("registration failed: {e}");
                         (500, "could not issue a node credential".into())
@@ -397,11 +399,17 @@ impl Api {
                 n.status = "ready".into();
                 let name = n.name.clone();
                 let region = n.region.clone();
+                // A tunnel reported twice would be withdrawn on one entry while scrubline_tunnel_up
+                // reads the other.
+                let mut seen = HashSet::new();
                 for st in &hb.tunnels {
                     if st.tunnel_id.is_empty() {
                         return Err(bad("tunnel_id required"));
                     }
                     crate::tunnel::validate_status(&st.state).map_err(bad)?;
+                    if !seen.insert(&st.tunnel_id) {
+                        return Err(bad(format!("duplicate tunnel_id {:?}", st.tunnel_id)));
+                    }
                 }
                 if !hb.tunnels.is_empty() {
                     let mut tunnels = hb.tunnels;
@@ -503,7 +511,10 @@ impl Api {
                     ml::validate_sample(s).map_err(|e| bad(format!("samples[{i}]: {e}")))?;
                 }
                 if self.store.data.samples.len() + batch.samples.len() > 200000 {
-                    return Err((413, "training set is limited to 200000 samples".into()));
+                    return Err((
+                        413,
+                        json!({"error":"training set is limited to 200000 samples","stored":self.store.data.samples.len()}),
+                    ));
                 }
                 let stored = self
                     .store
@@ -631,7 +642,8 @@ impl Api {
                     .map(|s| duration(s))
                     .transpose()
                     .map_err(bad)?
-                    .unwrap_or(86400000);
+                    .unwrap_or(86400000)
+                    .min(86400000);
                 let window = duration_string(span);
                 let prefixes = self.visible(&who);
                 match *kind {
@@ -665,7 +677,7 @@ impl Api {
                             ));
                         }
                         Ok(
-                            json!({"prefix":prefix,"window":window,"step":duration_string(step),"points":self.collector.points(prefix,span,step,ms)}),
+                            json!({"prefix":prefix,"window":window,"step":duration_string(analytics::resolution(step)),"points":self.collector.points(prefix,span,step,ms)}),
                         )
                     }
                     _ => {
@@ -768,23 +780,57 @@ pub fn duration_string(ms: i64) -> String {
 
 // The lock can be held across a durable write, so it is only ever waited on from the blocking
 // pool: waiting on it from an async handler parks one of the runtime's two worker threads.
-async fn health(State(s): State<Shared>) -> Json<Value> {
-    let mode = tokio::task::spawn_blocking(move || s.lock().unwrap().mode.clone())
+// A lock poisoned by a panicking request fails every call after it, so health must say so: a
+// liveness probe that keeps reading "ok" never restarts a control plane that has stopped working.
+async fn health(State(s): State<Shared>) -> Response {
+    let mode = tokio::task::spawn_blocking(move || s.lock().map(|a| a.mode.clone()).ok())
         .await
-        .unwrap_or_default();
-    Json(
-        json!({"status":"ok","product":"scrubline-cloud","datapath":"asic-tcam+fpga+pfring-zc+ml","mode":mode}),
-    )
+        .ok()
+        .flatten();
+    match mode {
+        Some(mode) => Json(
+            json!({"status":"ok","product":"scrubline-cloud","datapath":"asic-tcam+fpga+pfring-zc+ml","mode":mode}),
+        )
+        .into_response(),
+        None => response(Err((
+            503,
+            json!({"status":"error","error":"control-plane state is unusable after an internal failure; restart this process"}),
+        ))),
+    }
 }
 fn response(result: Answer) -> Response {
     match result {
         Ok(v) => Json(v).into_response(),
-        Err((status, message)) => (
+        Err((status, body)) => (
             StatusCode::from_u16(status).unwrap(),
-            Json(json!({"error":message})),
+            Json(if body.is_object() {
+                body
+            } else {
+                json!({"error":body})
+            }),
         )
             .into_response(),
     }
+}
+/// Paths arrive percent-encoded and ids are stored decoded, so an id needing escaping would never
+/// match its own route otherwise. None for an escape that is not two hex digits, or not UTF-8.
+fn decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))?;
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 async fn handler(
     State(s): State<Shared>,
@@ -793,7 +839,10 @@ async fn handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !uri.path().starts_with("/v1/") {
+    let Some(path) = decode_path(uri.path()) else {
+        return response(Err((400, "malformed request path".into())));
+    };
+    if !path.starts_with("/v1/") {
         return response(Err((404, "not found".into())));
     }
     let query: HashMap<_, _> = uri
@@ -807,23 +856,16 @@ async fn handler(
         })
         .unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || {
-        let (mut a, result) = if method == Method::POST && uri.path() == "/v1/ml/train" {
+        let (mut a, result) = if method == Method::POST && path == "/v1/ml/train" {
             let result = train(&s, &headers, &body);
             (s.lock().unwrap(), result)
         } else {
             let mut a = s.lock().unwrap();
-            let result = a.dispatch(
-                method.as_str(),
-                uri.path(),
-                &query,
-                &headers,
-                &body,
-                Utc::now(),
-            );
+            let result = a.dispatch(method.as_str(), &path, &query, &headers, &body, Utc::now());
             (a, result)
         };
         let code = result.as_ref().map(|_| 200).unwrap_or_else(|e| e.0);
-        let route = route_label(uri.path());
+        let route = route_label(&path);
         *a.requests.entry((route, code)).or_default() += 1;
         result
     })

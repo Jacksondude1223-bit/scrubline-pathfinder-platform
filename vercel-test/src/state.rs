@@ -171,11 +171,17 @@ impl Reputation {
             return;
         }
         let e = self.entries.get_mut(src).unwrap();
+        // Trust is held at the proof that earned it. A weaker proof, such as a blind handshake
+        // or spoofed return traffic, neither raises nor prolongs trust a challenge earned, and
+        // once trust lapses the old proof is gone rather than re-armed by whatever comes next.
+        if now < e.trusted && proof < e.proof {
+            return;
+        }
         if e.trusted < now {
             self.counts[2] += 1;
         }
         e.trusted = now + 300000;
-        e.proof = e.proof.max(proof);
+        e.proof = proof;
         e.strikes = 0;
     }
     pub fn strike(&mut self, src: &str, now: i64) {
@@ -210,15 +216,20 @@ impl Reputation {
             self.counts[3] += 1;
         }
     }
-    pub fn release(&mut self, src: &str) -> bool {
-        if let Some(e) = self.entries.get_mut(src) {
-            if e.penalised != 0 {
-                e.penalised = 0;
-                e.strikes = 0;
-                return true;
-            }
+    /// Forgives a source's strikes and lifts it out of the penalty box, reporting whether it was
+    /// actually in it. A sentence already served stays on record, because escalation decays from
+    /// the end of the last penalty.
+    pub fn release(&mut self, src: &str, now: i64) -> bool {
+        let Some(e) = self.entries.get_mut(src) else {
+            return false;
+        };
+        e.strikes = 0;
+        if now < e.penalised {
+            e.penalised = 0;
+            true
+        } else {
+            false
         }
-        false
     }
     pub fn stats(&self, now: i64) -> Value {
         json!({"tracked":self.entries.len(),"max":65536,"trusted":self.entries.values().filter(|e|now<e.trusted).count(),"penalised":self.entries.values().filter(|e|now<e.penalised).count(),"fast_passed":self.counts[0],"boxed":self.counts[1],"promotions":self.counts[2],"demotions":self.counts[3],"strikes":self.counts[4],"shielded":self.counts[5],"full":self.counts[6]})
@@ -271,10 +282,9 @@ pub struct Egress {
 }
 impl Egress {
     fn prefix(&mut self, prefix: &str) -> bool {
+        // Keys are the program's own prefixes and forget() prunes them on reload, so the table is
+        // bounded by the policy; a fixed cap silently turned lockdown off past the 256th prefix.
         if prefix.is_empty() {
-            return false;
-        }
-        if !self.series.contains_key(prefix) && self.series.len() >= 256 {
             return false;
         }
         self.series.entry(prefix.into()).or_default();
@@ -311,9 +321,17 @@ impl Egress {
         c.last_seen = now;
         now - c.first < grace
     }
-    pub fn observe_return(&mut self, prefix: &str, addr: &str, packets: i64, now: i64) -> bool {
+    /// Records a reply from the origin. Returns whether this reply confirms the client, and if so
+    /// whether the confirmation is fresh rather than a renewal of one already standing.
+    pub fn observe_return(
+        &mut self,
+        prefix: &str,
+        addr: &str,
+        packets: i64,
+        now: i64,
+    ) -> Option<bool> {
         if addr.is_empty() || packets <= 0 || !self.prefix(prefix) {
-            return false;
+            return None;
         }
         self.series.get_mut(prefix).unwrap().egress = now;
         if now - self.last_sweep >= 5000 {
@@ -332,7 +350,7 @@ impl Egress {
         if !s.clients.contains_key(addr) {
             if self.clients >= 65536 {
                 self.full += 1;
-                return false;
+                return None;
             }
             s.clients.insert(addr.into(), Client::default());
             self.clients += 1;
@@ -351,14 +369,14 @@ impl Egress {
             c.ticks += 1;
         }
         if c.packets < 10 || c.ticks < 3 {
-            return false;
+            return None;
         }
         let fresh = now >= c.confirmed;
         c.confirmed = now + 120000;
         if fresh {
             self.promotions += 1;
         }
-        fresh
+        Some(fresh)
     }
     pub fn confirmed(&self, p: &str, a: &str, now: i64) -> bool {
         self.series

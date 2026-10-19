@@ -1564,8 +1564,8 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ]",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 ] community [ 64512:100 64512:1:2 ]",
-        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]"
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
+        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]"
       ],
       "tunnels": {
         "node-a": [],
@@ -2099,7 +2099,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ]",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -3219,7 +3219,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ]",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -4830,8 +4830,8 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ]",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
-        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]"
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
+        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]"
       ],
       "tunnels": {
         "node-a": [],
@@ -5365,7 +5365,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ]",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -6485,7 +6485,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -8096,8 +8096,8 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ]",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
-        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]"
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
+        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]"
       ],
       "tunnels": {
         "node-a": [],
@@ -8631,7 +8631,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -9751,7 +9751,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ]",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -11362,8 +11362,8 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 ]",
         "announce route 198.51.100.0/24 as-path [ 64512 64512 64512 64512 64512 64512 ]",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 community [ 64512:100 64512:1:2 ]",
-        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]"
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 community [ 64512:100 ] large-community [ 64512:1:2 ]",
+        "announce route 203.0.113.0/24 as-path [ 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]"
       ],
       "tunnels": {
         "node-a": [],
@@ -11897,7 +11897,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ]",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {
@@ -13017,7 +13017,7 @@
         "announce route 198.51.100.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ]",
         "withdraw route 198.51.100.0/24",
         "withdraw route 198.51.100.0/24",
-        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ] community [ 64512:100 64512:1:2 ]",
+        "announce route 203.0.113.0/24 next-hop 192.0.2.1 as-path [ 64512 64512 64512 ] community [ 64512:100 ] large-community [ 64512:1:2 ]",
         "withdraw route 203.0.113.0/24"
       ],
       "tunnels": {

@@ -18,6 +18,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::{BTreeMap, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -29,6 +30,9 @@ pub struct Agent {
     health: Vec<TunnelStatus>,
     local_as: i64,
     next_hop: String,
+    // Prefixes this node announced that have since left its plan, kept as withdrawals: ExaBGP
+    // holds a route until told otherwise, and the pipeline no longer scrubs what it attracts.
+    retired: BTreeMap<String, Announcement>,
 }
 type Shared = Arc<Mutex<Agent>>;
 fn json_response(code: u16, v: Value) -> Response {
@@ -48,9 +52,47 @@ fn text(lines: Vec<String>) -> Response {
     )
         .into_response()
 }
+// A text format is written straight into a daemon's configuration, so a rendering failure must not
+// look like an empty plan: an empty 200 would have a speaker withdraw everything.
+fn rendered(lines: Vec<String>, err: &str) -> Response {
+    if err.is_empty() {
+        text(lines)
+    } else {
+        error(500, format!("could not render: {err}"))
+    }
+}
+fn hostname() -> String {
+    // HOSTNAME is a shell variable, usually not exported, so read the kernel's name first.
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "localhost".into())
+}
 impl Agent {
+    /// Installs a newly fetched program, turning anything it stopped announcing into a withdrawal.
+    pub fn install(&mut self, prog: Program) {
+        let planned: HashSet<_> = prog.announcements.iter().map(|a| &a.prefix).collect();
+        for a in &self.pipe.program.announcements {
+            if a.state == "announce" && !planned.contains(&a.prefix) {
+                self.retired.insert(
+                    a.prefix.clone(),
+                    Announcement {
+                        state: "withdraw".into(),
+                        prepends: 0,
+                        reason: "no longer in this node's plan".into(),
+                        ..a.clone()
+                    },
+                );
+            }
+        }
+        self.retired.retain(|prefix, _| !planned.contains(prefix));
+        self.pipe.load(prog);
+    }
     fn announcements(&self) -> Vec<Announcement> {
         let mut rows = self.pipe.program.announcements.clone();
+        rows.extend(self.retired.values().cloned());
         if !self.next_hop.is_empty() {
             for a in &mut rows {
                 a.next_hop = self.next_hop.clone();
@@ -122,7 +164,7 @@ impl Agent {
                     Err(e) => (vec![], e),
                 };
                 if format == "exabgp" {
-                    return text(commands);
+                    return rendered(commands, &err);
                 }
                 json_response(
                     200,
@@ -135,7 +177,7 @@ impl Agent {
                     Err(e) => (vec![], e),
                 };
                 if format == "iproute2" {
-                    return text(commands);
+                    return rendered(commands, &err);
                 }
                 json_response(
                     200,
@@ -151,12 +193,16 @@ impl Agent {
                     Ok(v) => v,
                     Err(e) => return error(400, e),
                 };
+                let mut seen = HashSet::new();
                 for t in &body.tunnels {
                     if t.tunnel_id.is_empty() {
                         return error(400, "tunnel_id required");
                     }
                     if let Err(e) = tunnel::validate_status(&t.state) {
                         return error(400, e);
+                    }
+                    if !seen.insert(&t.tunnel_id) {
+                        return error(400, format!("duplicate tunnel_id {:?}", t.tunnel_id));
                     }
                 }
                 self.health = body.tunnels;
@@ -180,7 +226,7 @@ impl Agent {
                     }
                 };
                 if format == "bird" {
-                    return text(config);
+                    return rendered(config, &err);
                 }
                 json_response(
                     200,
@@ -215,7 +261,7 @@ impl Agent {
                 let released = body
                     .release
                     .iter()
-                    .filter(|src| self.pipe.reputation.release(src))
+                    .filter(|src| self.pipe.reputation.release(src, ms))
                     .count();
                 json_response(200, json!({"released":released}))
             }
@@ -336,15 +382,20 @@ pub async fn run() -> Result<()> {
     } else {
         let listen = f.get("listen");
         if listen.starts_with("0.0.0.0:") || listen.starts_with("[::]:") {
-            format!(
-                "{}:{}",
-                std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into()),
-                listen.rsplit(':').next().unwrap()
-            )
+            format!("{}:{}", hostname(), listen.rsplit(':').next().unwrap())
         } else {
             listen.into()
         }
     };
+    let host = advertise
+        .rsplit_once(':')
+        .map_or(advertise.as_str(), |(h, _)| h)
+        .trim_matches(['[', ']']);
+    if next_hop.is_empty() && host.parse::<std::net::IpAddr>().is_err() {
+        eprintln!(
+            "warning: advertise host {host:?} is not an IP address, so announcements carry no next hop; pass -bgp-next-hop"
+        );
+    }
     let desired = Node {
         name: f.get("name").into(),
         region: f.get("region").into(),
@@ -385,6 +436,7 @@ pub async fn run() -> Result<()> {
         health: vec![],
         local_as,
         next_hop,
+        retired: BTreeMap::new(),
     }));
     let s = state.clone();
     tokio::spawn(async move {
@@ -425,7 +477,7 @@ pub async fn run() -> Result<()> {
                     || prog.version != a.pipe.program.version
                     || prog.compiled_at != a.pipe.program.compiled_at
                 {
-                    a.pipe.load(prog);
+                    a.install(prog);
                 }
             }
             if let Ok(model) =
@@ -465,4 +517,75 @@ pub async fn run() -> Result<()> {
         f.boolean("insecure")?,
     )
     .await
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn agent(announcements: Vec<Announcement>) -> Agent {
+        Agent {
+            node: Node {
+                id: "n".into(),
+                ..Default::default()
+            },
+            pipe: Pipeline::new(Program {
+                announcements,
+                ..Default::default()
+            }),
+            local_token: "local".into(),
+            health: vec![],
+            local_as: 0,
+            next_hop: String::new(),
+            retired: BTreeMap::new(),
+        }
+    }
+    fn row(prefix: &str, prepends: i64) -> Announcement {
+        Announcement {
+            prefix: prefix.into(),
+            node_id: "n".into(),
+            state: "announce".into(),
+            prepends,
+            ..Default::default()
+        }
+    }
+    fn call(a: &mut Agent, method: &str, uri: &str, body: &[u8]) -> u16 {
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer local".parse().unwrap());
+        a.dispatch(method, &uri.parse().unwrap(), &headers, body)
+            .status()
+            .as_u16()
+    }
+    #[test]
+    fn prefixes_leaving_the_plan_are_withdrawn() {
+        let mut a = agent(vec![row("203.0.113.0/24", 0), row("203.0.114.10/32", 0)]);
+        a.install(Program {
+            announcements: vec![row("203.0.113.0/24", 0)],
+            ..Default::default()
+        });
+        let withdrawn: Vec<_> = a
+            .announcements()
+            .into_iter()
+            .filter(|r| r.state == "withdraw")
+            .map(|r| r.prefix)
+            .collect();
+        assert_eq!(withdrawn, ["203.0.114.10/32"]);
+        a.install(Program {
+            announcements: vec![row("203.0.113.0/24", 0), row("203.0.114.10/32", 0)],
+            ..Default::default()
+        });
+        assert!(a.announcements().iter().all(|r| r.state == "announce"));
+    }
+    #[test]
+    fn text_formats_fail_loudly_when_they_cannot_render() {
+        let mut a = agent(vec![row("203.0.113.0/24", 2)]);
+        assert_eq!(call(&mut a, "GET", "/bgp?format=exabgp", b""), 500);
+        a.local_as = 64512;
+        assert_eq!(call(&mut a, "GET", "/bgp?format=exabgp", b""), 200);
+    }
+    #[test]
+    fn duplicate_tunnel_reports_are_refused() {
+        let mut a = agent(vec![]);
+        let twice =
+            br#"{"tunnels":[{"tunnel_id":"t","state":"up"},{"tunnel_id":"t","state":"down"}]}"#;
+        assert_eq!(call(&mut a, "POST", "/tunnels", twice), 400);
+    }
 }
