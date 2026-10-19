@@ -1,6 +1,6 @@
 use pathfinder::{
     ml,
-    model::{Flow, Match, Program, ZCEntry},
+    model::{Flow, GameFilter, Match, Program, ReputationPolicy, ZCEntry},
     pipeline::Pipeline,
     state::{Egress, Pulse, Reputation},
 };
@@ -77,15 +77,15 @@ fn bounded_state_expires_without_sleeping() {
         r.strike("source", start + i);
     }
     assert_eq!(r.check("source", start + 5), 2);
-    assert!(r.release("source"));
+    assert!(r.release("source", start + 5));
     assert_eq!(r.check("source", start + 6), 0);
     r.promote("source", 3, start + 7);
     assert_eq!(r.check("source", start + 8), 1);
     assert_eq!(r.check("source", start + 300008), 0);
     let mut e = Egress::default();
     for i in 0..3 {
-        let fresh = e.observe_return("p", "client", 4, start + i * 250);
-        assert_eq!(fresh, i == 2);
+        let confirmed = e.observe_return("p", "client", 4, start + i * 250);
+        assert_eq!(confirmed, (i == 2).then_some(true));
     }
     assert!(e.confirmed("p", "client", start + 501));
     assert_eq!(e.visibility("p", start + 501), "visible");
@@ -171,4 +171,139 @@ fn reloading_without_a_pulse_floor_restores_the_default() {
         pipe.decide(&burst, start + i * 1000);
     }
     assert_eq!(pipe.stats(start + 2000)["pulsing"], true);
+}
+const T0: i64 = 1767225600000;
+fn gated(games: Vec<GameFilter>, fast_pass: &str) -> Program {
+    Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        games,
+        challenge_secret: "secret".into(),
+        reputation: Some(ReputationPolicy {
+            fast_pass: fast_pass.into(),
+            penalty_box: true,
+        }),
+        ..Default::default()
+    }
+}
+fn game(id: &str, dport: i64, profile: &str) -> GameFilter {
+    GameFilter {
+        id: id.into(),
+        proto: "udp".into(),
+        dport,
+        profile: profile.into(),
+        ..Default::default()
+    }
+}
+fn packet(src: &str, dport: i64, payload: &[u8]) -> Flow {
+    Flow {
+        src_ip: src.into(),
+        dst_ip: "203.0.113.10".into(),
+        proto: "udp".into(),
+        dport,
+        pps: 1,
+        payload: payload.to_vec(),
+        has_payload: true,
+        ..Default::default()
+    }
+}
+#[test]
+fn handshake_players_stay_connected_after_their_trust_lapses() {
+    let mut pipe = Pipeline::new(gated(vec![game("game", 19132, "raknet")], "handshake"));
+    pipe.decide(&packet("192.0.2.1", 19132, &[0x05]), T0);
+    pipe.decide(&packet("192.0.2.1", 19132, &[0x07]), T0 + 1);
+    for s in 1..=40 {
+        let d = pipe.decide(&packet("192.0.2.1", 19132, &[0x84, 0, 0]), T0 + s * 10000);
+        assert_eq!(d.action, "permit", "t+{}s: {}", s * 10, d.reason);
+    }
+}
+#[test]
+fn clients_the_origin_keeps_answering_stay_trusted() {
+    let mut pipe = Pipeline::new(gated(vec![], "egress"));
+    let reply = Flow {
+        src_ip: "203.0.113.10".into(),
+        dst_ip: "192.0.2.9".into(),
+        proto: "udp".into(),
+        pps: 4,
+        ..Default::default()
+    };
+    for s in 0..=400 {
+        pipe.observe_return(&reply, T0 + s * 1000);
+    }
+    let client = packet("192.0.2.9", 19132, &[]);
+    let d = pipe.decide(&client, T0 + 400500);
+    assert_eq!(d.reason, "verified source, fast path");
+    assert_eq!(pipe.stats(T0 + 400500)["egress"]["promoted"], 1);
+}
+#[test]
+fn a_weaker_proof_neither_restores_nor_prolongs_trust() {
+    let mut r = Reputation::default();
+    r.proof = 3;
+    r.promote("victim", 3, T0);
+    assert_eq!(r.check("victim", T0 + 1), 1);
+    r.promote("victim", 1, T0 + 200000);
+    assert_eq!(r.check("victim", T0 + 300001), 0);
+    r.promote("victim", 1, T0 + 400000);
+    assert_eq!(r.check("victim", T0 + 400001), 0);
+    r.promote("victim", 3, T0 + 500000);
+    assert_eq!(r.check("victim", T0 + 500001), 1);
+}
+#[test]
+fn releasing_reports_only_sources_still_in_the_box() {
+    let mut r = Reputation::default();
+    r.boxing = true;
+    for i in 0..4 {
+        r.strike("source", T0 + i);
+    }
+    assert!(!r.release("source", T0 + 3 + 60000 + 1));
+    assert!(!r.release("never-seen", T0));
+}
+#[test]
+fn a2s_info_queries_are_admitted_with_the_challenge_after_their_string() {
+    let mut pipe = Pipeline::new(gated(vec![game("query", 27015, "a2s")], "challenge"));
+    let mut info = vec![255, 255, 255, 255, b'T'];
+    info.extend_from_slice(b"Source Engine Query\0");
+    let d = pipe.decide(&packet("192.0.2.1", 27015, &info), T0);
+    assert_eq!(d.action, "challenge");
+    let mut answer = info.clone();
+    answer.extend_from_slice(&d.reply[5..]);
+    let d = pipe.decide(&packet("192.0.2.1", 27015, &answer), T0 + 1);
+    assert_eq!(d.action, "permit", "{}", d.reason);
+}
+#[test]
+fn observe_only_filters_promote_nobody() {
+    let mut raknet = game("game", 19132, "raknet");
+    raknet.observe = true;
+    let mut pipe = Pipeline::new(gated(vec![raknet], "handshake"));
+    pipe.decide(&packet("192.0.2.1", 19132, &[0x07]), T0);
+    let d = pipe.decide(&packet("192.0.2.1", 19132, &[0x84]), T0 + 1);
+    assert_ne!(d.reason, "verified source, fast path");
+    assert_eq!(pipe.stats(T0 + 1)["reputation"]["promotions"], 0);
+}
+#[test]
+fn return_paths_are_tracked_for_every_prefix_a_node_carries() {
+    let mut e = Egress::default();
+    for i in 0..300 {
+        e.ingress(&format!("prefix-{i}"), T0);
+    }
+    assert_eq!(e.stats(T0)["prefixes"], 300);
+}
+#[test]
+fn flows_are_counted_under_the_most_specific_protected_prefix() {
+    let mut pipe = Pipeline::new(Program {
+        prefixes: vec!["203.0.112.0/22".into(), "203.0.113.0/24".into()],
+        ..Default::default()
+    });
+    pipe.decide(&packet("192.0.2.1", 443, &[]), T0);
+    let stats = pipe.stats(T0);
+    let flows = |prefix: &str| {
+        stats["prefixes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["prefix"] == prefix)
+            .unwrap()["flows"]
+            .clone()
+    };
+    assert_eq!(flows("203.0.113.0/24"), 1);
+    assert_eq!(flows("203.0.112.0/22"), 0);
 }

@@ -84,7 +84,10 @@ impl Series {
     fn fleet(&self, now: i64) -> ([u64; 3], bool, usize) {
         let (mut rates, mut pulse, mut nodes) = ([0u64; 3], false, 0);
         for g in self.gauges.values().filter(|g| now - g.at <= 30000) {
-            nodes += 1;
+            // A node still reporting the prefix after withdrawing it carries none of its traffic.
+            if g.rates[0] > 0 {
+                nodes += 1;
+            }
             for (i, r) in rates.iter_mut().enumerate() {
                 *r = (*r).saturating_add(g.rates[i]);
             }
@@ -132,6 +135,10 @@ pub struct Collector {
     prefix_counters: HashMap<(String, String), [u64; 5]>,
     rule_counters: HashMap<(String, String, bool), [u64; 5]>,
     nodes: HashMap<String, i64>,
+}
+/// The spacing series points actually have: a step rounded up to whole minutes, in milliseconds.
+pub fn resolution(step: i64) -> i64 {
+    ((step.max(1) + 59999) / 60000) * 60000
 }
 // History is kept per minute, so a window shorter than one still covers the current bucket. Without
 // the floor the bucket range runs backwards, and a reversed BTreeMap range panics while the request
@@ -182,11 +189,9 @@ impl Collector {
             .filter(|(_, at)| now - **at > 300000)
             .map(|(n, _)| n.clone())
             .collect();
+        // Only the gauges of a silent node expire. Its baselines stay: the agent keeps counting
+        // while it cannot report, and a counter that only counts up survives reports being missed.
         self.nodes.retain(|n, _| !expired.contains(n));
-        self.prefix_counters
-            .retain(|(n, _), _| !expired.contains(n));
-        self.rule_counters
-            .retain(|(n, _, _), _| !expired.contains(n));
         for s in self.series.values_mut() {
             s.gauges.retain(|n, _| !expired.contains(n));
             s.ring.retain(|minute, _| *minute >= now / 60000 - 1439);
@@ -194,7 +199,12 @@ impl Collector {
         let mut touched = HashSet::new();
         for row in rows(stats, "prefixes") {
             let p = row["prefix"].as_str().unwrap_or("");
-            if p.is_empty() || !self.series.contains_key(p) && self.series.len() >= 256 {
+            // Only what the node is programmed to protect: a row for a prefix just removed would
+            // bring its series back, and arbitrary strings would fill the series cap.
+            if p.is_empty()
+                || !program.prefixes.iter().any(|q| q == p)
+                || !self.series.contains_key(p) && self.series.len() >= 256
+            {
                 continue;
             }
             let s = self.series.entry(p.into()).or_default();
@@ -206,13 +216,14 @@ impl Collector {
                 n(row, "dropped"),
                 0,
             ];
-            let prev = self
-                .prefix_counters
-                .insert((node.into(), p.into()), cur)
-                .unwrap_or([0; 5]);
-            let b = s.ring.entry(now / 60000).or_default();
-            for i in 0..5 {
-                b.counts[i] = b.counts[i].saturating_add(delta(prev[i], cur[i]));
+            // A node's first report is only a baseline. Its counters run from agent start, so
+            // counting them from zero after a control-plane restart, a failover or a node's return
+            // would book its lifetime traffic into this minute.
+            if let Some(prev) = self.prefix_counters.insert((node.into(), p.into()), cur) {
+                let b = s.ring.entry(now / 60000).or_default();
+                for i in 0..5 {
+                    b.counts[i] = b.counts[i].saturating_add(delta(prev[i], cur[i]));
+                }
             }
             s.gauges.insert(
                 node.into(),
@@ -272,26 +283,37 @@ impl Collector {
                 } else {
                     [0, n(r, "drops"), 0, n(r, "pps_dropped"), 0]
                 };
-                let prev = self
+                let Some(prev) = self
                     .rule_counters
                     .insert((node.into(), id.into(), filter), cur)
-                    .unwrap_or([0; 5]);
+                else {
+                    continue;
+                };
                 let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], cur[i]));
                 if diff[1] == 0 && diff[3] == 0 && diff[4] == 0 {
                     continue;
                 }
                 for p in &scope.prefixes {
                     if let Some(s) = self.series.get_mut(p) {
-                        let bucket = s.ring.entry(now / 60000).or_default();
-                        bucket.counts[4] = bucket.counts[4].saturating_add(diff[4]);
+                        // A challenge count shared by several prefixes cannot be split between
+                        // them; booking it to each would double it and show one customer
+                        // another's. The event vectors carry it, marked shared.
+                        if !scope.shared {
+                            let bucket = s.ring.entry(now / 60000).or_default();
+                            bucket.counts[4] = bucket.counts[4].saturating_add(diff[4]);
+                        }
                         touched.insert(p.clone());
                     }
                 }
                 moved.push((id.to_owned(), filter, scope.clone(), diff));
             }
         }
-        for p in touched {
-            self.series.get_mut(&p).unwrap().judge(now);
+        // An open event is judged on every report, not only when its prefix is reported, or it
+        // stays open forever once no node carries the prefix any more.
+        for (p, s) in self.series.iter_mut() {
+            if touched.contains(p) || s.open.is_some() {
+                s.judge(now);
+            }
         }
         for (id, filter, scope, diff) in moved {
             for p in scope.prefixes {
@@ -365,7 +387,7 @@ impl Collector {
         json!({"prefix":p,"from":stamp((now-span).div_euclid(60000)*60000),"to":stamp(now),"flows":count[0],"flows_dropped":count[1],"offered":count[2],"dropped":count[3],"delivered":count[2].saturating_sub(count[3]),"challenged":count[4],"mitigated_pct":if count[2]>0{100.0*count[3]as f64/count[2]as f64}else{0.0},"peak_pps":peak,"peak_dropped_pps":peak_drop,"offered_pps":rates[0],"dropped_pps":rates[1],"nodes":nodes,"under_attack":under,"pulsing":pulse,"attacks":events.len(),"attack_seconds":events.iter().map(|e|e["seconds"].as_f64().unwrap_or(0.0)).sum::<f64>()})
     }
     pub fn points(&self, p: &str, span: i64, step: i64, now: i64) -> Vec<Value> {
-        let per = (step / 60000).max(1);
+        let per = resolution(step) / 60000;
         let last = now / 60000;
         let first = last - minutes(span.clamp(1, 86400000)) + 1;
         let first = first - first.rem_euclid(per);

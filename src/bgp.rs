@@ -25,12 +25,11 @@ pub fn validate_community(c: &str) -> Result<()> {
         }
     };
     for p in parts {
-        // Go's ParseUint accepts a leading +; preserve its numeric grammar.
-        let digits = p.strip_prefix('+').unwrap_or(p);
-        if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        // Plain digits only: neither Go's ParseUint nor ExaBGP's parser takes a sign.
+        if p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit()) {
             return Err(format!("community {c:?}: component {p:?} is not a number"));
         }
-        if digits.parse::<u64>().map_err(|e| e.to_string())? > max {
+        if p.parse::<u64>().map_err(|e| e.to_string())? > max {
             return Err(format!("community {c:?}: component {p:?} is above {max}"));
         }
     }
@@ -81,7 +80,24 @@ pub fn commands(plan: &[Announcement], local_as: i64) -> Result<Vec<String>> {
                 for c in &a.communities {
                     validate_community(c)?;
                 }
-                line += &format!(" community [ {} ]", a.communities.join(" "));
+                // ExaBGP reads `community` entries as ASN:value or a well-known name and refuses
+                // the whole command on a three-part value; large communities have their own.
+                let (large, standard): (Vec<&String>, Vec<&String>) = a
+                    .communities
+                    .iter()
+                    .partition(|c| c.matches(':').count() == 2);
+                let join = |v: Vec<&String>| {
+                    v.into_iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                };
+                if !standard.is_empty() {
+                    line += &format!(" community [ {} ]", join(standard));
+                }
+                if !large.is_empty() {
+                    line += &format!(" large-community [ {} ]", join(large));
+                }
             }
             Ok(line)
         })
@@ -124,8 +140,9 @@ pub fn validate_session(s: &Session, protected: Option<&HashSet<String>>) -> Res
     if !(0..=255).contains(&s.multihop) {
         return Err("multihop must be in 0..255".into());
     }
-    if s.max_prefixes < 0 {
-        return Err("max_prefixes must not be negative".into());
+    // BIRD refuses a number above 32 bits, and with it the node's whole session configuration.
+    if !(0..=u32::MAX as i64).contains(&s.max_prefixes) {
+        return Err(format!("max_prefixes must be within 0..{}", u32::MAX));
     }
     if s.prefixes.is_empty() {
         return Err("session needs at least one prefix".into());

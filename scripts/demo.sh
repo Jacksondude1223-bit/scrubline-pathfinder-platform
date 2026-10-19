@@ -67,6 +67,11 @@ node_token=$(field 'token' "$first" '["token"]')
 if [ -n "$node_id" ] && [ -n "$node_token" ]; then
   echo
   echo "report a flood at 203.0.113.0/24"
+  # A node's first report is the baseline its later counters are measured from.
+  curl -sf -H "Authorization: Bearer $node_token" -H 'Content-Type: application/json' \
+    -d '{"stats":{"prefixes":[{"prefix":"203.0.113.0/24"}],
+         "rules":[{"rule_id":"tcam-udp-flood","stage":"asic"}]}}' \
+    "$API/v1/nodes/$node_id/heartbeat" >/dev/null
   curl -sf -H "Authorization: Bearer $node_token" -H 'Content-Type: application/json' \
     -d '{"stats":{"prefixes":[
           {"prefix":"203.0.113.0/24","flows":12000,"flows_dropped":11400,

@@ -1,6 +1,9 @@
 use crate::{bgp, gamefilter, model::*, tunnel, Result};
 use ipnet::IpNet;
-use std::{collections::HashSet, net::Ipv4Addr};
+use std::{
+    collections::{HashMap, HashSet},
+    net::Ipv4Addr,
+};
 pub fn node(n: &Node) -> Result<()> {
     if n.name.is_empty() {
         return Err("name required".into());
@@ -44,14 +47,28 @@ pub fn policy(p: &Policy) -> Result<()> {
         return Err("name and protected prefixes required".into());
     }
     let mut protected = HashSet::new();
+    let mut networks = HashMap::new();
     for prefix in &p.protected {
-        prefix
+        let net = prefix
             .parse::<IpNet>()
             .map_err(|e| format!("protected prefix {prefix:?}: {e}"))?;
-        // A repeat would be announced, enforced and attributed twice per node.
-        if !protected.insert(prefix.clone()) {
-            return Err(format!("duplicate protected prefix {prefix}"));
+        // ExaBGP refuses a route with host bits set, so such a prefix would never be announced.
+        if net.addr() != net.network() {
+            return Err(format!(
+                "protected prefix {prefix} has host bits set; write it as {}",
+                net.trunc()
+            ));
         }
+        // A repeat would be announced, enforced and attributed twice per node, and another
+        // spelling of one network (case, leading zeros) is the same repeat.
+        if let Some(other) = networks.insert(net, prefix) {
+            return Err(if other == prefix {
+                format!("duplicate protected prefix {prefix}")
+            } else {
+                format!("protected prefixes {other} and {prefix} are the same network")
+            });
+        }
+        protected.insert(prefix.clone());
     }
     unique(p.steering.iter().map(|s| s.prefix.as_str()), "steering")?;
     for s in &p.steering {
@@ -144,6 +161,27 @@ pub fn policy(p: &Policy) -> Result<()> {
             || r.stage == "zc" && (r.action == "rate_limit" || r.action == "inspect");
         if r.pps > 0 && !meters {
             return Err("pps belongs on an fpga rate_limit or zc rate_limit/inspect rule".into());
+        }
+        // The datapath compares these as text, so a value outside the vocabulary is a rule that
+        // never matches, and proto is also written into the TCAM key.
+        if !["", "any", "tcp", "udp", "icmp"]
+            .contains(&r.r#match.proto.to_ascii_lowercase().as_str())
+        {
+            return Err(format!(
+                "rule {:?}: unknown proto {:?}; use tcp, udp, icmp or any",
+                r.id, r.r#match.proto
+            ));
+        }
+        if !r
+            .r#match
+            .tcp_flags
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b",|+".contains(&c))
+        {
+            return Err(format!(
+                "rule {:?}: tcp_flags may only hold flag names separated by ',', '|' or '+'",
+                r.id
+            ));
         }
         for cidr in [&r.r#match.src_cidr, &r.r#match.dst_cidr] {
             if !cidr.is_empty() {

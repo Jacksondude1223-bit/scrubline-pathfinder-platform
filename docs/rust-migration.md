@@ -52,6 +52,12 @@ omitted, and packet bytes retain JSON base64 encoding. State expiry and timer
 configuration use millisecond precision; the detector/rate buckets retain their
 250ms resolution.
 
+One recording is deliberately not reproduced. Go rendered large communities
+(`ASN:value:value`) inside ExaBGP's `community [ ]`, which ExaBGP refuses, so a
+policy using one was never announced. They now render as `large-community [ ]`,
+and the affected `commands` in `tests/fixtures/go-reference.json` were updated to
+match; everything else in that fixture is Go's output unchanged.
+
 ## Deployment
 
 Back up the state file and replace the binaries or rebuild the image. A restarted

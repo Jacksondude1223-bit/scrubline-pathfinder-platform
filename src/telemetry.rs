@@ -134,11 +134,8 @@ impl Metrics {
             let mut labels = identity(&node.id, &node.name, &node.region);
             labels.push(label("tunnel", &t.id));
             labels.push(label("remote", &t.remote));
-            let state = reports
-                .iter()
-                .find(|r| r.tunnel_id == t.id)
-                .map(|r| r.state.as_str())
-                .unwrap_or("unknown");
+            let report = reports.iter().find(|r| r.tunnel_id == t.id);
+            let state = report.map(|r| r.state.as_str()).unwrap_or("unknown");
             if state == "up" || state == "down" {
                 self.add(
                     "scrubline_tunnel_up",
@@ -147,10 +144,9 @@ impl Metrics {
                 );
             }
             for (name, v) in [
-                (
-                    "scrubline_tunnel_reported",
-                    f64::from(state == "up" || state == "down"),
-                ),
+                // Reporting "unknown" is still a provisioner speaking, which is what this tells
+                // apart from one that is not wired up at all.
+                ("scrubline_tunnel_reported", f64::from(report.is_some())),
                 ("scrubline_tunnel_required", f64::from(t.required)),
                 ("scrubline_tunnel_mtu_bytes", t.mtu as f64),
                 ("scrubline_tunnel_mss_clamp_bytes", t.mss_clamp as f64),

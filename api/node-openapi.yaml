@@ -82,6 +82,12 @@ paths:
           - exabgp
         description: Return ExaBGP commands as text/plain rather than JSON.
       responses:
+        '500':
+          description: The text format was asked for and the configuration could not be rendered. It is an error, not an empty body, so a daemon fed from it never mistakes a failure for an empty plan; the JSON form carries the same reason in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '200':
           description: The plan.
           content:
@@ -132,6 +138,12 @@ paths:
           - iproute2
         description: Return iproute2 and nftables lines as text/plain rather than JSON.
       responses:
+        '500':
+          description: The text format was asked for and the configuration could not be rendered. It is an error, not an empty body, so a daemon fed from it never mistakes a failure for an empty plan; the JSON form carries the same reason in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '200':
           description: The return paths, their rendered configuration, and what has been reported about
             them.
@@ -242,6 +254,12 @@ paths:
           - bird
         description: Return BIRD configuration as text/plain rather than JSON.
       responses:
+        '500':
+          description: The text format was asked for and the configuration could not be rendered. It is an error, not an empty body, so a daemon fed from it never mistakes a failure for an empty plan; the JSON form carries the same reason in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '200':
           description: The peerings and their rendered configuration.
           content:
