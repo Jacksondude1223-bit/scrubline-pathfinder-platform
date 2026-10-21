@@ -12,6 +12,16 @@ pub fn overhead(t: &Tunnel) -> i64 {
         24 + if t.key == 0 { 0 } else { 4 }
     }
 }
+/// The most clean traffic one tunnel may carry to a customer, summed across the fabric: 2.5 Gbit/s.
+pub const MAX_RATE_MBPS: i64 = 2500;
+/// The clean-traffic allowance a tunnel actually gets: its own, or the maximum when it sets none.
+pub fn rate_mbps(t: &Tunnel) -> i64 {
+    if t.rate_mbps == 0 {
+        MAX_RATE_MBPS
+    } else {
+        t.rate_mbps
+    }
+}
 pub fn default_mtu(t: &Tunnel) -> i64 {
     1500 - overhead(t)
 }
@@ -59,6 +69,11 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     }
     if !["", "both", "return"].contains(&t.direction.as_str()) {
         return Err("direction must be both or return".into());
+    }
+    if !(0..=MAX_RATE_MBPS).contains(&t.rate_mbps) {
+        return Err(format!(
+            "rate_mbps must be within 1..{MAX_RATE_MBPS} (2.5 Gbit/s); 0 takes the maximum"
+        ));
     }
     let mut disabled = HashSet::new();
     if t.disabled
@@ -125,44 +140,154 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         interface: interface_name(&t.id)?,
         comment: t.comment.clone(),
         direction: t.direction.clone(),
+        sources: {
+            let mut all = t.prefixes.clone();
+            all.sort();
+            all
+        },
+        // Only the whole policy says which other tunnels' prefixes sit inside this one's.
+        foreign: Vec::new(),
+        // The whole allowance; compiling the fabric splits it among the nodes sending.
+        rate_kbps: rate_mbps(t).saturating_mul(1000),
     })
 }
 /// Whether the customer's replies come back up this tunnel to the node.
 pub fn carries_replies(t: &NodeTunnel) -> bool {
     t.direction != "return"
 }
+/// The networks of one address family in `nets`, with any inside another of them left out: an
+/// nftables interval set refuses overlapping elements on older releases.
+fn outermost(nets: &[IpNet], v4: bool) -> Vec<IpNet> {
+    let mut out: Vec<IpNet> = nets
+        .iter()
+        .filter(|n| matches!(n, IpNet::V4(_)) == v4)
+        .filter(|n| {
+            !nets
+                .iter()
+                .any(|o| o.prefix_len() < n.prefix_len() && o.contains(*n))
+        })
+        .copied()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+/// `net` less every network in `holes`, as whole networks.
+fn subtract(net: IpNet, holes: &[IpNet]) -> Vec<IpNet> {
+    if holes.iter().any(|h| h.contains(&net)) {
+        return vec![];
+    }
+    if !holes.iter().any(|h| net.contains(h)) {
+        return vec![net];
+    }
+    net.subnets(net.prefix_len() + 1)
+        .map(|halves| halves.flat_map(|half| subtract(half, holes)).collect())
+        .unwrap_or_default()
+}
+/// Where replies up a tunnel may come from: every address whose most specific covering prefix,
+/// among all the tunnels' prefixes, is one of this tunnel's. Routing goes by the most specific
+/// prefix, so that is whose customer an address is.
+fn owned(mine: &[IpNet], theirs: &[IpNet]) -> Vec<IpNet> {
+    let all: Vec<IpNet> = mine.iter().chain(theirs).copied().collect();
+    let mut out = Vec::new();
+    for p in mine {
+        let inside: Vec<IpNet> = all
+            .iter()
+            .filter(|q| q.prefix_len() > p.prefix_len() && p.contains(*q))
+            .copied()
+            .collect();
+        out.extend(subtract(*p, &inside));
+    }
+    IpNet::aggregate(&out)
+}
+fn nets(prefixes: &[String]) -> Result<Vec<IpNet>> {
+    prefixes
+        .iter()
+        .map(|p| Ok(p.parse::<IpNet>().map_err(|e| e.to_string())?.trunc()))
+        .collect()
+}
+fn listed(nets: &[IpNet]) -> String {
+    nets.iter()
+        .map(IpNet::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 /// The rules for traffic coming back up a tunnel: the customer's replies, which the node forwards
 /// to the internet. Only the tunnel's own prefixes may be sources, or the tunnel would be an open
 /// relay for anything the customer's edge sends into it, and SYNs leaving through it are clamped
-/// so the far side's segments fit the tunnel too.
+/// so the far side's segments fit the tunnel too. A more specific prefix of another tunnel inside
+/// one of this tunnel's is that customer's, so it is refused as a source here, whether or not
+/// that tunnel is built on this node. A tunnel that carries no replies forwards nothing that
+/// comes up it.
 pub fn reply_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
-    let mut rows: Vec<_> = tunnels.iter().filter(|t| carries_replies(t)).collect();
+    let mut rows: Vec<_> = tunnels.iter().collect();
+    rows.sort_by_key(|t| &t.id);
+    let mut lines = Vec::new();
+    for t in &rows {
+        let name = interface_name(&t.id)?;
+        let rule =
+            |tail: String| format!("nft add rule inet scrubline forward iifname \"{name}\" {tail}");
+        if !carries_replies(t) {
+            lines.push(rule("drop".into()));
+            continue;
+        }
+        // Replies may come from any of the tunnel's prefixes, not only the ones this node
+        // announces: a customer routes them up whichever tunnel it likes. A program from a control
+        // plane that sends neither list falls back to what this node knows.
+        let mine = nets(if t.sources.is_empty() {
+            &t.prefixes
+        } else {
+            &t.sources
+        })?;
+        let mut theirs = nets(&t.foreign)?;
+        for other in rows.iter().filter(|o| o.id != t.id) {
+            theirs.extend(nets(if other.sources.is_empty() {
+                &other.prefixes
+            } else {
+                &other.sources
+            })?);
+        }
+        let owned = owned(&mine, &theirs);
+        for (family, match_on, v4) in [("ipv4", "ip", true), ("ipv6", "ip6", false)] {
+            let envelope = outermost(&mine, v4);
+            let foreign =
+                IpNet::aggregate(&envelope.iter().flat_map(|p| subtract(*p, &owned)).collect());
+            if !foreign.is_empty() {
+                lines.push(rule(format!(
+                    "{match_on} saddr {{ {} }} drop",
+                    listed(&foreign)
+                )));
+            }
+            lines.push(rule(if envelope.is_empty() {
+                format!("meta nfproto {family} drop")
+            } else {
+                format!("{match_on} saddr != {{ {} }} drop", listed(&envelope))
+            }));
+        }
+        if t.mss_clamp > 0 {
+            lines.push(rule(format!(
+                "tcp flags syn tcp option maxseg size set {}",
+                t.mss_clamp
+            )));
+        }
+    }
+    Ok(lines)
+}
+/// Holds the clean traffic going down each tunnel to this node's share of its allowance. A
+/// shaper rather than a policer, so TCP sees queueing it can back off from instead of drops; the
+/// burst covers 10ms at the rate, and never less than 32KiB so a slow share still passes a full
+/// frame and stays within what tbf can represent.
+pub fn rate_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
+    let mut rows: Vec<_> = tunnels.iter().filter(|t| t.rate_kbps > 0).collect();
     rows.sort_by_key(|t| &t.id);
     let mut lines = Vec::new();
     for t in rows {
         let name = interface_name(&t.id)?;
-        let (mut v4, mut v6) = (Vec::new(), Vec::new());
-        for prefix in &t.prefixes {
-            match prefix.parse::<IpNet>().map_err(|e| e.to_string())?.trunc() {
-                IpNet::V4(p) => v4.push(p.to_string()),
-                IpNet::V6(p) => v6.push(p.to_string()),
-            }
-        }
-        v4.sort();
-        v6.sort();
-        for (family, match_on, sources) in [("ipv4", "ip", v4), ("ipv6", "ip6", v6)] {
-            lines.push(if sources.is_empty() {
-                format!("nft add rule inet scrubline forward iifname \"{name}\" meta nfproto {family} drop")
-            } else {
-                format!(
-                    "nft add rule inet scrubline forward iifname \"{name}\" {match_on} saddr != {{ {} }} drop",
-                    sources.join(", ")
-                )
-            });
-        }
-        if t.mss_clamp > 0 {
-            lines.push(format!("nft add rule inet scrubline forward iifname \"{name}\" tcp flags syn tcp option maxseg size set {}", t.mss_clamp));
-        }
+        let burst = (t.rate_kbps.saturating_mul(5) / 4).max(32768);
+        lines.push(format!(
+            "tc qdisc replace dev {name} root tbf rate {}kbit burst {burst} latency 50ms",
+            t.rate_kbps
+        ));
     }
     Ok(lines)
 }

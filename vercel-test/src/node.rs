@@ -88,6 +88,22 @@ impl Agent {
             }
         }
         self.retired.retain(|prefix, _| !planned.contains(prefix));
+        // What the provisioner said about a tunnel stops applying once the tunnel leaves this
+        // node's program or is rebuilt between other ends. It rides every heartbeat, so keeping
+        // it would let a required tunnel be announced on a report about the one it replaced.
+        let old = &self.pipe.program.tunnels;
+        self.health.retain(|h| {
+            prog.tunnels.iter().any(|t| {
+                t.id == h.tunnel_id
+                    && old.iter().any(|o| {
+                        o.id == t.id
+                            && o.local == t.local
+                            && o.remote == t.remote
+                            && o.key == t.key
+                            && o.r#type == t.r#type
+                    })
+            })
+        });
         self.pipe.load(prog);
     }
     /// This node with the tunnel endpoint the control plane holds for it, which an operator may
@@ -184,6 +200,7 @@ impl Agent {
                 let tunnels = &self.pipe.program.tunnels;
                 let rendered_all = tunnel::commands(tunnels).and_then(|mut lines| {
                     lines.extend(tunnel::reply_commands(tunnels)?);
+                    lines.extend(tunnel::rate_commands(tunnels)?);
                     Ok(lines)
                 });
                 let (commands, err) = match rendered_all {
@@ -603,6 +620,34 @@ mod tests {
         assert_eq!(call(&mut a, "POST", "/tunnels", twice), 400);
     }
     #[test]
+    fn reports_about_tunnels_that_left_or_were_rebuilt_are_dropped() {
+        let tunnel = |id: &str, remote: &str| NodeTunnel {
+            id: id.into(),
+            local: "192.0.2.1".into(),
+            remote: remote.into(),
+            r#type: "gre".into(),
+            ..Default::default()
+        };
+        let program = |tunnels| Program {
+            tunnels,
+            ..Default::default()
+        };
+        let mut a = agent(vec![]);
+        a.install(program(vec![
+            tunnel("kept", "198.51.100.1"),
+            tunnel("moved", "198.51.100.2"),
+            tunnel("gone", "198.51.100.3"),
+        ]));
+        let up = br#"{"tunnels":[{"tunnel_id":"kept","state":"up"},{"tunnel_id":"moved","state":"up"},{"tunnel_id":"gone","state":"up"}]}"#;
+        assert_eq!(call(&mut a, "POST", "/tunnels", up), 200);
+        a.install(program(vec![
+            tunnel("kept", "198.51.100.1"),
+            tunnel("moved", "198.51.100.9"),
+        ]));
+        let left: Vec<_> = a.health.iter().map(|h| h.tunnel_id.as_str()).collect();
+        assert_eq!(left, ["kept"]);
+    }
+    #[test]
     fn sessions_peer_from_the_endpoint_the_control_plane_holds() {
         let mut a = agent(vec![]);
         a.node.tunnel_src = "192.0.2.9".into();
@@ -625,6 +670,7 @@ mod tests {
                 prefixes: vec!["203.0.113.0/24".into()],
                 mtu: 1476,
                 mss_clamp: 1436,
+                rate_kbps: 833333,
                 ..Default::default()
             }],
             ..Default::default()
@@ -649,6 +695,7 @@ mod tests {
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" ip saddr != { 203.0.113.0/24 } drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" meta nfproto ipv6 drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
+                "tc qdisc replace dev scr-northwind root tbf rate 833333kbit burst 1041666 latency 50ms",
             ]
         );
     }

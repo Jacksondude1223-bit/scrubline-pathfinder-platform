@@ -224,8 +224,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: A different live node already holds this name and region, or this control plane
-            is a replica.
+          description: A different live node already holds this name and region, another node holds the
+            tunnel_src (by an operator's assignment, or by registration while it is live), or this control
+            plane is a replica.
           content:
             application/json:
               schema:
@@ -317,7 +318,13 @@ paths:
         rather than having an endpoint of its own because it has to arrive as often as liveness does:
         a tunnel that went down between two polls is a prefix being black-holed until the next one. A
         tunnel reported down withdraws its prefixes from this node immediately, and the fabric recompiles
-        on the change rather than waiting for the next scheduled pass.'
+        on the change rather than waiting for the next scheduled pass.
+
+
+        A `tunnels` list, even an empty one, is everything the provisioner says now and replaces what
+        it said before; leaving the field out keeps it. Reports on a tunnel an operator has just
+        disabled, rebuilt, removed or moved to another address are ignored until the node next fetches
+        its program, since until then its agent is reporting on the tunnel as it was.'
       parameters: &id005
       - name: id
         in: path
@@ -413,7 +420,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Policy'
         '400':
-          description: A field will not validate. The message names the offending index and why.
+          description: A field will not validate, or a tunnel allocated to a customer names an unknown
+            one or carries a prefix outside theirs. The message names the offending item and why.
           content:
             application/json:
               schema:
@@ -859,7 +867,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '409': *id006
+        '409':
+          description: The change would leave a tunnel allocated to this customer carrying a prefix outside
+            their prefixes, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
@@ -923,12 +937,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '409': *id006
+        '409':
+          description: A tunnel is still allocated to this customer (the message names it), or this control
+            plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
       description: Takes the credential with it. One that outlived its tenant would authenticate to an
-        empty entitlement rather than to nothing.
+        empty entitlement rather than to nothing. A customer with a tunnel allocated is refused until the
+        tunnel is deleted or reallocated.
       parameters: *id005
   /v1/nodes/{id}/tunnel-endpoint:
     put:
@@ -944,8 +965,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/EndpointNode'
         '400':
-          description: The address is not IPv4, or is not one a customer edge could reach (unspecified,
-            loopback, multicast or broadcast).
+          description: The address is not IPv4, is not one a customer edge could reach (unspecified,
+            loopback, multicast or broadcast), is the customer end of a deployed tunnel, or lies inside a
+            protected prefix, which the fabric anycasts.
           content:
             application/json:
               schema:
@@ -957,8 +979,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Another node already terminates tunnels on that address, or this control plane
-            is a replica.
+          description: Another node holds that address (by an operator's assignment, or by registration
+            while it is live), or this control plane is a replica.
           content:
             application/json:
               schema:
@@ -972,9 +994,17 @@ paths:
 
 
         The assignment is the operator''s: it overrides the tunnel_src the node registered with, and survives
-        the node re-registering, so a node cannot move its own tunnels. Two nodes may not share an address,
-        since each would take the other''s customer replies. Prefixes withdrawn because the node had no
-        endpoint are announced again on the recompile this triggers.'
+        the node re-registering, so a node cannot move its own tunnels. It reaches the agent in its program;
+        registration answers with what the node registered. Two nodes may not share an address, since each
+        would take the other''s customer replies; a node that has stopped heartbeating keeps an assigned
+        address but not one it registered with, so a replacement box can take that over. Prefixes withdrawn
+        because the node had no endpoint are announced again on the recompile this triggers, and what was
+        reported about its tunnels from the old address is dropped, so a required tunnel reports up again.
+
+
+        Scrubline does not configure the address on the box: it must already be one the node owns and that
+        is routed to it. Agents must be on a release that reads the endpoint from their program before one
+        is assigned, or they keep peering customer sessions from the address they started with.'
       parameters: *id005
       requestBody:
         required: true
@@ -1000,7 +1030,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '409': *id006
+        '409':
+          description: The address the node registered with now belongs to another node, so falling back
+            to it would put two nodes on one address; assign this one another address instead. Or this
+            control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
@@ -1024,9 +1061,17 @@ paths:
         '401': *id002
         '403': *id003
       description: For each tunnel, every node that carries any of its prefixes, with the address the
-        tunnel terminates on there, whether it is enabled on that node, what the node's provisioner last
-        reported, and which of its prefixes the fabric is announcing or withdrawing from that node and
-        why. A row with a problem is a node that is not delivering those prefixes.
+        tunnel terminates on there, whether it is enabled on that node, its share of the clean-traffic
+        allowance, what the node's provisioner last reported, and which of its prefixes the fabric is
+        announcing or withdrawing from that node and why. A row with a problem is a node that is not
+        delivering those prefixes.
+      parameters:
+      - name: tenant
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Only the tunnels allocated to this customer (tenant id).
   /v1/tunnels/{id}:
     put:
       summary: Create or replace a tunnel in the deployed policy
@@ -1041,8 +1086,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/TunnelChange'
         '400':
-          description: The tunnel will not validate against the policy, or the id in the body differs
-            from the one in the path.
+          description: The tunnel will not validate against the policy (including a rate_mbps over 2500,
+            or the same encapsulation, remote and key as another tunnel), names an unknown customer or
+            carries a prefix outside theirs, lists a disabled entry that is not a registered node id, or
+            the id in the body differs from the one in the path.
           content:
             application/json:
               schema:
@@ -1058,7 +1105,13 @@ paths:
         '403': *id003
       description: 'Tunnels belong to the deployed policy, so a change here bumps its version, is validated
         with the whole policy, and is compiled onto the fabric straight away: no separate deploy. The body
-        replaces the tunnel whole, including its disabled list; the id comes from the path.'
+        replaces the tunnel whole, including its disabled list and rate; the id comes from the path.
+
+
+        To allocate a tunnel to a customer, set tenant. Its prefixes must then lie within that customer''s
+        prefixes; leave prefixes out and it carries the protected prefixes that are the customer''s
+        own, not those of a customer nested inside them that covers a prefix more specifically, and
+        that no other tunnel already carries.'
       parameters: *id005
       requestBody:
         required: true
@@ -1183,6 +1236,50 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/NodeSelection'
+  /v1/tunnels/{id}/rate:
+    put:
+      summary: Set how much clean traffic a tunnel may carry
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: rate_mbps is missing, negative or over 2500.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'Changes only the tunnel''s clean-traffic allowance, leaving the rest of it as it is.
+        The allowance is the total the customer receives across the fabric: each node sending the tunnel
+        gets an even share, and shapes what it sends down the tunnel to that share.'
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TunnelRate'
 components:
   securitySchemes:
     operatorToken:
@@ -1985,6 +2082,13 @@ components:
           additionalProperties:
             type: string
           description: Tenant id to credential hash. Hashes only, for the same reason node_tokens are.
+        tunnel_endpoints:
+          type: object
+          additionalProperties:
+            type: string
+          description: 'Node id to the tunnel endpoint an operator assigned it, which overrides the node''s
+            registered tunnel_src. A control plane from before this field drops it, so replicas are
+            upgraded before the primary they follow.'
     ReputationPolicy:
       type: object
       description: 'Tunes the two-tier source cache: who gets the short path, and whether repeat offenders
@@ -2131,9 +2235,7 @@ components:
     Tunnel:
       type: object
       required:
-      - id
       - remote
-      - prefixes
       description: 'The return path for a set of protected prefixes: where scrubbed traffic goes once
         it is clean. This is the half of a scrubbing service BGP cannot do — announcing a prefix pulls
         the traffic in, and it then cannot be routed back the ordinary way, because as far as the internet
@@ -2144,15 +2246,15 @@ components:
         id:
           type: string
           example: northwind
-          description: 'Becomes an interface name, so it is lowercase letters, digits and dashes, and
-            at most 11 characters: the kernel truncates a name over its limit rather than refusing it,
+          description: 'Required in a policy; on PUT /v1/tunnels/{id} it comes from the path. Becomes an
+            interface name, so it is lowercase letters, digits and dashes, and at most 11 characters: the kernel truncates a name over its limit rather than refusing it,
             and two tunnels truncating to one name is one tunnel.'
         prefixes:
           type: array
           items:
             type: string
-          minItems: 1
-          description: Which protected prefixes ride this tunnel. Each must be one the policy protects,
+          description: Which protected prefixes ride this tunnel; at least one, though PUT /v1/tunnels/{id}
+            fills them in from the tenant when it is allocated to one. Each must be one the policy protects,
             and a prefix belongs to at most one tunnel — backup paths are not modelled, so two would leave
             no answer to which return path is authoritative.
         type:
@@ -2166,7 +2268,9 @@ components:
         remote:
           type: string
           example: 198.51.100.1
-          description: 'The customer''s tunnel endpoint. The local end is each node''s own tunnel_src.
+          description: 'The customer''s tunnel endpoint. The local end is each node''s own tunnel_src. Two
+            tunnels of one encapsulation to the same remote need distinct keys, since Linux holds one tunnel
+            per remote and key.
             IPv4 only: the MTU arithmetic here is IPv4''s, and a v6 endpoint would compile a tunnel wrong
             by twenty bytes.'
         mtu:
@@ -2201,14 +2305,27 @@ components:
           description: 'both: clean traffic goes down the tunnel to the customer and the customer''s
             replies come back up it to the node, which forwards them to the internet. Replies are accepted
             only from the tunnel''s own prefixes, so the tunnel cannot relay anything else the customer
-            edge sends into it. return: the tunnel carries clean traffic out only, and replies leave the
-            customer by its own transit.'
+            edge sends into it. return: the tunnel carries clean traffic out only, replies leave the
+            customer by its own transit, and nothing that comes up the tunnel is forwarded.'
         disabled:
           type: array
           items:
             type: string
           description: Node ids that must not build this tunnel. They withdraw its prefixes instead of
-            attracting traffic they have no path to deliver. Set through the disable and enable endpoints.
+            attracting traffic they have no path to deliver. Set through the disable and enable endpoints;
+            on PUT /v1/tunnels/{id} each must be a registered node id.
+        tenant:
+          type: string
+          description: The customer (tenant id) this tunnel is allocated to. Its prefixes must lie within
+            that customer's prefixes, and the customer cannot be deleted, or lose those prefixes, while
+            it is allocated.
+        rate_mbps:
+          type: integer
+          minimum: 0
+          maximum: 2500
+          description: 'Clean traffic the customer receives down this tunnel, in Mbit/s, in total across
+            the fabric: every node sending it gets an even share and shapes to it. Zero, or leaving it out,
+            takes the maximum of 2500 (2.5 Gbit/s), so no tunnel is ever unlimited.'
         comment:
           type: string
     Session:
@@ -2324,6 +2441,25 @@ components:
           - both
           - return
           description: Empty means both.
+        sources:
+          type: array
+          items:
+            type: string
+          description: Every prefix of the tunnel, including ones steered away from this node. Replies coming
+            back up the tunnel may be sourced from any of them.
+        foreign:
+          type: array
+          items:
+            type: string
+          description: Other tunnels' prefixes inside this tunnel's, across the whole policy. Each is that
+            customer's, as routing goes by the most specific prefix, so replies up this tunnel may not be
+            sourced from it.
+        rate_kbps:
+          type: integer
+          description: This node's share of the tunnel's clean-traffic allowance, in kbit/s. The allowance
+            is split evenly across the nodes announcing the tunnel's prefixes; a node still building it
+            while withdrawing gets the same share for the traffic BGP has yet to move away, and with no
+            node announcing, the live nodes building it split it.
     TunnelEndpoint:
       type: object
       required:
@@ -2355,6 +2491,17 @@ components:
           items:
             type: string
           description: Node ids.
+    TunnelRate:
+      type: object
+      required:
+      - rate_mbps
+      properties:
+        rate_mbps:
+          type: integer
+          minimum: 0
+          maximum: 2500
+          example: 1000
+          description: Mbit/s. Zero takes the maximum, 2500 (2.5 Gbit/s).
     TunnelChange:
       type: object
       properties:
@@ -2417,6 +2564,12 @@ components:
           type: array
           items:
             type: string
+        tenant:
+          type: string
+          description: The customer it is allocated to. Empty when it is not.
+        rate_mbps:
+          type: integer
+          description: The allowance in force, with the default resolved.
         comment:
           type: string
         nodes:
@@ -2481,9 +2634,15 @@ components:
           type: integer
         mss_clamp:
           type: integer
+        rate_kbps:
+          type: integer
+          description: This node's share of the allowance, as last compiled. Absent when the node does
+            not build the tunnel.
         problem:
           type: string
-          description: Why this node is not delivering the tunnel's prefixes, when it is not.
+          description: Why this node is not delivering the tunnel's prefixes, when it is not. A configuration
+            problem (disabled here, no endpoint) when there is one, otherwise the reason the plan gives for
+            withdrawing the first of them, such as the tunnel being reported down.
     TunnelStatus:
       type: object
       required:

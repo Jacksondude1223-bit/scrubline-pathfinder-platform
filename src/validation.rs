@@ -102,8 +102,22 @@ pub fn policy(p: &Policy) -> Result<()> {
     gamefilter::compile(&p.games)?;
     unique(p.tunnels.iter().map(|t| t.id.as_str()), "tunnels")?;
     let mut carried = HashSet::new();
+    let mut ends = HashMap::new();
     for t in &p.tunnels {
         tunnel::validate(t, Some(&protected))?;
+        // Every tunnel on a node starts from the node's one address, and Linux holds one tunnel
+        // per encapsulation, remote and key: the second would fail to build on every node.
+        let kind = if t.r#type.is_empty() {
+            "gre"
+        } else {
+            t.r#type.as_str()
+        };
+        if let Some(other) = ends.insert((kind, t.remote.as_str(), t.key), t.id.as_str()) {
+            return Err(format!(
+                "tunnels {other} and {} both run {kind} to {} with key {}; give one a distinct key",
+                t.id, t.remote, t.key
+            ));
+        }
         for prefix in &t.prefixes {
             if !carried.insert(prefix) {
                 return Err("a prefix has one return path".into());
@@ -195,6 +209,52 @@ pub fn policy(p: &Policy) -> Result<()> {
         }
         if !(0..=65535).contains(&r.r#match.dport) || !(0..=65535).contains(&r.r#match.sport) {
             return Err("match ports must be within 0..65535".into());
+        }
+    }
+    Ok(())
+}
+/// How specifically a tenant's prefixes cover `net`: the length of the most specific one
+/// containing it, if any does.
+fn coverage(t: &Tenant, net: &IpNet) -> Option<u8> {
+    t.prefixes
+        .iter()
+        .filter_map(|p| p.parse::<IpNet>().ok())
+        .filter(|own| own.contains(net))
+        .map(|own| own.prefix_len())
+        .max()
+}
+/// Whether a tenant's address space covers a prefix.
+pub fn owns(t: &Tenant, prefix: &str) -> bool {
+    prefix
+        .parse::<IpNet>()
+        .is_ok_and(|net| coverage(t, &net).is_some())
+}
+/// Whether a prefix is `t`'s own rather than a customer of theirs': no other tenant covers it more
+/// specifically. Tenants' address space may nest, a reseller's around its customers'.
+pub fn belongs_to(prefix: &str, t: &Tenant, tenants: &[Tenant]) -> bool {
+    let Ok(net) = prefix.parse::<IpNet>() else {
+        return false;
+    };
+    let Some(mine) = coverage(t, &net) else {
+        return false;
+    };
+    tenants
+        .iter()
+        .filter_map(|other| coverage(other, &net))
+        .all(|theirs| theirs <= mine)
+}
+/// Tunnels allocated to a customer may only carry that customer's address space: a tunnel holding
+/// someone else's prefix would hand their clean traffic to the wrong edge.
+pub fn tunnel_tenants(p: &Policy, tenants: &[Tenant]) -> Result<()> {
+    for t in p.tunnels.iter().filter(|t| !t.tenant.is_empty()) {
+        let Some(owner) = tenants.iter().find(|v| v.id == t.tenant) else {
+            return Err(format!("tunnel {}: unknown tenant {:?}", t.id, t.tenant));
+        };
+        if let Some(prefix) = t.prefixes.iter().find(|prefix| !owns(owner, prefix)) {
+            return Err(format!(
+                "tunnel {}: prefix {prefix} is not within tenant {}'s prefixes",
+                t.id, t.tenant
+            ));
         }
     }
     Ok(())

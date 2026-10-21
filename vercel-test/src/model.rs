@@ -413,6 +413,18 @@ pub struct NodeTunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub direction: String,
+    /// Every prefix of the tunnel, including ones steered away from this node: replies coming
+    /// back up the tunnel may be sourced from any of them.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub sources: Vec<String>,
+    /// Other tunnels' prefixes inside this tunnel's, policy-wide. They are those customers'
+    /// address space, so replies coming up this tunnel may not be sourced from them.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub foreign: Vec<String>,
+    /// This node's share of the tunnel's clean-traffic allowance, in kbit/s.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub rate_kbps: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -509,6 +521,15 @@ pub struct Tunnel {
     /// Node ids that must not build this tunnel; they withdraw its prefixes instead.
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub disabled: Vec<String>,
+    /// The customer (tenant id) this tunnel is allocated to. Its prefixes must be the tenant's.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub tenant: String,
+    /// Clean traffic allowed down this tunnel in Mbit/s, summed across every node sending it.
+    /// Zero takes the maximum, tunnel::MAX_RATE_MBPS.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub rate_mbps: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

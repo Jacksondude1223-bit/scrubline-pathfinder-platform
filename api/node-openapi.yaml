@@ -128,9 +128,14 @@ paths:
 
 
         A tunnel whose direction is both also gets forwarding rules for the customer''s replies coming
-        back up it: only sources inside the tunnel''s own prefixes pass, per address family, and their
-        SYNs are MSS-clamped like those going down. They assume the `inet scrubline` table and its
-        `forward` chain exist, as the MSS clamp already does.
+        back up it: only sources inside the tunnel''s own prefixes pass, per address family, less any more
+        specific prefix of another tunnel inside them (whose customer an address is goes by the most specific
+        prefix, as routing does), and their SYNs are MSS-clamped like those going down. A return tunnel forwards nothing that comes up it. They assume the `inet scrubline`
+        table and its `forward` chain exist, as the MSS clamp already does.
+
+
+        Every tunnel then gets a `tc` token-bucket shaper holding what goes down it to this node''s share
+        of the tunnel''s clean-traffic allowance.
 
 
         `?format=iproute2` returns the configuration as plain text instead of JSON.'
@@ -184,6 +189,19 @@ paths:
                 ip link set scr-northwind mtu 1472 up
 
                 ip route replace 203.0.113.0/24 dev scr-northwind
+
+                nft add rule inet scrubline forward oifname "scr-northwind" tcp flags syn tcp option maxseg
+                size set 1432
+
+                nft add rule inet scrubline forward iifname "scr-northwind" ip saddr != { 203.0.113.0/24 }
+                drop
+
+                nft add rule inet scrubline forward iifname "scr-northwind" meta nfproto ipv6 drop
+
+                nft add rule inet scrubline forward iifname "scr-northwind" tcp flags syn tcp option maxseg
+                size set 1432
+
+                tc qdisc replace dev scr-northwind root tbf rate 2500000kbit burst 3125000 latency 50ms
 
                 '
         '401':
@@ -663,6 +681,28 @@ components:
           description: The link name this compiles to, inside the kernel's 15-character limit.
         comment:
           type: string
+        direction:
+          type: string
+          enum:
+          - both
+          - return
+          description: Absent or empty means both. A return tunnel forwards nothing that comes up it.
+        sources:
+          type: array
+          items:
+            type: string
+          description: Every prefix of the tunnel, including ones steered away from this node; replies
+            coming back up it may be sourced from any of them.
+        foreign:
+          type: array
+          items:
+            type: string
+          description: Other tunnels' prefixes inside this tunnel's, across the whole policy, which
+            replies coming back up it may not be sourced from.
+        rate_kbps:
+          type: integer
+          description: This node's share of the tunnel's clean-traffic allowance, in kbit/s, which the
+            rendered tc shaper holds it to.
     Session:
       type: object
       required:

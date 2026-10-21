@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -222,6 +222,34 @@ impl Store {
             }
             .into();
         }
+        // Two nodes on one tunnel address would each take the other's customer replies. The API
+        // refuses that, but a node that went quiet can come back to find its address given away,
+        // so whoever has the stronger claim keeps it: an operator's assignment, then a live node
+        // over a quiet one. A claim that cannot be settled that way is void, and those nodes
+        // withdraw what they cannot deliver rather than share.
+        let claim = |n: &Node| {
+            if self.data.tunnel_endpoints.contains_key(&n.id) {
+                2
+            } else {
+                u8::from(n.status != "stale")
+            }
+        };
+        let mut best: HashMap<String, (u8, usize)> = HashMap::new();
+        for n in ns.iter().filter(|n| !n.tunnel_src.is_empty()) {
+            let entry = best.entry(n.tunnel_src.clone()).or_insert((claim(n), 0));
+            match claim(n).cmp(&entry.0) {
+                std::cmp::Ordering::Greater => *entry = (claim(n), 1),
+                std::cmp::Ordering::Equal => entry.1 += 1,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        for n in &mut ns {
+            if let Some(&(strongest, holders)) = best.get(&n.tunnel_src) {
+                if claim(n) < strongest || holders > 1 {
+                    n.tunnel_src.clear();
+                }
+            }
+        }
         ns.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
         ns
     }
@@ -252,7 +280,9 @@ impl Store {
             d.node_tokens.insert(n.id.clone(), hash(&token));
             Ok(())
         })?;
-        Ok((self.effective(n), token))
+        // As registered: an operator's assignment reaches the node in its program, so an agent
+        // never mistakes it for an address of its own to fall back to once it is cleared.
+        Ok((n, token))
     }
     pub fn save_policy(&mut self, mut p: Policy, now: DateTime<Utc>) -> Result<Policy> {
         self.transaction(|d| {

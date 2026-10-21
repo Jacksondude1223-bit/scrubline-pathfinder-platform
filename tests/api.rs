@@ -405,9 +405,11 @@ fn operators_assign_each_node_its_own_tunnel_endpoint() {
     assert_eq!(node["tunnel_src"], "192.0.2.1");
     assert_eq!(node["tunnel_endpoint_assigned"], true);
     // The node re-registering with an address of its own does not move its tunnels: the
-    // operator's assignment stands until the operator clears it.
+    // operator's assignment stands until the operator clears it. The agent is answered with what
+    // it registered, and learns the assignment from its program, so it never mistakes the
+    // assignment for its own address once it is cleared.
     let again = register(json!({"name":"edge-a","region":"iad","tunnel_src":"192.0.2.9"}));
-    assert_eq!(again["node"]["tunnel_src"], "192.0.2.1");
+    assert_eq!(again["node"]["tunnel_src"], "192.0.2.9");
     let (_, nodes) = call(&base, "GET", "/v1/nodes", Some(OP), Value::Null);
     let listed = nodes
         .as_array()
@@ -577,6 +579,7 @@ fn a_replica_refuses_tunnel_changes() {
         ("DELETE", "/v1/tunnels/t", Value::Null),
         ("POST", "/v1/tunnels/t/disable", json!({"nodes":["n"]})),
         ("POST", "/v1/tunnels/t/enable", json!({"nodes":["n"]})),
+        ("PUT", "/v1/tunnels/t/rate", json!({"rate_mbps":100})),
     ];
     for (method, path, body) in writes {
         assert_eq!(
@@ -589,4 +592,97 @@ fn a_replica_refuses_tunnel_changes() {
         call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null).0,
         200
     );
+}
+#[test]
+fn staff_allocate_tunnels_to_customers_with_a_clean_traffic_allowance() {
+    let base = serve(Store::open("").unwrap());
+    let op = |method: &str, path: &str, body: Value| call(&base, method, path, Some(OP), body);
+    let register = |body: Value| call(&base, "POST", "/v1/nodes/register", Some(ENROLL), body).1;
+    let a = node_id(&register(
+        json!({"name":"edge-a","region":"iad","tunnel_src":"192.0.2.1"}),
+    ));
+    let b = node_id(&register(
+        json!({"name":"edge-b","region":"fra","tunnel_src":"192.0.2.2"}),
+    ));
+    let (_, customer) = op(
+        "POST",
+        "/v1/tenants",
+        json!({"name":"northwind","prefixes":["203.0.113.0/24"]}),
+    );
+    let tenant = customer["id"].as_str().unwrap().to_string();
+    let (_, other) = op(
+        "POST",
+        "/v1/tenants",
+        json!({"name":"contoso","prefixes":["198.51.100.0/24"]}),
+    );
+    let other = other["id"].as_str().unwrap().to_string();
+    let theirs = json!({"name":"p","protected":["203.0.113.0/24","198.51.100.0/24"],
+        "tunnels":[{"id":"t","remote":"198.18.0.9","prefixes":["198.51.100.0/24"],"tenant":tenant}]});
+    let (status, body) = op("POST", "/v1/policies", theirs);
+    assert_eq!(
+        status, 400,
+        "a customer's tunnel cannot carry another's prefix: {body}"
+    );
+    let policy = json!({"name":"p","protected":["203.0.113.0/24","198.51.100.0/24"]});
+    let (_, saved) = op("POST", "/v1/policies", policy);
+    let deploy = format!("/v1/policies/{}/deploy", saved["id"].as_str().unwrap());
+    assert_eq!(op("POST", &deploy, Value::Null).0, 200);
+    // Allocating without naming prefixes carries the customer's protected prefixes.
+    let allocate = json!({"remote":"198.18.0.9","tenant":tenant,"rate_mbps":1000});
+    let (status, allocated) = op("PUT", "/v1/tunnels/northwind", allocate);
+    assert_eq!(status, 200, "{allocated}");
+    assert_eq!(allocated["tunnel"]["prefixes"], json!(["203.0.113.0/24"]));
+    assert_eq!(allocated["tunnel"]["tenant"], tenant.as_str());
+    let unknown = json!({"remote":"198.18.0.9","tenant":"ten-none"});
+    assert_eq!(op("PUT", "/v1/tunnels/other", unknown).0, 400);
+    let foreign = json!({"remote":"198.18.0.10","tenant":tenant,"prefixes":["198.51.100.0/24"]});
+    assert_eq!(op("PUT", "/v1/tunnels/other", foreign).0, 400);
+    // The allowance is split across the nodes sending the tunnel.
+    let program = |node: &str| op("GET", &format!("/v1/nodes/{node}/program"), Value::Null).1;
+    assert_eq!(program(&a)["tunnels"][0]["rate_kbps"], 500_000);
+    assert_eq!(program(&b)["tunnels"][0]["rate_kbps"], 500_000);
+    let (_, fleet) = op("GET", &format!("/v1/tunnels?tenant={tenant}"), Value::Null);
+    assert_eq!(fleet["tunnels"].as_array().unwrap().len(), 1);
+    assert_eq!(fleet["tunnels"][0]["rate_mbps"], 1000);
+    assert_eq!(fleet["tunnels"][0]["tenant"], tenant.as_str());
+    assert_eq!(fleet["tunnels"][0]["nodes"][0]["rate_kbps"], 500_000);
+    let (_, none) = op("GET", &format!("/v1/tunnels?tenant={other}"), Value::Null);
+    assert_eq!(none["tunnels"], json!([]));
+    // Changing only the speed.
+    let rate = |id: &str, body: Value| op("PUT", &format!("/v1/tunnels/{id}/rate"), body);
+    for bad in [
+        json!({"rate_mbps":2501}),
+        json!({"rate_mbps":-1}),
+        json!({}),
+    ] {
+        assert_eq!(rate("northwind", bad.clone()).0, 400, "{bad}");
+    }
+    assert_eq!(rate("missing", json!({"rate_mbps":100})).0, 404);
+    let (status, changed) = rate("northwind", json!({"rate_mbps":2500}));
+    assert_eq!(
+        (status, &changed["tunnel"]["rate_mbps"]),
+        (200, &json!(2500))
+    );
+    assert_eq!(program(&a)["tunnels"][0]["rate_kbps"], 1_250_000);
+    let (_, reset) = rate("northwind", json!({"rate_mbps":0}));
+    assert!(reset["tunnel"]["rate_mbps"].is_null(), "{reset}");
+    let (_, fleet) = op("GET", "/v1/tunnels", Value::Null);
+    assert_eq!(
+        fleet["tunnels"][0]["rate_mbps"], 2500,
+        "no allowance set is held to the 2.5 Gbit/s maximum"
+    );
+    // A customer with a tunnel cannot be deleted, or lose the prefixes it carries.
+    let path = format!("/v1/tenants/{tenant}");
+    let (status, body) = op("DELETE", &path, Value::Null);
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("northwind"),
+        "{body}"
+    );
+    let shrink = json!({"id":tenant,"name":"northwind","prefixes":["192.0.2.0/24"]});
+    assert_eq!(op("POST", "/v1/tenants", shrink).0, 409);
+    let grow = json!({"id":tenant,"name":"northwind","prefixes":["203.0.112.0/22"]});
+    assert_eq!(op("POST", "/v1/tenants", grow).0, 200);
+    assert_eq!(op("DELETE", "/v1/tunnels/northwind", Value::Null).0, 200);
+    assert_eq!(op("DELETE", &path, Value::Null).0, 200);
 }
