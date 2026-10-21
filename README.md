@@ -638,8 +638,9 @@ deleted while it is allocated. `"rate_mbps"` caps the clean traffic the
 customer receives down it, in total across the fabric, at most 2500 (2.5
 Gbit/s); a tunnel without one is held to that maximum. The allowance is split
 evenly across the nodes announcing the tunnel's prefixes and each shapes to
-its share with a `tc` token bucket. `PUT /v1/tunnels/{id}/rate` changes only
-the speed.
+its share with a `tc` token bucket; since anycast rarely spreads traffic
+evenly, a node can be held to its share while others sit under theirs.
+`PUT /v1/tunnels/{id}/rate` changes only the speed.
 
 ### A dead tunnel withdraws the prefix
 

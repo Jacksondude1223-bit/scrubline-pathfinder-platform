@@ -129,8 +129,8 @@ paths:
 
         A tunnel whose direction is both also gets forwarding rules for the customer''s replies coming
         back up it: only sources inside the tunnel''s own prefixes pass, per address family, less any more
-        specific prefix another tunnel on the node delivers to, and their SYNs are MSS-clamped like those
-        going down. A return tunnel forwards nothing that comes up it. They assume the `inet scrubline`
+        specific prefix of another tunnel inside them (whose customer an address is goes by the most specific
+        prefix, as routing does), and their SYNs are MSS-clamped like those going down. A return tunnel forwards nothing that comes up it. They assume the `inet scrubline`
         table and its `forward` chain exist, as the MSS clamp already does.
 
 
@@ -693,6 +693,12 @@ components:
             type: string
           description: Every prefix of the tunnel, including ones steered away from this node; replies
             coming back up it may be sourced from any of them.
+        foreign:
+          type: array
+          items:
+            type: string
+          description: Other tunnels' prefixes inside this tunnel's, across the whole policy, which
+            replies coming back up it may not be sourced from.
         rate_kbps:
           type: integer
           description: This node's share of the tunnel's clean-traffic allowance, in kbit/s, which the

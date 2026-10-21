@@ -449,9 +449,15 @@ other's customer replies. That covers assigning, registering, and `DELETE` on
 the same path, which returns the node to what it registered with unless that
 address has since gone to another node. A node that has stopped heartbeating
 keeps an address an operator assigned it, but not one it only registered
-with, so a replacement box can take the old one's address. An address that is
-a deployed tunnel's customer end, or that sits inside a protected prefix (which
-the fabric anycasts), is refused with a `400`.
+with, so a replacement box can take the old one's address. If the old one
+comes back to find its address given away, the stronger claim keeps it (an
+operator's assignment, then a live node over a quiet one) and the other
+withdraws its tunnels' prefixes until it has an address of its own;
+`GET /v1/tunnels` says so. An address that is a deployed tunnel's customer
+end, or that sits inside a protected prefix (which the fabric anycasts), is
+refused with a `400`, and a node whose address ends up that way by another
+route, registering with it or a policy coming to protect it, withdraws the
+tunnels' prefixes instead of building them.
 
 The same address is what the node peers customer BGP sessions from.
 
@@ -517,9 +523,10 @@ Only sources inside the tunnel's own prefixes may come back up it, per
 address family. Without that the tunnel is an open relay for anything the
 customer's edge sends into it, spoofed or not. That is every prefix of the
 tunnel, including any steered away from this node, since a customer routes its
-replies up whichever tunnel it likes. A more specific prefix that another
-tunnel on the node delivers to belongs to that customer, so it is refused even
-inside one of this tunnel's. SYNs coming up are clamped like the ones going
+replies up whichever tunnel it likes. A more specific prefix of another tunnel
+belongs to that customer, as routing goes by the most specific prefix, so it
+is refused even inside one of this tunnel's, whether or not that tunnel is
+built on this node. SYNs coming up are clamped like the ones going
 down, so the far side's segments fit the tunnel too. The rules assume the
 `inet scrubline` table and its `forward` chain exist, as the MSS clamp always
 has.
@@ -580,10 +587,13 @@ PREFIX           NODE      REGION  STATE     PREPENDS  WHY
 
 #### Allocating a tunnel to a customer, with a speed
 
-A tunnel is allocated to a customer by naming their tenant id. Leave out
-`prefixes` and it carries every prefix of theirs the deployed policy
-protects; name them and each must lie within the customer's own prefixes, so
-a tunnel can never hand one customer's clean traffic to another's edge.
+A tunnel is allocated to a customer by naming their tenant id. Name its
+`prefixes` and each must lie within the customer's own prefixes, so a tunnel
+can never hand one customer's clean traffic to another's edge. Leave them out
+and it carries the protected prefixes that are the customer's own and that no
+other tunnel already carries. A reseller's tunnel does not pick up a prefix
+that one of its customers, also a tenant, covers more specifically, though it
+may still carry it when named.
 
 ```console
 $ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind -d '{
@@ -624,8 +634,17 @@ than drops. When a node stops announcing (withdrawn, disabled, or gone quiet)
 the others' shares grow to cover the whole allowance on the next recompile.
 A withdrawing node keeps the same share for the traffic BGP has yet to move
 away, so for the seconds a withdrawal takes to converge the total can briefly
-run over by that one share. `scrubline_tunnel_rate_limit_bits_per_second` on
-each node's `/metrics` is the share it is enforcing.
+run over by the withdrawing nodes' shares. With no node announcing, the live
+nodes still building the tunnel split it between them.
+`scrubline_tunnel_rate_limit_bits_per_second` on each node's `/metrics` is
+the share it is enforcing.
+
+The split is even, not by where the traffic lands. Anycast rarely spreads a
+customer's traffic evenly across the fabric, so the node nearest most of their
+users can be held to its share while others sit under theirs, and the customer
+then receives less than the allowance in total. Give a tunnel headroom over
+what the customer's link needs, or steer its prefixes to fewer nodes, where
+that matters.
 
 A customer with a tunnel allocated cannot be deleted, or have their prefixes
 changed so the tunnel carries something outside them; both answer `409`

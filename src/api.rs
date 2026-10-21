@@ -38,32 +38,35 @@ fn failed(e: impl ToString) -> Error {
     eprintln!("state operation failed: {}", e.to_string());
     (503, "could not persist control-plane state".into())
 }
-/// The protected prefixes of a policy that fall within a customer's address space.
-fn tenant_prefixes(p: &Policy, tenants: &[Tenant], tenant: &str) -> Answer<Vec<String>> {
+/// What a tunnel allocated to a customer carries when no prefixes are named: the protected
+/// prefixes that are the customer's own, not a nested customer's of theirs, and that no other
+/// tunnel already carries.
+fn tenant_prefixes(p: &Policy, tenants: &[Tenant], tenant: &str, id: &str) -> Answer<Vec<String>> {
     let Some(owner) = tenants.iter().find(|t| t.id == tenant) else {
         return Err(bad(format!("unknown tenant {tenant:?}")));
     };
-    let owned: Vec<IpNet> = owner
-        .prefixes
-        .iter()
-        .filter_map(|p| p.parse().ok())
-        .collect();
     let prefixes: Vec<String> = p
         .protected
         .iter()
+        .filter(|prefix| validation::belongs_to(prefix, owner, tenants))
         .filter(|prefix| {
-            prefix
-                .parse::<IpNet>()
-                .is_ok_and(|net| owned.iter().any(|o| o.contains(&net)))
+            !p.tunnels
+                .iter()
+                .any(|t| t.id != id && t.prefixes.contains(prefix))
         })
         .cloned()
         .collect();
     if prefixes.is_empty() {
         return Err(bad(format!(
-            "tenant {tenant} has no prefix the deployed policy protects; protect one or name the prefixes"
+            "tenant {tenant} has no protected prefix that another tunnel does not already carry; protect one or name the prefixes"
         )));
     }
     Ok(prefixes)
+}
+/// The answer to a tunnel change: the policy version it made, and the tunnel as saved.
+fn tunnel_answer(p: &Policy, id: &str) -> Value {
+    let saved = p.tunnels.iter().find(|v| v.id == id);
+    json!({"policy_id":p.id,"version":p.version,"tunnel":saved})
 }
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Answer<T> {
     serde_json::from_slice(body).map_err(bad)
@@ -129,6 +132,9 @@ pub struct Api {
     last_key: String,
     recompiles: u64,
     requests: BTreeMap<(String, u16), u64>,
+    /// Tunnel reports to ignore from each node until it fetches its program again, by tunnel id,
+    /// or None for all of them: what its agent holds until then is about tunnels since changed.
+    fences: HashMap<String, HashSet<Option<String>>>,
 }
 pub type Shared = Arc<Mutex<Api>>;
 pub type MetricState<'a> = (
@@ -149,6 +155,7 @@ impl Api {
             last_key: String::new(),
             recompiles: 0,
             requests: BTreeMap::new(),
+            fences: HashMap::new(),
         }
     }
     fn auth(&self, headers: &HeaderMap) -> Answer<Who> {
@@ -287,6 +294,17 @@ impl Api {
             }
         }
         self.store.tunnels.retain(|_, rows| !rows.is_empty());
+        // The agent reports on every heartbeat what its provisioner last said, and only learns of
+        // the change when it next fetches its program, so until then its reports are about the
+        // tunnels as they were.
+        for n in &self.store.data.nodes {
+            if node.is_none_or(|id| id == n.id) {
+                self.fences
+                    .entry(n.id.clone())
+                    .or_default()
+                    .insert(tunnel.map(String::from));
+            }
+        }
     }
     /// Tunnels belong to the deployed policy, so a change to one is a new version of that policy:
     /// validated whole, made durable, then compiled onto the fabric straight away. `forget` names
@@ -359,8 +377,7 @@ impl Api {
             t.disabled.sort();
             Ok(())
         })?;
-        let t = p.tunnels.iter().find(|v| v.id == id).cloned();
-        Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":t}))
+        Ok(tunnel_answer(&p, id))
     }
     /// Every tunnel of the deployed policy on every node that carries its prefixes: where it
     /// terminates, what the node built, what its provisioner last reported, its share of the
@@ -431,10 +448,25 @@ impl Api {
                         let problem = if !enabled {
                             "disabled on this node".to_string()
                         } else if n.tunnel_src.is_empty() {
-                            format!(
-                                "no tunnel endpoint; assign one with PUT /v1/nodes/{}/tunnel-endpoint",
-                                n.id
-                            )
+                            let registered = self
+                                .store
+                                .data
+                                .nodes
+                                .iter()
+                                .find(|v| v.id == n.id)
+                                .map(|v| v.tunnel_src.as_str())
+                                .unwrap_or("");
+                            if registered.is_empty() {
+                                format!(
+                                    "no tunnel endpoint; assign one with PUT /v1/nodes/{}/tunnel-endpoint",
+                                    n.id
+                                )
+                            } else {
+                                format!(
+                                    "the tunnel endpoint it registered, {registered}, is held by another node; assign it its own with PUT /v1/nodes/{}/tunnel-endpoint",
+                                    n.id
+                                )
+                            }
                         } else {
                             String::new()
                         };
@@ -660,8 +692,7 @@ impl Api {
                 #[serde(default)]
                 struct Heartbeat {
                     stats: wire::Stats,
-                    #[serde(deserialize_with = "crate::model::null_default")]
-                    tunnels: Vec<TunnelStatus>,
+                    tunnels: Option<Vec<TunnelStatus>>,
                 }
                 let hb: Heartbeat = if body.is_empty() {
                     Heartbeat::default()
@@ -671,6 +702,7 @@ impl Api {
                 let Some(n) = self.store.data.nodes.iter_mut().find(|n| n.id == id) else {
                     return Err((404, "unknown node".into()));
                 };
+                let fenced = self.fences.get(id);
                 n.last_seen = now;
                 n.status = "ready".into();
                 let name = n.name.clone();
@@ -678,7 +710,7 @@ impl Api {
                 // A tunnel reported twice would be withdrawn on one entry while scrubline_tunnel_up
                 // reads the other.
                 let mut seen = HashSet::new();
-                for st in &hb.tunnels {
+                for st in hb.tunnels.iter().flatten() {
                     if st.tunnel_id.is_empty() {
                         return Err(bad("tunnel_id required"));
                     }
@@ -687,13 +719,23 @@ impl Api {
                         return Err(bad(format!("duplicate tunnel_id {:?}", st.tunnel_id)));
                     }
                 }
-                if !hb.tunnels.is_empty() {
-                    let mut tunnels = hb.tunnels;
+                // A list, even an empty one, is everything the provisioner is saying now; leaving the
+                // field out says nothing.
+                if let Some(mut tunnels) = hb.tunnels {
+                    tunnels.retain(|t| {
+                        fenced.is_none_or(|f| {
+                            !f.contains(&None) && !f.contains(&Some(t.tunnel_id.clone()))
+                        })
+                    });
                     for t in &mut tunnels {
                         t.reported_at = now;
                     }
                     tunnels.sort_by(|a, b| a.tunnel_id.cmp(&b.tunnel_id));
-                    self.store.tunnels.insert(id.into(), tunnels);
+                    if tunnels.is_empty() {
+                        self.store.tunnels.remove(id);
+                    } else {
+                        self.store.tunnels.insert(id.into(), tunnels);
+                    }
                 }
                 if !body.is_empty() {
                     let stats = value(hb.stats);
@@ -708,6 +750,9 @@ impl Api {
             ("GET", ["nodes", _, "program"]) if !id.is_empty() => {
                 if !who.acts(id) {
                     return Err((403, "a node may only fetch its own program".into()));
+                }
+                if who.role == "node" {
+                    self.fences.remove(id);
                 }
                 self.store
                     .programs
@@ -889,26 +934,35 @@ impl Api {
                     )));
                 }
                 // A tunnel rebuilt to another remote, key or encapsulation is a new tunnel, and
-                // what was reported about the old one says nothing about it.
-                let rebuilt = self.deployed().is_none_or(|p| {
-                    !p.tunnels.iter().any(|v| {
-                        v.id == t.id
-                            && v.remote == t.remote
-                            && v.key == t.key
-                            && v.r#type == t.r#type
-                    })
-                });
-                let tenants = self.store.data.tenants.clone();
-                let forget = if rebuilt {
-                    vec![(None, Some(id))]
-                } else {
-                    vec![]
+                // what was reported about the old one says nothing about it. Nor does a report from
+                // before a node stopped building it say anything once it builds it again.
+                let old = self
+                    .deployed()
+                    .and_then(|p| p.tunnels.iter().find(|v| v.id == t.id))
+                    .cloned();
+                let toggled: Option<Vec<String>> = match &old {
+                    Some(v) if v.remote == t.remote && v.key == t.key && v.r#type == t.r#type => {
+                        Some(
+                            v.disabled
+                                .iter()
+                                .filter(|n| !t.disabled.contains(n))
+                                .chain(t.disabled.iter().filter(|n| !v.disabled.contains(n)))
+                                .cloned()
+                                .collect(),
+                        )
+                    }
+                    _ => None,
                 };
+                let forget: Vec<(Option<&str>, Option<&str>)> = match &toggled {
+                    Some(nodes) => nodes.iter().map(|n| (Some(n.as_str()), Some(id))).collect(),
+                    None => vec![(None, Some(id))],
+                };
+                let tenants = self.store.data.tenants.clone();
                 let p = self.change_tunnels(now, &forget, |p| {
-                    // Allocating a tunnel to a customer without naming prefixes carries everything
-                    // of theirs the policy protects.
+                    // Allocating a tunnel to a customer without naming prefixes carries their own
+                    // protected prefixes that no other tunnel carries.
                     if t.prefixes.is_empty() && !t.tenant.is_empty() {
-                        t.prefixes = tenant_prefixes(p, &tenants, &t.tenant)?;
+                        t.prefixes = tenant_prefixes(p, &tenants, &t.tenant, &t.id)?;
                     }
                     match p.tunnels.iter_mut().find(|v| v.id == t.id) {
                         Some(v) => *v = t,
@@ -916,8 +970,7 @@ impl Api {
                     }
                     Ok(())
                 })?;
-                let saved = p.tunnels.iter().find(|v| v.id == id).cloned();
-                Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":saved}))
+                Ok(tunnel_answer(&p, id))
             }
             ("PUT", ["tunnels", _, "rate"]) if !id.is_empty() => {
                 who.operator()?;
@@ -934,8 +987,7 @@ impl Api {
                     t.rate_mbps = r.rate_mbps;
                     Ok(())
                 })?;
-                let saved = p.tunnels.iter().find(|v| v.id == id).cloned();
-                Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":saved}))
+                Ok(tunnel_answer(&p, id))
             }
             ("DELETE", ["tunnels", _]) if !id.is_empty() => {
                 who.operator()?;
@@ -1623,26 +1675,22 @@ mod tests {
         let tunnel = json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"required":true});
         deploy(&mut a, 0, tunnel.clone());
         let beat = format!("/v1/nodes/{node}/heartbeat");
+        let fetch = format!("/v1/nodes/{node}/program");
         let up = json!({"tunnels":[{"tunnel_id":"nw","state":"up"}]});
-        assert_eq!(call(&mut a, 1, "POST", &beat, &token, up.clone()).0, 200);
+        // The agent's loop: report what the provisioner last said, then fetch the program.
+        let agent = |a: &mut Api, now: i64| {
+            assert_eq!(call(a, now, "POST", &beat, &token, up.clone()).0, 200);
+            assert_eq!(call(a, now, "GET", &fetch, &token, Value::Null).0, 200);
+        };
+        agent(&mut a, 1);
         assert_eq!(state(&a, &node).0, "announce");
         let nodes = json!({"nodes":[node]});
-        assert_eq!(
-            call(
-                &mut a,
-                2,
-                "POST",
-                "/v1/tunnels/nw/disable",
-                OP,
-                nodes.clone()
-            )
-            .0,
-            200
-        );
-        assert_eq!(
-            call(&mut a, 3, "POST", "/v1/tunnels/nw/enable", OP, nodes).0,
-            200
-        );
+        let toggle = |a: &mut Api, now, action: &str| {
+            let path = format!("/v1/tunnels/nw/{action}");
+            assert_eq!(call(a, now, "POST", &path, OP, nodes.clone()).0, 200);
+        };
+        toggle(&mut a, 2, "disable");
+        toggle(&mut a, 3, "enable");
         let unreported = "return tunnel nw is required and has not reported up";
         assert_eq!(state(&a, &node), ("withdraw".into(), unreported.into()));
         let (_, view) = call(&mut a, 3, "GET", "/v1/tunnels", OP, Value::Null);
@@ -1651,23 +1699,164 @@ mod tests {
             (&row["state"], &row["problem"]),
             (&json!("unreported"), &json!(unreported))
         );
-        assert_eq!(call(&mut a, 4, "POST", &beat, &token, up.clone()).0, 200);
+        // The heartbeat the agent sends before it learns of the change carries what it held for
+        // the tunnel before it, and is not taken as a report on the tunnel now.
+        agent(&mut a, 4);
+        assert_eq!(state(&a, &node).0, "withdraw");
+        agent(&mut a, 5);
         assert_eq!(state(&a, &node).0, "announce");
         // Changing only what does not rebuild the tunnel keeps its report...
         let mut changed = tunnel.clone();
         changed["rate_mbps"] = json!(100);
         assert_eq!(
-            call(&mut a, 5, "PUT", "/v1/tunnels/nw", OP, changed.clone()).0,
+            call(&mut a, 6, "PUT", "/v1/tunnels/nw", OP, changed.clone()).0,
             200
         );
         assert_eq!(state(&a, &node).0, "announce");
         // ...while a new remote is a new tunnel, which has to report for itself.
         changed["remote"] = json!("198.51.100.2");
-        assert_eq!(call(&mut a, 6, "PUT", "/v1/tunnels/nw", OP, changed).0, 200);
+        assert_eq!(call(&mut a, 7, "PUT", "/v1/tunnels/nw", OP, changed).0, 200);
         assert_eq!(state(&a, &node).0, "withdraw");
-        assert_eq!(call(&mut a, 7, "POST", &beat, &token, up).0, 200);
-        assert_eq!(endpoint(&mut a, 8, "PUT", &node, "192.0.2.9").0, 200);
+        agent(&mut a, 8);
+        assert_eq!(state(&a, &node).0, "withdraw");
+        agent(&mut a, 9);
+        assert_eq!(state(&a, &node).0, "announce");
+        // So is one built from another address.
+        assert_eq!(endpoint(&mut a, 10, "PUT", &node, "192.0.2.9").0, 200);
         assert_eq!(state(&a, &node).0, "withdraw", "moved to another address");
+        agent(&mut a, 11);
+        agent(&mut a, 12);
+        assert_eq!(state(&a, &node).0, "announce");
+        // A disabled entry dropped by a whole-tunnel PUT is the same as enabling it.
+        let mut off = json!({"id":"nw","remote":"198.51.100.2","prefixes":["203.0.113.0/24"],"required":true,"rate_mbps":100});
+        off["disabled"] = json!([node]);
+        assert_eq!(
+            call(&mut a, 13, "PUT", "/v1/tunnels/nw", OP, off.clone()).0,
+            200
+        );
+        off["disabled"] = json!([]);
+        assert_eq!(call(&mut a, 14, "PUT", "/v1/tunnels/nw", OP, off).0, 200);
+        assert_eq!(state(&a, &node), ("withdraw".into(), unreported.into()));
+        // An empty list is the provisioner saying it holds nothing up now.
+        agent(&mut a, 15);
+        agent(&mut a, 16);
+        assert_eq!(state(&a, &node).0, "announce");
+        let none = json!({"tunnels":[]});
+        assert_eq!(
+            call(
+                &mut a,
+                17,
+                "POST",
+                &format!("/v1/nodes/{node}/heartbeat"),
+                &token,
+                none
+            )
+            .0,
+            200
+        );
+        assert_eq!(state(&a, &node), ("withdraw".into(), unreported.into()));
+    }
+    #[test]
+    fn a_node_that_comes_back_to_find_its_address_reassigned_withdraws_instead_of_sharing_it() {
+        let mut a = api();
+        let (na, ta) = register(&mut a, 0, "edge-a", "192.0.2.4");
+        let (nb, _) = register(&mut a, 0, "edge-b", "192.0.2.5");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}),
+        );
+        // edge-a goes quiet long enough to be stale, and its address is given to edge-b.
+        assert_eq!(endpoint(&mut a, 40, "PUT", &nb, "192.0.2.4").0, 200);
+        let beat = format!("/v1/nodes/{na}/heartbeat");
+        assert_eq!(call(&mut a, 41, "POST", &beat, &ta, Value::Null).0, 200);
+        let nodes = a.store.nodes(at(41));
+        let src = |id: &str| {
+            nodes
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .tunnel_src
+                .clone()
+        };
+        assert_eq!((src(&na), src(&nb)), ("".into(), "192.0.2.4".into()));
+        assert_eq!(state(&a, &na).0, "withdraw");
+        let (_, view) = call(&mut a, 41, "GET", "/v1/tunnels", OP, Value::Null);
+        let rows = view["tunnels"][0]["nodes"].as_array().unwrap().clone();
+        let row = rows.iter().find(|r| r["node_id"] == na.as_str()).unwrap();
+        assert!(
+            row["problem"]
+                .as_str()
+                .unwrap()
+                .contains("held by another node"),
+            "{row}"
+        );
+    }
+    #[test]
+    fn an_endpoint_inside_a_protected_prefix_withdraws_however_it_got_there() {
+        let mut a = api();
+        let (node, _) = register(&mut a, 0, "edge-a", "198.51.100.7");
+        // The policy comes to protect the prefix the node's address is in.
+        let policy = json!({"id":"p","name":"p","protected":["203.0.113.0/24","198.51.100.0/24"],
+            "tunnels":[{"id":"nw","remote":"192.0.2.200","prefixes":["203.0.113.0/24"]}]});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, policy).0, 200);
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null).0,
+            200
+        );
+        let row = a
+            .store
+            .plan
+            .iter()
+            .find(|r| r.node_id == node && r.prefix == "203.0.113.0/24")
+            .unwrap();
+        assert_eq!(row.state, "withdraw");
+        assert!(
+            row.reason
+                .contains("inside protected prefix 198.51.100.0/24"),
+            "{}",
+            row.reason
+        );
+        assert!(a.store.programs[&node].tunnels.is_empty());
+    }
+    #[test]
+    fn allocating_without_prefixes_takes_only_the_customers_own() {
+        let mut a = api();
+        register(&mut a, 0, "edge-a", "192.0.2.1");
+        let tenant = |a: &mut Api, name: &str, prefixes: Value| {
+            let body = json!({"name":name,"prefixes":prefixes});
+            call(a, 0, "POST", "/v1/tenants", OP, body).1["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let reseller = tenant(&mut a, "reseller", json!(["203.0.112.0/22"]));
+        let customer = tenant(&mut a, "customer", json!(["203.0.113.0/24"]));
+        let policy = json!({"id":"p","name":"p",
+            "protected":["203.0.112.0/24","203.0.113.0/24","203.0.114.0/24"],
+            "tunnels":[{"id":"taken","remote":"198.18.0.9","prefixes":["203.0.114.0/24"]}]});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, policy).0, 200);
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null).0,
+            200
+        );
+        // The reseller's tunnel takes neither its customer's /24, which that customer covers more
+        // specifically, nor the /24 another tunnel already carries.
+        let body = json!({"remote":"198.18.0.10","tenant":reseller});
+        let (status, r) = call(&mut a, 0, "PUT", "/v1/tunnels/resale", OP, body);
+        assert_eq!(status, 200, "{r}");
+        assert_eq!(r["tunnel"]["prefixes"], json!(["203.0.112.0/24"]));
+        let body = json!({"remote":"198.18.0.11","tenant":customer});
+        let (status, c) = call(&mut a, 0, "PUT", "/v1/tunnels/cust", OP, body);
+        assert_eq!(status, 200, "{c}");
+        assert_eq!(c["tunnel"]["prefixes"], json!(["203.0.113.0/24"]));
+        // Named explicitly, a reseller may still carry its customer's prefix.
+        let body = json!({"remote":"198.18.0.12","tenant":reseller,"prefixes":["203.0.113.0/24"]});
+        assert_eq!(call(&mut a, 0, "PUT", "/v1/tunnels/cust", OP, body).0, 200);
+        // With nothing left of its own, allocation says so rather than taking a prefix in use.
+        let body = json!({"remote":"198.18.0.13","tenant":customer});
+        let (status, e) = call(&mut a, 0, "PUT", "/v1/tunnels/again", OP, body);
+        assert_eq!(status, 400, "{e}");
     }
     #[test]
     fn tunnel_puts_refuse_unknown_nodes_and_ends_linux_cannot_build_twice() {

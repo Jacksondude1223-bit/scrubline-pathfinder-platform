@@ -3,7 +3,7 @@ use crate::{bgp, model::*, tunnel};
 use chrono::Utc;
 use ipnet::IpNet;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
 };
 pub const MAX_PREPENDS: i64 = 5;
@@ -133,14 +133,8 @@ fn deliverable(p: &Policy, n: &Node, prefix: &str, health: &TunnelHealth) -> (bo
             "node has no tunnel_src, so it cannot build the return path for this prefix".into(),
         );
     }
-    if n.tunnel_src == t.remote {
-        return (
-            false,
-            format!(
-                "return tunnel {} would end where it starts: the node's tunnel_src is its remote",
-                t.id
-            ),
-        );
+    if let Some(why) = unusable_endpoint(p, n, t) {
+        return (false, why);
     }
     let nt = NodeTunnel {
         id: t.id.clone(),
@@ -155,6 +149,46 @@ fn deliverable(p: &Policy, n: &Node, prefix: &str, health: &TunnelHealth) -> (bo
             .map(String::as_str)
             .unwrap_or("unknown"),
     )
+}
+/// Why a node's tunnel_src cannot be the local end of this tunnel, when it cannot: a tunnel that
+/// ends where it starts, or an address inside a protected prefix, which the fabric anycasts, so
+/// the customer's packets to it are drawn to whichever scrubber is nearest.
+fn unusable_endpoint(p: &Policy, n: &Node, t: &Tunnel) -> Option<String> {
+    if n.tunnel_src == t.remote {
+        return Some(format!(
+            "return tunnel {} would end where it starts: the node's tunnel_src is its remote",
+            t.id
+        ));
+    }
+    let addr: IpAddr = n.tunnel_src.parse().ok()?;
+    p.protected
+        .iter()
+        .find(|prefix| prefix.parse::<IpNet>().is_ok_and(|net| net.contains(&addr)))
+        .map(|prefix| {
+            format!(
+                "the node's tunnel_src {} is inside protected prefix {prefix}, which the fabric anycasts",
+                n.tunnel_src
+            )
+        })
+}
+/// Other tunnels' prefixes inside this tunnel's, across the whole policy.
+fn foreign_to(p: &Policy, t: &Tunnel) -> Vec<String> {
+    let mine: Vec<IpNet> = t.prefixes.iter().filter_map(|v| v.parse().ok()).collect();
+    let mut out: Vec<String> = p
+        .tunnels
+        .iter()
+        .filter(|o| o.id != t.id)
+        .flat_map(|o| &o.prefixes)
+        .filter(|prefix| {
+            prefix.parse::<IpNet>().is_ok_and(|net| {
+                mine.iter()
+                    .any(|m| m.prefix_len() < net.prefix_len() && m.contains(&net))
+            })
+        })
+        .cloned()
+        .collect();
+    out.sort();
+    out
 }
 pub fn enforced_prefixes(p: &Policy, n: &Node) -> Vec<String> {
     p.protected
@@ -176,11 +210,14 @@ pub fn tunnels_for(p: &Policy, n: &Node, enforced: &[String]) -> Vec<NodeTunnel>
                 .collect();
             if mine.is_empty()
                 || t.disabled.iter().any(|id| id == &n.id)
-                || n.tunnel_src == t.remote
+                || unusable_endpoint(p, n, t).is_some()
             {
                 None
             } else {
-                tunnel::for_node(t, n, &mine).ok()
+                tunnel::for_node(t, n, &mine).ok().map(|mut built| {
+                    built.foreign = foreign_to(p, t);
+                    built
+                })
             }
         })
         .collect();
@@ -215,12 +252,19 @@ fn games_for(p: &Policy, prefixes: &[String], has_zc: bool) -> Vec<GameFilter> {
         .cloned()
         .collect()
 }
-/// Splits each tunnel's clean-traffic allowance evenly across the nodes sending it, so the
-/// customer never receives more than the allowance in total. A node sends a tunnel when it builds
-/// it and announces one of its prefixes; one still building it while withdrawing gets the same
-/// share for the traffic BGP has yet to move away.
-fn share_rates(programs: &mut HashMap<String, Program>) {
+/// Splits each tunnel's clean-traffic allowance evenly across the nodes sending it: those that
+/// build it and announce one of its prefixes, so the shares of the nodes attracting the
+/// customer's traffic add up to the allowance. A node still building the tunnel while it withdraws
+/// gets the same share for the traffic BGP has yet to move away, so while that converges the total
+/// can run over by those shares. With no node announcing, the live nodes building it split it.
+fn share_rates(programs: &mut HashMap<String, Program>, nodes: &[Node]) {
+    let live: HashSet<&str> = nodes
+        .iter()
+        .filter(|n| n.status != "stale")
+        .map(|n| n.id.as_str())
+        .collect();
     let mut senders: HashMap<String, i64> = HashMap::new();
+    let mut builders: HashMap<String, i64> = HashMap::new();
     for prog in programs.values() {
         for t in &prog.tunnels {
             let announced = prog
@@ -230,11 +274,19 @@ fn share_rates(programs: &mut HashMap<String, Program>) {
             if announced {
                 *senders.entry(t.id.clone()).or_default() += 1;
             }
+            if live.contains(prog.node_id.as_str()) {
+                *builders.entry(t.id.clone()).or_default() += 1;
+            }
         }
     }
     for prog in programs.values_mut() {
         for t in &mut prog.tunnels {
-            let n = senders.get(&t.id).copied().unwrap_or(1).max(1);
+            let n = senders
+                .get(&t.id)
+                .or_else(|| builders.get(&t.id))
+                .copied()
+                .unwrap_or(1)
+                .max(1);
             t.rate_kbps = (t.rate_kbps / n).max(1);
         }
     }
@@ -308,7 +360,7 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
             (n.id.clone(), prog)
         })
         .collect();
-    share_rates(&mut programs);
+    share_rates(&mut programs, nodes);
     programs
 }
 fn or_any(s: &str) -> &str {

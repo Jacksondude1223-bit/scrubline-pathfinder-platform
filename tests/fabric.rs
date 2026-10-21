@@ -528,3 +528,104 @@ fn a_node_whose_address_is_the_tunnels_remote_withdraws_rather_than_breaking_its
     // The node's other tunnels still render; one impossible tunnel no longer fails them all.
     assert!(tunnel::commands(&programs["a"].tunnels).is_ok());
 }
+#[test]
+fn replies_belong_to_the_tunnel_with_the_most_specific_prefix() {
+    let rule = |name: &str, tail: &str| {
+        format!("nft add rule inet scrubline forward iifname \"scr-{name}\" {tail}")
+    };
+    // a: 10.0.0.0/8 and 10.1.2.128/25; b: 10.1.2.0/24 between them.
+    let a = node_tunnel("a", &["10.0.0.0/8", "10.1.2.128/25"], "");
+    let b = node_tunnel("b", &["10.1.2.0/24"], "");
+    let lines = tunnel::reply_commands(&[a.clone(), b]).unwrap();
+    assert_eq!(
+        &lines[..2],
+        [
+            rule("a", "ip saddr { 10.1.2.0/25 } drop"),
+            rule("a", "ip saddr != { 10.0.0.0/8 } drop"),
+        ],
+        "a keeps its own /25 inside b's /24"
+    );
+    assert_eq!(
+        &lines[3..5],
+        [
+            rule("b", "ip saddr { 10.1.2.128/25 } drop"),
+            rule("b", "ip saddr != { 10.1.2.0/24 } drop"),
+        ]
+    );
+    // Another customer's prefix is refused even when its tunnel is not built on this node: the
+    // control plane names it.
+    let alone = NodeTunnel {
+        foreign: vec!["10.1.2.0/24".into()],
+        ..node_tunnel("a", &["10.0.0.0/8"], "")
+    };
+    assert_eq!(
+        tunnel::reply_commands(&[alone]).unwrap()[0],
+        rule("a", "ip saddr { 10.1.2.0/24 } drop")
+    );
+}
+#[test]
+fn the_compiler_names_other_tunnels_prefixes_inside_each_tunnel() {
+    let p = Policy {
+        protected: vec!["10.0.0.0/8".into(), "10.1.2.0/24".into()],
+        tunnels: vec![
+            Tunnel {
+                id: "wide".into(),
+                remote: "198.18.0.9".into(),
+                prefixes: vec!["10.0.0.0/8".into()],
+                ..Default::default()
+            },
+            Tunnel {
+                id: "narrow".into(),
+                remote: "198.18.0.10".into(),
+                prefixes: vec!["10.1.2.0/24".into()],
+                disabled: vec!["a".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let n = Node {
+        tunnel_src: "192.0.2.1".into(),
+        ..node("a", "iad", 100.0, "")
+    };
+    let plan = compiler::plan(
+        &p,
+        std::slice::from_ref(&n),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let programs = compiler::compile(&p, &[n], &plan);
+    let built = &programs["a"].tunnels;
+    assert_eq!(built.len(), 1, "narrow is disabled here");
+    assert_eq!(built[0].foreign, ["10.1.2.0/24"]);
+}
+#[test]
+fn with_no_node_announcing_the_live_nodes_building_a_tunnel_split_it() {
+    let p = Policy {
+        protected: vec!["203.0.113.0/24".into()],
+        tunnels: vec![Tunnel {
+            id: "nw".into(),
+            remote: "198.18.0.9".into(),
+            prefixes: vec!["203.0.113.0/24".into()],
+            required: true,
+            rate_mbps: 1000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let nodes: Vec<Node> = ["a", "b"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| Node {
+            tunnel_src: format!("192.0.2.{}", i + 1),
+            ..node(id, "iad", 100.0, "")
+        })
+        .collect();
+    // Required and never reported up: every node withdraws, but still builds the tunnel.
+    let plan = compiler::plan(&p, &nodes, &HashMap::new(), &HashMap::new());
+    assert!(plan.iter().all(|a| a.state == "withdraw"));
+    let programs = compiler::compile(&p, &nodes, &plan);
+    for id in ["a", "b"] {
+        assert_eq!(programs[id].tunnels[0].rate_kbps, 500_000, "{id}");
+    }
+}

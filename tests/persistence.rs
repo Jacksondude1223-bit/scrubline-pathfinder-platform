@@ -237,3 +237,48 @@ fn assigned_tunnel_endpoints_survive_a_restart_and_reregistration() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+#[test]
+fn a_tunnel_address_two_live_nodes_registered_is_neither_of_theirs() {
+    let mut store = Store::open("").unwrap();
+    let now = chrono::Utc::now();
+    for name in ["edge-a", "edge-b"] {
+        let n = Node {
+            name: name.into(),
+            region: "iad".into(),
+            tunnel_src: "192.0.2.9".into(),
+            ..Default::default()
+        };
+        store.register(n, now).unwrap();
+    }
+    assert!(store.nodes(now).iter().all(|n| n.tunnel_src.is_empty()));
+    // Once one goes quiet, the live one keeps it.
+    let later = now + chrono::Duration::seconds(31);
+    let b = store
+        .data
+        .nodes
+        .iter()
+        .find(|n| n.name == "edge-b")
+        .unwrap()
+        .id
+        .clone();
+    store
+        .data
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == b)
+        .unwrap()
+        .last_seen = later;
+    let nodes = store.nodes(later);
+    let src = |name: &str| {
+        nodes
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap()
+            .tunnel_src
+            .clone()
+    };
+    assert_eq!(
+        (src("edge-a"), src("edge-b")),
+        ("".into(), "192.0.2.9".into())
+    );
+}

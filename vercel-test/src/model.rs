@@ -417,6 +417,10 @@ pub struct NodeTunnel {
     /// back up the tunnel may be sourced from any of them.
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub sources: Vec<String>,
+    /// Other tunnels' prefixes inside this tunnel's, policy-wide. They are those customers'
+    /// address space, so replies coming up this tunnel may not be sourced from them.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub foreign: Vec<String>,
     /// This node's share of the tunnel's clean-traffic allowance, in kbit/s.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]

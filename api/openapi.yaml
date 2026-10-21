@@ -318,7 +318,13 @@ paths:
         rather than having an endpoint of its own because it has to arrive as often as liveness does:
         a tunnel that went down between two polls is a prefix being black-holed until the next one. A
         tunnel reported down withdraws its prefixes from this node immediately, and the fabric recompiles
-        on the change rather than waiting for the next scheduled pass.'
+        on the change rather than waiting for the next scheduled pass.
+
+
+        A `tunnels` list, even an empty one, is everything the provisioner says now and replaces what
+        it said before; leaving the field out keeps it. Reports on a tunnel an operator has just
+        disabled, rebuilt, removed or moved to another address are ignored until the node next fetches
+        its program, since until then its agent is reporting on the tunnel as it was.'
       parameters: &id005
       - name: id
         in: path
@@ -1103,7 +1109,9 @@ paths:
 
 
         To allocate a tunnel to a customer, set tenant. Its prefixes must then lie within that customer''s
-        prefixes; leave prefixes out and it carries every prefix of theirs the policy protects.'
+        prefixes; leave prefixes out and it carries the protected prefixes that are the customer''s
+        own, not those of a customer nested inside them that covers a prefix more specifically, and
+        that no other tunnel already carries.'
       parameters: *id005
       requestBody:
         required: true
@@ -2439,11 +2447,19 @@ components:
             type: string
           description: Every prefix of the tunnel, including ones steered away from this node. Replies coming
             back up the tunnel may be sourced from any of them.
+        foreign:
+          type: array
+          items:
+            type: string
+          description: Other tunnels' prefixes inside this tunnel's, across the whole policy. Each is that
+            customer's, as routing goes by the most specific prefix, so replies up this tunnel may not be
+            sourced from it.
         rate_kbps:
           type: integer
           description: This node's share of the tunnel's clean-traffic allowance, in kbit/s. The allowance
             is split evenly across the nodes announcing the tunnel's prefixes; a node still building it
-            while withdrawing gets the same share for the traffic BGP has yet to move away.
+            while withdrawing gets the same share for the traffic BGP has yet to move away, and with no
+            node announcing, the live nodes building it split it.
     TunnelEndpoint:
       type: object
       required:
