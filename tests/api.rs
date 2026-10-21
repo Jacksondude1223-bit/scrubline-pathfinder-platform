@@ -405,9 +405,11 @@ fn operators_assign_each_node_its_own_tunnel_endpoint() {
     assert_eq!(node["tunnel_src"], "192.0.2.1");
     assert_eq!(node["tunnel_endpoint_assigned"], true);
     // The node re-registering with an address of its own does not move its tunnels: the
-    // operator's assignment stands until the operator clears it.
+    // operator's assignment stands until the operator clears it. The agent is answered with what
+    // it registered, and learns the assignment from its program, so it never mistakes the
+    // assignment for its own address once it is cleared.
     let again = register(json!({"name":"edge-a","region":"iad","tunnel_src":"192.0.2.9"}));
-    assert_eq!(again["node"]["tunnel_src"], "192.0.2.1");
+    assert_eq!(again["node"]["tunnel_src"], "192.0.2.9");
     let (_, nodes) = call(&base, "GET", "/v1/nodes", Some(OP), Value::Null);
     let listed = nodes
         .as_array()

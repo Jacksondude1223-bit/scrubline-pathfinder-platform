@@ -44,7 +44,7 @@ to open the control plane.
 | `401` | No credential, or one the control plane does not know. |
 | `403` | The credential is valid but not allowed here. **Not** `404` — the API tells you it exists and you cannot have it. |
 | `404` | The thing genuinely is not there. |
-| `409` | A conflict: a duplicate live node, no live nodes to deploy onto, or a write sent to a replica. |
+| `409` | A conflict: a duplicate live node, no live nodes to deploy onto, a tunnel address another node holds, a tunnel change with no deployed policy, a customer a tunnel is still allocated to, or a write sent to a replica. |
 | `413` | The sample batch would push the training set past its limit. |
 | `503` | Durable state could not be written. **The change was rolled back and did not take effect.** |
 
@@ -441,12 +441,27 @@ $ curl -X PUT -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: applicatio
 
 The fabric recompiles on the spot, and the agent builds its tunnels from that
 address on its next poll. The assignment belongs to the operator: it survives
-the node re-registering, so a node cannot move its own tunnels. Two nodes on
-one address are refused with a `409`, since each would take the other's
-customer replies. `DELETE` on the same path returns the node to what it
-registered with.
+the node re-registering, so a node cannot move its own tunnels. It reaches the
+agent in its program; registration answers with what the node registered.
+
+Two nodes on one address are refused with a `409`, since each would take the
+other's customer replies. That covers assigning, registering, and `DELETE` on
+the same path, which returns the node to what it registered with unless that
+address has since gone to another node. A node that has stopped heartbeating
+keeps an address an operator assigned it, but not one it only registered
+with, so a replacement box can take the old one's address. An address that is
+a deployed tunnel's customer end, or that sits inside a protected prefix (which
+the fabric anycasts), is refused with a `400`.
 
 The same address is what the node peers customer BGP sessions from.
+
+Scrubline does not put the address on the box. It must be one the node
+already owns and that is routed to it; a node told to build tunnels from an
+address it does not have builds tunnels nothing reaches. Upgrade agents before
+assigning endpoints: an agent from before this release takes no endpoint from
+its program and keeps peering customer sessions from the address it started
+with. Upgrade replicas before their primary, too: a control plane from before
+this release drops the assignments from the state it follows.
 
 #### One tunnel per node, not one per customer
 
@@ -463,6 +478,10 @@ ip link add scr-northwind type gre local 192.0.2.1 remote 198.18.0.9 key 42
 ip link set scr-northwind mtu 1472 up
 ip route replace 203.0.113.0/24 dev scr-northwind
 nft add rule inet scrubline forward oifname "scr-northwind" tcp flags syn tcp option maxseg size set 1432
+nft add rule inet scrubline forward iifname "scr-northwind" ip saddr != { 203.0.113.0/24 } drop
+nft add rule inet scrubline forward iifname "scr-northwind" meta nfproto ipv6 drop
+nft add rule inet scrubline forward iifname "scr-northwind" tcp flags syn tcp option maxseg size set 1432
+tc qdisc replace dev scr-northwind root tbf rate 1250000kbit burst 1562500 latency 50ms
 
 $ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-b:9091/tunnels?format=iproute2'
 # Northwind primary return path
@@ -496,14 +515,19 @@ nft add rule inet scrubline forward iifname "scr-northwind" tcp flags syn tcp op
 
 Only sources inside the tunnel's own prefixes may come back up it, per
 address family. Without that the tunnel is an open relay for anything the
-customer's edge sends into it, spoofed or not. SYNs coming up are clamped
-like the ones going down, so the far side's segments fit the tunnel too. The
-rules assume the `inet scrubline` table and its `forward` chain exist, as the
-MSS clamp always has.
+customer's edge sends into it, spoofed or not. That is every prefix of the
+tunnel, including any steered away from this node, since a customer routes its
+replies up whichever tunnel it likes. A more specific prefix that another
+tunnel on the node delivers to belongs to that customer, so it is refused even
+inside one of this tunnel's. SYNs coming up are clamped like the ones going
+down, so the far side's segments fit the tunnel too. The rules assume the
+`inet scrubline` table and its `forward` chain exist, as the MSS clamp always
+has.
 
 `"direction": "return"` on the tunnel is for customers whose replies leave by
-their own transit: the tunnel then only carries clean traffic out, and gets
-no reply rules.
+their own transit: the tunnel then only carries clean traffic out, and
+nothing that comes up it is forwarded
+(`nft add rule inet scrubline forward iifname "scr-northwind" drop`).
 
 #### Controlling tunnels from the API
 

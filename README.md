@@ -592,10 +592,12 @@ The local end is each node's own address, because it is per node, not per
 tunnel: the customer's tunnel runs straight to the scrubbing node. An operator
 assigns it with `PUT /v1/nodes/{id}/tunnel-endpoint`; a node can also supply
 one with `-tunnel-src`, and the operator's assignment wins and survives the
-node re-registering. The fabric is anycast, so a return path fans out rather than
-being assigned: every node carrying the prefix holds its own tunnel to the
-one customer endpoint. Ten scrubbers protecting one customer is ten tunnels.
-That is the cost of not pinning a prefix to one box.
+node re-registering. No two nodes may hold one address, and the address must
+already be one the node owns: Scrubline does not configure it. The fabric is
+anycast, so a return path fans out rather than being assigned: every node
+carrying the prefix holds its own tunnel to the one customer endpoint. Ten
+scrubbers protecting one customer is ten tunnels. That is the cost of not
+pinning a prefix to one box.
 
 The agent serves the compiled result at `/tunnels`, the way it serves the
 announcement plan at `/bgp` — Scrubline does not create interfaces any more
@@ -614,7 +616,8 @@ them to the internet. The agent renders forwarding rules for that half that
 admit only sources inside the tunnel's own prefixes, per address family, so
 the tunnel cannot relay anything else the customer's edge sends into it; SYNs
 coming back up are MSS-clamped too. `"direction": "return"` is for customers
-whose replies leave by their own transit.
+whose replies leave by their own transit, and forwards nothing that comes up
+the tunnel.
 
 ### Controlling tunnels from the API
 

@@ -133,6 +133,15 @@ fn deliverable(p: &Policy, n: &Node, prefix: &str, health: &TunnelHealth) -> (bo
             "node has no tunnel_src, so it cannot build the return path for this prefix".into(),
         );
     }
+    if n.tunnel_src == t.remote {
+        return (
+            false,
+            format!(
+                "return tunnel {} would end where it starts: the node's tunnel_src is its remote",
+                t.id
+            ),
+        );
+    }
     let nt = NodeTunnel {
         id: t.id.clone(),
         required: t.required,
@@ -165,7 +174,10 @@ pub fn tunnels_for(p: &Policy, n: &Node, enforced: &[String]) -> Vec<NodeTunnel>
                 .filter(|prefix| enforced.contains(prefix))
                 .cloned()
                 .collect();
-            if mine.is_empty() || t.disabled.iter().any(|id| id == &n.id) {
+            if mine.is_empty()
+                || t.disabled.iter().any(|id| id == &n.id)
+                || n.tunnel_src == t.remote
+            {
                 None
             } else {
                 tunnel::for_node(t, n, &mine).ok()

@@ -102,8 +102,22 @@ pub fn policy(p: &Policy) -> Result<()> {
     gamefilter::compile(&p.games)?;
     unique(p.tunnels.iter().map(|t| t.id.as_str()), "tunnels")?;
     let mut carried = HashSet::new();
+    let mut ends = HashMap::new();
     for t in &p.tunnels {
         tunnel::validate(t, Some(&protected))?;
+        // Every tunnel on a node starts from the node's one address, and Linux holds one tunnel
+        // per encapsulation, remote and key: the second would fail to build on every node.
+        let kind = if t.r#type.is_empty() {
+            "gre"
+        } else {
+            t.r#type.as_str()
+        };
+        if let Some(other) = ends.insert((kind, t.remote.as_str(), t.key), t.id.as_str()) {
+            return Err(format!(
+                "tunnels {other} and {} both run {kind} to {} with key {}; give one a distinct key",
+                t.id, t.remote, t.key
+            ));
+        }
         for prefix in &t.prefixes {
             if !carried.insert(prefix) {
                 return Err("a prefix has one return path".into());

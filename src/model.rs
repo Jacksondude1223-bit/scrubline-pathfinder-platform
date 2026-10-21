@@ -413,6 +413,10 @@ pub struct NodeTunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub direction: String,
+    /// Every prefix of the tunnel, including ones steered away from this node: replies coming
+    /// back up the tunnel may be sourced from any of them.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub sources: Vec<String>,
     /// This node's share of the tunnel's clean-traffic allowance, in kbit/s.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]

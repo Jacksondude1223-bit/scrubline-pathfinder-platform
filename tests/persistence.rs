@@ -226,7 +226,11 @@ fn assigned_tunnel_endpoints_survive_a_restart_and_reregistration() {
     let now = chrono::Utc::now();
     assert_eq!(restored.nodes(now)[0].tunnel_src, "192.0.2.1");
     let (again, _) = restored.register(edge(), now).unwrap();
-    assert_eq!(again.tunnel_src, "192.0.2.1");
+    assert_eq!(
+        again.tunnel_src, "192.0.2.9",
+        "answered with what it registered"
+    );
+    assert_eq!(restored.nodes(now)[0].tunnel_src, "192.0.2.1");
     assert_eq!(
         restored.data.nodes[0].tunnel_src, "192.0.2.9",
         "the registered address is kept to fall back to"

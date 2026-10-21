@@ -140,6 +140,11 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         interface: interface_name(&t.id)?,
         comment: t.comment.clone(),
         direction: t.direction.clone(),
+        sources: {
+            let mut all = t.prefixes.clone();
+            all.sort();
+            all
+        },
         // The whole allowance; compiling the fabric splits it among the nodes sending.
         rate_kbps: rate_mbps(t).saturating_mul(1000),
     })
@@ -148,37 +153,91 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
 pub fn carries_replies(t: &NodeTunnel) -> bool {
     t.direction != "return"
 }
+/// Networks in `nets` of one address family, with any inside another of them left out: an
+/// nftables interval set refuses overlapping elements on older releases.
+fn outermost(nets: &[IpNet], v4: bool) -> Vec<String> {
+    let mut out: Vec<IpNet> = nets
+        .iter()
+        .filter(|n| matches!(n, IpNet::V4(_)) == v4)
+        .filter(|n| {
+            !nets
+                .iter()
+                .any(|o| o.prefix_len() < n.prefix_len() && o.contains(*n))
+        })
+        .copied()
+        .collect();
+    out.sort();
+    out.dedup();
+    out.iter().map(IpNet::to_string).collect()
+}
 /// The rules for traffic coming back up a tunnel: the customer's replies, which the node forwards
 /// to the internet. Only the tunnel's own prefixes may be sources, or the tunnel would be an open
 /// relay for anything the customer's edge sends into it, and SYNs leaving through it are clamped
-/// so the far side's segments fit the tunnel too.
+/// so the far side's segments fit the tunnel too. A more specific prefix another tunnel on this
+/// node delivers to belongs to that customer, so it is refused as a source even inside one of
+/// this tunnel's. A tunnel that carries no replies forwards nothing that comes up it.
 pub fn reply_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
-    let mut rows: Vec<_> = tunnels.iter().filter(|t| carries_replies(t)).collect();
+    let mut rows: Vec<_> = tunnels.iter().collect();
     rows.sort_by_key(|t| &t.id);
+    let mut owned = Vec::new();
+    for t in &rows {
+        // Replies may come from any of the tunnel's prefixes, not only the ones this node
+        // announces: a customer routes them up whichever tunnel it likes. A program from a
+        // control plane that does not send the full list falls back to this node's share.
+        let sources = if t.sources.is_empty() {
+            &t.prefixes
+        } else {
+            &t.sources
+        };
+        for prefix in sources {
+            let net = prefix.parse::<IpNet>().map_err(|e| e.to_string())?.trunc();
+            owned.push((t.id.as_str(), net));
+        }
+    }
     let mut lines = Vec::new();
     for t in rows {
         let name = interface_name(&t.id)?;
-        let (mut v4, mut v6) = (Vec::new(), Vec::new());
-        for prefix in &t.prefixes {
-            match prefix.parse::<IpNet>().map_err(|e| e.to_string())?.trunc() {
-                IpNet::V4(p) => v4.push(p.to_string()),
-                IpNet::V6(p) => v6.push(p.to_string()),
-            }
+        let rule =
+            |tail: String| format!("nft add rule inet scrubline forward iifname \"{name}\" {tail}");
+        if !carries_replies(t) {
+            lines.push(rule("drop".into()));
+            continue;
         }
-        v4.sort();
-        v6.sort();
-        for (family, match_on, sources) in [("ipv4", "ip", v4), ("ipv6", "ip6", v6)] {
-            lines.push(if sources.is_empty() {
-                format!("nft add rule inet scrubline forward iifname \"{name}\" meta nfproto {family} drop")
+        let mine: Vec<IpNet> = owned
+            .iter()
+            .filter(|(id, _)| *id == t.id)
+            .map(|(_, n)| *n)
+            .collect();
+        let foreign: Vec<IpNet> = owned
+            .iter()
+            .filter(|(id, n)| {
+                *id != t.id
+                    && mine
+                        .iter()
+                        .any(|m| m.prefix_len() < n.prefix_len() && m.contains(n))
+            })
+            .map(|(_, n)| *n)
+            .collect();
+        for (family, match_on, v4) in [("ipv4", "ip", true), ("ipv6", "ip6", false)] {
+            let theirs = outermost(&foreign, v4);
+            if !theirs.is_empty() {
+                lines.push(rule(format!(
+                    "{match_on} saddr {{ {} }} drop",
+                    theirs.join(", ")
+                )));
+            }
+            let sources = outermost(&mine, v4);
+            lines.push(rule(if sources.is_empty() {
+                format!("meta nfproto {family} drop")
             } else {
-                format!(
-                    "nft add rule inet scrubline forward iifname \"{name}\" {match_on} saddr != {{ {} }} drop",
-                    sources.join(", ")
-                )
-            });
+                format!("{match_on} saddr != {{ {} }} drop", sources.join(", "))
+            }));
         }
         if t.mss_clamp > 0 {
-            lines.push(format!("nft add rule inet scrubline forward iifname \"{name}\" tcp flags syn tcp option maxseg size set {}", t.mss_clamp));
+            lines.push(rule(format!(
+                "tcp flags syn tcp option maxseg size set {}",
+                t.mss_clamp
+            )));
         }
     }
     Ok(lines)

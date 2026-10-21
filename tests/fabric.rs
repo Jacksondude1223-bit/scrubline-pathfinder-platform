@@ -181,7 +181,7 @@ fn replies_up_a_tunnel_may_only_come_from_its_own_prefixes() {
         format!("nft add rule inet scrubline forward iifname \"scr-{name}\" {tail}")
     };
     let tunnels = [
-        node_tunnel("zeta", &["203.0.113.0/24"], "return"),
+        node_tunnel("zeta", &["192.0.2.128/25"], "return"),
         NodeTunnel {
             mss_clamp: 1396,
             ..node_tunnel(
@@ -201,10 +201,31 @@ fn replies_up_a_tunnel_may_only_come_from_its_own_prefixes() {
                 "mixed",
                 "ip saddr != { 198.51.100.0/24, 203.0.113.0/25 } drop"
             ),
+            // alpha's /48 sits inside mixed's /32 but is alpha's customer's, so mixed's customer
+            // may not source from it.
+            rule("mixed", "ip6 saddr { 2001:db8:1::/48 } drop"),
             rule("mixed", "ip6 saddr != { 2001:db8::/32 } drop"),
             rule("mixed", "tcp flags syn tcp option maxseg size set 1396"),
+            // A return-only tunnel carries nothing back, so nothing coming up it is forwarded.
+            rule("zeta", "drop"),
+        ]
+    );
+    // Replies may come from every prefix of the tunnel, including ones steered away from this
+    // node, and a prefix nested in another of the same tunnel is not repeated.
+    let steered = NodeTunnel {
+        sources: vec![
+            "203.0.113.0/24".into(),
+            "203.0.113.0/25".into(),
+            "198.51.100.0/24".into(),
         ],
-        "a return-only tunnel carries nothing back, so it gets no reply rules"
+        ..node_tunnel("steered", &["203.0.113.0/24"], "")
+    };
+    assert_eq!(
+        tunnel::reply_commands(&[steered]).unwrap()[0],
+        rule(
+            "steered",
+            "ip saddr != { 198.51.100.0/24, 203.0.113.0/24 } drop"
+        )
     );
     assert!(tunnel::carries_replies(&node_tunnel("t", &[], "")));
     assert!(!tunnel::carries_replies(&node_tunnel("t", &[], "return")));
@@ -459,4 +480,51 @@ fn tunnels_allocated_to_a_customer_carry_only_their_prefixes() {
             "{prefixes:?} {tenant}"
         );
     }
+}
+#[test]
+fn a_node_whose_address_is_the_tunnels_remote_withdraws_rather_than_breaking_its_tunnels() {
+    let p = Policy {
+        protected: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
+        tunnels: vec![
+            Tunnel {
+                id: "loop".into(),
+                remote: "192.0.2.1".into(),
+                prefixes: vec!["203.0.113.0/24".into()],
+                ..Default::default()
+            },
+            Tunnel {
+                id: "fine".into(),
+                remote: "198.18.0.9".into(),
+                prefixes: vec!["198.51.100.0/24".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let n = Node {
+        tunnel_src: "192.0.2.1".into(),
+        ..node("a", "iad", 100.0, "")
+    };
+    let plan = compiler::plan(
+        &p,
+        std::slice::from_ref(&n),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+    let looped = plan.iter().find(|a| a.prefix == "203.0.113.0/24").unwrap();
+    assert_eq!(looped.state, "withdraw");
+    assert!(
+        looped.reason.contains("would end where it starts"),
+        "{}",
+        looped.reason
+    );
+    let programs = compiler::compile(&p, &[n], &plan);
+    let built: Vec<_> = programs["a"]
+        .tunnels
+        .iter()
+        .map(|t| t.id.as_str())
+        .collect();
+    assert_eq!(built, ["fine"]);
+    // The node's other tunnels still render; one impossible tunnel no longer fails them all.
+    assert!(tunnel::commands(&programs["a"].tunnels).is_ok());
 }

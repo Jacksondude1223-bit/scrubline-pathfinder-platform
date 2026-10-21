@@ -224,8 +224,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: A different live node already holds this name and region, or this control plane
-            is a replica.
+          description: A different live node already holds this name and region, another node holds the
+            tunnel_src (by an operator's assignment, or by registration while it is live), or this control
+            plane is a replica.
           content:
             application/json:
               schema:
@@ -958,8 +959,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/EndpointNode'
         '400':
-          description: The address is not IPv4, or is not one a customer edge could reach (unspecified,
-            loopback, multicast or broadcast).
+          description: The address is not IPv4, is not one a customer edge could reach (unspecified,
+            loopback, multicast or broadcast), is the customer end of a deployed tunnel, or lies inside a
+            protected prefix, which the fabric anycasts.
           content:
             application/json:
               schema:
@@ -971,8 +973,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Another node already terminates tunnels on that address, or this control plane
-            is a replica.
+          description: Another node holds that address (by an operator's assignment, or by registration
+            while it is live), or this control plane is a replica.
           content:
             application/json:
               schema:
@@ -986,9 +988,17 @@ paths:
 
 
         The assignment is the operator''s: it overrides the tunnel_src the node registered with, and survives
-        the node re-registering, so a node cannot move its own tunnels. Two nodes may not share an address,
-        since each would take the other''s customer replies. Prefixes withdrawn because the node had no
-        endpoint are announced again on the recompile this triggers.'
+        the node re-registering, so a node cannot move its own tunnels. It reaches the agent in its program;
+        registration answers with what the node registered. Two nodes may not share an address, since each
+        would take the other''s customer replies; a node that has stopped heartbeating keeps an assigned
+        address but not one it registered with, so a replacement box can take that over. Prefixes withdrawn
+        because the node had no endpoint are announced again on the recompile this triggers, and what was
+        reported about its tunnels from the old address is dropped, so a required tunnel reports up again.
+
+
+        Scrubline does not configure the address on the box: it must already be one the node owns and that
+        is routed to it. Agents must be on a release that reads the endpoint from their program before one
+        is assigned, or they keep peering customer sessions from the address they started with.'
       parameters: *id005
       requestBody:
         required: true
@@ -1014,7 +1024,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '409': *id006
+        '409':
+          description: The address the node registered with now belongs to another node, so falling back
+            to it would put two nodes on one address; assign this one another address instead. Or this
+            control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
@@ -1063,9 +1080,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/TunnelChange'
         '400':
-          description: The tunnel will not validate against the policy (including a rate_mbps over 2500),
-            names an unknown customer or carries a prefix outside theirs, or the id in the body differs
-            from the one in the path.
+          description: The tunnel will not validate against the policy (including a rate_mbps over 2500,
+            or the same encapsulation, remote and key as another tunnel), names an unknown customer or
+            carries a prefix outside theirs, lists a disabled entry that is not a registered node id, or
+            the id in the body differs from the one in the path.
           content:
             application/json:
               schema:
@@ -2056,6 +2074,13 @@ components:
           additionalProperties:
             type: string
           description: Tenant id to credential hash. Hashes only, for the same reason node_tokens are.
+        tunnel_endpoints:
+          type: object
+          additionalProperties:
+            type: string
+          description: 'Node id to the tunnel endpoint an operator assigned it, which overrides the node''s
+            registered tunnel_src. A control plane from before this field drops it, so replicas are
+            upgraded before the primary they follow.'
     ReputationPolicy:
       type: object
       description: 'Tunes the two-tier source cache: who gets the short path, and whether repeat offenders
@@ -2202,9 +2227,7 @@ components:
     Tunnel:
       type: object
       required:
-      - id
       - remote
-      - prefixes
       description: 'The return path for a set of protected prefixes: where scrubbed traffic goes once
         it is clean. This is the half of a scrubbing service BGP cannot do — announcing a prefix pulls
         the traffic in, and it then cannot be routed back the ordinary way, because as far as the internet
@@ -2215,15 +2238,15 @@ components:
         id:
           type: string
           example: northwind
-          description: 'Becomes an interface name, so it is lowercase letters, digits and dashes, and
-            at most 11 characters: the kernel truncates a name over its limit rather than refusing it,
+          description: 'Required in a policy; on PUT /v1/tunnels/{id} it comes from the path. Becomes an
+            interface name, so it is lowercase letters, digits and dashes, and at most 11 characters: the kernel truncates a name over its limit rather than refusing it,
             and two tunnels truncating to one name is one tunnel.'
         prefixes:
           type: array
           items:
             type: string
-          minItems: 1
-          description: Which protected prefixes ride this tunnel. Each must be one the policy protects,
+          description: Which protected prefixes ride this tunnel; at least one, though PUT /v1/tunnels/{id}
+            fills them in from the tenant when it is allocated to one. Each must be one the policy protects,
             and a prefix belongs to at most one tunnel — backup paths are not modelled, so two would leave
             no answer to which return path is authoritative.
         type:
@@ -2237,7 +2260,9 @@ components:
         remote:
           type: string
           example: 198.51.100.1
-          description: 'The customer''s tunnel endpoint. The local end is each node''s own tunnel_src.
+          description: 'The customer''s tunnel endpoint. The local end is each node''s own tunnel_src. Two
+            tunnels of one encapsulation to the same remote need distinct keys, since Linux holds one tunnel
+            per remote and key.
             IPv4 only: the MTU arithmetic here is IPv4''s, and a v6 endpoint would compile a tunnel wrong
             by twenty bytes.'
         mtu:
@@ -2272,14 +2297,15 @@ components:
           description: 'both: clean traffic goes down the tunnel to the customer and the customer''s
             replies come back up it to the node, which forwards them to the internet. Replies are accepted
             only from the tunnel''s own prefixes, so the tunnel cannot relay anything else the customer
-            edge sends into it. return: the tunnel carries clean traffic out only, and replies leave the
-            customer by its own transit.'
+            edge sends into it. return: the tunnel carries clean traffic out only, replies leave the
+            customer by its own transit, and nothing that comes up the tunnel is forwarded.'
         disabled:
           type: array
           items:
             type: string
           description: Node ids that must not build this tunnel. They withdraw its prefixes instead of
-            attracting traffic they have no path to deliver. Set through the disable and enable endpoints.
+            attracting traffic they have no path to deliver. Set through the disable and enable endpoints;
+            on PUT /v1/tunnels/{id} each must be a registered node id.
         tenant:
           type: string
           description: The customer (tenant id) this tunnel is allocated to. Its prefixes must lie within
@@ -2407,6 +2433,12 @@ components:
           - both
           - return
           description: Empty means both.
+        sources:
+          type: array
+          items:
+            type: string
+          description: Every prefix of the tunnel, including ones steered away from this node. Replies coming
+            back up the tunnel may be sourced from any of them.
         rate_kbps:
           type: integer
           description: This node's share of the tunnel's clean-traffic allowance, in kbit/s. The allowance
@@ -2592,7 +2624,9 @@ components:
             not build the tunnel.
         problem:
           type: string
-          description: Why this node is not delivering the tunnel's prefixes, when it is not.
+          description: Why this node is not delivering the tunnel's prefixes, when it is not. A configuration
+            problem (disabled here, no endpoint) when there is one, otherwise the reason the plan gives for
+            withdrawing the first of them, such as the tunnel being reported down.
     TunnelStatus:
       type: object
       required:

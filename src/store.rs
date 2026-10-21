@@ -252,7 +252,9 @@ impl Store {
             d.node_tokens.insert(n.id.clone(), hash(&token));
             Ok(())
         })?;
-        Ok((self.effective(n), token))
+        // As registered: an operator's assignment reaches the node in its program, so an agent
+        // never mistakes it for an address of its own to fall back to once it is cleared.
+        Ok((n, token))
     }
     pub fn save_policy(&mut self, mut p: Policy, now: DateTime<Utc>) -> Result<Policy> {
         self.transaction(|d| {
