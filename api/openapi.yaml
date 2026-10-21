@@ -83,6 +83,9 @@ tags:
 - name: Policy
   description: Protected prefixes, stage rules, steering, game filters, and compiling them across the
     fabric.
+- name: Tunnels
+  description: 'Customer return tunnels: the address each scrubbing node terminates them on, and
+    adding, changing and switching them off node by node on the deployed policy.'
 - name: Classifier
   description: The flow-level model the ZC stage scores with.
 - name: Analytics
@@ -927,6 +930,259 @@ paths:
       description: Takes the credential with it. One that outlived its tenant would authenticate to an
         empty entitlement rather than to nothing.
       parameters: *id005
+  /v1/nodes/{id}/tunnel-endpoint:
+    put:
+      summary: Assign the address a node's tunnels terminate on
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Assigned, and the fabric recompiled with it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointNode'
+        '400':
+          description: The address is not IPv4, or is not one a customer edge could reach (unspecified,
+            loopback, multicast or broadcast).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No such node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Another node already terminates tunnels on that address, or this control plane
+            is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'Makes this node''s own address the local end of every customer tunnel it builds,
+        so each customer''s GRE tunnel runs straight to the scrubbing node that carries its prefixes. The
+        same address is what the node peers customer BGP sessions from.
+
+
+        The assignment is the operator''s: it overrides the tunnel_src the node registered with, and survives
+        the node re-registering, so a node cannot move its own tunnels. Two nodes may not share an address,
+        since each would take the other''s customer replies. Prefixes withdrawn because the node had no
+        endpoint are announced again on the recompile this triggers.'
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TunnelEndpoint'
+    delete:
+      summary: Return a node to the tunnel endpoint it registered with
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Cleared, and the fabric recompiled without it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointNode'
+        '404':
+          description: No such node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': *id006
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: The node falls back to its own registered tunnel_src. A node that registered without
+        one has no endpoint afterwards, and withdraws every prefix that has a return path.
+      parameters: *id005
+  /v1/tunnels:
+    get:
+      summary: Every return tunnel of the deployed policy, node by node
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: The deployed policy's tunnels. A control plane with nothing deployed answers with
+            a null policy_id and no tunnels.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelFleet'
+        '401': *id002
+        '403': *id003
+      description: For each tunnel, every node that carries any of its prefixes, with the address the
+        tunnel terminates on there, whether it is enabled on that node, what the node's provisioner last
+        reported, and which of its prefixes the fabric is announcing or withdrawing from that node and
+        why. A row with a problem is a node that is not delivering those prefixes.
+  /v1/tunnels/{id}:
+    put:
+      summary: Create or replace a tunnel in the deployed policy
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: The tunnel will not validate against the policy, or the id in the body differs
+            from the one in the path.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'Tunnels belong to the deployed policy, so a change here bumps its version, is validated
+        with the whole policy, and is compiled onto the fabric straight away: no separate deploy. The body
+        replaces the tunnel whole, including its disabled list; the id comes from the path.'
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Tunnel'
+    delete:
+      summary: Remove a tunnel from the deployed policy
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Removed as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelDeleted'
+        '404':
+          description: The deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Its prefixes no longer have a return path, so the nodes carrying them announce them
+        without one, as they would a prefix that never had a tunnel.
+      parameters: *id005
+  /v1/tunnels/{id}/disable:
+    post:
+      summary: Take a tunnel down on some nodes
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: The body names no nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No such node, or the deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'The named nodes stop building the tunnel and withdraw its prefixes, since they would
+        have no way to deliver what they attracted; the rest of the fabric keeps carrying them. For maintenance
+        on one site''s path, or taking a misbehaving one out without touching the others.'
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeSelection'
+  /v1/tunnels/{id}/enable:
+    post:
+      summary: Bring a tunnel back on some nodes
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: The body names no nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No such node, or the deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Undoes disable for the named nodes. Naming a node the tunnel was never disabled on
+        is not an error.
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeSelection'
 components:
   securitySchemes:
     operatorToken:
@@ -1233,7 +1489,8 @@ components:
             sessions from. Per node rather than per tunnel because the fabric is anycast: every node carrying
             a prefix needs its own tunnel to the one customer endpoint, and they cannot share a source.
             A node without one is withdrawn from any prefix that has a return path, rather than attracting
-            traffic it could not deliver.'
+            traffic it could not deliver. An operator''s assignment through PUT /v1/nodes/{id}/tunnel-endpoint
+            takes the place of the registered value and survives re-registration.'
         last_seen:
           type: string
           format: date-time
@@ -1379,6 +1636,10 @@ components:
           format: date-time
           description: Changes on every recompile, including one that reassigns prefixes without bumping
             the policy version. Agents key their reload on it.
+        tunnel_src:
+          type: string
+          description: The tunnel endpoint the control plane holds for this node, which an operator may
+            have assigned since it registered. The agent peers customer sessions from it.
     Flow:
       type: object
       description: One flow record.
@@ -1931,6 +2192,23 @@ components:
             a node. Off by default: a fabric whose provisioner reports nothing would otherwise announce
             nothing at all and give no hint why. On, for operators whose tunnels report reliably and who
             would rather drop traffic than black-hole it.'
+        direction:
+          type: string
+          enum:
+          - both
+          - return
+          default: both
+          description: 'both: clean traffic goes down the tunnel to the customer and the customer''s
+            replies come back up it to the node, which forwards them to the internet. Replies are accepted
+            only from the tunnel''s own prefixes, so the tunnel cannot relay anything else the customer
+            edge sends into it. return: the tunnel carries clean traffic out only, and replies leave the
+            customer by its own transit.'
+        disabled:
+          type: array
+          items:
+            type: string
+          description: Node ids that must not build this tunnel. They withdraw its prefixes instead of
+            attracting traffic they have no path to deliver. Set through the disable and enable endpoints.
         comment:
           type: string
     Session:
@@ -2040,6 +2318,172 @@ components:
           description: The link name this compiles to, inside the kernel's 15-character limit.
         comment:
           type: string
+        direction:
+          type: string
+          enum:
+          - both
+          - return
+          description: Empty means both.
+    TunnelEndpoint:
+      type: object
+      required:
+      - address
+      properties:
+        address:
+          type: string
+          example: 192.0.2.1
+          description: 'The node''s own IPv4 address, reachable from customer edges: the local end of
+            its GRE tunnels.'
+    EndpointNode:
+      description: A node as the fabric uses it, with the tunnel endpoint in force.
+      allOf:
+      - $ref: '#/components/schemas/Node'
+      - type: object
+        properties:
+          tunnel_endpoint_assigned:
+            type: boolean
+            description: Whether tunnel_src is an operator's assignment rather than what the node registered
+              with.
+    NodeSelection:
+      type: object
+      required:
+      - nodes
+      properties:
+        nodes:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Node ids.
+    TunnelChange:
+      type: object
+      properties:
+        policy_id:
+          type: string
+        version:
+          type: integer
+          description: The deployed policy's version after the change.
+        tunnel:
+          $ref: '#/components/schemas/Tunnel'
+    TunnelDeleted:
+      type: object
+      properties:
+        policy_id:
+          type: string
+        version:
+          type: integer
+        deleted:
+          type: string
+          description: The tunnel id removed.
+    TunnelFleet:
+      type: object
+      properties:
+        policy_id:
+          type: string
+          nullable: true
+        version:
+          type: integer
+        tunnels:
+          type: array
+          items:
+            $ref: '#/components/schemas/TunnelOverview'
+    TunnelOverview:
+      type: object
+      description: A policy Tunnel with its defaults resolved, and how it stands on each node.
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum:
+          - gre
+          - ipip
+        direction:
+          type: string
+          enum:
+          - both
+          - return
+        remote:
+          type: string
+        key:
+          type: integer
+        prefixes:
+          type: array
+          items:
+            type: string
+        required:
+          type: boolean
+        disabled:
+          type: array
+          items:
+            type: string
+        comment:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/TunnelNode'
+    TunnelNode:
+      type: object
+      description: One node carrying some of a tunnel's prefixes.
+      properties:
+        node_id:
+          type: string
+        name:
+          type: string
+        region:
+          type: string
+        status:
+          type: string
+          enum:
+          - ready
+          - stale
+        endpoint:
+          type: string
+          description: The local end of this node's tunnel. Empty when it has none.
+        endpoint_assigned:
+          type: boolean
+          description: Whether the endpoint is an operator's assignment.
+        enabled:
+          type: boolean
+        state:
+          type: string
+          enum:
+          - up
+          - down
+          - unknown
+          - unreported
+          description: What the node's provisioner last reported.
+        reported_at:
+          type: string
+          format: date-time
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: The tunnel's prefixes this node carries.
+        announced:
+          type: array
+          items:
+            type: string
+        withdrawn:
+          type: array
+          items:
+            type: object
+            properties:
+              prefix:
+                type: string
+              reason:
+                type: string
+        interface:
+          type: string
+        mtu:
+          type: integer
+        mss_clamp:
+          type: integer
+        problem:
+          type: string
+          description: Why this node is not delivering the tunnel's prefixes, when it is not.
     TunnelStatus:
       type: object
       required:

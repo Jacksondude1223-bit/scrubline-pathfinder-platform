@@ -422,9 +422,31 @@ customer's own edge instead, and that return path is declared in the policy:
 }
 ```
 
-Nodes need somewhere to source a tunnel from, which is per node, not per
-tunnel — register them with `tunnel_src`, or start the agent with
-`-tunnel-src`.
+Each node terminates the tunnel on its own address, which is per node, not
+per tunnel. An operator assigns it through the API (below); a node can also
+register with `tunnel_src`, or the agent be started with `-tunnel-src`, and
+an operator's assignment takes precedence over both.
+
+#### Each node's own address
+
+The customer's GRE tunnel runs straight to the scrubbing node, so each node
+needs an address the customer's edge can reach. Assign it per node:
+
+```console
+$ curl -X PUT -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+    $API/v1/nodes/node-20c0e739603a7b60/tunnel-endpoint -d '{"address":"192.0.2.1"}'
+{"id":"node-20c0e739603a7b60","name":"edge-lhr","region":"lhr","status":"ready",
+ "tunnel_src":"192.0.2.1","tunnel_endpoint_assigned":true,…}
+```
+
+The fabric recompiles on the spot, and the agent builds its tunnels from that
+address on its next poll. The assignment belongs to the operator: it survives
+the node re-registering, so a node cannot move its own tunnels. Two nodes on
+one address are refused with a `409`, since each would take the other's
+customer replies. `DELETE` on the same path returns the node to what it
+registered with.
+
+The same address is what the node peers customer BGP sessions from.
 
 #### One tunnel per node, not one per customer
 
@@ -451,6 +473,82 @@ ip link add scr-northwind type gre local 192.0.2.2 remote 198.18.0.9 key 42
 Same customer endpoint, different local end. As with `/bgp`, **nothing here
 is executed** — the agent compiles the configuration and serves it to whatever
 provisions interfaces on that box.
+
+#### Replies come back up the same tunnel
+
+By default a tunnel carries traffic both ways: clean traffic goes down it to
+the customer, and the customer's replies come back up it to the node, which
+forwards them to the internet. That is what lets a customer run with no
+transit of its own. The agent renders the rules for that half too:
+
+```console
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-a:9091/tunnels?format=iproute2'
+# Northwind primary return path
+ip link add scr-northwind type gre local 192.0.2.1 remote 198.18.0.9 key 42
+ip link set scr-northwind mtu 1472 up
+ip route replace 2001:db8::/32 dev scr-northwind
+ip route replace 203.0.113.0/24 dev scr-northwind
+nft add rule inet scrubline forward oifname "scr-northwind" tcp flags syn tcp option maxseg size set 1412
+nft add rule inet scrubline forward iifname "scr-northwind" ip saddr != { 203.0.113.0/24 } drop
+nft add rule inet scrubline forward iifname "scr-northwind" ip6 saddr != { 2001:db8::/32 } drop
+nft add rule inet scrubline forward iifname "scr-northwind" tcp flags syn tcp option maxseg size set 1412
+```
+
+Only sources inside the tunnel's own prefixes may come back up it, per
+address family. Without that the tunnel is an open relay for anything the
+customer's edge sends into it, spoofed or not. SYNs coming up are clamped
+like the ones going down, so the far side's segments fit the tunnel too. The
+rules assume the `inet scrubline` table and its `forward` chain exist, as the
+MSS clamp always has.
+
+`"direction": "return"` on the tunnel is for customers whose replies leave by
+their own transit: the tunnel then only carries clean traffic out, and gets
+no reply rules.
+
+#### Controlling tunnels from the API
+
+Tunnels belong to the deployed policy, so they can be changed in place
+without saving and deploying a whole policy. Each change is validated with the
+whole policy, saved as its next version, and compiled onto the fabric straight
+away. They need a deployed policy; with none, they answer `409`.
+
+```console
+$ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels
+{"policy_id":"p","version":1,"tunnels":[{"id":"northwind","type":"gre","direction":"both",
+  "remote":"198.18.0.9","key":42,"prefixes":["203.0.113.0/24","2001:db8::/32"],"disabled":[],
+  "nodes":[{"node_id":"node-20c0e739603a7b60","name":"edge-lhr","region":"lhr","status":"ready",
+            "endpoint":"192.0.2.1","endpoint_assigned":true,"enabled":true,"state":"unreported",
+            "interface":"scr-northwind","mtu":1472,"mss_clamp":1412,
+            "prefixes":["203.0.113.0/24","2001:db8::/32"],
+            "announced":["2001:db8::/32","203.0.113.0/24"],"withdrawn":[]}]}]}
+```
+
+Every node carrying a tunnel's prefixes is listed with the address it
+terminates on, what its provisioner last reported and what the fabric is
+announcing from it. A node with a `problem` is not delivering those prefixes,
+and the problem says why — usually that it has no endpoint yet.
+
+| Call | What it does |
+| --- | --- |
+| `PUT /v1/tunnels/{id}` | Add a tunnel, or replace it whole. The id comes from the path. |
+| `DELETE /v1/tunnels/{id}` | Remove it. Its prefixes are announced without a return path, like any prefix that never had one. |
+| `POST /v1/tunnels/{id}/disable` | `{"nodes":["…"]}`: those nodes stop building it and withdraw its prefixes. |
+| `POST /v1/tunnels/{id}/enable` | `{"nodes":["…"]}`: undo that. |
+
+Disabling is for maintenance on one site's path, or taking a misbehaving one
+out without touching the rest of the fabric:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/disable \
+    -d '{"nodes":["node-20c0e739603a7b60"]}'
+{"policy_id":"p","version":2,"tunnel":{"id":"northwind","remote":"198.18.0.9",
+ "prefixes":["203.0.113.0/24","2001:db8::/32"],"key":42,
+ "disabled":["node-20c0e739603a7b60"],…}}
+
+$ scrubctl bgp
+PREFIX           NODE      REGION  STATE     PREPENDS  WHY
+203.0.113.0/24   edge-lhr  lhr     withdraw  -         return tunnel northwind is disabled on this node
+```
 
 #### The MTU and the clamp are not decoration
 

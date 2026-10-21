@@ -127,6 +127,12 @@ paths:
         customer''s prefixes holds its own tunnel to the same customer endpoint, from its own address.
 
 
+        A tunnel whose direction is both also gets forwarding rules for the customer''s replies coming
+        back up it: only sources inside the tunnel''s own prefixes pass, per address family, and their
+        SYNs are MSS-clamped like those going down. They assume the `inet scrubline` table and its
+        `forward` chain exist, as the MSS clamp already does.
+
+
         `?format=iproute2` returns the configuration as plain text instead of JSON.'
       parameters:
       - name: format

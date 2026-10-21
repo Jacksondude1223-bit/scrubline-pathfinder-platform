@@ -151,3 +151,138 @@ fn a_tunnel_reported_unknown_still_counts_as_reported() {
     ));
     assert!(!text.contains("scrubline_tunnel_up"));
 }
+fn node_tunnel(id: &str, prefixes: &[&str], direction: &str) -> NodeTunnel {
+    NodeTunnel {
+        id: id.into(),
+        r#type: "gre".into(),
+        local: "192.0.2.1".into(),
+        remote: "198.51.100.1".into(),
+        prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+        mtu: 1476,
+        direction: direction.into(),
+        ..Default::default()
+    }
+}
+#[test]
+fn replies_up_a_tunnel_may_only_come_from_its_own_prefixes() {
+    let rule = |name: &str, tail: &str| {
+        format!("nft add rule inet scrubline forward iifname \"scr-{name}\" {tail}")
+    };
+    let tunnels = [
+        node_tunnel("zeta", &["203.0.113.0/24"], "return"),
+        NodeTunnel {
+            mss_clamp: 1396,
+            ..node_tunnel(
+                "mixed",
+                &["2001:db8::/32", "198.51.100.0/24", "203.0.113.0/25"],
+                "both",
+            )
+        },
+        node_tunnel("alpha", &["2001:db8:1::/48"], ""),
+    ];
+    assert_eq!(
+        tunnel::reply_commands(&tunnels).unwrap(),
+        [
+            rule("alpha", "meta nfproto ipv4 drop"),
+            rule("alpha", "ip6 saddr != { 2001:db8:1::/48 } drop"),
+            rule(
+                "mixed",
+                "ip saddr != { 198.51.100.0/24, 203.0.113.0/25 } drop"
+            ),
+            rule("mixed", "ip6 saddr != { 2001:db8::/32 } drop"),
+            rule("mixed", "tcp flags syn tcp option maxseg size set 1396"),
+        ],
+        "a return-only tunnel carries nothing back, so it gets no reply rules"
+    );
+    assert!(tunnel::carries_replies(&node_tunnel("t", &[], "")));
+    assert!(!tunnel::carries_replies(&node_tunnel("t", &[], "return")));
+    let mut bad = node_tunnel("t", &["not-a-prefix"], "both");
+    assert!(tunnel::reply_commands(std::slice::from_ref(&bad)).is_err());
+    bad.prefixes = vec!["203.0.113.0/24".into()];
+    bad.id = "Not-Valid".into();
+    assert!(tunnel::reply_commands(&[bad]).is_err());
+}
+#[test]
+fn tunnel_direction_and_disabled_nodes_are_validated() {
+    let t = Tunnel {
+        id: "t".into(),
+        remote: "198.51.100.1".into(),
+        prefixes: vec!["203.0.113.0/24".into()],
+        ..Default::default()
+    };
+    for direction in ["", "both", "return"] {
+        let ok = Tunnel {
+            direction: direction.into(),
+            disabled: vec!["node-a".into(), "node-b".into()],
+            ..t.clone()
+        };
+        tunnel::validate(&ok, None).unwrap();
+    }
+    for bad in [
+        Tunnel {
+            direction: "inbound".into(),
+            ..t.clone()
+        },
+        Tunnel {
+            disabled: vec!["node-a".into(), "node-a".into()],
+            ..t.clone()
+        },
+        Tunnel {
+            disabled: vec![" ".into()],
+            ..t.clone()
+        },
+    ] {
+        assert!(tunnel::validate(&bad, None).is_err(), "{bad:?}");
+    }
+}
+#[test]
+fn disabling_a_tunnel_on_a_node_withdraws_its_prefixes_there() {
+    let prefix = "203.0.113.0/24";
+    let p = Policy {
+        protected: vec![prefix.into(), "198.51.100.0/24".into()],
+        tunnels: vec![Tunnel {
+            id: "northwind".into(),
+            remote: "198.18.0.9".into(),
+            prefixes: vec![prefix.into()],
+            disabled: vec!["a".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let with_endpoint = |id: &str, src: &str| Node {
+        tunnel_src: src.into(),
+        ..node(id, "iad", 100.0, "")
+    };
+    let nodes = [
+        with_endpoint("a", "192.0.2.1"),
+        with_endpoint("b", "192.0.2.2"),
+    ];
+    let plan = compiler::plan(&p, &nodes, &HashMap::new(), &HashMap::new());
+    let row = |node: &str, prefix: &str| {
+        plan.iter()
+            .find(|a| a.node_id == node && a.prefix == prefix)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("a", prefix).state, "withdraw");
+    assert_eq!(
+        row("a", prefix).reason,
+        "return tunnel northwind is disabled on this node"
+    );
+    assert_eq!(
+        row("a", "198.51.100.0/24").state,
+        "announce",
+        "other prefixes are untouched"
+    );
+    assert_eq!(row("b", prefix).state, "announce");
+    let programs = compiler::compile(&p, &nodes, &plan);
+    assert!(programs["a"].tunnels.is_empty());
+    assert_eq!(programs["a"].tunnel_src, "192.0.2.1");
+    let built = &programs["b"].tunnels;
+    assert_eq!(built.len(), 1);
+    assert_eq!(
+        (built[0].local.as_str(), built[0].remote.as_str()),
+        ("192.0.2.2", "198.18.0.9")
+    );
+    assert_eq!(programs["b"].tunnel_src, "192.0.2.2");
+}

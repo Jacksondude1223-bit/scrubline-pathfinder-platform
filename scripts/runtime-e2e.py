@@ -123,6 +123,18 @@ with tempfile.TemporaryDirectory() as temporary:
         call(local, '/decide', token=LOCAL, expected=405)
         call(local, '/sessions?format=bird', token=LOCAL)
         call(local, '/tunnels?format=iproute2', token=LOCAL)
+        # The operator moves this node's tunnels onto an address of its own; the agent picks it
+        # up from its program and builds the tunnel, and the reply path, from there.
+        endpoint = f'/v1/nodes/{runtime_id}/tunnel-endpoint'
+        call(base, endpoint, 'PUT', node_token, {'address':'192.0.2.30'}, expected=403)
+        call(base, endpoint, 'PUT', OP, {'address':'192.0.2.2'}, expected=409)
+        assert call(base, endpoint, 'PUT', OP, {'address':'192.0.2.30'})['tunnel_src'] == '192.0.2.30'
+        rendered = wait_for(lambda: (lambda text: 'local 192.0.2.30 ' in text and text)(
+            call(local, '/tunnels?format=iproute2', token=LOCAL)))
+        assert 'iifname "scr-customer" ip saddr != { 203.0.113.0/24 } drop' in rendered, rendered
+        rows = call(base, '/v1/tunnels', token=OP)['tunnels'][0]['nodes']
+        assert any(r['node_id'] == runtime_id and r['endpoint'] == '192.0.2.30'
+                   and r['endpoint_assigned'] for r in rows), rows
         call(local, '/tunnels', 'POST', LOCAL,
              {'tunnels':[{'tunnel_id':'customer','state':'up'}]})
         wait_for(lambda: any(a['node_id']==runtime_id and a['state']=='announce'

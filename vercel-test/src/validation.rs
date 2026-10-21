@@ -18,18 +18,23 @@ pub fn node(n: &Node) -> Result<()> {
         return Err("capacity_pps must not be negative".into());
     }
     if !n.tunnel_src.is_empty() {
-        let a = n
-            .tunnel_src
-            .parse::<Ipv4Addr>()
-            .map_err(|_| "tunnel_src must be IPv4")?;
-        if a.is_unspecified() || a.is_multicast() || a.is_loopback() {
-            return Err("tunnel_src is not a usable tunnel endpoint".into());
-        }
+        tunnel_endpoint(&n.tunnel_src)?;
     }
     for b in &n.backends {
         if !["asic", "fpga", "zc"].contains(&b.as_str()) {
             return Err(format!("unknown backend {b:?}"));
         }
+    }
+    Ok(())
+}
+/// A node's own address for tunnels: IPv4, since the encapsulation arithmetic is IPv4's, and one
+/// a peer can actually reach.
+pub fn tunnel_endpoint(addr: &str) -> Result<()> {
+    let a = addr
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "tunnel_src must be IPv4")?;
+    if a.is_unspecified() || a.is_multicast() || a.is_loopback() || a.is_broadcast() {
+        return Err("tunnel_src is not a usable tunnel endpoint".into());
     }
     Ok(())
 }

@@ -203,3 +203,33 @@ fn policy_validation_rejects_rules_that_never_match_and_respelled_prefixes() {
         assert!(validation::policy(&p).is_err(), "{protected:?}");
     }
 }
+#[test]
+fn assigned_tunnel_endpoints_survive_a_restart_and_reregistration() {
+    let dir = temp();
+    let path = dir.join("state.json");
+    let mut store = Store::open(path.to_str().unwrap()).unwrap();
+    let edge = || Node {
+        name: "edge".into(),
+        region: "iad".into(),
+        tunnel_src: "192.0.2.9".into(),
+        ..Default::default()
+    };
+    let (node, _) = store.register(edge(), chrono::Utc::now()).unwrap();
+    store
+        .transaction(|d| {
+            d.tunnel_endpoints
+                .insert(node.id.clone(), "192.0.2.1".into());
+            Ok(())
+        })
+        .unwrap();
+    let mut restored = Store::open(path.to_str().unwrap()).unwrap();
+    let now = chrono::Utc::now();
+    assert_eq!(restored.nodes(now)[0].tunnel_src, "192.0.2.1");
+    let (again, _) = restored.register(edge(), now).unwrap();
+    assert_eq!(again.tunnel_src, "192.0.2.1");
+    assert_eq!(
+        restored.data.nodes[0].tunnel_src, "192.0.2.9",
+        "the registered address is kept to fall back to"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
