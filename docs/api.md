@@ -534,6 +534,10 @@ and the problem says why — usually that it has no endpoint yet.
 | `DELETE /v1/tunnels/{id}` | Remove it. Its prefixes are announced without a return path, like any prefix that never had one. |
 | `POST /v1/tunnels/{id}/disable` | `{"nodes":["…"]}`: those nodes stop building it and withdraw its prefixes. |
 | `POST /v1/tunnels/{id}/enable` | `{"nodes":["…"]}`: undo that. |
+| `PUT /v1/tunnels/{id}/rate` | `{"rate_mbps":1000}`: change only its clean-traffic allowance. |
+
+`GET /v1/tunnels?tenant=ten-…` lists only the tunnels allocated to one
+customer.
 
 Disabling is for maintenance on one site's path, or taking a misbehaving one
 out without touching the rest of the fabric:
@@ -549,6 +553,59 @@ $ scrubctl bgp
 PREFIX           NODE      REGION  STATE     PREPENDS  WHY
 203.0.113.0/24   edge-lhr  lhr     withdraw  -         return tunnel northwind is disabled on this node
 ```
+
+#### Allocating a tunnel to a customer, with a speed
+
+A tunnel is allocated to a customer by naming their tenant id. Leave out
+`prefixes` and it carries every prefix of theirs the deployed policy
+protects; name them and each must lie within the customer's own prefixes, so
+a tunnel can never hand one customer's clean traffic to another's edge.
+
+```console
+$ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind -d '{
+    "remote": "198.18.0.9", "key": 42,
+    "tenant": "ten-706ac6846f855fa4", "rate_mbps": 1000,
+    "comment": "Northwind primary return path"}'
+{"policy_id":"p","version":2,"tunnel":{"id":"northwind","remote":"198.18.0.9","key":42,
+ "prefixes":["203.0.113.0/24","2001:db8::/32"],"tenant":"ten-706ac6846f855fa4",
+ "rate_mbps":1000,"comment":"Northwind primary return path"}}
+```
+
+`rate_mbps` is how much clean traffic the customer receives down the tunnel,
+in Mbit/s, **in total**, at most 2500 (2.5 Gbit/s). A tunnel without one is
+held to that maximum, so no tunnel is ever unlimited. Changing only the speed:
+
+```console
+$ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/rate \
+    -d '{"rate_mbps":2000}'
+{"policy_id":"p","version":3,"tunnel":{…,"rate_mbps":2000,…}}
+
+$ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/rate \
+    -d '{"rate_mbps":5000}'
+{"error":"rate_mbps must be within 1..2500 (2.5 Gbit/s); 0 takes the maximum"}
+```
+
+The fabric is anycast, so the tunnel runs from every node carrying the
+customer's prefixes, and the allowance is split evenly across the nodes
+announcing them. Two nodes sending a 2000 Mbit/s tunnel get 1000 Mbit/s each,
+which `GET /v1/tunnels` shows per node as `rate_kbps`, and each node shapes
+what it sends down the tunnel to its share:
+
+```
+tc qdisc replace dev scr-northwind root tbf rate 1000000kbit burst 1250000 latency 50ms
+```
+
+A shaper rather than a policer, so TCP sees queueing it backs off from rather
+than drops. When a node stops announcing (withdrawn, disabled, or gone quiet)
+the others' shares grow to cover the whole allowance on the next recompile.
+A withdrawing node keeps the same share for the traffic BGP has yet to move
+away, so for the seconds a withdrawal takes to converge the total can briefly
+run over by that one share. `scrubline_tunnel_rate_limit_bits_per_second` on
+each node's `/metrics` is the share it is enforcing.
+
+A customer with a tunnel allocated cannot be deleted, or have their prefixes
+changed so the tunnel carries something outside them; both answer `409`
+naming the tunnel.
 
 #### The MTU and the clamp are not decoration
 

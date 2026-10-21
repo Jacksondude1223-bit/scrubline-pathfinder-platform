@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use pathfinder::{bgp, compiler, model::*, steering, telemetry::Metrics, tunnel};
+use pathfinder::{bgp, compiler, model::*, steering, telemetry::Metrics, tunnel, validation};
 use std::collections::HashMap;
 fn node(id: &str, region: &str, gbps: f64, advertise: &str) -> Node {
     Node {
@@ -150,6 +150,18 @@ fn a_tunnel_reported_unknown_still_counts_as_reported() {
         "scrubline_tunnel_reported{node=\"n\",name=\"n\",region=\"r\",tunnel=\"t\",remote=\"198.18.0.9\"} 1"
     ));
     assert!(!text.contains("scrubline_tunnel_up"));
+    assert!(!text.contains("scrubline_tunnel_rate_limit"));
+    let mut m = Metrics::new();
+    let limited = NodeTunnel {
+        id: "t".into(),
+        remote: "198.18.0.9".into(),
+        rate_kbps: 833333,
+        ..Default::default()
+    };
+    m.tunnels(&n, &[limited], &[]);
+    assert!(m.render().unwrap().contains(
+        "scrubline_tunnel_rate_limit_bits_per_second{node=\"n\",name=\"n\",region=\"r\",tunnel=\"t\",remote=\"198.18.0.9\"} 8.33333e+08"
+    ));
 }
 fn node_tunnel(id: &str, prefixes: &[&str], direction: &str) -> NodeTunnel {
     NodeTunnel {
@@ -285,4 +297,166 @@ fn disabling_a_tunnel_on_a_node_withdraws_its_prefixes_there() {
         ("192.0.2.2", "198.18.0.9")
     );
     assert_eq!(programs["b"].tunnel_src, "192.0.2.2");
+}
+#[test]
+fn a_tunnels_clean_traffic_allowance_is_capped_and_validated() {
+    let t = Tunnel {
+        id: "t".into(),
+        remote: "198.51.100.1".into(),
+        prefixes: vec!["203.0.113.0/24".into()],
+        ..Default::default()
+    };
+    assert_eq!(tunnel::rate_mbps(&t), tunnel::MAX_RATE_MBPS);
+    assert_eq!(tunnel::MAX_RATE_MBPS, 2500, "2.5 Gbit/s");
+    for ok in [0, 1, 1000, 2500] {
+        let v = Tunnel {
+            rate_mbps: ok,
+            ..t.clone()
+        };
+        tunnel::validate(&v, None).unwrap();
+    }
+    for bad in [-1, 2501, i64::MAX] {
+        let v = Tunnel {
+            rate_mbps: bad,
+            ..t.clone()
+        };
+        assert!(tunnel::validate(&v, None).is_err(), "{bad}");
+    }
+    let n = Node {
+        id: "n".into(),
+        tunnel_src: "192.0.2.1".into(),
+        ..Default::default()
+    };
+    let whole = |rate| {
+        tunnel::for_node(
+            &Tunnel {
+                rate_mbps: rate,
+                ..t.clone()
+            },
+            &n,
+            &t.prefixes,
+        )
+        .unwrap()
+        .rate_kbps
+    };
+    assert_eq!(whole(0), 2_500_000);
+    assert_eq!(whole(1000), 1_000_000);
+}
+#[test]
+fn the_allowance_is_split_across_the_nodes_sending_the_tunnel() {
+    let prefix = "203.0.113.0/24";
+    let policy = |rate_mbps, disabled: &[&str]| Policy {
+        protected: vec![prefix.into()],
+        tunnels: vec![Tunnel {
+            id: "northwind".into(),
+            remote: "198.18.0.9".into(),
+            prefixes: vec![prefix.into()],
+            rate_mbps,
+            disabled: disabled.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let with_endpoint = |id: &str, src: &str| Node {
+        tunnel_src: src.into(),
+        ..node(id, "iad", 100.0, "")
+    };
+    let mut nodes = vec![
+        with_endpoint("a", "192.0.2.1"),
+        with_endpoint("b", "192.0.2.2"),
+        with_endpoint("c", "192.0.2.3"),
+    ];
+    let shares = |p: &Policy, nodes: &[Node]| {
+        let plan = compiler::plan(p, nodes, &HashMap::new(), &HashMap::new());
+        let programs = compiler::compile(p, nodes, &plan);
+        let mut out: Vec<_> = programs
+            .values()
+            .map(|prog| {
+                (
+                    prog.node_id.clone(),
+                    prog.tunnels.first().map(|t| t.rate_kbps),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let three = |kbps| {
+        vec![
+            ("a".to_string(), Some(kbps)),
+            ("b".to_string(), Some(kbps)),
+            ("c".to_string(), Some(kbps)),
+        ]
+    };
+    assert_eq!(shares(&policy(1500, &[]), &nodes), three(500_000));
+    assert_eq!(
+        shares(&policy(0, &[]), &nodes),
+        three(833_333),
+        "no allowance set is the 2.5 Gbit/s maximum, never more in total"
+    );
+    assert_eq!(
+        shares(&policy(1500, &["c"]), &nodes),
+        vec![
+            ("a".to_string(), Some(750_000)),
+            ("b".to_string(), Some(750_000)),
+            ("c".to_string(), None),
+        ],
+        "a node the tunnel is disabled on sends nothing, so the others share the whole allowance"
+    );
+    // A node that stopped heartbeating is withdrawn: it is not sending, so it does not take a
+    // share away from the nodes that are, but it gets the same share for what is still in flight.
+    nodes[2].status = "stale".into();
+    assert_eq!(shares(&policy(1500, &[]), &nodes), three(750_000),);
+}
+#[test]
+fn rate_limits_render_as_a_shaper_on_the_tunnel() {
+    let limited = |id: &str, kbps| NodeTunnel {
+        rate_kbps: kbps,
+        ..node_tunnel(id, &["203.0.113.0/24"], "")
+    };
+    assert_eq!(
+        tunnel::rate_commands(&[
+            limited("zeta", 0),
+            limited("slow", 1000),
+            limited("fast", 833_333)
+        ])
+        .unwrap(),
+        [
+            "tc qdisc replace dev scr-fast root tbf rate 833333kbit burst 1041666 latency 50ms",
+            "tc qdisc replace dev scr-slow root tbf rate 1000kbit burst 32768 latency 50ms",
+        ]
+    );
+}
+#[test]
+fn tunnels_allocated_to_a_customer_carry_only_their_prefixes() {
+    let tenant = Tenant {
+        id: "ten-1".into(),
+        name: "northwind".into(),
+        prefixes: vec!["203.0.112.0/22".into()],
+        ..Default::default()
+    };
+    let p = |prefixes: &[&str], tenant: &str| Policy {
+        tunnels: vec![Tunnel {
+            id: "t".into(),
+            prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            tenant: tenant.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let tenants = [tenant];
+    validation::tunnel_tenants(&p(&["203.0.113.0/24", "203.0.112.0/22"], "ten-1"), &tenants)
+        .unwrap();
+    validation::tunnel_tenants(&p(&["198.51.100.0/24"], ""), &tenants).unwrap();
+    for (prefixes, tenant) in [
+        (&["198.51.100.0/24"][..], "ten-1"),
+        (&["203.0.112.0/21"][..], "ten-1"),
+        (&["2001:db8::/32"][..], "ten-1"),
+        (&["203.0.113.0/24"][..], "ten-2"),
+    ] {
+        assert!(
+            validation::tunnel_tenants(&p(prefixes, tenant), &tenants).is_err(),
+            "{prefixes:?} {tenant}"
+        );
+    }
 }

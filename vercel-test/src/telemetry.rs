@@ -154,6 +154,13 @@ impl Metrics {
             ] {
                 self.add(name, labels.clone(), v);
             }
+            if t.rate_kbps > 0 {
+                self.add(
+                    "scrubline_tunnel_rate_limit_bits_per_second",
+                    labels.clone(),
+                    t.rate_kbps as f64 * 1000.0,
+                );
+            }
         }
     }
     pub fn render(self) -> crate::Result<String> {

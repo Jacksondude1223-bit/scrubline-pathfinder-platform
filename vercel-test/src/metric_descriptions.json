@@ -183,6 +183,10 @@
     "kind": "gauge",
     "help": "The TCP MSS traffic into this tunnel is clamped to. Without it, a customer whose path drops the ICMP that path-MTU discovery needs sees TCP hang on anything larger than a handshake."
   },
+  "scrubline_tunnel_rate_limit_bits_per_second": {
+    "kind": "gauge",
+    "help": "Clean traffic this node lets down the tunnel: its even share of the tunnel's allowance across the nodes sending it."
+  },
   "scrubline_tunnel_prefixes": {
     "kind": "gauge",
     "help": "Protected prefixes delivered over this tunnel from this node."

@@ -38,6 +38,33 @@ fn failed(e: impl ToString) -> Error {
     eprintln!("state operation failed: {}", e.to_string());
     (503, "could not persist control-plane state".into())
 }
+/// The protected prefixes of a policy that fall within a customer's address space.
+fn tenant_prefixes(p: &Policy, tenants: &[Tenant], tenant: &str) -> Answer<Vec<String>> {
+    let Some(owner) = tenants.iter().find(|t| t.id == tenant) else {
+        return Err(bad(format!("unknown tenant {tenant:?}")));
+    };
+    let owned: Vec<IpNet> = owner
+        .prefixes
+        .iter()
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let prefixes: Vec<String> = p
+        .protected
+        .iter()
+        .filter(|prefix| {
+            prefix
+                .parse::<IpNet>()
+                .is_ok_and(|net| owned.iter().any(|o| o.contains(&net)))
+        })
+        .cloned()
+        .collect();
+    if prefixes.is_empty() {
+        return Err(bad(format!(
+            "tenant {tenant} has no prefix the deployed policy protects; protect one or name the prefixes"
+        )));
+    }
+    Ok(prefixes)
+}
 fn parse<T: DeserializeOwned>(body: &[u8]) -> Answer<T> {
     serde_json::from_slice(body).map_err(bad)
 }
@@ -250,6 +277,7 @@ impl Api {
         };
         change(&mut p)?;
         validation::policy(&p).map_err(bad)?;
+        validation::tunnel_tenants(&p, &self.store.data.tenants).map_err(bad)?;
         let saved = self.store.save_policy(p, now).map_err(failed)?;
         self.deploy(&saved, now, true).map_err(failed)?;
         Ok(saved)
@@ -295,9 +323,10 @@ impl Api {
         Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":t}))
     }
     /// Every tunnel of the deployed policy on every node that carries its prefixes: where it
-    /// terminates, what the node built, what its provisioner last reported, and what the fabric
-    /// is announcing because of it.
-    fn tunnel_view(&self, now: DateTime<Utc>) -> Value {
+    /// terminates, what the node built, what its provisioner last reported, its share of the
+    /// clean-traffic allowance, and what the fabric is announcing because of it. With a tenant,
+    /// only the tunnels allocated to that customer.
+    fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self
             .store
             .data
@@ -311,6 +340,7 @@ impl Api {
         let tunnels: Vec<_> = p
             .tunnels
             .iter()
+            .filter(|t| tenant.is_none_or(|wanted| t.tenant == wanted))
             .map(|t| {
                 let rows: Vec<_> = nodes
                     .iter()
@@ -356,6 +386,14 @@ impl Api {
                         if let Some(r) = report {
                             row["reported_at"] = json!(r.reported_at);
                         }
+                        if let Some(built) = self
+                            .store
+                            .programs
+                            .get(&n.id)
+                            .and_then(|prog| prog.tunnels.iter().find(|v| v.id == t.id))
+                        {
+                            row["rate_kbps"] = json!(built.rate_kbps);
+                        }
                         let problem = if !enabled {
                             "disabled on this node".to_string()
                         } else if n.tunnel_src.is_empty() {
@@ -390,6 +428,8 @@ impl Api {
                     "prefixes": t.prefixes,
                     "required": t.required,
                     "disabled": t.disabled,
+                    "tenant": t.tenant,
+                    "rate_mbps": crate::tunnel::rate_mbps(t),
                     "comment": t.comment,
                     "nodes": rows,
                 })
@@ -636,6 +676,7 @@ impl Api {
                 self.writable()?;
                 let mut p: Policy = parse(body)?;
                 validation::policy(&p).map_err(bad)?;
+                validation::tunnel_tenants(&p, &self.store.data.tenants).map_err(bad)?;
                 if p.challenge_secret.is_empty() && !p.games.is_empty() {
                     p.challenge_secret = store::secret().map_err(failed)?;
                 }
@@ -723,7 +764,11 @@ impl Api {
             }
             ("GET", ["tunnels"]) => {
                 who.operator()?;
-                Ok(self.tunnel_view(now))
+                let tenant = query
+                    .get("tenant")
+                    .map(String::as_str)
+                    .filter(|t| !t.is_empty());
+                Ok(self.tunnel_view(now, tenant))
             }
             ("PUT", ["tunnels", _]) if !id.is_empty() => {
                 who.operator()?;
@@ -735,14 +780,39 @@ impl Api {
                     ));
                 }
                 t.id = id.into();
+                let tenants = self.store.data.tenants.clone();
                 let p = self.change_tunnels(now, |p| {
+                    // Allocating a tunnel to a customer without naming prefixes carries everything
+                    // of theirs the policy protects.
+                    if t.prefixes.is_empty() && !t.tenant.is_empty() {
+                        t.prefixes = tenant_prefixes(p, &tenants, &t.tenant)?;
+                    }
                     match p.tunnels.iter_mut().find(|v| v.id == t.id) {
-                        Some(v) => *v = t.clone(),
-                        None => p.tunnels.push(t.clone()),
+                        Some(v) => *v = t,
+                        None => p.tunnels.push(t),
                     }
                     Ok(())
                 })?;
-                Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":t}))
+                let saved = p.tunnels.iter().find(|v| v.id == id).cloned();
+                Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":saved}))
+            }
+            ("PUT", ["tunnels", _, "rate"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                #[derive(Deserialize)]
+                struct Rate {
+                    rate_mbps: i64,
+                }
+                let r: Rate = parse(body)?;
+                let p = self.change_tunnels(now, |p| {
+                    let Some(t) = p.tunnels.iter_mut().find(|v| v.id == id) else {
+                        return Err((404, "unknown tunnel".into()));
+                    };
+                    t.rate_mbps = r.rate_mbps;
+                    Ok(())
+                })?;
+                let saved = p.tunnels.iter().find(|v| v.id == id).cloned();
+                Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":saved}))
             }
             ("DELETE", ["tunnels", _]) if !id.is_empty() => {
                 who.operator()?;
@@ -881,8 +951,33 @@ impl Api {
             ("POST", ["tenants"]) => {
                 who.operator()?;
                 self.writable()?;
-                let t: Tenant = parse(body)?;
+                let mut t: Tenant = parse(body)?;
                 validation::tenant(&t).map_err(bad)?;
+                if t.id.is_empty() {
+                    t.id = store::id("ten", &[&t.name]);
+                }
+                // A change to a customer's prefixes must leave every tunnel allocated to them
+                // carrying only their own address space.
+                let mut tenants = self.store.data.tenants.clone();
+                tenants.retain(|v| v.id != t.id);
+                tenants.push(t.clone());
+                for p in &self.store.data.policies {
+                    let allocated = Policy {
+                        tunnels: p
+                            .tunnels
+                            .iter()
+                            .filter(|v| v.tenant == t.id)
+                            .cloned()
+                            .collect(),
+                        ..Default::default()
+                    };
+                    validation::tunnel_tenants(&allocated, &tenants).map_err(|e| {
+                        (
+                            409,
+                            format!("policy {}: {e}; change the tunnel first", p.id).into(),
+                        )
+                    })?;
+                }
                 Ok(value(self.store.save_tenant(t, now).map_err(failed)?))
             }
             ("POST", ["tenants", _, "token"]) if !id.is_empty() => {
@@ -899,6 +994,22 @@ impl Api {
                 self.writable()?;
                 if !self.store.data.tenants.iter().any(|t| t.id == id) {
                     return Err((404, "unknown tenant".into()));
+                }
+                if let Some((p, t)) = self
+                    .store
+                    .data
+                    .policies
+                    .iter()
+                    .find_map(|p| p.tunnels.iter().find(|t| t.tenant == id).map(|t| (p, t)))
+                {
+                    return Err((
+                        409,
+                        format!(
+                            "tunnel {} in policy {} is allocated to this tenant; delete or reallocate it first",
+                            t.id, p.id
+                        )
+                        .into(),
+                    ));
                 }
                 self.store
                     .transaction(|d| {
@@ -1178,7 +1289,9 @@ fn route_label(path: &str) -> String {
         ["tenants", _] => "tenants/delete".into(),
         ["nodes", _, "tunnel-endpoint"] => "nodes/tunnel-endpoint".into(),
         ["tunnels", _] => "tunnels/item".into(),
-        ["tunnels", _, leaf] if ["disable", "enable"].contains(leaf) => format!("tunnels/{leaf}"),
+        ["tunnels", _, leaf] if ["disable", "enable", "rate"].contains(leaf) => {
+            format!("tunnels/{leaf}")
+        }
         [single]
             if [
                 "state", "promote", "nodes", "policies", "fabric", "tenants", "decide", "tunnels",

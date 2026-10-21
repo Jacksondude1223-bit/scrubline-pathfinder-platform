@@ -40,9 +40,15 @@ fn compiler_and_renderers_match_go() {
                 .unwrap()
                 .to_utc();
             // The endpoint a node's tunnels terminate on is carried in its program since it
-            // became operator-assignable; the Go recording predates it.
+            // became operator-assignable, and each tunnel its share of the clean-traffic
+            // allowance since that became limited; the Go recording predates both.
             let mut rust = json!(prog);
             rust.as_object_mut().unwrap().remove("tunnel_src");
+            if let Some(tunnels) = rust.get_mut("tunnels").and_then(|t| t.as_array_mut()) {
+                for t in tunnels {
+                    t.as_object_mut().unwrap().remove("rate_kbps");
+                }
+            }
             assert_eq!(
                 normalized(rust),
                 normalized(c["programs"][&node.id].clone()),

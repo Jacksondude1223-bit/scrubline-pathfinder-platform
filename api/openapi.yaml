@@ -413,7 +413,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Policy'
         '400':
-          description: A field will not validate. The message names the offending index and why.
+          description: A field will not validate, or a tunnel allocated to a customer names an unknown
+            one or carries a prefix outside theirs. The message names the offending item and why.
           content:
             application/json:
               schema:
@@ -859,7 +860,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '409': *id006
+        '409':
+          description: The change would leave a tunnel allocated to this customer carrying a prefix outside
+            their prefixes, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
@@ -923,12 +930,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '409': *id006
+        '409':
+          description: A tunnel is still allocated to this customer (the message names it), or this control
+            plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
       description: Takes the credential with it. One that outlived its tenant would authenticate to an
-        empty entitlement rather than to nothing.
+        empty entitlement rather than to nothing. A customer with a tunnel allocated is refused until the
+        tunnel is deleted or reallocated.
       parameters: *id005
   /v1/nodes/{id}/tunnel-endpoint:
     put:
@@ -1024,9 +1038,17 @@ paths:
         '401': *id002
         '403': *id003
       description: For each tunnel, every node that carries any of its prefixes, with the address the
-        tunnel terminates on there, whether it is enabled on that node, what the node's provisioner last
-        reported, and which of its prefixes the fabric is announcing or withdrawing from that node and
-        why. A row with a problem is a node that is not delivering those prefixes.
+        tunnel terminates on there, whether it is enabled on that node, its share of the clean-traffic
+        allowance, what the node's provisioner last reported, and which of its prefixes the fabric is
+        announcing or withdrawing from that node and why. A row with a problem is a node that is not
+        delivering those prefixes.
+      parameters:
+      - name: tenant
+        in: query
+        required: false
+        schema:
+          type: string
+        description: Only the tunnels allocated to this customer (tenant id).
   /v1/tunnels/{id}:
     put:
       summary: Create or replace a tunnel in the deployed policy
@@ -1041,7 +1063,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/TunnelChange'
         '400':
-          description: The tunnel will not validate against the policy, or the id in the body differs
+          description: The tunnel will not validate against the policy (including a rate_mbps over 2500),
+            names an unknown customer or carries a prefix outside theirs, or the id in the body differs
             from the one in the path.
           content:
             application/json:
@@ -1058,7 +1081,11 @@ paths:
         '403': *id003
       description: 'Tunnels belong to the deployed policy, so a change here bumps its version, is validated
         with the whole policy, and is compiled onto the fabric straight away: no separate deploy. The body
-        replaces the tunnel whole, including its disabled list; the id comes from the path.'
+        replaces the tunnel whole, including its disabled list and rate; the id comes from the path.
+
+
+        To allocate a tunnel to a customer, set tenant. Its prefixes must then lie within that customer''s
+        prefixes; leave prefixes out and it carries every prefix of theirs the policy protects.'
       parameters: *id005
       requestBody:
         required: true
@@ -1183,6 +1210,50 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/NodeSelection'
+  /v1/tunnels/{id}/rate:
+    put:
+      summary: Set how much clean traffic a tunnel may carry
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: rate_mbps is missing, negative or over 2500.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'Changes only the tunnel''s clean-traffic allowance, leaving the rest of it as it is.
+        The allowance is the total the customer receives across the fabric: each node sending the tunnel
+        gets an even share, and shapes what it sends down the tunnel to that share.'
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TunnelRate'
 components:
   securitySchemes:
     operatorToken:
@@ -2209,6 +2280,18 @@ components:
             type: string
           description: Node ids that must not build this tunnel. They withdraw its prefixes instead of
             attracting traffic they have no path to deliver. Set through the disable and enable endpoints.
+        tenant:
+          type: string
+          description: The customer (tenant id) this tunnel is allocated to. Its prefixes must lie within
+            that customer's prefixes, and the customer cannot be deleted, or lose those prefixes, while
+            it is allocated.
+        rate_mbps:
+          type: integer
+          minimum: 0
+          maximum: 2500
+          description: 'Clean traffic the customer receives down this tunnel, in Mbit/s, in total across
+            the fabric: every node sending it gets an even share and shapes to it. Zero, or leaving it out,
+            takes the maximum of 2500 (2.5 Gbit/s), so no tunnel is ever unlimited.'
         comment:
           type: string
     Session:
@@ -2324,6 +2407,11 @@ components:
           - both
           - return
           description: Empty means both.
+        rate_kbps:
+          type: integer
+          description: This node's share of the tunnel's clean-traffic allowance, in kbit/s. The allowance
+            is split evenly across the nodes announcing the tunnel's prefixes; a node still building it
+            while withdrawing gets the same share for the traffic BGP has yet to move away.
     TunnelEndpoint:
       type: object
       required:
@@ -2355,6 +2443,17 @@ components:
           items:
             type: string
           description: Node ids.
+    TunnelRate:
+      type: object
+      required:
+      - rate_mbps
+      properties:
+        rate_mbps:
+          type: integer
+          minimum: 0
+          maximum: 2500
+          example: 1000
+          description: Mbit/s. Zero takes the maximum, 2500 (2.5 Gbit/s).
     TunnelChange:
       type: object
       properties:
@@ -2417,6 +2516,12 @@ components:
           type: array
           items:
             type: string
+        tenant:
+          type: string
+          description: The customer it is allocated to. Empty when it is not.
+        rate_mbps:
+          type: integer
+          description: The allowance in force, with the default resolved.
         comment:
           type: string
         nodes:
@@ -2481,6 +2586,10 @@ components:
           type: integer
         mss_clamp:
           type: integer
+        rate_kbps:
+          type: integer
+          description: This node's share of the allowance, as last compiled. Absent when the node does
+            not build the tunnel.
         problem:
           type: string
           description: Why this node is not delivering the tunnel's prefixes, when it is not.

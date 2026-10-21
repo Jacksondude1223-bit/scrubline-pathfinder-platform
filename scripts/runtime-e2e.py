@@ -135,6 +135,16 @@ with tempfile.TemporaryDirectory() as temporary:
         rows = call(base, '/v1/tunnels', token=OP)['tunnels'][0]['nodes']
         assert any(r['node_id'] == runtime_id and r['endpoint'] == '192.0.2.30'
                    and r['endpoint_assigned'] for r in rows), rows
+        # The clean traffic down the tunnel is capped, never more than 2.5 Gbit/s in total, and
+        # the agent shapes to its share of whatever the operator allocates.
+        call(base, '/v1/tunnels/customer/rate', 'PUT', OP, {'rate_mbps':2501}, expected=400)
+        assert call(base, '/v1/tunnels/customer/rate', 'PUT', OP,
+                    {'rate_mbps':100})['tunnel']['rate_mbps'] == 100
+        def shaped(text):
+            rates = [int(line.split(' rate ')[1].split('kbit')[0]) for line in text.splitlines()
+                     if line.startswith('tc qdisc replace dev scr-customer root tbf rate ')]
+            return rates and 0 < rates[0] <= 100000 and text
+        wait_for(lambda: shaped(call(local, '/tunnels?format=iproute2', token=LOCAL)))
         call(local, '/tunnels', 'POST', LOCAL,
              {'tunnels':[{'tunnel_id':'customer','state':'up'}]})
         wait_for(lambda: any(a['node_id']==runtime_id and a['state']=='announce'

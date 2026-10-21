@@ -203,9 +203,33 @@ fn games_for(p: &Policy, prefixes: &[String], has_zc: bool) -> Vec<GameFilter> {
         .cloned()
         .collect()
 }
+/// Splits each tunnel's clean-traffic allowance evenly across the nodes sending it, so the
+/// customer never receives more than the allowance in total. A node sends a tunnel when it builds
+/// it and announces one of its prefixes; one still building it while withdrawing gets the same
+/// share for the traffic BGP has yet to move away.
+fn share_rates(programs: &mut HashMap<String, Program>) {
+    let mut senders: HashMap<String, i64> = HashMap::new();
+    for prog in programs.values() {
+        for t in &prog.tunnels {
+            let announced = prog
+                .announcements
+                .iter()
+                .any(|a| a.state == "announce" && t.prefixes.contains(&a.prefix));
+            if announced {
+                *senders.entry(t.id.clone()).or_default() += 1;
+            }
+        }
+    }
+    for prog in programs.values_mut() {
+        for t in &mut prog.tunnels {
+            let n = senders.get(&t.id).copied().unwrap_or(1).max(1);
+            t.rate_kbps = (t.rate_kbps / n).max(1);
+        }
+    }
+}
 pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<String, Program> {
     let now = Utc::now();
-    nodes
+    let mut programs: HashMap<String, Program> = nodes
         .iter()
         .map(|n| {
             let prefixes = enforced_prefixes(p, n);
@@ -271,7 +295,9 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
             prog.zc.sort_by_key(|r| r.priority);
             (n.id.clone(), prog)
         })
-        .collect()
+        .collect();
+    share_rates(&mut programs);
+    programs
 }
 fn or_any(s: &str) -> &str {
     if s.is_empty() {

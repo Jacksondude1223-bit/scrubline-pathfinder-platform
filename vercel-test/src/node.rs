@@ -184,6 +184,7 @@ impl Agent {
                 let tunnels = &self.pipe.program.tunnels;
                 let rendered_all = tunnel::commands(tunnels).and_then(|mut lines| {
                     lines.extend(tunnel::reply_commands(tunnels)?);
+                    lines.extend(tunnel::rate_commands(tunnels)?);
                     Ok(lines)
                 });
                 let (commands, err) = match rendered_all {
@@ -625,6 +626,7 @@ mod tests {
                 prefixes: vec!["203.0.113.0/24".into()],
                 mtu: 1476,
                 mss_clamp: 1436,
+                rate_kbps: 833333,
                 ..Default::default()
             }],
             ..Default::default()
@@ -649,6 +651,7 @@ mod tests {
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" ip saddr != { 203.0.113.0/24 } drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" meta nfproto ipv6 drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
+                "tc qdisc replace dev scr-northwind root tbf rate 833333kbit burst 1041666 latency 50ms",
             ]
         );
     }

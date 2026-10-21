@@ -12,6 +12,16 @@ pub fn overhead(t: &Tunnel) -> i64 {
         24 + if t.key == 0 { 0 } else { 4 }
     }
 }
+/// The most clean traffic one tunnel may carry to a customer, summed across the fabric: 2.5 Gbit/s.
+pub const MAX_RATE_MBPS: i64 = 2500;
+/// The clean-traffic allowance a tunnel actually gets: its own, or the maximum when it sets none.
+pub fn rate_mbps(t: &Tunnel) -> i64 {
+    if t.rate_mbps == 0 {
+        MAX_RATE_MBPS
+    } else {
+        t.rate_mbps
+    }
+}
 pub fn default_mtu(t: &Tunnel) -> i64 {
     1500 - overhead(t)
 }
@@ -59,6 +69,11 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     }
     if !["", "both", "return"].contains(&t.direction.as_str()) {
         return Err("direction must be both or return".into());
+    }
+    if !(0..=MAX_RATE_MBPS).contains(&t.rate_mbps) {
+        return Err(format!(
+            "rate_mbps must be within 1..{MAX_RATE_MBPS} (2.5 Gbit/s); 0 takes the maximum"
+        ));
     }
     let mut disabled = HashSet::new();
     if t.disabled
@@ -125,6 +140,8 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         interface: interface_name(&t.id)?,
         comment: t.comment.clone(),
         direction: t.direction.clone(),
+        // The whole allowance; compiling the fabric splits it among the nodes sending.
+        rate_kbps: rate_mbps(t).saturating_mul(1000),
     })
 }
 /// Whether the customer's replies come back up this tunnel to the node.
@@ -163,6 +180,24 @@ pub fn reply_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
         if t.mss_clamp > 0 {
             lines.push(format!("nft add rule inet scrubline forward iifname \"{name}\" tcp flags syn tcp option maxseg size set {}", t.mss_clamp));
         }
+    }
+    Ok(lines)
+}
+/// Holds the clean traffic going down each tunnel to this node's share of its allowance. A
+/// shaper rather than a policer, so TCP sees queueing it can back off from instead of drops; the
+/// burst covers 10ms at the rate, and never less than 32KiB so a slow share still passes a full
+/// frame and stays within what tbf can represent.
+pub fn rate_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
+    let mut rows: Vec<_> = tunnels.iter().filter(|t| t.rate_kbps > 0).collect();
+    rows.sort_by_key(|t| &t.id);
+    let mut lines = Vec::new();
+    for t in rows {
+        let name = interface_name(&t.id)?;
+        let burst = (t.rate_kbps.saturating_mul(5) / 4).max(32768);
+        lines.push(format!(
+            "tc qdisc replace dev {name} root tbf rate {}kbit burst {burst} latency 50ms",
+            t.rate_kbps
+        ));
     }
     Ok(lines)
 }

@@ -133,6 +133,10 @@ paths:
         `forward` chain exist, as the MSS clamp already does.
 
 
+        Every tunnel then gets a `tc` token-bucket shaper holding what goes down it to this node''s share
+        of the tunnel''s clean-traffic allowance.
+
+
         `?format=iproute2` returns the configuration as plain text instead of JSON.'
       parameters:
       - name: format

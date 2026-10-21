@@ -199,6 +199,32 @@ pub fn policy(p: &Policy) -> Result<()> {
     }
     Ok(())
 }
+/// Tunnels allocated to a customer may only carry that customer's address space: a tunnel holding
+/// someone else's prefix would hand their clean traffic to the wrong edge.
+pub fn tunnel_tenants(p: &Policy, tenants: &[Tenant]) -> Result<()> {
+    for t in p.tunnels.iter().filter(|t| !t.tenant.is_empty()) {
+        let Some(owner) = tenants.iter().find(|v| v.id == t.tenant) else {
+            return Err(format!("tunnel {}: unknown tenant {:?}", t.id, t.tenant));
+        };
+        let owned: Vec<IpNet> = owner
+            .prefixes
+            .iter()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        for prefix in &t.prefixes {
+            let inside = prefix
+                .parse::<IpNet>()
+                .is_ok_and(|net| owned.iter().any(|o| o.contains(&net)));
+            if !inside {
+                return Err(format!(
+                    "tunnel {}: prefix {prefix} is not within tenant {}'s prefixes",
+                    t.id, t.tenant
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 pub fn tenant(t: &Tenant) -> Result<()> {
     if t.name.is_empty() {
         return Err("name required".into());

@@ -386,6 +386,7 @@ work":
 - `scrubline_reputation_shielded_total{node}` — strikes that landed on an already-verified source and were not acted on. Alert on this: it is a spoofing attempt against a real player, or a verified client misbehaving.
 - `scrubline_tunnel_up{node,tunnel,remote}` — 1 when a return path is reported carrying traffic, 0 when reported down. A never-reported tunnel is **absent**, not zero: `scrubline_tunnel_reported` is how you tell "nothing is reporting" from "it is broken".
 - `scrubline_tunnel_mtu_bytes{node,tunnel}` and `scrubline_tunnel_mss_clamp_bytes{...}` — the derived encapsulation numbers, so a hung-TCP complaint can be checked against them rather than guessed at.
+- `scrubline_tunnel_rate_limit_bits_per_second{node,tunnel}` — the share of the tunnel's clean-traffic allowance this node shapes to.
 - `scrubline_report_age_seconds{node}` — how stale the control plane's copy of a node's counters is.
 
 Counters survive a reprogram for rules that stay in the policy, so a poll every
@@ -625,6 +626,17 @@ what was last reported, what is being announced and why), `PUT` and `DELETE
 brings it back on particular nodes, which withdraw its prefixes meanwhile.
 Each change is validated with the whole policy, saved as its next version and
 deployed straight away. See [docs/api.md](docs/api.md#9-getting-the-clean-traffic-back).
+
+### Customers and clean-traffic speed
+
+A tunnel is allocated to a customer with `"tenant"`: its prefixes must lie
+within that customer's own (and default to them), and the customer cannot be
+deleted while it is allocated. `"rate_mbps"` caps the clean traffic the
+customer receives down it, in total across the fabric, at most 2500 (2.5
+Gbit/s); a tunnel without one is held to that maximum. The allowance is split
+evenly across the nodes announcing the tunnel's prefixes and each shapes to
+its share with a `tc` token bucket. `PUT /v1/tunnels/{id}/rate` changes only
+the speed.
 
 ### A dead tunnel withdraws the prefix
 
@@ -929,6 +941,7 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `GET /v1/tunnels` every tunnel of the deployed policy, node by node (operator only)
 - `PUT /v1/tunnels/{id}`, `DELETE /v1/tunnels/{id}` add, replace or remove a tunnel in the deployed policy, and deploy it (operator only)
 - `POST /v1/tunnels/{id}/disable`, `POST /v1/tunnels/{id}/enable` take a tunnel down or bring it back on the listed nodes (operator only)
+- `PUT /v1/tunnels/{id}/rate` set a tunnel's clean-traffic allowance, up to 2500 Mbit/s in total (operator only)
 - `GET /v1/analytics/overview` per-prefix traffic, mitigation and attack state, summed across the fabric
 - `GET /v1/analytics/series` one prefix over time; each point is the heaviest moment inside it, not an average
 - `GET /v1/analytics/events` the attack log, each entry naming the rules and filters that stopped it
