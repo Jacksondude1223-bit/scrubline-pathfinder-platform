@@ -34,6 +34,12 @@ pub struct Snapshot {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     #[serde(deserialize_with = "crate::model::null_default")]
     pub tenant_tokens: BTreeMap<String, String>,
+    /// Tunnel endpoints an operator assigned, by node id. They override the address a node
+    /// registers with and survive its re-registration, so the operator stays in control of
+    /// which address each node's tunnels terminate on.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(deserialize_with = "crate::model::null_default")]
+    pub tunnel_endpoints: BTreeMap<String, String>,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -49,6 +55,7 @@ impl Default for Snapshot {
             model: ml::Model::default(),
             tenants: vec![],
             tenant_tokens: BTreeMap::new(),
+            tunnel_endpoints: BTreeMap::new(),
         }
     }
 }
@@ -192,8 +199,21 @@ impl Store {
         self.tunnels.clear();
         Ok(())
     }
+    /// A node as the fabric uses it: with the operator's tunnel endpoint, if one is assigned, in
+    /// place of the one it registered with.
+    pub fn effective(&self, mut n: Node) -> Node {
+        if let Some(endpoint) = self.data.tunnel_endpoints.get(&n.id) {
+            n.tunnel_src = endpoint.clone();
+        }
+        n
+    }
     pub fn nodes(&self, now: DateTime<Utc>) -> Vec<Node> {
-        let mut ns = self.data.nodes.clone();
+        let mut ns: Vec<_> = self
+            .data
+            .nodes
+            .iter()
+            .map(|n| self.effective(n.clone()))
+            .collect();
         for n in &mut ns {
             n.status = if now.signed_duration_since(n.last_seen).num_milliseconds() > 30000 {
                 "stale"
@@ -232,7 +252,7 @@ impl Store {
             d.node_tokens.insert(n.id.clone(), hash(&token));
             Ok(())
         })?;
-        Ok((n, token))
+        Ok((self.effective(n), token))
     }
     pub fn save_policy(&mut self, mut p: Policy, now: DateTime<Utc>) -> Result<Policy> {
         self.transaction(|d| {

@@ -215,6 +215,188 @@ impl Api {
             .map_err(failed)?;
         Ok(value(m))
     }
+    /// A node as the fabric sees it, saying whether its tunnel endpoint was assigned by an operator.
+    fn node_view(&self, id: &str, now: DateTime<Utc>) -> Value {
+        let n = self
+            .store
+            .nodes(now)
+            .into_iter()
+            .find(|n| n.id == id)
+            .unwrap_or_default();
+        let mut v = value(&n);
+        v["tunnel_endpoint_assigned"] = json!(self.store.data.tunnel_endpoints.contains_key(id));
+        v
+    }
+    /// Tunnels belong to the deployed policy, so a change to one is a new version of that policy:
+    /// validated whole, made durable, then compiled onto the fabric straight away.
+    fn change_tunnels(
+        &mut self,
+        now: DateTime<Utc>,
+        change: impl FnOnce(&mut Policy) -> Answer<()>,
+    ) -> Answer<Policy> {
+        let Some(mut p) = self
+            .store
+            .data
+            .policies
+            .iter()
+            .find(|p| !p.id.is_empty() && p.id == self.store.data.last_policy_id)
+            .cloned()
+        else {
+            return Err((
+                409,
+                "no policy is deployed; tunnels belong to the deployed policy, so deploy one first"
+                    .into(),
+            ));
+        };
+        change(&mut p)?;
+        validation::policy(&p).map_err(bad)?;
+        let saved = self.store.save_policy(p, now).map_err(failed)?;
+        self.deploy(&saved, now, true).map_err(failed)?;
+        Ok(saved)
+    }
+    /// Takes a tunnel off some nodes, or puts it back. A node it is off withdraws its prefixes,
+    /// since it has no path to deliver them on.
+    fn toggle_tunnel(
+        &mut self,
+        id: &str,
+        body: &[u8],
+        disable: bool,
+        now: DateTime<Utc>,
+    ) -> Answer {
+        #[derive(Deserialize)]
+        struct Nodes {
+            nodes: Vec<String>,
+        }
+        let req: Nodes = parse(body)?;
+        if req.nodes.is_empty() {
+            return Err(bad("nodes requires at least one node id"));
+        }
+        if let Some(unknown) = req
+            .nodes
+            .iter()
+            .find(|n| !self.store.data.nodes.iter().any(|v| &v.id == *n))
+        {
+            return Err((404, format!("unknown node {unknown:?}").into()));
+        }
+        let p = self.change_tunnels(now, |p| {
+            let Some(t) = p.tunnels.iter_mut().find(|v| v.id == id) else {
+                return Err((404, "unknown tunnel".into()));
+            };
+            for n in &req.nodes {
+                t.disabled.retain(|v| v != n);
+                if disable {
+                    t.disabled.push(n.clone());
+                }
+            }
+            t.disabled.sort();
+            Ok(())
+        })?;
+        let t = p.tunnels.iter().find(|v| v.id == id).cloned();
+        Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":t}))
+    }
+    /// Every tunnel of the deployed policy on every node that carries its prefixes: where it
+    /// terminates, what the node built, what its provisioner last reported, and what the fabric
+    /// is announcing because of it.
+    fn tunnel_view(&self, now: DateTime<Utc>) -> Value {
+        let Some(p) = self
+            .store
+            .data
+            .policies
+            .iter()
+            .find(|p| !p.id.is_empty() && p.id == self.store.data.last_policy_id)
+        else {
+            return json!({"policy_id":null,"version":0,"tunnels":[]});
+        };
+        let nodes = self.store.nodes(now);
+        let tunnels: Vec<_> = p
+            .tunnels
+            .iter()
+            .map(|t| {
+                let rows: Vec<_> = nodes
+                    .iter()
+                    .filter_map(|n| {
+                        let enforced = compiler::enforced_prefixes(p, n);
+                        let mine: Vec<String> = t
+                            .prefixes
+                            .iter()
+                            .filter(|prefix| enforced.contains(prefix))
+                            .cloned()
+                            .collect();
+                        if mine.is_empty() {
+                            return None;
+                        }
+                        let enabled = !t.disabled.iter().any(|id| id == &n.id);
+                        let report = self
+                            .store
+                            .tunnels
+                            .get(&n.id)
+                            .and_then(|rows| rows.iter().find(|s| s.tunnel_id == t.id));
+                        let (announced, withdrawn): (Vec<_>, Vec<_>) = self
+                            .store
+                            .plan
+                            .iter()
+                            .filter(|a| a.node_id == n.id && mine.contains(&a.prefix))
+                            .partition(|a| a.state == "announce");
+                        let mut row = json!({
+                            "node_id": n.id,
+                            "name": n.name,
+                            "region": n.region,
+                            "status": n.status,
+                            "endpoint": n.tunnel_src,
+                            "endpoint_assigned": self.store.data.tunnel_endpoints.contains_key(&n.id),
+                            "enabled": enabled,
+                            "state": report.map_or("unreported", |r| r.state.as_str()),
+                            "prefixes": mine,
+                            "announced": announced.iter().map(|a| &a.prefix).collect::<Vec<_>>(),
+                            "withdrawn": withdrawn
+                                .iter()
+                                .map(|a| json!({"prefix": a.prefix, "reason": a.reason}))
+                                .collect::<Vec<_>>(),
+                        });
+                        if let Some(r) = report {
+                            row["reported_at"] = json!(r.reported_at);
+                        }
+                        let problem = if !enabled {
+                            "disabled on this node".to_string()
+                        } else if n.tunnel_src.is_empty() {
+                            format!(
+                                "no tunnel endpoint; assign one with PUT /v1/nodes/{}/tunnel-endpoint",
+                                n.id
+                            )
+                        } else {
+                            String::new()
+                        };
+                        match crate::tunnel::for_node(t, n, &mine) {
+                            Ok(built) => {
+                                row["interface"] = json!(built.interface);
+                                row["mtu"] = json!(built.mtu);
+                                row["mss_clamp"] = json!(built.mss_clamp);
+                            }
+                            Err(e) if problem.is_empty() => row["problem"] = json!(e),
+                            Err(_) => {}
+                        }
+                        if !problem.is_empty() {
+                            row["problem"] = json!(problem);
+                        }
+                        Some(row)
+                    })
+                    .collect();
+                json!({
+                    "id": t.id,
+                    "type": if t.r#type.is_empty() { "gre" } else { t.r#type.as_str() },
+                    "direction": if t.direction.is_empty() { "both" } else { t.direction.as_str() },
+                    "remote": t.remote,
+                    "key": t.key,
+                    "prefixes": t.prefixes,
+                    "required": t.required,
+                    "disabled": t.disabled,
+                    "comment": t.comment,
+                    "nodes": rows,
+                })
+            })
+            .collect();
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels})
+    }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
             return Ok(());
@@ -485,6 +667,104 @@ impl Api {
                 Ok(
                     json!({"policy_id":p.id,"version":p.version,"announcements":self.store.plan,"nodes":self.store.programs.len(),"datapath":"asic/tcam + fpga + pf_ring zc + ml","ml_ready":self.store.data.model.ready}),
                 )
+            }
+            ("PUT", ["nodes", _, "tunnel-endpoint"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                #[derive(Deserialize)]
+                struct Endpoint {
+                    address: String,
+                }
+                let e: Endpoint = parse(body)?;
+                validation::tunnel_endpoint(&e.address).map_err(bad)?;
+                if !self.store.data.nodes.iter().any(|n| n.id == id) {
+                    return Err((404, "unknown node".into()));
+                }
+                // Two nodes terminating tunnels on one address would each take the other's
+                // customer replies.
+                if let Some(other) = self
+                    .store
+                    .nodes(now)
+                    .into_iter()
+                    .find(|n| n.id != id && n.tunnel_src == e.address)
+                {
+                    return Err((
+                        409,
+                        format!(
+                            "{} is already the tunnel endpoint of {}",
+                            e.address, other.id
+                        )
+                        .into(),
+                    ));
+                }
+                self.store
+                    .transaction(|d| {
+                        d.tunnel_endpoints.insert(id.into(), e.address.clone());
+                        Ok(())
+                    })
+                    .map_err(failed)?;
+                self.reconcile(now, false).map_err(failed)?;
+                Ok(value(self.node_view(id, now)))
+            }
+            ("DELETE", ["nodes", _, "tunnel-endpoint"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                if !self.store.data.nodes.iter().any(|n| n.id == id) {
+                    return Err((404, "unknown node".into()));
+                }
+                self.store
+                    .transaction(|d| {
+                        d.tunnel_endpoints.remove(id);
+                        Ok(())
+                    })
+                    .map_err(failed)?;
+                self.reconcile(now, false).map_err(failed)?;
+                Ok(value(self.node_view(id, now)))
+            }
+            ("GET", ["tunnels"]) => {
+                who.operator()?;
+                Ok(self.tunnel_view(now))
+            }
+            ("PUT", ["tunnels", _]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                let mut t: Tunnel = parse(body)?;
+                if !t.id.is_empty() && t.id != id {
+                    return Err(bad(
+                        "the tunnel id in the body differs from the one in the path",
+                    ));
+                }
+                t.id = id.into();
+                let p = self.change_tunnels(now, |p| {
+                    match p.tunnels.iter_mut().find(|v| v.id == t.id) {
+                        Some(v) => *v = t.clone(),
+                        None => p.tunnels.push(t.clone()),
+                    }
+                    Ok(())
+                })?;
+                Ok(json!({"policy_id":p.id,"version":p.version,"tunnel":t}))
+            }
+            ("DELETE", ["tunnels", _]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                let p = self.change_tunnels(now, |p| {
+                    if !p.tunnels.iter().any(|v| v.id == id) {
+                        return Err((404, "unknown tunnel".into()));
+                    }
+                    p.tunnels.retain(|v| v.id != id);
+                    Ok(())
+                })?;
+                Ok(json!({"policy_id":p.id,"version":p.version,"deleted":id}))
+            }
+            ("POST", ["tunnels", _, "disable"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                self.toggle_tunnel(id, body, true, now)
+            }
+            ("POST", ["tunnels", _, "enable"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                self.toggle_tunnel(id, body, false, now)
             }
             ("GET", ["fabric"]) => {
                 who.operator()?;
@@ -896,9 +1176,12 @@ fn route_label(path: &str) -> String {
         ["policies", _, "deploy"] => "policies/deploy".into(),
         ["tenants", _, "token"] => "tenants/token".into(),
         ["tenants", _] => "tenants/delete".into(),
+        ["nodes", _, "tunnel-endpoint"] => "nodes/tunnel-endpoint".into(),
+        ["tunnels", _] => "tunnels/item".into(),
+        ["tunnels", _, leaf] if ["disable", "enable"].contains(leaf) => format!("tunnels/{leaf}"),
         [single]
             if [
-                "state", "promote", "nodes", "policies", "fabric", "tenants", "decide",
+                "state", "promote", "nodes", "policies", "fabric", "tenants", "decide", "tunnels",
             ]
             .contains(single) =>
         {

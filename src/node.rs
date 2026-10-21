@@ -90,6 +90,15 @@ impl Agent {
         self.retired.retain(|prefix, _| !planned.contains(prefix));
         self.pipe.load(prog);
     }
+    /// This node with the tunnel endpoint the control plane holds for it, which an operator may
+    /// have reassigned since the agent registered.
+    fn peering_node(&self) -> Node {
+        let mut node = self.node.clone();
+        if !self.pipe.program.tunnel_src.is_empty() {
+            node.tunnel_src = self.pipe.program.tunnel_src.clone();
+        }
+        node
+    }
     fn announcements(&self) -> Vec<Announcement> {
         let mut rows = self.pipe.program.announcements.clone();
         rows.extend(self.retired.values().cloned());
@@ -172,7 +181,12 @@ impl Agent {
                 )
             }
             ("GET", "/tunnels") => {
-                let (commands, err) = match tunnel::commands(&self.pipe.program.tunnels) {
+                let tunnels = &self.pipe.program.tunnels;
+                let rendered_all = tunnel::commands(tunnels).and_then(|mut lines| {
+                    lines.extend(tunnel::reply_commands(tunnels)?);
+                    Ok(lines)
+                });
+                let (commands, err) = match rendered_all {
                     Ok(v) => (v, String::new()),
                     Err(e) => (vec![], e),
                 };
@@ -218,7 +232,7 @@ impl Agent {
                 } else {
                     match bgp::session_config(
                         &self.pipe.program.sessions,
-                        &self.node,
+                        &self.peering_node(),
                         self.local_as,
                     ) {
                         Ok(v) => (v, String::new()),
@@ -587,5 +601,55 @@ mod tests {
         let twice =
             br#"{"tunnels":[{"tunnel_id":"t","state":"up"},{"tunnel_id":"t","state":"down"}]}"#;
         assert_eq!(call(&mut a, "POST", "/tunnels", twice), 400);
+    }
+    #[test]
+    fn sessions_peer_from_the_endpoint_the_control_plane_holds() {
+        let mut a = agent(vec![]);
+        a.node.tunnel_src = "192.0.2.9".into();
+        assert_eq!(a.peering_node().tunnel_src, "192.0.2.9");
+        a.install(Program {
+            tunnel_src: "192.0.2.1".into(),
+            ..Default::default()
+        });
+        assert_eq!(a.peering_node().tunnel_src, "192.0.2.1");
+    }
+    #[tokio::test]
+    async fn tunnels_render_the_reply_path_after_the_tunnel() {
+        let mut a = agent(vec![]);
+        a.install(Program {
+            tunnels: vec![NodeTunnel {
+                id: "northwind".into(),
+                r#type: "gre".into(),
+                local: "192.0.2.1".into(),
+                remote: "198.51.100.1".into(),
+                prefixes: vec!["203.0.113.0/24".into()],
+                mtu: 1476,
+                mss_clamp: 1436,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer local".parse().unwrap());
+        let uri = "/tunnels?format=iproute2".parse().unwrap();
+        let resp = a.dispatch("GET", &uri, &headers, b"");
+        assert_eq!(resp.status().as_u16(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "ip link add scr-northwind type gre local 192.0.2.1 remote 198.51.100.1",
+                "ip link set scr-northwind mtu 1476 up",
+                "ip route replace 203.0.113.0/24 dev scr-northwind",
+                "nft add rule inet scrubline forward oifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
+                "nft add rule inet scrubline forward iifname \"scr-northwind\" ip saddr != { 203.0.113.0/24 } drop",
+                "nft add rule inet scrubline forward iifname \"scr-northwind\" meta nfproto ipv6 drop",
+                "nft add rule inet scrubline forward iifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
+            ]
+        );
     }
 }

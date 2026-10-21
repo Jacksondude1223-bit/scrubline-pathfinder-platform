@@ -587,8 +587,11 @@ alongside it.
 "tunnels": [{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"key":42}]
 ```
 
-Nodes supply the local end with `-tunnel-src`, because it is per node, not
-per tunnel. The fabric is anycast, so a return path fans out rather than
+The local end is each node's own address, because it is per node, not per
+tunnel: the customer's tunnel runs straight to the scrubbing node. An operator
+assigns it with `PUT /v1/nodes/{id}/tunnel-endpoint`; a node can also supply
+one with `-tunnel-src`, and the operator's assignment wins and survives the
+node re-registering. The fabric is anycast, so a return path fans out rather than
 being assigned: every node carrying the prefix holds its own tunnel to the
 one customer endpoint. Ten scrubbers protecting one customer is ten tunnels.
 That is the cost of not pinning a prefix to one box.
@@ -601,6 +604,27 @@ encapsulation's overhead (1476/1436 for GRE, 1472/1432 with a key,
 that does. The clamp is the part people skip: without it, a customer whose
 path drops the ICMP that path-MTU discovery needs sees TCP complete its
 handshake and then hang, which reads as a scrubbing fault.
+
+### Both directions
+
+A tunnel carries traffic both ways by default: clean traffic down to the
+customer, and the customer's replies back up it to the node, which forwards
+them to the internet. The agent renders forwarding rules for that half that
+admit only sources inside the tunnel's own prefixes, per address family, so
+the tunnel cannot relay anything else the customer's edge sends into it; SYNs
+coming back up are MSS-clamped too. `"direction": "return"` is for customers
+whose replies leave by their own transit.
+
+### Controlling tunnels from the API
+
+Operators change tunnels on the deployed policy in place: `GET /v1/tunnels`
+shows every tunnel on every node carrying it (the address it terminates on,
+what was last reported, what is being announced and why), `PUT` and `DELETE
+/v1/tunnels/{id}` add, replace or remove one, and `POST
+/v1/tunnels/{id}/disable` or `/enable` with `{"nodes":[...]}` takes it down or
+brings it back on particular nodes, which withdraw its prefixes meanwhile.
+Each change is validated with the whole policy, saved as its next version and
+deployed straight away. See [docs/api.md](docs/api.md#9-getting-the-clean-traffic-back).
 
 ### A dead tunnel withdraws the prefix
 
@@ -901,6 +925,10 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `GET /v1/ml/model` weights the node agent installs
 - `DELETE /v1/ml/model` retire the published model; agents clear it on the next poll
 - `POST /v1/nodes/{id}/heartbeat` also carries `tunnels`: what this node's provisioner says about its return paths
+- `PUT /v1/nodes/{id}/tunnel-endpoint`, `DELETE ...` assign or clear the address a node's tunnels terminate on (operator only)
+- `GET /v1/tunnels` every tunnel of the deployed policy, node by node (operator only)
+- `PUT /v1/tunnels/{id}`, `DELETE /v1/tunnels/{id}` add, replace or remove a tunnel in the deployed policy, and deploy it (operator only)
+- `POST /v1/tunnels/{id}/disable`, `POST /v1/tunnels/{id}/enable` take a tunnel down or bring it back on the listed nodes (operator only)
 - `GET /v1/analytics/overview` per-prefix traffic, mitigation and attack state, summed across the fabric
 - `GET /v1/analytics/series` one prefix over time; each point is the heaviest moment inside it, not an average
 - `GET /v1/analytics/events` the attack log, each entry naming the rules and filters that stopped it

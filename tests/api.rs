@@ -18,11 +18,14 @@ fn serve(store: Store) -> String {
     serve_shared(store).0
 }
 fn serve_shared(store: Store) -> (String, Shared) {
+    serve_as(store, "primary")
+}
+fn serve_as(store: Store, mode: &str) -> (String, Shared) {
     let state: Shared = Arc::new(Mutex::new(Api::new(
         store,
         OP.into(),
         ENROLL.into(),
-        "primary".into(),
+        mode.into(),
     )));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -353,5 +356,237 @@ fn baselines_survive_a_silent_node() {
     assert_eq!(
         c.summary("203.0.113.0/24", 3600000, NOW + 312000)["offered"],
         1100
+    );
+}
+fn node_id(reg: &Value) -> String {
+    reg["node"]["id"].as_str().unwrap().to_string()
+}
+fn plan_row(base: &str, node: &str, prefix: &str) -> Value {
+    let (_, fabric) = call(base, "GET", "/v1/fabric", Some(OP), Value::Null);
+    fabric["announcements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["node_id"] == node && a["prefix"] == prefix)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+#[test]
+fn operators_assign_each_node_its_own_tunnel_endpoint() {
+    let base = serve(Store::open("").unwrap());
+    let register = |body: Value| call(&base, "POST", "/v1/nodes/register", Some(ENROLL), body).1;
+    let a = node_id(&register(json!({"name":"edge-a","region":"iad"})));
+    let b = node_id(&register(
+        json!({"name":"edge-b","region":"iad","tunnel_src":"192.0.2.2"}),
+    ));
+    let endpoint = |node: &str, token, body| {
+        let path = format!("/v1/nodes/{node}/tunnel-endpoint");
+        call(&base, "PUT", &path, token, body)
+    };
+    let address = |a: &str| json!({ "address": a });
+    assert_eq!(endpoint(&a, None, address("192.0.2.1")).0, 401);
+    assert_eq!(endpoint(&a, Some(ENROLL), address("192.0.2.1")).0, 403);
+    for unusable in ["2001:db8::1", "127.0.0.1", "0.0.0.0", "224.0.0.1", "nope"] {
+        assert_eq!(
+            endpoint(&a, Some(OP), address(unusable)).0,
+            400,
+            "{unusable}"
+        );
+    }
+    assert_eq!(endpoint("node-none", Some(OP), address("192.0.2.1")).0, 404);
+    let (status, body) = endpoint(&a, Some(OP), address("192.0.2.2"));
+    assert_eq!(
+        status, 409,
+        "two nodes on one address would take each other's replies"
+    );
+    assert!(body["error"].as_str().unwrap().contains(&b), "{body}");
+    let (status, node) = endpoint(&a, Some(OP), address("192.0.2.1"));
+    assert_eq!(status, 200, "{node}");
+    assert_eq!(node["tunnel_src"], "192.0.2.1");
+    assert_eq!(node["tunnel_endpoint_assigned"], true);
+    // The node re-registering with an address of its own does not move its tunnels: the
+    // operator's assignment stands until the operator clears it.
+    let again = register(json!({"name":"edge-a","region":"iad","tunnel_src":"192.0.2.9"}));
+    assert_eq!(again["node"]["tunnel_src"], "192.0.2.1");
+    let (_, nodes) = call(&base, "GET", "/v1/nodes", Some(OP), Value::Null);
+    let listed = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == a.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(listed["tunnel_src"], "192.0.2.1");
+    let clear = format!("/v1/nodes/{a}/tunnel-endpoint");
+    let (status, node) = call(&base, "DELETE", &clear, Some(OP), Value::Null);
+    assert_eq!(status, 200, "{node}");
+    assert_eq!(
+        node["tunnel_src"], "192.0.2.9",
+        "falls back to what the node registered with"
+    );
+    assert_eq!(node["tunnel_endpoint_assigned"], false);
+    let missing = "/v1/nodes/node-none/tunnel-endpoint";
+    assert_eq!(call(&base, "DELETE", missing, Some(OP), Value::Null).0, 404);
+}
+#[test]
+fn operators_control_tunnels_on_the_deployed_policy() {
+    let base = serve(Store::open("").unwrap());
+    let register = |body: Value| call(&base, "POST", "/v1/nodes/register", Some(ENROLL), body).1;
+    let a = node_id(&register(json!({"name":"edge-a","region":"iad"})));
+    let b = node_id(&register(
+        json!({"name":"edge-b","region":"fra","tunnel_src":"192.0.2.2"}),
+    ));
+    let prefix = "203.0.113.0/24";
+    let tunnel = json!({"remote":"198.51.100.1","prefixes":[prefix],"key":42});
+    let (status, fleet) = call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null);
+    assert_eq!((status, &fleet["policy_id"]), (200, &Value::Null));
+    let put =
+        |id: &str, body: Value| call(&base, "PUT", &format!("/v1/tunnels/{id}"), Some(OP), body);
+    let (status, body) = put("northwind", tunnel.clone());
+    assert_eq!(status, 409, "nothing deployed to change yet: {body}");
+    let policy = json!({"name":"p","protected":[prefix, "198.51.100.0/24"],"tunnels":[]});
+    let (_, saved) = call(&base, "POST", "/v1/policies", Some(OP), policy);
+    let deploy = format!("/v1/policies/{}/deploy", saved["id"].as_str().unwrap());
+    assert_eq!(call(&base, "POST", &deploy, Some(OP), Value::Null).0, 200);
+    let mut wrong = tunnel.clone();
+    wrong["id"] = json!("other");
+    assert_eq!(put("northwind", wrong).0, 400);
+    let mut bad_remote = tunnel.clone();
+    bad_remote["remote"] = json!("127.0.0.1");
+    assert_eq!(put("northwind", bad_remote).0, 400);
+    let mut bad_direction = tunnel.clone();
+    bad_direction["direction"] = json!("inbound");
+    assert_eq!(put("northwind", bad_direction).0, 400);
+    let (status, changed) = put("northwind", tunnel.clone());
+    assert_eq!(status, 200, "{changed}");
+    assert_eq!(
+        changed["version"], 2,
+        "a tunnel change is a new version of the policy"
+    );
+    assert_eq!(changed["tunnel"]["id"], "northwind");
+    // A node with no endpoint cannot carry a prefix with a return path; one with an endpoint
+    // gets its own tunnel to the customer from it.
+    assert_eq!(plan_row(&base, &a, prefix)["state"], "withdraw");
+    assert_eq!(plan_row(&base, &b, prefix)["state"], "announce");
+    let program = |node: &str| {
+        call(
+            &base,
+            "GET",
+            &format!("/v1/nodes/{node}/program"),
+            Some(OP),
+            Value::Null,
+        )
+        .1
+    };
+    let prog = program(&b);
+    assert_eq!(prog["tunnel_src"], "192.0.2.2");
+    assert_eq!(prog["tunnels"][0]["local"], "192.0.2.2");
+    let (_, fleet) = call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null);
+    let rows = fleet["tunnels"][0]["nodes"].as_array().unwrap().clone();
+    let row = |node: &str| rows.iter().find(|r| r["node_id"] == node).unwrap().clone();
+    assert_eq!(fleet["tunnels"][0]["direction"], "both");
+    assert_eq!(row(&a)["endpoint"], "");
+    assert!(row(&a)["problem"]
+        .as_str()
+        .unwrap()
+        .contains("tunnel-endpoint"));
+    assert_eq!(row(&b)["endpoint"], "192.0.2.2");
+    assert_eq!(row(&b)["state"], "unreported");
+    assert_eq!(row(&b)["interface"], "scr-northwind");
+    assert_eq!(row(&b)["announced"], json!([prefix]));
+    // Giving the node its endpoint brings it into the tunnel straight away.
+    let endpoint = format!("/v1/nodes/{a}/tunnel-endpoint");
+    let address = json!({"address":"192.0.2.1"});
+    assert_eq!(call(&base, "PUT", &endpoint, Some(OP), address).0, 200);
+    assert_eq!(plan_row(&base, &a, prefix)["state"], "announce");
+    assert_eq!(program(&a)["tunnels"][0]["local"], "192.0.2.1");
+    let toggle = |id: &str, action: &str, body: Value| {
+        call(
+            &base,
+            "POST",
+            &format!("/v1/tunnels/{id}/{action}"),
+            Some(OP),
+            body,
+        )
+    };
+    let nodes = |ids: &[&str]| json!({ "nodes": ids });
+    assert_eq!(toggle("northwind", "disable", nodes(&[])).0, 400);
+    assert_eq!(toggle("northwind", "disable", nodes(&["node-none"])).0, 404);
+    assert_eq!(toggle("missing", "disable", nodes(&[&a])).0, 404);
+    assert_eq!(
+        toggle("northwind", "disable", nodes(&[&a])).1["version"],
+        3,
+        "a 404 saves nothing"
+    );
+    let (status, off) = toggle("northwind", "disable", nodes(&[&a]));
+    assert_eq!(status, 200);
+    assert_eq!(
+        off["tunnel"]["disabled"],
+        json!([a]),
+        "disabling twice lists the node once"
+    );
+    let withdrawn = plan_row(&base, &a, prefix);
+    assert_eq!(withdrawn["state"], "withdraw");
+    assert_eq!(
+        withdrawn["reason"],
+        "return tunnel northwind is disabled on this node"
+    );
+    assert_eq!(plan_row(&base, &b, prefix)["state"], "announce");
+    assert!(program(&a)["tunnels"].is_null(), "{}", program(&a));
+    let (status, on) = toggle("northwind", "enable", nodes(&[&a]));
+    assert_eq!(status, 200);
+    assert!(on["tunnel"]["disabled"].is_null(), "{on}");
+    assert_eq!(plan_row(&base, &a, prefix)["state"], "announce");
+    let mut second = tunnel.clone();
+    second["remote"] = json!("198.51.100.2");
+    assert_eq!(put("second", second).0, 400, "a prefix has one return path");
+    let delete = |id: &str| {
+        call(
+            &base,
+            "DELETE",
+            &format!("/v1/tunnels/{id}"),
+            Some(OP),
+            Value::Null,
+        )
+    };
+    assert_eq!(delete("missing").0, 404);
+    let (status, gone) = delete("northwind");
+    assert_eq!((status, &gone["deleted"]), (200, &json!("northwind")));
+    let (_, fleet) = call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null);
+    assert_eq!(fleet["tunnels"], json!([]));
+    assert_eq!(
+        call(&base, "GET", "/v1/tunnels", Some(ENROLL), Value::Null).0,
+        403
+    );
+}
+#[test]
+fn a_replica_refuses_tunnel_changes() {
+    let (base, _) = serve_as(Store::open("").unwrap(), "replica");
+    let writes = [
+        (
+            "PUT",
+            "/v1/nodes/n/tunnel-endpoint",
+            json!({"address":"192.0.2.1"}),
+        ),
+        ("DELETE", "/v1/nodes/n/tunnel-endpoint", Value::Null),
+        (
+            "PUT",
+            "/v1/tunnels/t",
+            json!({"remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}),
+        ),
+        ("DELETE", "/v1/tunnels/t", Value::Null),
+        ("POST", "/v1/tunnels/t/disable", json!({"nodes":["n"]})),
+        ("POST", "/v1/tunnels/t/enable", json!({"nodes":["n"]})),
+    ];
+    for (method, path, body) in writes {
+        assert_eq!(
+            call(&base, method, path, Some(OP), body).0,
+            409,
+            "{method} {path}"
+        );
+    }
+    assert_eq!(
+        call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null).0,
+        200
     );
 }

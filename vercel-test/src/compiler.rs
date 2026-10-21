@@ -121,6 +121,12 @@ fn deliverable(p: &Policy, n: &Node, prefix: &str, health: &TunnelHealth) -> (bo
     else {
         return (true, String::new());
     };
+    if t.disabled.iter().any(|id| id == &n.id) {
+        return (
+            false,
+            format!("return tunnel {} is disabled on this node", t.id),
+        );
+    }
     if n.tunnel_src.is_empty() {
         return (
             false,
@@ -159,7 +165,7 @@ pub fn tunnels_for(p: &Policy, n: &Node, enforced: &[String]) -> Vec<NodeTunnel>
                 .filter(|prefix| enforced.contains(prefix))
                 .cloned()
                 .collect();
-            if mine.is_empty() {
+            if mine.is_empty() || t.disabled.iter().any(|id| id == &n.id) {
                 None
             } else {
                 tunnel::for_node(t, n, &mine).ok()
@@ -217,6 +223,7 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                 egress: p.egress.clone(),
                 tunnels: tunnels_for(p, n, &prefixes),
                 sessions: sessions_for(p, n),
+                tunnel_src: n.tunnel_src.clone(),
                 compiled_at: now,
                 ..Default::default()
             };

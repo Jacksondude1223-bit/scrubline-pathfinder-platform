@@ -350,6 +350,12 @@ pub struct Program {
     pub tunnels: Vec<NodeTunnel>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub sessions: Vec<Session>,
+    /// The node's own address for tunnels and customer peering, as the control plane holds it.
+    /// An operator can reassign it at any time, so the agent takes it from here rather than from
+    /// what it registered with.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub tunnel_src: String,
     #[serde(deserialize_with = "null_time")]
     pub compiled_at: DateTime<Utc>,
 }
@@ -371,6 +377,7 @@ impl Default for Program {
             egress: None,
             tunnels: Vec::new(),
             sessions: Vec::new(),
+            tunnel_src: Default::default(),
             compiled_at: zero_time(),
         }
     }
@@ -403,6 +410,9 @@ pub struct NodeTunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub comment: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub direction: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -490,6 +500,15 @@ pub struct Tunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub comment: String,
+    /// "both" (the default when empty): clean traffic goes to the customer through the tunnel
+    /// and the customer's replies come back up it to the node. "return": the tunnel only
+    /// carries clean traffic out, and replies leave the customer directly.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub direction: String,
+    /// Node ids that must not build this tunnel; they withdraw its prefixes instead.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub disabled: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

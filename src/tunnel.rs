@@ -57,6 +57,16 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
         "ipip" => return Err("ipip carries no key".into()),
         _ => return Err("unknown tunnel type".into()),
     }
+    if !["", "both", "return"].contains(&t.direction.as_str()) {
+        return Err("direction must be both or return".into());
+    }
+    let mut disabled = HashSet::new();
+    if t.disabled
+        .iter()
+        .any(|id| id.trim().is_empty() || !disabled.insert(id))
+    {
+        return Err("disabled must list distinct node ids".into());
+    }
     let remote = t.remote.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
     if remote.is_unspecified() || remote.is_multicast() || remote.is_loopback() {
         return Err("remote is not a usable endpoint".into());
@@ -114,7 +124,47 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         required: t.required,
         interface: interface_name(&t.id)?,
         comment: t.comment.clone(),
+        direction: t.direction.clone(),
     })
+}
+/// Whether the customer's replies come back up this tunnel to the node.
+pub fn carries_replies(t: &NodeTunnel) -> bool {
+    t.direction != "return"
+}
+/// The rules for traffic coming back up a tunnel: the customer's replies, which the node forwards
+/// to the internet. Only the tunnel's own prefixes may be sources, or the tunnel would be an open
+/// relay for anything the customer's edge sends into it, and SYNs leaving through it are clamped
+/// so the far side's segments fit the tunnel too.
+pub fn reply_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
+    let mut rows: Vec<_> = tunnels.iter().filter(|t| carries_replies(t)).collect();
+    rows.sort_by_key(|t| &t.id);
+    let mut lines = Vec::new();
+    for t in rows {
+        let name = interface_name(&t.id)?;
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        for prefix in &t.prefixes {
+            match prefix.parse::<IpNet>().map_err(|e| e.to_string())?.trunc() {
+                IpNet::V4(p) => v4.push(p.to_string()),
+                IpNet::V6(p) => v6.push(p.to_string()),
+            }
+        }
+        v4.sort();
+        v6.sort();
+        for (family, match_on, sources) in [("ipv4", "ip", v4), ("ipv6", "ip6", v6)] {
+            lines.push(if sources.is_empty() {
+                format!("nft add rule inet scrubline forward iifname \"{name}\" meta nfproto {family} drop")
+            } else {
+                format!(
+                    "nft add rule inet scrubline forward iifname \"{name}\" {match_on} saddr != {{ {} }} drop",
+                    sources.join(", ")
+                )
+            });
+        }
+        if t.mss_clamp > 0 {
+            lines.push(format!("nft add rule inet scrubline forward iifname \"{name}\" tcp flags syn tcp option maxseg size set {}", t.mss_clamp));
+        }
+    }
+    Ok(lines)
 }
 pub fn commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
     let mut rows: Vec<_> = tunnels.iter().collect();

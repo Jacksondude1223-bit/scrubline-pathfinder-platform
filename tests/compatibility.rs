@@ -39,8 +39,12 @@ fn compiler_and_renderers_match_go() {
             prog.compiled_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
                 .unwrap()
                 .to_utc();
+            // The endpoint a node's tunnels terminate on is carried in its program since it
+            // became operator-assignable; the Go recording predates it.
+            let mut rust = json!(prog);
+            rust.as_object_mut().unwrap().remove("tunnel_src");
             assert_eq!(
-                normalized(json!(prog)),
+                normalized(rust),
                 normalized(c["programs"][&node.id].clone()),
                 "program case {i} node {}",
                 node.id
