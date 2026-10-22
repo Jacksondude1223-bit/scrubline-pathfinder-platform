@@ -3,7 +3,7 @@
 build:
 	cargo build --locked --release --bins
 	mkdir -p bin
-	cp target/release/scrub-api target/release/scrub-node target/release/scrubctl target/release/scrub-traffic bin/
+	cp target/release/scrub-api target/release/scrub-node target/release/scrub-provision target/release/scrubctl target/release/scrub-traffic bin/
 
 test:
 	cargo test --locked --all-targets

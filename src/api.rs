@@ -135,6 +135,11 @@ pub struct Api {
     /// Tunnel reports to ignore from each node until it fetches its program again, by tunnel id,
     /// or None for all of them: what its agent holds until then is about tunnels since changed.
     fences: HashMap<String, HashSet<Option<String>>>,
+    /// Until when each node that was measured overloaded keeps the rest of the fabric helping
+    /// with its pinned customers.
+    overflow_until: HashMap<String, DateTime<Utc>>,
+    /// The nodes the fabric is helping as of the last compile: overloaded, or not heartbeating.
+    overflowing: HashSet<String>,
 }
 pub type Shared = Arc<Mutex<Api>>;
 pub type MetricState<'a> = (
@@ -156,6 +161,8 @@ impl Api {
             recompiles: 0,
             requests: BTreeMap::new(),
             fences: HashMap::new(),
+            overflow_until: HashMap::new(),
+            overflowing: HashSet::new(),
         }
     }
     fn auth(&self, headers: &HeaderMap) -> Answer<Who> {
@@ -407,6 +414,14 @@ impl Api {
                             return None;
                         }
                         let enabled = !t.disabled.iter().any(|id| id == &n.id);
+                        let role = if t.node.is_empty() {
+                            "member"
+                        } else if t.node == n.id {
+                            "location"
+                        } else {
+                            "helper"
+                        };
+                        let standing_by = role == "helper" && !self.overflowing.contains(&t.node);
                         let report = self
                             .store
                             .tunnels
@@ -423,6 +438,7 @@ impl Api {
                             "name": n.name,
                             "region": n.region,
                             "status": n.status,
+                            "role": role,
                             "endpoint": n.tunnel_src,
                             "endpoint_assigned": self.store.data.tunnel_endpoints.contains_key(&n.id),
                             "enabled": enabled,
@@ -470,18 +486,30 @@ impl Api {
                         } else {
                             String::new()
                         };
-                        match crate::tunnel::for_node(t, n, &mine) {
-                            Ok(built) => {
-                                row["interface"] = json!(built.interface);
-                                row["mtu"] = json!(built.mtu);
-                                row["mss_clamp"] = json!(built.mss_clamp);
+                        if role == "helper" {
+                            // A helper's part is the tunnel it forwards to the location over.
+                            row["standing_by"] = json!(standing_by);
+                            if let Some(b) = self.store.programs.get(&n.id).and_then(|prog| {
+                                prog.backhaul.iter().find(|b| b.peer == t.node)
+                            }) {
+                                row["interface"] = json!(b.interface);
+                                row["mtu"] = json!(b.mtu);
+                                row["mss_clamp"] = json!(b.mss_clamp);
                             }
-                            Err(e) if problem.is_empty() => row["problem"] = json!(e),
-                            Err(_) => {}
+                        } else {
+                            match crate::tunnel::for_node(t, n, &mine) {
+                                Ok(built) => {
+                                    row["interface"] = json!(built.interface);
+                                    row["mtu"] = json!(built.mtu);
+                                    row["mss_clamp"] = json!(built.mss_clamp);
+                                }
+                                Err(e) if problem.is_empty() => row["problem"] = json!(e),
+                                Err(_) => {}
+                            }
                         }
                         if !problem.is_empty() {
                             row["problem"] = json!(problem);
-                        } else if row.get("problem").is_none() {
+                        } else if row.get("problem").is_none() && !standing_by {
                             if let Some(a) = withdrawn.first() {
                                 row["problem"] = json!(a.reason);
                             }
@@ -500,6 +528,9 @@ impl Api {
                     "disabled": t.disabled,
                     "tenant": t.tenant,
                     "rate_mbps": crate::tunnel::rate_mbps(t),
+                    "node": t.node,
+                    "location": nodes.iter().find(|n| n.id == t.node).map(|n| &n.name),
+                    "overflow": !t.node.is_empty() && self.overflowing.contains(&t.node),
                     "comment": t.comment,
                     "nodes": rows,
                 })
@@ -550,6 +581,24 @@ impl Api {
             })
             .collect();
         let shedding = self.steering.observe_at(&samples, now);
+        for (node, level) in &shedding {
+            if *level > 0 {
+                self.overflow_until
+                    .insert(node.clone(), now + steering::OVERFLOW_HOLD);
+            }
+        }
+        self.overflow_until.retain(|_, until| *until > now);
+        let overflowing: HashSet<String> = self
+            .overflow_until
+            .keys()
+            .cloned()
+            .chain(
+                nodes
+                    .iter()
+                    .filter(|n| n.status == "stale")
+                    .map(|n| n.id.clone()),
+            )
+            .collect();
         let health: compiler::TunnelHealth = self
             .store
             .tunnels
@@ -568,8 +617,9 @@ impl Api {
             n.last_seen = zero_time();
         }
         let key = format!(
-            "{}{:?}{:?}",
+            "{}{:?}{:?}{:?}",
             value(&fingerprint),
+            std::collections::BTreeSet::<_>::from_iter(overflowing.iter()),
             BTreeMap::<_, _>::from_iter(shedding.iter()),
             BTreeMap::<_, _>::from_iter(
                 health
@@ -580,7 +630,8 @@ impl Api {
         if !force && key == self.last_key {
             return Ok(());
         }
-        let plan = compiler::plan(policy, &nodes, &shedding, &health);
+        let plan = compiler::plan_with(policy, &nodes, &shedding, &health, &overflowing);
+        self.overflowing = overflowing;
         let programs = compiler::compile(policy, &nodes, &plan);
         if self.store.data.last_policy_id != policy.id {
             self.store.transaction(|d| {
@@ -933,6 +984,12 @@ impl Api {
                         "disabled lists {unknown:?}, which is not a registered node id"
                     )));
                 }
+                if !t.node.is_empty() && !self.store.data.nodes.iter().any(|v| v.id == t.node) {
+                    return Err(bad(format!(
+                        "node {:?} is not a registered node id",
+                        t.node
+                    )));
+                }
                 // A tunnel rebuilt to another remote, key or encapsulation is a new tunnel, and
                 // what was reported about the old one says nothing about it. Nor does a report from
                 // before a node stopped building it say anything once it builds it again.
@@ -941,7 +998,12 @@ impl Api {
                     .and_then(|p| p.tunnels.iter().find(|v| v.id == t.id))
                     .cloned();
                 let toggled: Option<Vec<String>> = match &old {
-                    Some(v) if v.remote == t.remote && v.key == t.key && v.r#type == t.r#type => {
+                    Some(v)
+                        if v.remote == t.remote
+                            && v.key == t.key
+                            && v.r#type == t.r#type
+                            && v.node == t.node =>
+                    {
                         Some(
                             v.disabled
                                 .iter()
@@ -985,6 +1047,31 @@ impl Api {
                         return Err((404, "unknown tunnel".into()));
                     };
                     t.rate_mbps = r.rate_mbps;
+                    Ok(())
+                })?;
+                Ok(tunnel_answer(&p, id))
+            }
+            ("PUT", ["tunnels", _, "location"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                #[derive(Deserialize)]
+                struct Location {
+                    node: String,
+                }
+                let l: Location = parse(body)?;
+                if !l.node.is_empty() && !self.store.data.nodes.iter().any(|v| v.id == l.node) {
+                    return Err(bad(format!(
+                        "node {:?} is not a registered node id",
+                        l.node
+                    )));
+                }
+                // Moving the customer's tunnel builds it somewhere else, and nothing reported about
+                // where it was says anything about where it is now.
+                let p = self.change_tunnels(now, &[(None, Some(id))], |p| {
+                    let Some(t) = p.tunnels.iter_mut().find(|v| v.id == id) else {
+                        return Err((404, "unknown tunnel".into()));
+                    };
+                    t.node = l.node;
                     Ok(())
                 })?;
                 Ok(tunnel_answer(&p, id))
@@ -1464,7 +1551,7 @@ fn route_label(path: &str) -> String {
         ["tenants", _] => "tenants/delete".into(),
         ["nodes", _, "tunnel-endpoint"] => "nodes/tunnel-endpoint".into(),
         ["tunnels", _] => "tunnels/item".into(),
-        ["tunnels", _, leaf] if ["disable", "enable", "rate"].contains(leaf) => {
+        ["tunnels", _, leaf] if ["disable", "enable", "rate", "location"].contains(leaf) => {
             format!("tunnels/{leaf}")
         }
         [single]
@@ -1857,6 +1944,110 @@ mod tests {
         let body = json!({"remote":"198.18.0.13","tenant":customer});
         let (status, e) = call(&mut a, 0, "PUT", "/v1/tunnels/again", OP, body);
         assert_eq!(status, 400, "{e}");
+    }
+    #[test]
+    fn other_nodes_join_in_while_a_pinned_tunnels_location_is_overloaded() {
+        let mut a = api();
+        let reg = |a: &mut Api, name: &str, src: &str| {
+            let body =
+                json!({"name":name,"region":"iad","tunnel_src":src,"capacity_pps":1_000_000});
+            let (_, r) = call(a, 0, "POST", "/v1/nodes/register", ENROLL, body);
+            (
+                r["node"]["id"].as_str().unwrap().to_string(),
+                r["token"].as_str().unwrap().to_string(),
+            )
+        };
+        let (lhr, lhr_token) = reg(&mut a, "lhr", "192.0.2.1");
+        let (fra, fra_token) = reg(&mut a, "fra", "192.0.2.2");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":lhr}),
+        );
+        let state_of = |a: &Api, node: &str| state(a, node).0;
+        assert_eq!(
+            (state_of(&a, &lhr), state_of(&a, &fra)),
+            ("announce".into(), "withdraw".into())
+        );
+        let beat = |a: &mut Api, now: i64, node: &str, token: &str, pps: u64| {
+            let body = json!({"stats":{"offered_pps":pps}});
+            let path = format!("/v1/nodes/{node}/heartbeat");
+            assert_eq!(call(a, now, "POST", &path, token, body).0, 200);
+        };
+        // lhr runs at 90% of what it can take: fra starts announcing too.
+        beat(&mut a, 1, &fra, &fra_token, 0);
+        beat(&mut a, 1, &lhr, &lhr_token, 900_000);
+        assert_eq!(state_of(&a, &fra), "announce");
+        let (_, view) = call(&mut a, 1, "GET", "/v1/tunnels", OP, Value::Null);
+        assert_eq!(view["tunnels"][0]["overflow"], true);
+        // Help brings lhr's load down, but it goes on until lhr has been calm for a while.
+        for s in (31..=300).step_by(30) {
+            beat(&mut a, s, &fra, &fra_token, 0);
+            beat(&mut a, s, &lhr, &lhr_token, 100_000);
+        }
+        assert_eq!(state_of(&a, &fra), "announce", "still inside the hold");
+        for s in (330..=420).step_by(30) {
+            beat(&mut a, s, &fra, &fra_token, 0);
+            beat(&mut a, s, &lhr, &lhr_token, 100_000);
+        }
+        let (status, reason) = state(&a, &fra);
+        assert_eq!(status, "withdraw");
+        assert!(reason.starts_with("standing by"), "{reason}");
+        let (_, view) = call(&mut a, 420, "GET", "/v1/tunnels", OP, Value::Null);
+        let rows = view["tunnels"][0]["nodes"].as_array().unwrap().clone();
+        let fra_row = rows.iter().find(|r| r["node_id"] == fra.as_str()).unwrap();
+        assert_eq!(
+            (&fra_row["role"], &fra_row["standing_by"]),
+            (&json!("helper"), &json!(true))
+        );
+        assert!(
+            fra_row.get("problem").is_none(),
+            "standing by is not a problem: {fra_row}"
+        );
+        assert_eq!(
+            fra_row["interface"],
+            json!(crate::tunnel::backhaul_name(&lhr))
+        );
+        // A location that stops heartbeating is helped as well.
+        beat(&mut a, 460, &fra, &fra_token, 0);
+        assert_eq!(state_of(&a, &fra), "announce");
+        assert_eq!(state_of(&a, &lhr), "withdraw");
+    }
+    #[test]
+    fn the_panel_moves_a_tunnel_between_locations() {
+        let mut a = api();
+        let (lhr, _) = register(&mut a, 0, "lhr", "192.0.2.1");
+        let (fra, _) = register(&mut a, 0, "fra", "192.0.2.2");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}),
+        );
+        let place = |a: &mut Api, tunnel: &str, node: &str| {
+            let path = format!("/v1/tunnels/{tunnel}/location");
+            call(a, 0, "PUT", &path, OP, json!({ "node": node }))
+        };
+        assert_eq!(place(&mut a, "nw", "node-none").0, 400);
+        assert_eq!(place(&mut a, "missing", &lhr).0, 404);
+        let (status, moved) = place(&mut a, "nw", &lhr);
+        assert_eq!(status, 200, "{moved}");
+        assert_eq!(moved["tunnel"]["node"], json!(lhr));
+        assert!(a.store.programs[&lhr].tunnels.len() == 1);
+        assert!(a.store.programs[&fra].tunnels.is_empty());
+        assert_eq!(a.store.programs[&fra].backhaul[0].peer, lhr);
+        let (status, moved) = place(&mut a, "nw", &fra);
+        assert_eq!(status, 200, "{moved}");
+        assert!(a.store.programs[&lhr].tunnels.is_empty());
+        assert_eq!(a.store.programs[&fra].tunnels.len(), 1);
+        // An empty location fans the tunnel out to every node again.
+        assert_eq!(place(&mut a, "nw", "").0, 200);
+        assert!(a
+            .store
+            .programs
+            .values()
+            .all(|p| p.tunnels.len() == 1 && p.backhaul.is_empty()));
+        let body = json!({"remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":"nowhere"});
+        assert_eq!(call(&mut a, 0, "PUT", "/v1/tunnels/nw", OP, body).0, 400);
     }
     #[test]
     fn tunnel_puts_refuse_unknown_nodes_and_ends_linux_cannot_build_twice() {

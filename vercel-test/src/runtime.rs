@@ -137,9 +137,12 @@ impl Flags {
             if !arg.starts_with('-') || !values.contains_key(key) {
                 return Err(format!("unknown option {arg}"));
             }
+            // A flag that is off by default is a switch: naming it turns it on, the way Go's flag
+            // package reads one, so it never swallows the argument after it.
+            let switch = defaults.iter().any(|(k, v)| *k == key && *v == "false");
             let value = if let Some(v) = inline {
                 v.into()
-            } else if key == "insecure" {
+            } else if switch {
                 "true".into()
             } else {
                 args.next()

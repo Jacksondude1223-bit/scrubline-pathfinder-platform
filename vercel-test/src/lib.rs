@@ -15,6 +15,7 @@ pub mod api;
 pub mod gamefilter;
 pub mod node;
 pub mod pipeline;
+pub mod provision;
 pub mod runtime;
 pub mod state;
 pub mod store;

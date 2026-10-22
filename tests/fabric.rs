@@ -629,3 +629,159 @@ fn with_no_node_announcing_the_live_nodes_building_a_tunnel_split_it() {
         assert_eq!(programs[id].tunnels[0].rate_kbps, 500_000, "{id}");
     }
 }
+fn pinned_fabric() -> (Policy, Vec<Node>) {
+    let p = Policy {
+        protected: vec!["203.0.113.0/24".into(), "2001:db8::/32".into()],
+        tunnels: vec![Tunnel {
+            id: "northwind".into(),
+            remote: "198.18.0.9".into(),
+            prefixes: vec!["203.0.113.0/24".into(), "2001:db8::/32".into()],
+            rate_mbps: 1000,
+            node: "lhr".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let nodes = [
+        ("lhr", "192.0.2.1"),
+        ("fra", "192.0.2.2"),
+        ("sin", "192.0.2.3"),
+    ]
+    .iter()
+    .map(|(id, src)| Node {
+        tunnel_src: src.to_string(),
+        ..node(id, id, 100.0, "")
+    })
+    .collect();
+    (p, nodes)
+}
+fn row<'a>(plan: &'a [Announcement], node: &str, prefix: &str) -> &'a Announcement {
+    plan.iter()
+        .find(|a| a.node_id == node && a.prefix == prefix)
+        .unwrap()
+}
+#[test]
+fn a_pinned_tunnel_is_announced_from_its_location_until_it_needs_help() {
+    let (p, nodes) = pinned_fabric();
+    let calm = compiler::plan(&p, &nodes, &HashMap::new(), &HashMap::new());
+    assert_eq!(row(&calm, "lhr", "203.0.113.0/24").state, "announce");
+    for helper in ["fra", "sin"] {
+        let a = row(&calm, helper, "203.0.113.0/24");
+        assert_eq!(a.state, "withdraw");
+        assert!(a.reason.starts_with("standing by"), "{}", a.reason);
+    }
+    let overflowing = std::collections::HashSet::from(["lhr".to_string()]);
+    let busy = compiler::plan_with(&p, &nodes, &HashMap::new(), &HashMap::new(), &overflowing);
+    for helper in ["fra", "sin"] {
+        let a = row(&busy, helper, "2001:db8::/32");
+        assert_eq!(a.state, "announce");
+        assert!(a.reason.starts_with("overflow for lhr: "), "{}", a.reason);
+    }
+    // A location that cannot deliver takes the helpers down with it: there is nowhere for them
+    // to forward to.
+    let down = HashMap::from([(
+        "lhr".to_string(),
+        HashMap::from([("northwind".to_string(), "down".to_string())]),
+    )]);
+    let broken = compiler::plan_with(&p, &nodes, &HashMap::new(), &down, &overflowing);
+    let a = row(&broken, "fra", "203.0.113.0/24");
+    assert_eq!(a.state, "withdraw");
+    assert!(
+        a.reason.contains("cannot deliver at its location lhr"),
+        "{}",
+        a.reason
+    );
+    // So does a location that is not a node at all.
+    let mut lost = p.clone();
+    lost.tunnels[0].node = "nowhere".into();
+    let none = compiler::plan(&lost, &nodes, &HashMap::new(), &HashMap::new());
+    assert!(none.iter().all(|a| a.state == "withdraw"));
+}
+#[test]
+fn helpers_forward_to_the_location_which_alone_builds_the_customers_tunnel() {
+    let (p, nodes) = pinned_fabric();
+    let plan = compiler::plan(&p, &nodes, &HashMap::new(), &HashMap::new());
+    let programs = compiler::compile(&p, &nodes, &plan);
+    let lhr = &programs["lhr"];
+    assert_eq!(lhr.tunnels.len(), 1, "the customer's one tunnel");
+    assert_eq!(
+        lhr.tunnels[0].rate_kbps, 1_000_000,
+        "all their clean traffic leaves through it, so it holds the whole allowance"
+    );
+    assert_eq!(lhr.pinned, ["2001:db8::/32", "203.0.113.0/24"]);
+    // The location receives from every helper, and routes nothing back over those tunnels.
+    let peers: Vec<_> = lhr.backhaul.iter().map(|b| b.peer.as_str()).collect();
+    assert_eq!(peers, ["fra", "sin"]);
+    assert!(lhr.backhaul.iter().all(|b| b.prefixes.is_empty()));
+    for helper in ["fra", "sin"] {
+        let prog = &programs[helper];
+        assert!(
+            prog.tunnels.is_empty(),
+            "{helper} holds no tunnel to the customer"
+        );
+        assert_eq!(prog.backhaul.len(), 1);
+        let b = &prog.backhaul[0];
+        assert_eq!((b.peer.as_str(), b.remote.as_str()), ("lhr", "192.0.2.1"));
+        assert_eq!(b.interface, tunnel::backhaul_name("lhr"));
+        assert_eq!(b.prefixes, ["2001:db8::/32", "203.0.113.0/24"]);
+        assert_eq!((b.mtu, b.mss_clamp), (1476, 1416));
+    }
+    // Both ends of every node-to-node tunnel use the same pair of addresses.
+    let fra_to_lhr = &programs["fra"].backhaul[0];
+    let lhr_from_fra = lhr.backhaul.iter().find(|b| b.peer == "fra").unwrap();
+    assert_eq!(
+        (fra_to_lhr.local.as_str(), fra_to_lhr.remote.as_str()),
+        (lhr_from_fra.remote.as_str(), lhr_from_fra.local.as_str())
+    );
+    // Every node accepts tunnels from every other node, and the location from the customer.
+    assert_eq!(lhr.tunnel_peers, ["192.0.2.2", "192.0.2.3", "198.18.0.9"]);
+    assert_eq!(programs["fra"].tunnel_peers, ["192.0.2.1", "192.0.2.3"]);
+}
+#[test]
+fn backhaul_and_the_tunnel_firewall_render() {
+    let name = tunnel::backhaul_name("lhr");
+    assert_eq!(name.len(), 15);
+    assert_eq!(name, tunnel::backhaul_name("lhr"), "stable across compiles");
+    assert_ne!(name, tunnel::backhaul_name("fra"));
+    let to_location = Backhaul {
+        peer: "lhr".into(),
+        interface: name.clone(),
+        local: "192.0.2.2".into(),
+        remote: "192.0.2.1".into(),
+        mtu: 1476,
+        mss_clamp: 1416,
+        prefixes: vec!["203.0.113.0/24".into(), "2001:db8::/32".into()],
+    };
+    let rule = |tail: &str| format!("nft add rule inet scrubline forward {tail}");
+    assert_eq!(
+        tunnel::backhaul_commands(
+            std::slice::from_ref(&to_location),
+            &["198.51.100.0/24".into()]
+        )
+        .unwrap(),
+        [
+            format!("ip link add {name} type gre local 192.0.2.2 remote 192.0.2.1"),
+            format!("ip link set {name} mtu 1476 up"),
+            format!("ip route replace 203.0.113.0/24 dev {name}"),
+            format!("ip route replace 2001:db8::/32 dev {name}"),
+            rule(&format!(
+                "oifname \"{name}\" tcp flags syn tcp option maxseg size set 1416"
+            )),
+            // Arriving over a backhaul: only traffic for the customers pinned here.
+            rule("iifname \"sbh-*\" ip daddr != { 198.51.100.0/24 } drop"),
+            rule("iifname \"sbh-*\" meta nfproto ipv6 drop"),
+        ]
+    );
+    assert!(tunnel::backhaul_commands(&[], &[]).unwrap().is_empty());
+    let mut forged = to_location.clone();
+    forged.interface = "eth0".into();
+    assert!(tunnel::backhaul_commands(&[forged], &[]).is_err());
+    assert_eq!(
+        tunnel::firewall_commands(&["198.18.0.9".into(), "192.0.2.1".into()]).unwrap(),
+        [
+            "nft add rule inet scrubline input meta l4proto { gre, ipencap } ip saddr != { 192.0.2.1, 198.18.0.9 } drop",
+            "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { gre, ipencap } drop",
+        ]
+    );
+    assert!(tunnel::firewall_commands(&["not-an-address".into()]).is_err());
+}

@@ -1271,8 +1271,8 @@ paths:
         '401': *id002
         '403': *id003
       description: 'Changes only the tunnel''s clean-traffic allowance, leaving the rest of it as it is.
-        The allowance is the total the customer receives across the fabric: each node sending the tunnel
-        gets an even share, and shapes what it sends down the tunnel to that share.'
+        The allowance is the total the customer receives: a pinned tunnel''s location shapes all of it,
+        and a fanned-out tunnel gives each node sending it an even share to shape to.'
       parameters: *id005
       requestBody:
         required: true
@@ -1280,6 +1280,53 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/TunnelRate'
+  /v1/tunnels/{id}/location:
+    put:
+      summary: Pin a tunnel to the node the customer's one tunnel ends on
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: node is missing, or not a registered node id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: 'For a panel offering customers a choice of location. That node builds the customer''s
+        GRE tunnel from its tunnel endpoint, so the customer configures one tunnel, to that address, and
+        alone announces their prefixes until it is overloaded or down; the other nodes then announce
+        them too and forward what they scrub to it over node-to-node GRE. Moving a tunnel rebuilds it,
+        so what was reported about it where it was is dropped. An empty node fans it out to every node
+        carrying its prefixes again.'
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TunnelLocation'
 components:
   securitySchemes:
     operatorToken:
@@ -1737,6 +1784,25 @@ components:
           type: string
           description: The tunnel endpoint the control plane holds for this node, which an operator may
             have assigned since it registered. The agent peers customer sessions from it.
+        backhaul:
+          type: array
+          items:
+            $ref: '#/components/schemas/Backhaul'
+          description: Node-to-node tunnels for pinned customers, to their locations and from the nodes that
+            may help this one.
+        pinned:
+          type: array
+          items:
+            type: string
+          description: Prefixes of the customers pinned to this node, which is all that traffic arriving over
+            a node-to-node tunnel may be addressed to.
+        tunnel_peers:
+          type: array
+          items:
+            type: string
+          description: Every address this node accepts GRE and IPIP from, the other nodes' tunnel endpoints
+            and the customer end of each tunnel it builds. Compiled from the fabric, so a node that joins is
+            accepted everywhere on the next compile.
     Flow:
       type: object
       description: One flow record.
@@ -2323,9 +2389,19 @@ components:
           type: integer
           minimum: 0
           maximum: 2500
-          description: 'Clean traffic the customer receives down this tunnel, in Mbit/s, in total across
-            the fabric: every node sending it gets an even share and shapes to it. Zero, or leaving it out,
-            takes the maximum of 2500 (2.5 Gbit/s), so no tunnel is ever unlimited.'
+          description: 'Clean traffic the customer receives down this tunnel, in Mbit/s, in total. A pinned
+            tunnel''s location shapes all of it; a fanned-out tunnel gives every node sending it an even
+            share to shape to. Zero, or leaving it out, takes the maximum of 2500 (2.5 Gbit/s), so no tunnel
+            is ever unlimited.'
+        node:
+          type: string
+          example: node-20c0e739603a7b60
+          description: 'The node the customer''s tunnel ends on: the location chosen for them, so they hold
+            one tunnel. It alone announces the prefixes until it passes 80% of its capacity_pps or stops
+            heartbeating; then the other nodes carrying them announce them too, and forward what they scrub
+            to it over node-to-node GRE. Help holds for five minutes after it was last measured overloaded.
+            On PUT /v1/tunnels/{id}, a registered node id. Empty fans the tunnel out: every node carrying
+            the prefixes holds its own tunnel to the customer and announces them.'
         comment:
           type: string
     Session:
@@ -2491,6 +2567,15 @@ components:
           items:
             type: string
           description: Node ids.
+    TunnelLocation:
+      type: object
+      required:
+      - node
+      properties:
+        node:
+          type: string
+          example: node-20c0e739603a7b60
+          description: A node id from GET /v1/nodes, or empty to fan the tunnel out.
     TunnelRate:
       type: object
       required:
@@ -2570,6 +2655,17 @@ components:
         rate_mbps:
           type: integer
           description: The allowance in force, with the default resolved.
+        node:
+          type: string
+          description: The node it is pinned to. Empty when it fans out.
+        location:
+          type: string
+          nullable: true
+          description: That node's name, or null when it is not a registered node.
+        overflow:
+          type: boolean
+          description: Whether the other nodes are announcing its prefixes, the location being overloaded
+            or down.
         comment:
           type: string
         nodes:
@@ -2580,6 +2676,19 @@ components:
       type: object
       description: One node carrying some of a tunnel's prefixes.
       properties:
+        role:
+          type: string
+          enum:
+          - location
+          - helper
+          - member
+          description: 'location: a pinned tunnel''s node, which builds the customer''s tunnel. helper:
+            another node carrying a pinned tunnel''s prefixes, which forwards to the location over its
+            interface here. member: a node of a fanned-out tunnel.'
+        standing_by:
+          type: boolean
+          description: For a helper, whether it is waiting for the location to need it rather than
+            announcing. Standing by is not a problem.
         node_id:
           type: string
         name:
@@ -2643,6 +2752,32 @@ components:
           description: Why this node is not delivering the tunnel's prefixes, when it is not. A configuration
             problem (disabled here, no endpoint) when there is one, otherwise the reason the plan gives for
             withdrawing the first of them, such as the tunnel being reported down.
+    Backhaul:
+      type: object
+      description: A node-to-node GRE tunnel. A node helping another with a customer pinned there forwards
+        the clean traffic it scrubs over one, and the location receives it on its end.
+      properties:
+        peer:
+          type: string
+          description: The node at the other end.
+        interface:
+          type: string
+          example: sbh-b981c02c78d
+          description: sbh- and a digest of the peer's id.
+        local:
+          type: string
+        remote:
+          type: string
+        mtu:
+          type: integer
+        mss_clamp:
+          type: integer
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: What is routed into it, the prefixes pinned at the peer that this node carries.
+            Empty on the location's end, which only receives.
     TunnelStatus:
       type: object
       required:

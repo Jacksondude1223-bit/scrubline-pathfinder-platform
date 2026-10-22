@@ -293,6 +293,18 @@ Hardware programming is represented as compiled programs the node agent pulls. A
 
 ## Run
 
+On servers, [`scripts/install.sh`](docs/install.md) installs the control
+plane, or a scrubbing node with the provisioner that applies its tunnels, as
+systemd services:
+
+```sh
+sudo scripts/install.sh api                       # the control plane
+sudo scripts/install.sh node --api https://10.0.0.5:8080 --ca ca.pem \
+    --enroll-token <token> --name lhr-1 --region lhr   # each scrubbing node
+```
+
+To try it on one machine instead:
+
 ```sh
 export SCRUBLINE_API_TOKEN=dev-scrubline-token
 export SCRUBLINE_ENROLL_TOKEN=dev-scrubline-enroll
@@ -593,15 +605,35 @@ tunnel: the customer's tunnel runs straight to the scrubbing node. An operator
 assigns it with `PUT /v1/nodes/{id}/tunnel-endpoint`; a node can also supply
 one with `-tunnel-src`, and the operator's assignment wins and survives the
 node re-registering. No two nodes may hold one address, and the address must
-already be one the node owns: Scrubline does not configure it. The fabric is
-anycast, so a return path fans out rather than being assigned: every node
-carrying the prefix holds its own tunnel to the one customer endpoint. Ten
-scrubbers protecting one customer is ten tunnels. That is the cost of not
-pinning a prefix to one box.
+already be one the node owns: Scrubline does not configure it.
+
+### One location per customer
+
+Pin a tunnel to the node it should end on, and the customer holds a single
+GRE tunnel, to that node's address:
+
+```json
+"tunnels": [{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":"node-a1b2c3d4e5f60718"}]
+```
+
+`PUT /v1/tunnels/{id}/location` with `{"node":"..."}` moves it, which is what
+a panel offering a choice of location calls. Only that node announces the
+customer's prefixes while it copes. When it passes 80% of its `-capacity-pps`,
+or stops heartbeating, the other nodes carrying the prefixes announce them
+too, as anycast, to take the load; they forward what they scrub to the
+location over node-to-node GRE, and it delivers everything down the
+customer's one tunnel. Help holds for five minutes after the location was last
+measured overloaded, so the routes do not flap with every swing of an attack.
+The other nodes keep their node-to-node tunnels up while they stand by, so
+help starts the moment BGP moves traffic.
+
+A tunnel with no `node` fans out instead: every node carrying the prefixes
+holds its own tunnel to the one customer endpoint, and all of them announce.
 
 The agent serves the compiled result at `/tunnels`, the way it serves the
-announcement plan at `/bgp` — Scrubline does not create interfaces any more
-than it speaks BGP. The MTU and the TCP MSS clamp are derived from the
+announcement plan at `/bgp`; the provisioner that [`scripts/install.sh`](docs/install.md)
+installs beside it applies that to the box and reports which tunnels it
+built. The MTU and the TCP MSS clamp are derived from the
 encapsulation's overhead (1476/1436 for GRE, 1472/1432 with a key,
 1480/1440 for IPIP) and an MTU that does not fit is refused with the one
 that does. The clamp is the part people skip: without it, a customer whose
@@ -618,6 +650,11 @@ the tunnel cannot relay anything else the customer's edge sends into it; SYNs
 coming back up are MSS-clamped too. `"direction": "return"` is for customers
 whose replies leave by their own transit, and forwards nothing that comes up
 the tunnel.
+
+Every node's firewall accepts GRE and IPIP only from the other nodes' tunnel
+addresses and the customer end of each tunnel it builds. The list is compiled
+from the fabric, so a node that joins is accepted everywhere on the next
+compile, and one that leaves is dropped.
 
 ### Controlling tunnels from the API
 
@@ -636,11 +673,13 @@ A tunnel is allocated to a customer with `"tenant"`: its prefixes must lie
 within that customer's own (and default to them), and the customer cannot be
 deleted while it is allocated. `"rate_mbps"` caps the clean traffic the
 customer receives down it, in total across the fabric, at most 2500 (2.5
-Gbit/s); a tunnel without one is held to that maximum. The allowance is split
-evenly across the nodes announcing the tunnel's prefixes and each shapes to
-its share with a `tc` token bucket; since anycast rarely spreads traffic
-evenly, a node can be held to its share while others sit under theirs.
-`PUT /v1/tunnels/{id}/rate` changes only the speed.
+Gbit/s); a tunnel without one is held to that maximum. A pinned tunnel carries
+all of the customer's clean traffic out of its location, so the location
+shapes it to the whole allowance with a `tc` token bucket. A fanned-out one
+splits it evenly across the nodes announcing its prefixes, each shaping to its
+share; since anycast rarely spreads traffic evenly, a node can be held to its
+share while others sit under theirs. `PUT /v1/tunnels/{id}/rate` changes only
+the speed.
 
 ### A dead tunnel withdraws the prefix
 
@@ -946,6 +985,7 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `PUT /v1/tunnels/{id}`, `DELETE /v1/tunnels/{id}` add, replace or remove a tunnel in the deployed policy, and deploy it (operator only)
 - `POST /v1/tunnels/{id}/disable`, `POST /v1/tunnels/{id}/enable` take a tunnel down or bring it back on the listed nodes (operator only)
 - `PUT /v1/tunnels/{id}/rate` set a tunnel's clean-traffic allowance, up to 2500 Mbit/s in total (operator only)
+- `PUT /v1/tunnels/{id}/location` pin a tunnel to the node the customer's one tunnel ends on (operator only)
 - `GET /v1/analytics/overview` per-prefix traffic, mitigation and attack state, summed across the fabric
 - `GET /v1/analytics/series` one prefix over time; each point is the heaviest moment inside it, not an average
 - `GET /v1/analytics/events` the attack log, each entry naming the rules and filters that stopped it

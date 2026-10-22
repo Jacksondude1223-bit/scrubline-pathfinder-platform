@@ -84,3 +84,42 @@ jobs:
       - name: Clean up
         if: always()
         run: docker compose --env-file deploy/.env.example -f deploy/docker-compose.yml down -v
+  installer:
+    name: Install script under systemd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Lint
+        run: shellcheck -s bash scripts/install.sh
+      # The control plane and a scrubbing node on one server, built by the script itself, the way
+      # a first install runs; the runner has systemd, which the units' sandboxing is checked by.
+      - name: Install
+        run: sudo scripts/install.sh all --listen 127.0.0.1:18443 --region ci
+      - name: Check what it started
+        run: |
+          systemctl is-active scrubline-api scrubline-node scrubline-provision
+          curl -fsS --cacert /etc/scrubline/tls/ca.pem https://127.0.0.1:18443/health
+          sudo scrubline-ctl nodes | grep -q '"region":"ci"'
+          # The provisioner loads the node's tunnel firewall within a pass or two.
+          for attempt in $(seq 1 30); do
+            if sudo nft list table inet scrubline | grep -q 'meta l4proto'; then exit 0; fi
+            sleep 1
+          done
+          sudo nft list ruleset
+          exit 1
+      - name: Upgrade in place
+        run: |
+          token=$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)
+          sudo scripts/install.sh all
+          test "$token" = "$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)"
+          systemctl is-active scrubline-api scrubline-node scrubline-provision
+      - name: Logs on failure
+        if: failure()
+        run: sudo journalctl --no-pager -u scrubline-api -u scrubline-node -u scrubline-provision
+      - name: Remove
+        run: |
+          sudo scripts/install.sh uninstall --purge
+          if systemctl is-active --quiet scrubline-api; then exit 1; fi
+          if sudo nft list table inet scrubline >/dev/null 2>&1; then exit 1; fi
+          if id scrubline >/dev/null 2>&1; then exit 1; fi

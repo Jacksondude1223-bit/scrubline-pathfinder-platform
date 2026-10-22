@@ -197,13 +197,8 @@ impl Agent {
                 )
             }
             ("GET", "/tunnels") => {
-                let tunnels = &self.pipe.program.tunnels;
-                let rendered_all = tunnel::commands(tunnels).and_then(|mut lines| {
-                    lines.extend(tunnel::reply_commands(tunnels)?);
-                    lines.extend(tunnel::rate_commands(tunnels)?);
-                    Ok(lines)
-                });
-                let (commands, err) = match rendered_all {
+                let prog = &self.pipe.program;
+                let (commands, err) = match tunnel::render(prog) {
                     Ok(v) => (v, String::new()),
                     Err(e) => (vec![], e),
                 };
@@ -212,7 +207,7 @@ impl Agent {
                 }
                 json_response(
                     200,
-                    json!({"node":self.node.id,"tunnels":self.pipe.program.tunnels,"iproute2":commands,"status":self.health,"error":err}),
+                    json!({"node":self.node.id,"tunnels":prog.tunnels,"backhaul":prog.backhaul,"pinned":prog.pinned,"tunnel_peers":prog.tunnel_peers,"iproute2":commands,"status":self.health,"error":err}),
                 )
             }
             ("POST", "/tunnels") => {
@@ -673,6 +668,7 @@ mod tests {
                 rate_kbps: 833333,
                 ..Default::default()
             }],
+            tunnel_peers: vec!["198.51.100.1".into()],
             ..Default::default()
         });
         let mut headers = HeaderMap::new();
@@ -695,6 +691,8 @@ mod tests {
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" ip saddr != { 203.0.113.0/24 } drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" meta nfproto ipv6 drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
+                "nft add rule inet scrubline input meta l4proto { gre, ipencap } ip saddr != { 198.51.100.1 } drop",
+                "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { gre, ipencap } drop",
                 "tc qdisc replace dev scr-northwind root tbf rate 833333kbit burst 1041666 latency 50ms",
             ]
         );

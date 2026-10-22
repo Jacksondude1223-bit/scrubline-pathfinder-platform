@@ -469,13 +469,82 @@ its program and keeps peering customer sessions from the address it started
 with. Upgrade replicas before their primary, too: a control plane from before
 this release drops the assignments from the state it follows.
 
-#### One tunnel per node, not one per customer
+#### One tunnel per customer, at the location you choose
 
-The fabric is anycast: every eligible node announces every protected prefix.
-So a return path fans out rather than being assigned. Ten scrubbers
-protecting one customer is ten tunnels to that customer's one endpoint, each
-from a different source address. That is the cost of not pinning a prefix to
-one box.
+Pin a tunnel to a node and the customer holds one GRE tunnel, to that node's
+address. Moving it is one call, which is what a panel offering a choice of
+location makes:
+
+```console
+$ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/location \
+    -d '{"node":"node-20c0e739603a7b60"}'
+{"policy_id":"p","version":4,"tunnel":{"id":"northwind","remote":"198.18.0.9","key":42,
+ "prefixes":["203.0.113.0/24"],"node":"node-20c0e739603a7b60",…}}
+```
+
+Traffic for the customer goes to that location: it alone announces their
+prefixes while it copes. The rest of the fabric stands by:
+
+```console
+$ scrubctl bgp
+PREFIX          NODE  REGION  STATE     PREPENDS  WHY
+203.0.113.0/24  fra   eu      withdraw  -         standing by: return tunnel northwind is at lhr, and this node announces only while that one is overloaded or down
+203.0.113.0/24  lhr   eu      announce  0         anycast member at full preference
+```
+
+When the location passes 80% of its `-capacity-pps`, the same mark that pads
+it for load, or stops heartbeating, the other nodes carrying the prefixes
+announce them too, and anycast spreads the attack across them. They scrub what
+they attract and forward the clean traffic to the location over node-to-node
+GRE (`sbh-*` interfaces), which delivers all of it down the customer's one
+tunnel. Help holds for five minutes after the location was last measured
+overloaded: help takes load off it, and ending help the moment it recovers
+would put the traffic straight back and flap the routes with every swing.
+
+The node-to-node tunnels stay up while the others stand by, so help starts the
+moment BGP moves traffic, and traffic still arriving after it moves back is
+delivered rather than dropped. What a node receives over them must be
+addressed to a customer pinned there:
+
+```console
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://lhr:9091/tunnels?format=iproute2'
+ip link add scr-northwind type gre local 192.0.2.1 remote 198.18.0.9 key 42
+ip link set scr-northwind mtu 1472 up
+ip route replace 203.0.113.0/24 dev scr-northwind
+ip link add sbh-b981c02c78d type gre local 192.0.2.1 remote 192.0.2.2
+ip link set sbh-b981c02c78d mtu 1476 up
+nft add rule inet scrubline forward oifname "scr-northwind" tcp flags syn tcp option maxseg size set 1432
+nft add rule inet scrubline forward oifname "sbh-b981c02c78d" tcp flags syn tcp option maxseg size set 1436
+nft add rule inet scrubline forward iifname "sbh-*" ip daddr != { 203.0.113.0/24 } drop
+nft add rule inet scrubline forward iifname "sbh-*" meta nfproto ipv6 drop
+…
+tc qdisc replace dev scr-northwind root tbf rate 1000000kbit burst 1250000 latency 50ms
+
+$ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://fra:9091/tunnels?format=iproute2'
+ip link add sbh-6deacd5f1df type gre local 192.0.2.2 remote 192.0.2.1
+ip link set sbh-6deacd5f1df mtu 1476 up
+ip route replace 203.0.113.0/24 dev sbh-6deacd5f1df
+…
+```
+
+If the location cannot deliver (its tunnel is reported down, it has no
+endpoint, the tunnel is disabled there), the others withdraw too, since they
+would have nowhere to forward to. A location that stops heartbeating is still
+helped: if its box is forwarding, the others reach the customer through it;
+if it is gone, so is the customer's only tunnel, and help only absorbs the
+attack. For a customer that must ride out losing a location, fan the tunnel
+out instead.
+
+`GET /v1/tunnels` gives each tunnel's `node`, `location` name and whether it is
+in `overflow`, and each node's `role`: `location`, or `helper` with
+`standing_by` and the node-to-node interface it forwards over.
+
+#### Or one tunnel per node
+
+A tunnel with no `node` fans out. The fabric is anycast, every eligible node
+announces every protected prefix, and each of them holds its own tunnel to the
+customer's one endpoint, from its own address. Ten scrubbers protecting one
+customer is ten tunnels at the customer's end.
 
 ```console
 $ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-a:9091/tunnels?format=iproute2'
@@ -495,9 +564,12 @@ ip link add scr-northwind type gre local 192.0.2.2 remote 198.18.0.9 key 42
 ...
 ```
 
-Same customer endpoint, different local end. As with `/bgp`, **nothing here
-is executed** — the agent compiles the configuration and serves it to whatever
-provisions interfaces on that box.
+Same customer endpoint, different local end. As with `/bgp`, the agent only
+compiles the configuration and serves it. The provisioner that
+[`scripts/install.sh`](install.md) installs beside it applies it to the box
+every few seconds (building, rebuilding and removing interfaces, routes,
+rules and shapers to match) and reports which customer tunnels it built.
+Bring your own instead with `--no-provision`.
 
 #### Replies come back up the same tunnel
 
@@ -536,6 +608,21 @@ their own transit: the tunnel then only carries clean traffic out, and
 nothing that comes up it is forwarded
 (`nft add rule inet scrubline forward iifname "scr-northwind" drop`).
 
+#### The tunnel firewall
+
+Each node accepts GRE and IPIP only from the addresses it has tunnels with:
+every other node's tunnel endpoint, for node-to-node forwarding, and the
+customer end of each tunnel it builds. Neither is accepted over IPv6.
+
+```
+nft add rule inet scrubline input meta l4proto { gre, ipencap } ip saddr != { 192.0.2.2, 198.18.0.9 } drop
+nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { gre, ipencap } drop
+```
+
+The list is compiled from the fabric, so when a server is installed and
+enrols, every node accepts its tunnels on the next compile, and when one goes,
+it is dropped.
+
 #### Controlling tunnels from the API
 
 Tunnels belong to the deployed policy, so they can be changed in place
@@ -566,6 +653,7 @@ and the problem says why — usually that it has no endpoint yet.
 | `POST /v1/tunnels/{id}/disable` | `{"nodes":["…"]}`: those nodes stop building it and withdraw its prefixes. |
 | `POST /v1/tunnels/{id}/enable` | `{"nodes":["…"]}`: undo that. |
 | `PUT /v1/tunnels/{id}/rate` | `{"rate_mbps":1000}`: change only its clean-traffic allowance. |
+| `PUT /v1/tunnels/{id}/location` | `{"node":"node-…"}`: pin it to the node the customer's one tunnel ends on; `""` fans it out again. |
 
 `GET /v1/tunnels?tenant=ten-…` lists only the tunnels allocated to one
 customer.
@@ -619,9 +707,9 @@ $ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/ra
 {"error":"rate_mbps must be within 1..2500 (2.5 Gbit/s); 0 takes the maximum"}
 ```
 
-The fabric is anycast, so the tunnel runs from every node carrying the
-customer's prefixes, and the allowance is split evenly across the nodes
-announcing them. Two nodes sending a 2000 Mbit/s tunnel get 1000 Mbit/s each,
+A tunnel that fans out runs from every node carrying the customer's prefixes,
+and the allowance is split evenly across the nodes announcing them. Two nodes
+sending a 2000 Mbit/s tunnel get 1000 Mbit/s each,
 which `GET /v1/tunnels` shows per node as `rate_kbps`, and each node shapes
 what it sends down the tunnel to its share:
 
@@ -639,12 +727,16 @@ nodes still building the tunnel split it between them.
 `scrubline_tunnel_rate_limit_bits_per_second` on each node's `/metrics` is
 the share it is enforcing.
 
-The split is even, not by where the traffic lands. Anycast rarely spreads a
-customer's traffic evenly across the fabric, so the node nearest most of their
-users can be held to its share while others sit under theirs, and the customer
-then receives less than the allowance in total. Give a tunnel headroom over
-what the customer's link needs, or steer its prefixes to fewer nodes, where
-that matters.
+A pinned tunnel has none of this to work out: all of the customer's clean
+traffic leaves through its location, so the location shapes to the whole
+allowance, and the cap is exact.
+
+For a fanned-out tunnel the split is even, not by where the traffic lands.
+Anycast rarely spreads a customer's traffic evenly across the fabric, so the
+node nearest most of their users can be held to its share while others sit
+under theirs, and the customer then receives less than the allowance in total.
+Give such a tunnel headroom over what the customer's link needs, steer its
+prefixes to fewer nodes, or pin it.
 
 A customer with a tunnel allocated cannot be deleted, or have their prefixes
 changed so the tunnel carries something outside them; both answer `409`
