@@ -193,6 +193,15 @@ LISTEN=${LISTEN:-0.0.0.0:8080}
 PORT=${LISTEN##*:}
 [[ $PORT =~ ^[0-9]+$ ]] || die "--listen needs a port, e.g. 0.0.0.0:8080"
 plain --listen "$LISTEN"
+# Where this server reaches its own API: loopback when it listens on every address, or the one
+# address it listens on.
+LOCAL=${LISTEN%:*}
+LOCAL=${LOCAL#[}
+LOCAL=${LOCAL%]}
+case $LOCAL in
+'' | 0.0.0.0 | ::) LOCAL=127.0.0.1 ;;
+esac
+if [[ $LOCAL == *:* ]]; then LOCAL_URL="https://[$LOCAL]:$PORT"; else LOCAL_URL="https://$LOCAL:$PORT"; fi
 if [[ -n $TLS_CERT || -n $TLS_KEY ]]; then
 	[[ -n $TLS_CERT && -n $TLS_KEY ]] || die "--tls-cert and --tls-key go together"
 	[[ -f $TLS_CERT && -f $TLS_KEY ]] || die "--tls-cert and --tls-key must be files"
@@ -217,7 +226,7 @@ if has_node; then
 	NEXT_HOP=${NEXT_HOP:-$TUNNEL_IP}
 	plain --bgp-next-hop "$NEXT_HOP"
 	if [[ $ROLE == all ]]; then
-		API_URL=${API_URL:-https://127.0.0.1:$PORT}
+		API_URL=${API_URL:-$LOCAL_URL}
 	fi
 	[[ -n $API_URL ]] || die "--api is required: the control plane's URL, e.g. https://10.0.0.5:8080"
 	plain --api "$API_URL"
@@ -345,7 +354,11 @@ certificates() {
 	done
 	local -a extra=()
 	IFS=, read -r -a extra <<<"$HOSTNAMES"
+	extra+=("$LOCAL")
 	for h in "${extra[@]}"; do
+		case ",$sans," in
+		*",IP:$h,"* | *",DNS:$h,"*) continue ;;
+		esac
 		[[ -n $h ]] || continue
 		if ipv4 "$h" || [[ $h == *:* ]]; then sans+=",IP:$h"; else sans+=",DNS:$h"; fi
 	done
@@ -394,7 +407,7 @@ ENV
 set -e
 SCRUBLINE_API_TOKEN=\$(sed -n 's/^SCRUBLINE_API_TOKEN=//p' $ETC/api.env)
 export SCRUBLINE_API_TOKEN
-exec $PREFIX/scrubctl -api https://127.0.0.1:$PORT -ca $ETC/tls/ca.pem "\$@"
+exec $PREFIX/scrubctl -api $LOCAL_URL -ca $ETC/tls/ca.pem "\$@"
 CTL
 		install -m 0750 "$PREFIX/scrubline-ctl.new" "$PREFIX/scrubline-ctl"
 		rm -f "$PREFIX/scrubline-ctl.new"
@@ -607,7 +620,7 @@ if [[ $START -eq 1 ]]; then
 			wait_for scrubline-api "control plane is running" systemctl is-active --quiet scrubline-api
 		else
 			wait_for scrubline-api "control plane is up on port $PORT" \
-				curl -fsS --cacert "$ETC/tls/ca.pem" "https://127.0.0.1:$PORT/health"
+				curl -fsS --cacert "$ETC/tls/ca.pem" "$LOCAL_URL/health"
 		fi
 	fi
 	if has_node; then
@@ -623,18 +636,26 @@ fi
 echo
 HERE=$(addresses | head -n1)
 HERE=${HERE:-$(hostname -s)}
+# The address other servers reach the API on: this server's, when it listens on every address.
+case ${LISTEN%:*} in
+'' | 0.0.0.0 | '[::]' | ::) API_HERE=https://$HERE:$PORT ;;
+*) API_HERE=$LOCAL_URL ;;
+esac
 if has_api; then
 	ca_note=
 	if [[ $CUSTOM_TLS == 1 ]]; then ca_note=" (not used: you supplied a certificate)"; fi
+	if [[ $LOCAL == 127.* || $LOCAL == ::1 || $LOCAL == localhost ]]; then
+		warn "the API listens on loopback only, so nodes on other servers cannot reach it; use --listen 0.0.0.0:$PORT for them"
+	fi
 	cat <<NEXT
 Control plane
-  API             https://$HERE:$PORT
+  API             $API_HERE
   credentials     $ETC/api.env (SCRUBLINE_API_TOKEN, the operator token, is for your panel)
   CA certificate  $ETC/tls/ca.pem$ca_note
   try it          sudo scrubline-ctl nodes
 
 To add a scrubbing node, copy $ETC/tls/ca.pem to it and run there:
-  sudo scripts/install.sh node --api https://$HERE:$PORT \\
+  sudo scripts/install.sh node --api $API_HERE \\
       --ca /path/to/ca.pem --enroll-token $enroll_token \\
       --name <name> --region <location>
 
