@@ -7,6 +7,9 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 pub const MAX_PREPENDS: i64 = 5;
+/// How the reason a helper withdraws a pinned customer's prefix starts when the only reason is
+/// that their location needs no help.
+pub const STANDING_BY: &str = "standing by: ";
 pub type TunnelHealth = HashMap<String, HashMap<String, String>>;
 fn capacity(n: &Node) -> f64 {
     if n.capacity_gbps.is_finite() && n.capacity_gbps >= 0.0 {
@@ -205,12 +208,29 @@ fn deliverable(
         return (
             false,
             format!(
-                "standing by: return tunnel {} is at {}, and this node announces only while that one is overloaded or down",
+                "{STANDING_BY}return tunnel {} is at {}, and this node announces only while that one is overloaded or down",
                 t.id, at.name
             ),
         );
     }
     (true, String::new())
+}
+/// Why a tunnel cannot have its location at a node, when it cannot: steering keeps one of its
+/// prefixes out of the node's region, so the node would never announce that prefix, and nobody
+/// else could deliver it.
+pub fn misplaced(p: &Policy, at: &Node, t: &Tunnel) -> Option<String> {
+    let prefix = t.prefixes.iter().find(|prefix| !eligible(p, at, prefix))?;
+    let regions = p
+        .steering
+        .iter()
+        .rev()
+        .find(|s| &s.prefix == prefix)
+        .map(|s| s.regions.join(", "))
+        .unwrap_or_default();
+    Some(format!(
+        "{} is in region {:?}, and steering sends {prefix} only to {regions}",
+        at.name, at.region
+    ))
 }
 /// Whether a node can build a tunnel's customer end and deliver over it.
 fn builds(p: &Policy, n: &Node, t: &Tunnel, health: &TunnelHealth) -> (bool, String) {
@@ -313,15 +333,23 @@ pub fn tunnels_for(p: &Policy, n: &Node, enforced: &[String]) -> Vec<NodeTunnel>
             {
                 None
             } else {
-                tunnel::for_node(t, n, &mine).ok().map(|mut built| {
-                    built.foreign = foreign_to(p, t);
-                    built
-                })
+                build(p, t, n, &mine).ok()
             }
         })
         .collect();
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+/// A tunnel as a node builds it, carrying these of its prefixes. A pinned customer's traffic can
+/// reach their location over a node-to-node tunnel, so the segments the location lets the
+/// customer's peers send must fit that tunnel too.
+pub fn build(p: &Policy, t: &Tunnel, n: &Node, prefixes: &[String]) -> crate::Result<NodeTunnel> {
+    let mut built = tunnel::for_node(t, n, prefixes)?;
+    if !t.node.is_empty() {
+        built.mss_clamp = built.mss_clamp.min(tunnel::backhaul_clamp(&t.prefixes));
+    }
+    built.foreign = foreign_to(p, t);
+    Ok(built)
 }
 /// Whether a pinned tunnel's location builds the customer's end, so it can take what other nodes
 /// forward to it.
@@ -362,10 +390,12 @@ pub fn backhaul_for(p: &Policy, nodes: &[Node], n: &Node, enforced: &[String]) -
                 peers.entry(h.id.as_str()).or_default();
             }
         } else if helps(p, n, t, at) {
+            // Only what the location routes down the customer's tunnel: a prefix steered away
+            // from it would have nowhere to go there.
             peers.entry(at.id.as_str()).or_default().extend(
                 t.prefixes
                     .iter()
-                    .filter(|prefix| enforced.contains(prefix))
+                    .filter(|prefix| enforced.contains(prefix) && eligible(p, at, prefix))
                     .cloned(),
             );
         }
@@ -379,30 +409,26 @@ pub fn backhaul_for(p: &Policy, nodes: &[Node], n: &Node, enforced: &[String]) -
             }
             prefixes.sort();
             prefixes.dedup();
-            let v6 = prefixes.iter().any(|prefix| {
-                prefix
-                    .parse::<IpNet>()
-                    .is_ok_and(|net| net.addr().is_ipv6())
-            });
             Some(Backhaul {
                 peer: id.into(),
                 interface: tunnel::backhaul_name(id),
                 local: n.tunnel_src.clone(),
                 remote: peer.tunnel_src.clone(),
                 mtu: tunnel::BACKHAUL_MTU,
-                mss_clamp: tunnel::BACKHAUL_MTU - if v6 { 60 } else { 40 },
+                mss_clamp: tunnel::backhaul_clamp(&prefixes),
                 prefixes,
             })
         })
         .collect()
 }
-/// Prefixes of the customers pinned to a node that it builds the tunnel for.
+/// Prefixes of the customers pinned to a node that it builds the tunnel for and routes down it.
 fn pinned_at(p: &Policy, n: &Node) -> Vec<String> {
     let mut out: Vec<String> = p
         .tunnels
         .iter()
         .filter(|t| t.node == n.id && location_builds(p, n, t))
-        .flat_map(|t| t.prefixes.iter().cloned())
+        .flat_map(|t| t.prefixes.iter().filter(|prefix| eligible(p, n, prefix)))
+        .cloned()
         .collect();
     out.sort();
     out

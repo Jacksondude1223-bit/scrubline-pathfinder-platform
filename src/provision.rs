@@ -87,8 +87,49 @@ table inet scrubline {
 }
 ";
 
+/// An interface the provisioner may touch, as the renderers name them.
+fn interface(name: &str) -> bool {
+    ours(name)
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+fn number(word: &str) -> bool {
+    !word.is_empty() && word.len() <= 10 && word.bytes().all(|c| c.is_ascii_digit())
+}
+fn address(word: &str) -> bool {
+    word.parse::<std::net::Ipv4Addr>().is_ok()
+}
+/// An nft rule as the renderers write them, and nothing else: a forwarding rule scoped to one of
+/// our interfaces, or a firewall rule scoped to GRE and IPIP, made of the words they use, with
+/// drop the only verdict.
+fn rule(words: &[&str]) -> bool {
+    let quoted = |w: &str| {
+        w.strip_prefix('"')
+            .and_then(|w| w.strip_suffix('"'))
+            .is_some_and(|name| interface(name) || name == "sbh-*")
+    };
+    let rest = match words {
+        ["forward", "oifname" | "iifname", name, rest @ ..] if quoted(name) => rest,
+        ["input", "meta", "l4proto", "{", "47,", "4", "}", rest @ ..] => rest,
+        ["input", "meta", "nfproto", "ipv6", "meta", "l4proto", "{", "47,", "4", "}", rest @ ..] => {
+            rest
+        }
+        _ => return false,
+    };
+    const WORDS: &[&str] = &[
+        "tcp", "flags", "syn", "option", "maxseg", "size", "set", "ip", "ip6", "saddr", "daddr",
+        "!=", "{", "}", "drop", "meta", "nfproto", "ipv4", "ipv6",
+    ];
+    let clamp = matches!(rest, [.., "set", n] if number(n));
+    (clamp || rest.last() == Some(&"drop"))
+        && rest.iter().all(|w| {
+            WORDS.contains(w) || number(w) || destination(w.trim_end_matches(',')).is_some()
+        })
+}
 /// Works out a pass. It refuses a line it does not recognise rather than guess at it: these are
-/// commands run as root.
+/// commands run as root, so every line must have exactly the shape the renderers give it.
 pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
     let mut adds: BTreeMap<String, &str> = BTreeMap::new();
     let mut sets = Vec::new();
@@ -96,32 +137,56 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
     let mut shapers = Vec::new();
     let mut nft = String::from(TABLE);
     for line in desired.lines.iter().map(|l| l.trim()) {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let refuse = || format!("refusing to apply an unrecognised line: {line:?}");
+        // Nothing that could end one command and start another reaches nft or a command line.
+        if !line
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b" .:/,{}!=*\"-".contains(&c))
+        {
+            return Err(refuse());
+        }
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
-            [] => {}
-            [first, ..] if first.starts_with('#') => {}
-            ["ip", "link", "add", name, "type", ..] if ours(name) => {
+            ["ip", "link", "add", name, "type", "gre" | "ipip", "local", a, "remote", b, key @ ..]
+                if interface(name)
+                    && address(a)
+                    && address(b)
+                    && matches!(key, [] | ["key", _])
+                    && key.get(1).is_none_or(|k| k.parse::<u32>().is_ok()) =>
+            {
                 adds.insert(name.to_string(), line);
             }
-            ["ip", "link", "set", name, "mtu", _, "up"] if ours(name) => sets.push((*name, line)),
-            ["ip", "route", "replace", dst, "dev", name] if ours(name) => {
-                let dst = destination(dst).ok_or_else(|| format!("unreadable route {line:?}"))?;
+            ["ip", "link", "set", name, "mtu", mtu, "up"]
+                if interface(name)
+                    && mtu.parse::<u16>().is_ok_and(|m| (576..=9000).contains(&m)) =>
+            {
+                sets.push((*name, line))
+            }
+            ["ip", "route", "replace", dst, "dev", name] if interface(name) => {
+                // Only the customers' networks: never a default route through a tunnel.
+                let dst = destination(dst)
+                    .filter(|d| !d.ends_with("/0"))
+                    .ok_or_else(refuse)?;
                 routes.insert((dst, name.to_string()), line);
             }
-            ["nft", "add", "rule", "inet", "scrubline", ..] => {
+            ["nft", "add", "rule", "inet", "scrubline", tail @ ..] if rule(tail) => {
                 nft.push_str(&line[4..]);
                 nft.push('\n');
             }
-            ["tc", "qdisc", "replace", "dev", name, "root", "tbf", "rate", rate, ..]
-                if ours(name) =>
+            ["tc", "qdisc", "replace", "dev", name, "root", "tbf", "rate", rate, "burst", burst, "latency", "50ms"]
+                if interface(name) && number(burst) =>
             {
                 let kbit: u64 = rate
                     .strip_suffix("kbit")
+                    .filter(|v| number(v))
                     .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| format!("unreadable shaper {line:?}"))?;
+                    .ok_or_else(refuse)?;
                 shapers.push((*name, kbit * 125, line));
             }
-            _ => return Err(format!("refusing to apply an unrecognised line: {line:?}")),
+            _ => return Err(refuse()),
         }
     }
     let mut pass = Pass::default();
@@ -266,11 +331,16 @@ pub fn observe(r: &mut impl Runner) -> Result<Observed> {
 pub struct Applied {
     pub failed: BTreeMap<String, String>,
     pub errors: Vec<String>,
+    /// Why the ruleset did not load, when it did not. The pass stops there.
+    pub blocked: Option<String>,
 }
 
-/// Applies a pass, loading the ruleset when it differs from the last one loaded or the table has
-/// gone. A failure is recorded against its interface and the pass carries on, so one bad tunnel
-/// does not hold up the others.
+/// Applies a pass. The ruleset loads first, when it differs from the last one loaded or the table
+/// has gone: its rules match interfaces by name, so they are in place before any interface they
+/// filter comes up. If it does not load, nothing else changes, and the box keeps the last
+/// consistent state it had; a tunnel is never brought up without its filters. After that a
+/// failure is recorded against its interface and the pass carries on, so one bad tunnel does not
+/// hold up the others.
 pub fn apply(
     r: &mut impl Runner,
     pass: &Pass,
@@ -278,6 +348,16 @@ pub fn apply(
     last_nft: &mut String,
 ) -> Applied {
     let mut out = Applied::default();
+    if pass.nft != *last_nft || !observed.table {
+        let load = ["nft", "-f", "-"].map(String::from);
+        match r.run(&load, Some(&pass.nft)) {
+            Ok(_) => *last_nft = pass.nft.clone(),
+            Err(e) => {
+                out.blocked = Some(e);
+                return out;
+            }
+        }
+    }
     for s in &pass.steps {
         if let Err(e) = r.run(&s.argv, None) {
             match &s.link {
@@ -286,13 +366,6 @@ pub fn apply(
                 }
                 None => out.errors.push(e),
             }
-        }
-    }
-    if pass.nft != *last_nft || !observed.table {
-        let load = ["nft", "-f", "-"].map(String::from);
-        match r.run(&load, Some(&pass.nft)) {
-            Ok(_) => *last_nft = pass.nft.clone(),
-            Err(e) => out.errors.push(e),
         }
     }
     out
@@ -304,9 +377,16 @@ pub fn report(desired: &Desired, applied: &Applied) -> Value {
     let rows: Vec<Value> = desired
         .tunnels
         .iter()
-        .map(|t| match applied.failed.get(&t.interface) {
-            None => json!({"tunnel_id":t.id,"state":"up"}),
-            Some(e) => json!({"tunnel_id":t.id,"state":"down","detail":e}),
+        .map(|t| {
+            let failed = applied
+                .blocked
+                .as_ref()
+                .map(|e| format!("the tunnel firewall did not load: {e}"))
+                .or_else(|| applied.failed.get(&t.interface).cloned());
+            match failed {
+                None => json!({"tunnel_id":t.id,"state":"up"}),
+                Some(e) => json!({"tunnel_id":t.id,"state":"down","detail":e}),
+            }
         })
         .collect();
     json!({ "tunnels": rows })
@@ -439,10 +519,26 @@ mod tests {
     fn it_runs_nothing_it_does_not_recognise() {
         for line in [
             "ip link add eth0 type gre local 192.0.2.1 remote 198.51.100.1",
+            "ip link add scr-nw type gre local 192.0.2.1 remote 198.51.100.1 dev eth0",
+            "ip link add scr-nw type vxlan id 42 local 192.0.2.1 remote 198.51.100.1",
+            "ip link set scr-nw mtu 65535 up",
             "ip route replace 0.0.0.0/0 dev eth0",
+            // ip -j route lists these as "default", so they could never be taken down again.
+            "ip route replace 0.0.0.0/0 dev scr-nw",
+            "ip route replace ::/0 dev scr-nw",
             "nft flush ruleset",
+            // Everything after the first words goes into an nft script, where ; and a newline
+            // each start another command.
+            "nft add rule inet scrubline input accept; flush ruleset",
+            "nft add rule inet scrubline input meta l4proto { 47, 4 } drop\nflush ruleset",
+            "nft add rule inet scrubline input accept",
+            "nft add rule inet scrubline input meta l4proto { 47, 4 } accept",
+            "nft add rule inet scrubline forward oifname \"eth0\" drop",
+            "nft add rule inet scrubline forward iifname \"scr-nw\" jump elsewhere",
+            "nft add rule inet scrubline forward oifname \"scr-nw\" tcp flags syn tcp option maxseg size set rt mtu",
             "rm -rf /",
             "tc qdisc del dev scr-nw root",
+            "tc qdisc replace dev scr-nw root tbf rate 1000kbit burst 32768 latency 50ms limit 1",
         ] {
             assert!(
                 plan(&desired(&[line]), &Observed::default()).is_err(),
@@ -499,6 +595,33 @@ mod tests {
         assert_eq!(report(&d, &applied)["tunnels"][0]["state"], "up");
         apply(&mut r, &pass, &Observed::default(), &mut last);
         assert_eq!(loads(&r), 1);
+    }
+    #[test]
+    fn nothing_comes_up_without_its_filters() {
+        let d = desired(&[ADD, SET, ROUTE]);
+        let pass = plan(&d, &Observed::default()).unwrap();
+        let mut r = Fake {
+            ran: vec![],
+            fail: "nft -f -",
+        };
+        let mut last = String::new();
+        let applied = apply(&mut r, &pass, &Observed::default(), &mut last);
+        assert_eq!(r.ran.first().map(String::as_str), Some("nft -f -"));
+        assert!(
+            r.ran.iter().all(|l| !l.starts_with("ip ")),
+            "no link or route changes: {:?}",
+            r.ran
+        );
+        assert!(last.is_empty(), "a failed load is tried again next pass");
+        let row = &report(&d, &applied)["tunnels"][0];
+        assert_eq!(row["state"], "down");
+        assert!(
+            row["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("the tunnel firewall did not load"),
+            "{row}"
+        );
     }
     #[test]
     fn host_routes_compare_whichever_way_they_are_written() {

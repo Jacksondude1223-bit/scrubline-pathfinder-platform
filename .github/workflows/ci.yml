@@ -100,26 +100,56 @@ jobs:
         run: |
           systemctl is-active scrubline-api scrubline-node scrubline-provision
           curl -fsS --cacert /etc/scrubline/tls/ca.pem https://127.0.0.1:18443/health
-          sudo scrubline-ctl nodes | grep -q '"region":"ci"'
-          # The provisioner loads the node's tunnel firewall within a pass or two.
+          sudo /usr/local/bin/scrubline-ctl nodes | grep -q '"region":"ci"'
+          # With nothing deployed there is nothing to apply, and the provisioner says so.
+          sudo grep '^waiting' /run/scrubline-provision/status
+      # A customer's tunnel pinned to the node, built on the runner's own kernel.
+      - name: Pin a tunnel to the node
+        run: |
+          node=$(sudo /usr/local/bin/scrubline-ctl nodes | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+          printf '{"id":"ci","name":"ci","protected":["203.0.113.0/24"],"tunnels":[{"id":"ci","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"rate_mbps":100,"node":"%s"}]}' "$node" >policy.json
+          sudo /usr/local/bin/scrubline-ctl apply policy.json
+          sudo /usr/local/bin/scrubline-ctl deploy ci
           for attempt in $(seq 1 30); do
-            if sudo nft list table inet scrubline | grep -q 'meta l4proto'; then exit 0; fi
+            if sudo grep -q '^ok' /run/scrubline-provision/status; then break; fi
             sleep 1
           done
-          sudo nft list ruleset
+          sudo cat /run/scrubline-provision/status
+          sudo grep -q '^ok' /run/scrubline-provision/status
+          ip -d link show scr-ci | grep -q 'remote 198.51.100.1'
+          ip route show 203.0.113.0/24 | grep -q 'dev scr-ci'
+          tc qdisc show dev scr-ci | grep -q tbf
+          sudo nft list table inet scrubline | grep -q 198.51.100.1
+          # The provisioner's report reaches the control plane.
+          token=$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)
+          for attempt in $(seq 1 30); do
+            if curl -fsS --cacert /etc/scrubline/tls/ca.pem -H "Authorization: Bearer $token" \
+              https://127.0.0.1:18443/v1/tunnels | grep -q '"state":"up"'; then exit 0; fi
+            sleep 1
+          done
           exit 1
-      - name: Upgrade in place
+      - name: Upgrade in place, moving the API
         run: |
           token=$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)
-          sudo scripts/install.sh all
+          sudo sed -i 's/^SCRUBLINE_NODE_EXTRA_OPTS=.*/SCRUBLINE_NODE_EXTRA_OPTS=-capacity 25/' /etc/scrubline/node.env
+          sudo scripts/install.sh all --listen 127.0.0.1:18444
           test "$token" = "$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)"
           systemctl is-active scrubline-api scrubline-node scrubline-provision
+          # The agent follows the API to its new port, and what was added by hand stays.
+          sudo grep -q -- '-api https://127.0.0.1:18444 ' /etc/scrubline/node.env
+          sudo grep -qx 'SCRUBLINE_NODE_EXTRA_OPTS=-capacity 25' /etc/scrubline/node.env
+          sudo /usr/local/bin/scrubline-ctl nodes | grep -q '"capacity_gbps":25'
+          sudo grep -q '^ok' /run/scrubline-provision/status
+          ip link show scr-ci >/dev/null
       - name: Logs on failure
         if: failure()
-        run: sudo journalctl --no-pager -u scrubline-api -u scrubline-node -u scrubline-provision
+        run: |
+          sudo cat /run/scrubline-provision/status || true
+          sudo journalctl --no-pager -u scrubline-api -u scrubline-node -u scrubline-provision
       - name: Remove
         run: |
           sudo scripts/install.sh uninstall --purge
           if systemctl is-active --quiet scrubline-api; then exit 1; fi
           if sudo nft list table inet scrubline >/dev/null 2>&1; then exit 1; fi
+          if ip link show scr-ci >/dev/null 2>&1; then exit 1; fi
           if id scrubline >/dev/null 2>&1; then exit 1; fi

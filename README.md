@@ -635,7 +635,8 @@ announcement plan at `/bgp`; the provisioner that [`scripts/install.sh`](docs/in
 installs beside it applies that to the box and reports which tunnels it
 built. The MTU and the TCP MSS clamp are derived from the
 encapsulation's overhead (1476/1436 for GRE, 1472/1432 with a key,
-1480/1440 for IPIP) and an MTU that does not fit is refused with the one
+1480/1440 for IPIP, which pinned to a location clamps to the 1436 that
+node-to-node GRE carries) and an MTU that does not fit is refused with the one
 that does. The clamp is the part people skip: without it, a customer whose
 path drops the ICMP that path-MTU discovery needs sees TCP complete its
 handshake and then hang, which reads as a scrubbing fault.

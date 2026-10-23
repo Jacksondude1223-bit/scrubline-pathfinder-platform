@@ -470,7 +470,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: No live nodes to deploy onto, or this control plane is a replica.
+          description: No live nodes to deploy onto, a tunnel is pinned to a node outside the steering
+            regions of one of its prefixes, or this control plane is a replica.
           content:
             application/json:
               schema:
@@ -1088,8 +1089,9 @@ paths:
         '400':
           description: The tunnel will not validate against the policy (including a rate_mbps over 2500,
             or the same encapsulation, remote and key as another tunnel), names an unknown customer or
-            carries a prefix outside theirs, lists a disabled entry that is not a registered node id, or
-            the id in the body differs from the one in the path.
+            carries a prefix outside theirs, lists a disabled entry that is not a registered node id, names
+            a node that is not a registered node id or is outside the steering regions of one of the
+            tunnel's prefixes, or the id in the body differs from the one in the path.
           content:
             application/json:
               schema:
@@ -1288,13 +1290,15 @@ paths:
       security: *id001
       responses:
         '200':
-          description: Saved as a new version of the deployed policy, and deployed.
+          description: Saved as a new version of the deployed policy, and deployed. Naming the node the
+            tunnel is already at changes nothing.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TunnelChange'
         '400':
-          description: node is missing, or not a registered node id.
+          description: node is missing, is not a registered node id, or is outside the steering regions
+            of one of the tunnel's prefixes, so it could never announce that prefix.
           content:
             application/json:
               schema:
@@ -1318,8 +1322,8 @@ paths:
         GRE tunnel from its tunnel endpoint, so the customer configures one tunnel, to that address, and
         alone announces their prefixes until it is overloaded or down; the other nodes then announce
         them too and forward what they scrub to it over node-to-node GRE. Moving a tunnel rebuilds it,
-        so what was reported about it where it was is dropped. An empty node fans it out to every node
-        carrying its prefixes again.'
+        so what was reported about it at its old and new location is dropped. An empty node fans it out
+        to every node carrying its prefixes again.'
       parameters: *id005
       requestBody:
         required: true

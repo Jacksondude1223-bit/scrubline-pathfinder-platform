@@ -482,6 +482,11 @@ $ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/lo
  "prefixes":["203.0.113.0/24"],"node":"node-20c0e739603a7b60",…}}
 ```
 
+The location must be in the steering regions of every prefix the tunnel
+carries, or it could never announce them; a node outside them is refused, as
+is deploying a policy that pins a tunnel to one. Naming the node a tunnel is
+already at changes nothing.
+
 Traffic for the customer goes to that location: it alone announces their
 prefixes while it copes. The rest of the fabric stands by:
 
@@ -532,8 +537,11 @@ endpoint, the tunnel is disabled there), the others withdraw too, since they
 would have nowhere to forward to. A location that stops heartbeating is still
 helped: if its box is forwarding, the others reach the customer through it;
 if it is gone, so is the customer's only tunnel, and help only absorbs the
-attack. For a customer that must ride out losing a location, fan the tunnel
-out instead.
+attack. After the control plane restarts, or a replica is promoted, a node it
+has not heard from yet counts as down only once the 30-second heartbeat
+timeout has passed, so the first node to check in does not announce for all
+the others. For a customer that must ride out losing a location, fan the
+tunnel out instead.
 
 `GET /v1/tunnels` gives each tunnel's `node`, `location` name and whether it is
 in `overflow`, and each node's `role`: `location`, or `helper` with
@@ -610,13 +618,14 @@ nothing that comes up it is forwarded
 
 #### The tunnel firewall
 
-Each node accepts GRE and IPIP only from the addresses it has tunnels with:
-every other node's tunnel endpoint, for node-to-node forwarding, and the
-customer end of each tunnel it builds. Neither is accepted over IPv6.
+Each node accepts GRE and IPIP (IP protocols 47 and 4) only from the
+addresses it has tunnels with: every other node's tunnel endpoint, for
+node-to-node forwarding, and the customer end of each tunnel it builds.
+Neither is accepted over IPv6.
 
 ```
-nft add rule inet scrubline input meta l4proto { gre, ipencap } ip saddr != { 192.0.2.2, 198.18.0.9 } drop
-nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { gre, ipencap } drop
+nft add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != { 192.0.2.2, 198.18.0.9 } drop
+nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { 47, 4 } drop
 ```
 
 The list is compiled from the fabric, so when a server is installed and
@@ -751,7 +760,10 @@ naming the tunnel.
 | IPIP | 20 | 1480 | 1440 |
 
 Both are derived unless you set them, and an MTU that does not fit the
-encapsulation is refused with the largest one that does. The clamp is the
+encapsulation is refused with the largest one that does. A tunnel pinned to a
+location also clamps to what node-to-node GRE carries (1436, or 1416 with IPv6
+prefixes), since the traffic other nodes scrub for it reaches the location over
+that: a pinned IPIP tunnel clamps to 1436. The clamp is the
 part people skip: a tunnel with a correct MTU still hangs for any customer
 whose path drops the ICMP that path-MTU discovery depends on. The handshake
 completes, the first full-size segment does not, and the connection sits

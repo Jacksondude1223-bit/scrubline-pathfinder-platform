@@ -156,7 +156,7 @@ with tempfile.TemporaryDirectory() as temporary:
             return run.returncode == 0 and 'tbf rate 100000kbit' in run.stdout and run.stdout
         planned = wait_for(provisioned)
         assert 'ip link add scr-customer type gre local 192.0.2.30 remote 192.0.2.100' in planned, planned
-        assert 'add rule inet scrubline input meta l4proto { gre, ipencap } ip saddr != {' in planned, planned
+        assert 'add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != {' in planned, planned
         call(local, '/tunnels', 'POST', LOCAL,
              {'tunnels':[{'tunnel_id':'customer','state':'up'}]})
         wait_for(lambda: any(a['node_id']==runtime_id and a['state']=='announce'

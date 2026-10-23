@@ -12,6 +12,7 @@ fn run() -> Result<()> {
         ("interval", "5s"),
         ("once", "false"),
         ("dry-run", "false"),
+        ("status", ""),
     ])?;
     let token = runtime::required_env("SCRUBLINE_NODE_API_TOKEN")?;
     let agent = f.get("agent").trim_end_matches('/').to_owned();
@@ -23,32 +24,57 @@ fn run() -> Result<()> {
     let interval = f.duration("interval")?;
     let once = f.boolean("once")?;
     let dry_run = f.boolean("dry-run")?;
+    let status = f.get("status");
     let mut last_nft = String::new();
+    let mut last = String::new();
     loop {
-        if let Err(e) = pass(&client, &agent, &token, dry_run, &mut last_nft) {
-            eprintln!("provision: {e}");
-            if once {
-                return Err(e);
+        let outcome = pass(&client, &agent, &token, dry_run, &mut last_nft);
+        let line = match &outcome {
+            Ok(v) => v.clone(),
+            Err(e) => format!("error: {e}"),
+        };
+        // Every pass writes how it went for whoever is watching, the install script among them;
+        // the log gets it when it changes, so a fabric with nothing deployed yet does not fill it.
+        if !status.is_empty() {
+            let tmp = format!("{status}.tmp");
+            if let Err(e) = std::fs::write(&tmp, format!("{line}\n"))
+                .and_then(|_| std::fs::rename(&tmp, status))
+            {
+                eprintln!("provision: writing {status}: {e}");
             }
         }
+        if line != last {
+            eprintln!("provision: {line}");
+            last = line;
+        }
         if once {
-            return Ok(());
+            return outcome.map(|_| ());
         }
         std::thread::sleep(runtime::jitter(interval));
     }
 }
+/// One pass: how it went, or why it could not run.
 fn pass(
     client: &reqwest::blocking::Client,
     agent: &str,
     token: &str,
     dry_run: bool,
     last_nft: &mut String,
-) -> Result<()> {
+) -> Result<String> {
+    // The box first, so a provisioner that cannot read it says so whether or not there is
+    // anything to apply yet.
+    let mut system = System;
+    let observed = provision::observe(&mut system)?;
     let r = client
         .get(format!("{agent}/tunnels"))
         .bearer_auth(token)
         .send()
         .map_err(|e| format!("reading the agent: {e}"))?;
+    if r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        // The agent has yet to hear from the control plane, so it cannot say what this node
+        // holds, and the box stays as it is.
+        return Ok("waiting: the agent has no program from the control plane yet".into());
+    }
     if !r.status().is_success() {
         return Err(format!("reading the agent: {}", r.status()));
     }
@@ -58,23 +84,15 @@ fn pass(
         // down tunnels that were working.
         return Err(format!("the agent could not render: {}", desired.error));
     }
-    let mut system = System;
-    let observed = provision::observe(&mut system)?;
     let plan = provision::plan(&desired, &observed)?;
     if dry_run {
         for step in &plan.steps {
             println!("{}", provision::shell(&step.argv));
         }
         println!("nft -f - <<'EOF'\n{}EOF", plan.nft);
-        return Ok(());
+        return Ok("ok: dry run".into());
     }
     let applied = provision::apply(&mut system, &plan, &observed, last_nft);
-    for (link, e) in &applied.failed {
-        eprintln!("provision {link}: {e}");
-    }
-    for e in &applied.errors {
-        eprintln!("provision: {e}");
-    }
     let r = client
         .post(format!("{agent}/tunnels"))
         .bearer_auth(token)
@@ -84,7 +102,27 @@ fn pass(
     if !r.status().is_success() {
         return Err(format!("reporting to the agent: {}", r.status()));
     }
-    Ok(())
+    if let Some(e) = &applied.blocked {
+        return Err(format!("the tunnel firewall did not load: {e}"));
+    }
+    let failed: Vec<String> = applied
+        .failed
+        .iter()
+        .map(|(link, e)| format!("{link}: {e}"))
+        .chain(applied.errors.iter().cloned())
+        .collect();
+    if !failed.is_empty() {
+        return Err(failed.join("; "));
+    }
+    let backhaul = desired
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("ip link add sbh-"))
+        .count();
+    Ok(format!(
+        "ok: {} customer and {backhaul} node-to-node tunnels in place",
+        desired.tunnels.len()
+    ))
 }
 fn main() {
     if let Err(e) = run() {

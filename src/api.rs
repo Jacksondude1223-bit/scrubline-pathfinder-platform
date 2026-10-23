@@ -140,6 +140,9 @@ pub struct Api {
     overflow_until: HashMap<String, DateTime<Utc>>,
     /// The nodes the fabric is helping as of the last compile: overloaded, or not heartbeating.
     overflowing: HashSet<String>,
+    /// Since when this process has been taking heartbeats: from its first compile, or from its
+    /// promotion. A node it has not heard from in that time is stale only for want of news.
+    watching_since: Option<DateTime<Utc>>,
 }
 pub type Shared = Arc<Mutex<Api>>;
 pub type MetricState<'a> = (
@@ -163,6 +166,7 @@ impl Api {
             fences: HashMap::new(),
             overflow_until: HashMap::new(),
             overflowing: HashSet::new(),
+            watching_since: None,
         }
     }
     fn auth(&self, headers: &HeaderMap) -> Answer<Who> {
@@ -267,6 +271,16 @@ impl Api {
         let mut v = value(&n);
         v["tunnel_endpoint_assigned"] = json!(self.store.data.tunnel_endpoints.contains_key(id));
         v
+    }
+    /// Why a policy cannot go onto the fabric as it stands, when it cannot: it pins a tunnel to a
+    /// registered node outside the steering regions of one of the tunnel's prefixes, which that
+    /// node would never announce and nobody else could deliver.
+    fn misplaced(&self, p: &Policy) -> Option<String> {
+        p.tunnels.iter().find_map(|t| {
+            let at = self.store.data.nodes.iter().find(|n| n.id == t.node)?;
+            compiler::misplaced(p, at, t)
+                .map(|why| format!("tunnel {} cannot have its location there: {why}", t.id))
+        })
     }
     /// The policy currently deployed onto the fabric, if any.
     fn deployed(&self) -> Option<&Policy> {
@@ -410,7 +424,9 @@ impl Api {
                             .filter(|prefix| enforced.contains(prefix))
                             .cloned()
                             .collect();
-                        if mine.is_empty() {
+                        // The location always has a row, so a tunnel placed where steering keeps
+                        // its prefixes away still shows where it is and why.
+                        if mine.is_empty() && t.node != n.id {
                             return None;
                         }
                         let enabled = !t.disabled.iter().any(|id| id == &n.id);
@@ -483,6 +499,12 @@ impl Api {
                                     n.id
                                 )
                             }
+                        } else if role == "location" {
+                            compiler::misplaced(p, n, t)
+                                .map(|why| {
+                                    format!("{why}, so nobody announces it while the tunnel is here")
+                                })
+                                .unwrap_or_default()
                         } else {
                             String::new()
                         };
@@ -497,7 +519,7 @@ impl Api {
                                 row["mss_clamp"] = json!(b.mss_clamp);
                             }
                         } else {
-                            match crate::tunnel::for_node(t, n, &mine) {
+                            match compiler::build(p, t, n, &mine) {
                                 Ok(built) => {
                                     row["interface"] = json!(built.interface);
                                     row["mtu"] = json!(built.mtu);
@@ -509,8 +531,12 @@ impl Api {
                         }
                         if !problem.is_empty() {
                             row["problem"] = json!(problem);
-                        } else if row.get("problem").is_none() && !standing_by {
-                            if let Some(a) = withdrawn.first() {
+                        } else if row.get("problem").is_none() {
+                            // Standing by is what a helper does while its location needs no help.
+                            if let Some(a) = withdrawn
+                                .iter()
+                                .find(|a| !a.reason.starts_with(compiler::STANDING_BY))
+                            {
                                 row["problem"] = json!(a.reason);
                             }
                         }
@@ -555,6 +581,7 @@ impl Api {
         self.deploy(&policy, now, force)
     }
     fn deploy(&mut self, policy: &Policy, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
+        let since = *self.watching_since.get_or_insert(now);
         let nodes = self.store.nodes(now);
         if !nodes.iter().any(|n| n.status != "stale") {
             return Ok(());
@@ -588,6 +615,11 @@ impl Api {
             }
         }
         self.overflow_until.retain(|_, until| *until > now);
+        // Every node starts out stale after a restart or a promotion, and the first to heartbeat
+        // would otherwise announce every other location's customers until they check in too. So
+        // a node not heard from since then is helped only once it has had a heartbeat timeout
+        // to check in.
+        let settled = now.signed_duration_since(since) > store::STALE_AFTER;
         let overflowing: HashSet<String> = self
             .overflow_until
             .keys()
@@ -595,7 +627,7 @@ impl Api {
             .chain(
                 nodes
                     .iter()
-                    .filter(|n| n.status == "stale")
+                    .filter(|n| n.status == "stale" && (settled || n.last_seen != zero_time()))
                     .map(|n| n.id.clone()),
             )
             .collect();
@@ -691,6 +723,7 @@ impl Api {
                     return Err((409, "this control plane is already the primary".into()));
                 }
                 self.mode = "primary".into();
+                self.watching_since = Some(now);
                 Ok(json!({"mode":"primary"}))
             }
             ("POST", ["nodes", "register"]) => {
@@ -827,6 +860,9 @@ impl Api {
                 let mut p: Policy = parse(body)?;
                 validation::policy(&p).map_err(bad)?;
                 validation::tunnel_tenants(&p, &self.store.data.tenants).map_err(bad)?;
+                if let Some(why) = self.misplaced(&p) {
+                    return Err(bad(why));
+                }
                 if p.challenge_secret.is_empty() && !p.games.is_empty() {
                     p.challenge_secret = store::secret().map_err(failed)?;
                 }
@@ -853,6 +889,9 @@ impl Api {
                 };
                 if !self.store.nodes(now).iter().any(|n| n.status == "ready") {
                     return Err((409, "no live nodes registered".into()));
+                }
+                if let Some(why) = self.misplaced(&p) {
+                    return Err((409, why.into()));
                 }
                 self.deploy(&p, now, true).map_err(failed)?;
                 Ok(
@@ -984,7 +1023,14 @@ impl Api {
                         "disabled lists {unknown:?}, which is not a registered node id"
                     )));
                 }
-                if !t.node.is_empty() && !self.store.data.nodes.iter().any(|v| v.id == t.node) {
+                let location = self
+                    .store
+                    .data
+                    .nodes
+                    .iter()
+                    .find(|v| v.id == t.node)
+                    .cloned();
+                if !t.node.is_empty() && location.is_none() {
                     return Err(bad(format!(
                         "node {:?} is not a registered node id",
                         t.node
@@ -1026,6 +1072,12 @@ impl Api {
                     if t.prefixes.is_empty() && !t.tenant.is_empty() {
                         t.prefixes = tenant_prefixes(p, &tenants, &t.tenant, &t.id)?;
                     }
+                    if let Some(why) = location.and_then(|at| compiler::misplaced(p, &at, &t)) {
+                        return Err(bad(format!(
+                            "tunnel {} cannot have its location there: {why}",
+                            t.id
+                        )));
+                    }
                     match p.tunnels.iter_mut().find(|v| v.id == t.id) {
                         Some(v) => *v = t,
                         None => p.tunnels.push(t),
@@ -1059,19 +1111,49 @@ impl Api {
                     node: String,
                 }
                 let l: Location = parse(body)?;
-                if !l.node.is_empty() && !self.store.data.nodes.iter().any(|v| v.id == l.node) {
+                let location = self
+                    .store
+                    .data
+                    .nodes
+                    .iter()
+                    .find(|v| v.id == l.node)
+                    .cloned();
+                if !l.node.is_empty() && location.is_none() {
                     return Err(bad(format!(
                         "node {:?} is not a registered node id",
                         l.node
                     )));
                 }
+                let from = self
+                    .deployed()
+                    .and_then(|p| p.tunnels.iter().find(|v| v.id == id))
+                    .map(|t| t.node.clone());
+                if from.as_ref() == Some(&l.node) {
+                    // Nothing moves, so everything reported about the tunnel still holds.
+                    if let Some(p) = self.deployed() {
+                        return Ok(tunnel_answer(p, id));
+                    }
+                }
                 // Moving the customer's tunnel builds it somewhere else, and nothing reported about
-                // where it was says anything about where it is now.
-                let p = self.change_tunnels(now, &[(None, Some(id))], |p| {
+                // where it was says anything about where it is now. Unpinned, it was or will be
+                // built everywhere.
+                let forget: Vec<(Option<&str>, Option<&str>)> = match from.as_deref() {
+                    Some(old) if !old.is_empty() && !l.node.is_empty() => {
+                        vec![(Some(old), Some(id)), (Some(l.node.as_str()), Some(id))]
+                    }
+                    _ => vec![(None, Some(id))],
+                };
+                let p = self.change_tunnels(now, &forget, |p| {
                     let Some(t) = p.tunnels.iter_mut().find(|v| v.id == id) else {
                         return Err((404, "unknown tunnel".into()));
                     };
-                    t.node = l.node;
+                    t.node = l.node.clone();
+                    let t = t.clone();
+                    if let Some(why) = location.and_then(|at| compiler::misplaced(p, &at, &t)) {
+                        return Err(bad(format!(
+                            "tunnel {id} cannot have its location there: {why}"
+                        )));
+                    }
                     Ok(())
                 })?;
                 Ok(tunnel_answer(&p, id))
@@ -2048,6 +2130,206 @@ mod tests {
             .all(|p| p.tunnels.len() == 1 && p.backhaul.is_empty()));
         let body = json!({"remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":"nowhere"});
         assert_eq!(call(&mut a, 0, "PUT", "/v1/tunnels/nw", OP, body).0, 400);
+    }
+    /// Registers a node in a region and returns its id and credential.
+    fn register_in(a: &mut Api, name: &str, region: &str, src: &str) -> (String, String) {
+        let body = json!({"name":name,"region":region,"tunnel_src":src});
+        let (status, reg) = call(a, 0, "POST", "/v1/nodes/register", ENROLL, body);
+        assert_eq!(status, 200, "{reg}");
+        (
+            reg["node"]["id"].as_str().unwrap().into(),
+            reg["token"].as_str().unwrap().into(),
+        )
+    }
+    #[test]
+    fn a_location_must_be_in_the_steering_regions_of_its_prefixes() {
+        let policy = |tunnel: &Value| {
+            json!({"id":"p","name":"p","protected":["203.0.113.0/24"],
+                "steering":[{"prefix":"203.0.113.0/24","regions":["us"]}],"tunnels":[tunnel]})
+        };
+        let tunnel = json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]});
+        let mut a = api();
+        let (lhr, _) = register_in(&mut a, "lhr", "eu", "192.0.2.1");
+        let (nyc, _) = register_in(&mut a, "nyc", "us", "192.0.2.3");
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies", OP, policy(&tunnel)).0,
+            200
+        );
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null).0,
+            200
+        );
+        let place = |a: &mut Api, node: &str| {
+            call(
+                a,
+                0,
+                "PUT",
+                "/v1/tunnels/nw/location",
+                OP,
+                json!({ "node": node }),
+            )
+        };
+        let (status, why) = place(&mut a, &lhr);
+        assert_eq!(status, 400, "{why}");
+        assert!(
+            why.as_str()
+                .unwrap()
+                .contains("steering sends 203.0.113.0/24 only to us"),
+            "{why}"
+        );
+        let mut pinned = tunnel.clone();
+        pinned["node"] = json!(lhr);
+        assert_eq!(
+            call(&mut a, 0, "PUT", "/v1/tunnels/nw", OP, pinned.clone()).0,
+            400
+        );
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies", OP, policy(&pinned)).0,
+            400
+        );
+        assert_eq!(place(&mut a, &nyc).0, 200);
+        assert_eq!(state(&a, &nyc).0, "announce");
+        // A policy saved before its location registered is caught when it is deployed.
+        let mut b = api();
+        let early = store::id("node", &["lhr", "eu"]);
+        pinned["node"] = json!(early);
+        assert_eq!(
+            call(&mut b, 0, "POST", "/v1/policies", OP, policy(&pinned)).0,
+            200
+        );
+        assert_eq!(register_in(&mut b, "lhr", "eu", "192.0.2.1").0, early);
+        let (status, why) = call(&mut b, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null);
+        assert_eq!(status, 409, "{why}");
+    }
+    #[test]
+    fn a_tunnel_left_outside_its_steering_regions_shows_why_nobody_announces_it() {
+        let mut a = api();
+        let (lhr, _) = register_in(&mut a, "lhr", "eu", "192.0.2.1");
+        let (nyc, _) = register_in(&mut a, "nyc", "us", "192.0.2.3");
+        let policy = json!({"id":"p","name":"p","protected":["203.0.113.0/24"],
+            "steering":[{"prefix":"203.0.113.0/24","regions":["us"]}],
+            "tunnels":[{"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}]});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, policy).0, 200);
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null).0,
+            200
+        );
+        // Placed before locations were checked, or left there by an agent registering under the
+        // same id from another region.
+        a.store.data.policies[0].tunnels[0].node = lhr.clone();
+        a.reconcile(at(1), true).unwrap();
+        assert!(a.store.plan.iter().all(|r| r.state == "withdraw"));
+        let (_, view) = call(&mut a, 1, "GET", "/v1/tunnels", OP, Value::Null);
+        let rows = view["tunnels"][0]["nodes"].as_array().unwrap().clone();
+        let row = |id: &str| rows.iter().find(|r| r["node_id"] == id).unwrap().clone();
+        let at_lhr = row(&lhr);
+        assert_eq!(at_lhr["role"], "location");
+        assert!(
+            at_lhr["problem"]
+                .as_str()
+                .unwrap()
+                .ends_with("so nobody announces it while the tunnel is here"),
+            "{at_lhr}"
+        );
+        let at_nyc = row(&nyc);
+        assert_eq!(at_nyc["standing_by"], true);
+        assert!(
+            at_nyc["problem"]
+                .as_str()
+                .unwrap()
+                .contains("outside this prefix's steering regions"),
+            "standing by hides only standing by: {at_nyc}"
+        );
+    }
+    #[test]
+    fn naming_the_location_a_tunnel_is_already_at_changes_nothing() {
+        let mut a = api();
+        let (lhr, lhr_token) = register(&mut a, 0, "lhr", "192.0.2.1");
+        let (fra, fra_token) = register(&mut a, 0, "fra", "192.0.2.2");
+        let tunnel = json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"required":true,"node":lhr});
+        deploy(&mut a, 0, tunnel);
+        let up = json!({"tunnels":[{"tunnel_id":"nw","state":"up"}]});
+        let agent = |a: &mut Api, now: i64, node: &str, token: &str| {
+            let beat = format!("/v1/nodes/{node}/heartbeat");
+            assert_eq!(call(a, now, "POST", &beat, token, up.clone()).0, 200);
+            let fetch = format!("/v1/nodes/{node}/program");
+            assert_eq!(call(a, now, "GET", &fetch, token, Value::Null).0, 200);
+        };
+        agent(&mut a, 1, &lhr, &lhr_token);
+        assert_eq!(state(&a, &lhr).0, "announce");
+        let place = |a: &mut Api, now: i64, node: &str| {
+            call(
+                a,
+                now,
+                "PUT",
+                "/v1/tunnels/nw/location",
+                OP,
+                json!({ "node": node }),
+            )
+        };
+        let (status, same) = place(&mut a, 2, &lhr);
+        assert_eq!(status, 200, "{same}");
+        assert_eq!(same["version"], 1);
+        assert_eq!(state(&a, &lhr).0, "announce");
+        let beat = format!("/v1/nodes/{lhr}/heartbeat");
+        assert_eq!(
+            call(&mut a, 3, "POST", &beat, &lhr_token, up.clone()).0,
+            200
+        );
+        assert_eq!(state(&a, &lhr).0, "announce", "nothing was fenced");
+        // A move does start over at the new location.
+        assert_eq!(place(&mut a, 4, &fra).0, 200);
+        let unreported = "return tunnel nw is required and has not reported up";
+        assert_eq!(state(&a, &fra), ("withdraw".into(), unreported.into()));
+        agent(&mut a, 5, &fra, &fra_token);
+        agent(&mut a, 6, &fra, &fra_token);
+        assert_eq!(state(&a, &fra).0, "announce");
+    }
+    #[test]
+    fn nodes_get_a_heartbeat_timeout_to_check_in_before_they_are_helped() {
+        let mut a = api();
+        let (lhr, _) = register(&mut a, 0, "lhr", "192.0.2.1");
+        let (fra, fra_token) = register(&mut a, 0, "fra", "192.0.2.2");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":lhr}),
+        );
+        // What a restarted control plane, or a replica, starts from: every node stale.
+        let mut data = a.store.data.clone();
+        for n in &mut data.nodes {
+            n.last_seen = zero_time();
+        }
+        let beat = |a: &mut Api, now: i64| {
+            let path = format!("/v1/nodes/{fra}/heartbeat");
+            assert_eq!(call(a, now, "POST", &path, &fra_token, Value::Null).0, 200);
+        };
+        let standing_by = |a: &Api| {
+            let (status, reason) = state(a, &fra);
+            status == "withdraw" && reason.starts_with(compiler::STANDING_BY)
+        };
+        let mut b = api();
+        b.store.data = data.clone();
+        beat(&mut b, 100);
+        assert!(standing_by(&b), "{:?}", state(&b, &fra));
+        beat(&mut b, 125);
+        assert!(standing_by(&b));
+        // lhr has had its chance and not taken it.
+        beat(&mut b, 131);
+        assert_eq!(state(&b, &fra).0, "announce");
+        // A replica starts the clock again when it is promoted, however long it has been up.
+        let mut c = api();
+        c.mode = "replica".into();
+        c.store.data = data;
+        c.reconcile(at(0), false).unwrap();
+        assert_eq!(
+            call(&mut c, 500, "POST", "/v1/promote", OP, Value::Null).0,
+            200
+        );
+        beat(&mut c, 501);
+        assert!(standing_by(&c), "{:?}", state(&c, &fra));
+        beat(&mut c, 531);
+        assert_eq!(state(&c, &fra).0, "announce");
     }
     #[test]
     fn tunnel_puts_refuse_unknown_nodes_and_ends_linux_cannot_build_twice() {

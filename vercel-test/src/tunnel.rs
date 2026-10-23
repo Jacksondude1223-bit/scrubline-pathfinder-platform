@@ -24,6 +24,10 @@ pub fn rate_mbps(t: &Tunnel) -> i64 {
 }
 /// The MTU of a node-to-node tunnel: GRE without a key over a 1500-byte path.
 pub const BACKHAUL_MTU: i64 = 1476;
+/// The largest segment that fits a node-to-node tunnel carrying these prefixes.
+pub fn backhaul_clamp(prefixes: &[String]) -> i64 {
+    BACKHAUL_MTU - if carries_v6(prefixes) { 60 } else { 40 }
+}
 /// The interface a node-to-node tunnel to `peer` compiles to: a digest of the node id, since ids
 /// are longer than the kernel's 15 characters and any truncation of them could collide.
 pub fn backhaul_name(peer: &str) -> String {
@@ -352,8 +356,9 @@ pub fn backhaul_commands(backhaul: &[Backhaul], pinned: &[String]) -> Result<Vec
     }
     Ok(lines)
 }
-/// The firewall for tunnels: GRE and IPIP are accepted only from the addresses this node has
-/// tunnels with. Tunnel endpoints are IPv4, so neither is accepted over IPv6 at all.
+/// The firewall for tunnels: GRE and IPIP (protocols 47 and 4, by number, so the ruleset does
+/// not depend on /etc/protocols) are accepted only from the addresses this node has tunnels with.
+/// Tunnel endpoints are IPv4, so neither is accepted over IPv6 at all.
 pub fn firewall_commands(peers: &[String]) -> Result<Vec<String>> {
     let mut allowed = Vec::new();
     for p in peers {
@@ -362,10 +367,10 @@ pub fn firewall_commands(peers: &[String]) -> Result<Vec<String>> {
     allowed.sort();
     allowed.dedup();
     let mut lines = vec![if allowed.is_empty() {
-        "nft add rule inet scrubline input meta l4proto { gre, ipencap } drop".to_string()
+        "nft add rule inet scrubline input meta l4proto { 47, 4 } drop".to_string()
     } else {
         format!(
-            "nft add rule inet scrubline input meta l4proto {{ gre, ipencap }} ip saddr != {{ {} }} drop",
+            "nft add rule inet scrubline input meta l4proto {{ 47, 4 }} ip saddr != {{ {} }} drop",
             allowed
                 .iter()
                 .map(Ipv4Addr::to_string)
@@ -374,8 +379,7 @@ pub fn firewall_commands(peers: &[String]) -> Result<Vec<String>> {
         )
     }];
     lines.push(
-        "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { gre, ipencap } drop"
-            .into(),
+        "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { 47, 4 } drop".into(),
     );
     Ok(lines)
 }
@@ -387,7 +391,13 @@ pub fn render(prog: &Program) -> Result<Vec<String>> {
     let mut lines = commands(&prog.tunnels)?;
     lines.extend(backhaul_commands(&prog.backhaul, &prog.pinned)?);
     lines.extend(reply_commands(&prog.tunnels)?);
-    lines.extend(firewall_commands(&prog.tunnel_peers)?);
+    // The ends of this node's own tunnels are always peers, whatever the list from the control
+    // plane says: one from before the list existed sends none, and that is no reason to cut
+    // this node's customers off.
+    let mut peers = prog.tunnel_peers.clone();
+    peers.extend(prog.tunnels.iter().map(|t| t.remote.clone()));
+    peers.extend(prog.backhaul.iter().map(|b| b.remote.clone()));
+    lines.extend(firewall_commands(&peers)?);
     lines.extend(rate_commands(&prog.tunnels)?);
     Ok(lines)
 }

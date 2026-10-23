@@ -779,9 +779,161 @@ fn backhaul_and_the_tunnel_firewall_render() {
     assert_eq!(
         tunnel::firewall_commands(&["198.18.0.9".into(), "192.0.2.1".into()]).unwrap(),
         [
-            "nft add rule inet scrubline input meta l4proto { gre, ipencap } ip saddr != { 192.0.2.1, 198.18.0.9 } drop",
-            "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { gre, ipencap } drop",
+            "nft add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != { 192.0.2.1, 198.18.0.9 } drop",
+            "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { 47, 4 } drop",
         ]
     );
     assert!(tunnel::firewall_commands(&["not-an-address".into()]).is_err());
+}
+#[test]
+fn a_prefix_steered_away_from_the_location_is_neither_forwarded_nor_admitted_there() {
+    let p = Policy {
+        protected: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
+        steering: vec![Steering {
+            prefix: "198.51.100.0/24".into(),
+            regions: vec!["us".into()],
+            ..Default::default()
+        }],
+        tunnels: vec![Tunnel {
+            id: "nw".into(),
+            remote: "198.18.0.9".into(),
+            prefixes: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
+            node: "lhr".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let nodes: Vec<Node> = [("lhr", "eu", "192.0.2.1"), ("nyc", "us", "192.0.2.3")]
+        .iter()
+        .map(|(id, region, src)| Node {
+            tunnel_src: src.to_string(),
+            ..node(id, region, 100.0, "")
+        })
+        .collect();
+    let why = compiler::misplaced(&p, &nodes[0], &p.tunnels[0]).unwrap();
+    assert!(why.contains("198.51.100.0/24"), "{why}");
+    assert!(
+        compiler::misplaced(&p, &nodes[1], &p.tunnels[0]).is_none(),
+        "nyc may carry both"
+    );
+    let overflowing = std::collections::HashSet::from(["lhr".to_string()]);
+    let plan = compiler::plan_with(&p, &nodes, &HashMap::new(), &HashMap::new(), &overflowing);
+    assert_eq!(row(&plan, "nyc", "203.0.113.0/24").state, "announce");
+    let dark = row(&plan, "nyc", "198.51.100.0/24");
+    assert_eq!(dark.state, "withdraw");
+    assert!(
+        dark.reason
+            .contains("outside this prefix's steering regions"),
+        "{}",
+        dark.reason
+    );
+    let programs = compiler::compile(&p, &nodes, &plan);
+    let lhr = &programs["lhr"];
+    assert_eq!(lhr.tunnels[0].prefixes, ["203.0.113.0/24"]);
+    assert_eq!(lhr.pinned, ["203.0.113.0/24"], "nothing lhr cannot deliver");
+    assert_eq!(programs["nyc"].backhaul[0].prefixes, ["203.0.113.0/24"]);
+}
+#[test]
+fn what_reaches_a_location_over_backhaul_fits_back_down_the_customers_tunnel() {
+    let (mut p, nodes) = pinned_fabric();
+    let clamp = |p: &Policy| {
+        let plan = compiler::plan(p, &nodes, &HashMap::new(), &HashMap::new());
+        let t = &compiler::compile(p, &nodes, &plan)["lhr"].tunnels[0];
+        (t.mtu, t.mss_clamp)
+    };
+    // GRE carrying IPv6: the tunnel and the backhaul take the same segments.
+    assert_eq!(clamp(&p), (1476, 1416));
+    // IPIP takes 4 bytes more than node-to-node GRE does, so a pinned IPIP tunnel clamps to what
+    // the backhaul carries. Fanned out, nothing reaches it over a backhaul.
+    p.protected = vec!["203.0.113.0/24".into()];
+    p.tunnels[0].prefixes = vec!["203.0.113.0/24".into()];
+    p.tunnels[0].r#type = "ipip".into();
+    assert_eq!(clamp(&p), (1480, 1436));
+    p.tunnels[0].node.clear();
+    assert_eq!(clamp(&p), (1480, 1440));
+    // A key costs GRE 4 bytes, so a keyed tunnel already clamps below the backhaul.
+    p.tunnels[0].r#type = "gre".into();
+    p.tunnels[0].key = 42;
+    p.tunnels[0].node = "lhr".into();
+    assert_eq!(clamp(&p), (1472, 1432));
+}
+#[test]
+fn a_program_from_before_tunnel_peers_still_accepts_its_own_tunnels() {
+    let prog = Program {
+        tunnels: vec![node_tunnel("nw", &["203.0.113.0/24"], "both")],
+        backhaul: vec![Backhaul {
+            peer: "lhr".into(),
+            interface: tunnel::backhaul_name("lhr"),
+            local: "192.0.2.2".into(),
+            remote: "192.0.2.9".into(),
+            mtu: 1476,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(prog.tunnel_peers.is_empty());
+    let lines = tunnel::render(&prog).unwrap();
+    assert!(lines.contains(
+        &"nft add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != { 192.0.2.9, 198.51.100.1 } drop"
+            .to_string()
+    ), "{lines:#?}");
+}
+#[test]
+fn the_provisioner_accepts_everything_the_agent_renders() {
+    let (mut p, mut nodes) = pinned_fabric();
+    p.protected.extend([
+        "198.51.100.0/24".to_string(),
+        "198.51.100.128/25".to_string(),
+        "100.64.0.0/16".to_string(),
+    ]);
+    p.tunnels.extend([
+        Tunnel {
+            id: "contoso".into(),
+            remote: "198.18.0.10".into(),
+            key: 4_294_967_295,
+            prefixes: vec!["198.51.100.0/24".into()],
+            comment: "Contoso; rm -rf / \"quoted\"".into(),
+            rate_mbps: 1,
+            ..Default::default()
+        },
+        Tunnel {
+            id: "fabrikam".into(),
+            r#type: "ipip".into(),
+            remote: "198.18.0.11".into(),
+            prefixes: vec!["198.51.100.128/25".into()],
+            direction: "return".into(),
+            mtu: 1400,
+            ..Default::default()
+        },
+        Tunnel {
+            id: "tailspin".into(),
+            remote: "198.18.0.12".into(),
+            key: 7,
+            prefixes: vec!["100.64.0.0/16".into()],
+            node: "sin".into(),
+            disabled: vec!["fra".into()],
+            ..Default::default()
+        },
+    ]);
+    nodes.push(Node {
+        tunnel_src: String::new(),
+        ..node("bare", "bare", 10.0, "")
+    });
+    validation::policy(&Policy {
+        name: "everything".into(),
+        ..p.clone()
+    })
+    .unwrap();
+    let overflowing = std::collections::HashSet::from(["lhr".to_string()]);
+    let plan = compiler::plan_with(&p, &nodes, &HashMap::new(), &HashMap::new(), &overflowing);
+    for (id, prog) in compiler::compile(&p, &nodes, &plan) {
+        let lines = tunnel::render(&prog).unwrap();
+        let desired = pathfinder::provision::Desired {
+            tunnels: prog.tunnels.clone(),
+            lines: lines.clone(),
+            error: String::new(),
+        };
+        let pass = pathfinder::provision::plan(&desired, &Default::default());
+        assert!(pass.is_ok(), "{id}: {:?}\n{lines:#?}", pass.err());
+    }
 }

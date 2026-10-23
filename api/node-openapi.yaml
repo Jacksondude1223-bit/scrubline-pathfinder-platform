@@ -136,7 +136,8 @@ paths:
 
         Node-to-node tunnels (`sbh-*`) carry what other nodes scrub for customers pinned to this one, and
         what this one scrubs for customers pinned elsewhere; what arrives over them must be addressed to a
-        customer pinned here. The firewall accepts GRE and IPIP only from the addresses in `tunnel_peers`.
+        customer pinned here. The firewall accepts GRE and IPIP only from the addresses in `tunnel_peers`
+        and the remote ends of the tunnels in `tunnels` and `backhaul`.
 
 
         Every customer tunnel then gets a `tc` token-bucket shaper holding what goes down it to this
@@ -161,6 +162,14 @@ paths:
       responses:
         '500':
           description: The text format was asked for and the configuration could not be rendered. It is an error, not an empty body, so a daemon fed from it never mistakes a failure for an empty plan; the JSON form carries the same reason in `error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: The agent has not had a program from the control plane since it started, so it
+            does not know what this node should hold. A provisioner leaves the box as it is rather than
+            take this for an empty plan.
           content:
             application/json:
               schema:
