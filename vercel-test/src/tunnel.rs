@@ -22,6 +22,21 @@ pub fn rate_mbps(t: &Tunnel) -> i64 {
         t.rate_mbps
     }
 }
+/// The MTU of a node-to-node tunnel: GRE without a key over a 1500-byte path.
+pub const BACKHAUL_MTU: i64 = 1476;
+/// The largest segment that fits a node-to-node tunnel carrying these prefixes.
+pub fn backhaul_clamp(prefixes: &[String]) -> i64 {
+    BACKHAUL_MTU - if carries_v6(prefixes) { 60 } else { 40 }
+}
+/// The interface a node-to-node tunnel to `peer` compiles to: a digest of the node id, since ids
+/// are longer than the kernel's 15 characters and any truncation of them could collide.
+pub fn backhaul_name(peer: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "sbh-{}",
+        &hex::encode(Sha256::digest(peer.as_bytes()))[..11]
+    )
+}
 pub fn default_mtu(t: &Tunnel) -> i64 {
     1500 - overhead(t)
 }
@@ -289,6 +304,101 @@ pub fn rate_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
             t.rate_kbps
         ));
     }
+    Ok(lines)
+}
+/// The node-to-node tunnels, the routes into them, and what may arrive over them: clean traffic
+/// for the customers pinned to this node, and nothing else, so another node, or anyone who can
+/// forge one, cannot relay through this one.
+pub fn backhaul_commands(backhaul: &[Backhaul], pinned: &[String]) -> Result<Vec<String>> {
+    let mut rows: Vec<_> = backhaul.iter().collect();
+    rows.sort_by_key(|b| &b.interface);
+    let mut lines = Vec::new();
+    for b in &rows {
+        let name = &b.interface;
+        if name.len() != 15
+            || !name.starts_with("sbh-")
+            || !name[4..].bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err(format!("invalid backhaul interface {name:?}"));
+        }
+        let local = b.local.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
+        let remote = b.remote.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
+        if local == remote {
+            return Err("local and remote endpoints are the same".into());
+        }
+        if b.mtu < 576 {
+            return Err("MTU below the IPv4 minimum".into());
+        }
+        lines.push(format!(
+            "ip link add {name} type gre local {local} remote {remote}"
+        ));
+        lines.push(format!("ip link set {name} mtu {} up", b.mtu));
+        for net in nets(&b.prefixes)? {
+            lines.push(format!("ip route replace {net} dev {name}"));
+        }
+        if b.mss_clamp > 0 {
+            lines.push(format!("nft add rule inet scrubline forward oifname \"{name}\" tcp flags syn tcp option maxseg size set {}", b.mss_clamp));
+        }
+    }
+    if !rows.is_empty() {
+        let pinned = nets(pinned)?;
+        for (family, match_on, v4) in [("ipv4", "ip", true), ("ipv6", "ip6", false)] {
+            let allowed = outermost(&pinned, v4);
+            lines.push(if allowed.is_empty() {
+                format!("nft add rule inet scrubline forward iifname \"sbh-*\" meta nfproto {family} drop")
+            } else {
+                format!(
+                    "nft add rule inet scrubline forward iifname \"sbh-*\" {match_on} daddr != {{ {} }} drop",
+                    listed(&allowed)
+                )
+            });
+        }
+    }
+    Ok(lines)
+}
+/// The firewall for tunnels: GRE and IPIP (protocols 47 and 4, by number, so the ruleset does
+/// not depend on /etc/protocols) are accepted only from the addresses this node has tunnels with.
+/// Tunnel endpoints are IPv4, so neither is accepted over IPv6 at all.
+pub fn firewall_commands(peers: &[String]) -> Result<Vec<String>> {
+    let mut allowed = Vec::new();
+    for p in peers {
+        allowed.push(p.parse::<Ipv4Addr>().map_err(|e| e.to_string())?);
+    }
+    allowed.sort();
+    allowed.dedup();
+    let mut lines = vec![if allowed.is_empty() {
+        "nft add rule inet scrubline input meta l4proto { 47, 4 } drop".to_string()
+    } else {
+        format!(
+            "nft add rule inet scrubline input meta l4proto {{ 47, 4 }} ip saddr != {{ {} }} drop",
+            allowed
+                .iter()
+                .map(Ipv4Addr::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }];
+    lines.push(
+        "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { 47, 4 } drop".into(),
+    );
+    Ok(lines)
+}
+/// Everything a node's program asks of the box for its tunnels, in the order it applies: the
+/// customer tunnels and the node-to-node ones with their routes, then the forwarding and firewall
+/// rules, then the shapers. The rules assume the `inet scrubline` table with its `forward` and
+/// `input` chains, which the provisioner creates.
+pub fn render(prog: &Program) -> Result<Vec<String>> {
+    let mut lines = commands(&prog.tunnels)?;
+    lines.extend(backhaul_commands(&prog.backhaul, &prog.pinned)?);
+    lines.extend(reply_commands(&prog.tunnels)?);
+    // The ends of this node's own tunnels are always peers, whatever the list from the control
+    // plane says: one from before the list existed sends none, and that is no reason to cut
+    // this node's customers off.
+    let mut peers = prog.tunnel_peers.clone();
+    peers.extend(prog.tunnels.iter().map(|t| t.remote.clone()));
+    peers.extend(prog.backhaul.iter().map(|b| b.remote.clone()));
+    lines.extend(firewall_commands(&peers)?);
+    lines.extend(rate_commands(&prog.tunnels)?);
     Ok(lines)
 }
 pub fn commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {

@@ -10,6 +10,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+/// How long a node may go without heartbeating before it is stale.
+pub const STALE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
@@ -215,7 +217,7 @@ impl Store {
             .map(|n| self.effective(n.clone()))
             .collect();
         for n in &mut ns {
-            n.status = if now.signed_duration_since(n.last_seen).num_milliseconds() > 30000 {
+            n.status = if now.signed_duration_since(n.last_seen) > STALE_AFTER {
                 "stale"
             } else {
                 "ready"
@@ -261,7 +263,7 @@ impl Store {
             n.backends = vec!["asic".into(), "fpga".into(), "zc".into()];
         }
         if let Some(old) = self.data.nodes.iter().find(|o| o.id == n.id) {
-            if now.signed_duration_since(old.last_seen).num_milliseconds() <= 30000
+            if now.signed_duration_since(old.last_seen) <= STALE_AFTER
                 && !old.advertise.is_empty()
                 && !n.advertise.is_empty()
                 && old.advertise != n.advertise

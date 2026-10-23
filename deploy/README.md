@@ -3,7 +3,8 @@
 A single-host fabric you can point a client at: a control plane, three
 scrubbers in three regions, a policy protecting two customers, and traffic
 being driven through the datapath so the analytics have something real to
-report.
+report. To install on real servers, with tunnels built on each scrubbing node,
+see [docs/install.md](../docs/install.md) instead.
 
 ```sh
 cp deploy/.env.example deploy/.env

@@ -145,6 +145,18 @@ with tempfile.TemporaryDirectory() as temporary:
                      if line.startswith('tc qdisc replace dev scr-customer root tbf rate ')]
             return rates and 0 < rates[0] <= 100000 and text
         wait_for(lambda: shaped(call(local, '/tunnels?format=iproute2', token=LOCAL)))
+        # The panel pins the customer's tunnel to this node, which then holds the whole
+        # allowance; the provisioner, dry-run, shows what it would put on the box for it.
+        call(base, '/v1/tunnels/customer/location', 'PUT', OP, {'node':'node-none'}, expected=400)
+        pinned = call(base, '/v1/tunnels/customer/location', 'PUT', OP, {'node':runtime_id})
+        assert pinned['tunnel']['node'] == runtime_id, pinned
+        def provisioned():
+            run = subprocess.run([str(BIN / 'scrub-provision'), '-agent', local, '-once', '-dry-run'],
+                                 cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=30)
+            return run.returncode == 0 and 'tbf rate 100000kbit' in run.stdout and run.stdout
+        planned = wait_for(provisioned)
+        assert 'ip link add scr-customer type gre local 192.0.2.30 remote 192.0.2.100' in planned, planned
+        assert 'add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != {' in planned, planned
         call(local, '/tunnels', 'POST', LOCAL,
              {'tunnels':[{'tunnel_id':'customer','state':'up'}]})
         wait_for(lambda: any(a['node_id']==runtime_id and a['state']=='announce'

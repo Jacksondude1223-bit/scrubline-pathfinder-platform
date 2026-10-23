@@ -33,6 +33,9 @@ pub struct Agent {
     // Prefixes this node announced that have since left its plan, kept as withdrawals: ExaBGP
     // holds a route until told otherwise, and the pipeline no longer scrubs what it attracts.
     retired: BTreeMap<String, Announcement>,
+    // Whether a program from the control plane has been installed. Until one has, the agent
+    // knows nothing about this node's tunnels, and an empty answer would read as "none".
+    installed: bool,
 }
 type Shared = Arc<Mutex<Agent>>;
 fn json_response(code: u16, v: Value) -> Response {
@@ -105,6 +108,7 @@ impl Agent {
             })
         });
         self.pipe.load(prog);
+        self.installed = true;
     }
     /// This node with the tunnel endpoint the control plane holds for it, which an operator may
     /// have reassigned since the agent registered.
@@ -197,13 +201,13 @@ impl Agent {
                 )
             }
             ("GET", "/tunnels") => {
-                let tunnels = &self.pipe.program.tunnels;
-                let rendered_all = tunnel::commands(tunnels).and_then(|mut lines| {
-                    lines.extend(tunnel::reply_commands(tunnels)?);
-                    lines.extend(tunnel::rate_commands(tunnels)?);
-                    Ok(lines)
-                });
-                let (commands, err) = match rendered_all {
+                if !self.installed {
+                    // A provisioner would take an empty answer as "build nothing" and tear down
+                    // what the box holds.
+                    return error(503, "no program from the control plane yet");
+                }
+                let prog = &self.pipe.program;
+                let (commands, err) = match tunnel::render(prog) {
                     Ok(v) => (v, String::new()),
                     Err(e) => (vec![], e),
                 };
@@ -212,7 +216,7 @@ impl Agent {
                 }
                 json_response(
                     200,
-                    json!({"node":self.node.id,"tunnels":self.pipe.program.tunnels,"iproute2":commands,"status":self.health,"error":err}),
+                    json!({"node":self.node.id,"tunnels":prog.tunnels,"backhaul":prog.backhaul,"pinned":prog.pinned,"tunnel_peers":prog.tunnel_peers,"iproute2":commands,"status":self.health,"error":err}),
                 )
             }
             ("POST", "/tunnels") => {
@@ -468,6 +472,7 @@ pub async fn run() -> Result<()> {
         local_as,
         next_hop,
         retired: BTreeMap::new(),
+        installed: false,
     }));
     let s = state.clone();
     tokio::spawn(async move {
@@ -567,6 +572,7 @@ mod tests {
             local_as: 0,
             next_hop: String::new(),
             retired: BTreeMap::new(),
+            installed: false,
         }
     }
     fn row(prefix: &str, prepends: i64) -> Announcement {
@@ -611,6 +617,14 @@ mod tests {
         assert_eq!(call(&mut a, "GET", "/bgp?format=exabgp", b""), 500);
         a.local_as = 64512;
         assert_eq!(call(&mut a, "GET", "/bgp?format=exabgp", b""), 200);
+    }
+    #[test]
+    fn tunnels_wait_for_the_first_program() {
+        let mut a = agent(vec![]);
+        assert_eq!(call(&mut a, "GET", "/tunnels", b""), 503);
+        assert_eq!(call(&mut a, "GET", "/tunnels?format=iproute2", b""), 503);
+        a.install(Program::default());
+        assert_eq!(call(&mut a, "GET", "/tunnels", b""), 200);
     }
     #[test]
     fn duplicate_tunnel_reports_are_refused() {
@@ -673,6 +687,7 @@ mod tests {
                 rate_kbps: 833333,
                 ..Default::default()
             }],
+            tunnel_peers: vec!["198.51.100.1".into()],
             ..Default::default()
         });
         let mut headers = HeaderMap::new();
@@ -695,6 +710,8 @@ mod tests {
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" ip saddr != { 203.0.113.0/24 } drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" meta nfproto ipv6 drop",
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
+                "nft add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != { 198.51.100.1 } drop",
+                "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { 47, 4 } drop",
                 "tc qdisc replace dev scr-northwind root tbf rate 833333kbit burst 1041666 latency 50ms",
             ]
         );

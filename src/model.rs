@@ -356,6 +356,17 @@ pub struct Program {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub tunnel_src: String,
+    /// Tunnels to the other nodes, for customers pinned to one of them or to this one.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub backhaul: Vec<Backhaul>,
+    /// Prefixes of the customers pinned to this node: what traffic arriving over a backhaul may
+    /// be addressed to.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub pinned: Vec<String>,
+    /// Every address this node accepts tunnels from: the other nodes' tunnel endpoints and the
+    /// customer end of each tunnel built here. The firewall drops GRE and IPIP from anywhere else.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub tunnel_peers: Vec<String>,
     #[serde(deserialize_with = "null_time")]
     pub compiled_at: DateTime<Utc>,
 }
@@ -378,6 +389,9 @@ impl Default for Program {
             tunnels: Vec::new(),
             sessions: Vec::new(),
             tunnel_src: Default::default(),
+            backhaul: Vec::new(),
+            pinned: Vec::new(),
+            tunnel_peers: Vec::new(),
             compiled_at: zero_time(),
         }
     }
@@ -530,6 +544,36 @@ pub struct Tunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub rate_mbps: i64,
+    /// The node (id) the customer's tunnel ends on: the location chosen for them, so they hold
+    /// one tunnel. Only it announces the prefixes until it is overloaded or down; then the other
+    /// nodes join in and forward what they scrub to it. Empty fans the tunnel out to every node
+    /// carrying the prefixes instead.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub node: String,
+}
+
+/// A node-to-node GRE tunnel. A node that helps another with a customer pinned there forwards
+/// the clean traffic it scrubs over one, and the location receives it on its own end.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Backhaul {
+    #[serde(deserialize_with = "null_default")]
+    pub peer: String,
+    #[serde(deserialize_with = "null_default")]
+    pub interface: String,
+    #[serde(deserialize_with = "null_default")]
+    pub local: String,
+    #[serde(deserialize_with = "null_default")]
+    pub remote: String,
+    #[serde(deserialize_with = "null_default")]
+    pub mtu: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub mss_clamp: i64,
+    /// Prefixes routed into it: those pinned at the peer that this node carries. Empty on the
+    /// location's end, which only receives.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

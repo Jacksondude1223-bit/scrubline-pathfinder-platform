@@ -130,12 +130,23 @@ paths:
         A tunnel whose direction is both also gets forwarding rules for the customer''s replies coming
         back up it: only sources inside the tunnel''s own prefixes pass, per address family, less any more
         specific prefix of another tunnel inside them (whose customer an address is goes by the most specific
-        prefix, as routing does), and their SYNs are MSS-clamped like those going down. A return tunnel forwards nothing that comes up it. They assume the `inet scrubline`
-        table and its `forward` chain exist, as the MSS clamp already does.
+        prefix, as routing does), and their SYNs are MSS-clamped like those going down. A return tunnel
+        forwards nothing that comes up it.
 
 
-        Every tunnel then gets a `tc` token-bucket shaper holding what goes down it to this node''s share
-        of the tunnel''s clean-traffic allowance.
+        Node-to-node tunnels (`sbh-*`) carry what other nodes scrub for customers pinned to this one, and
+        what this one scrubs for customers pinned elsewhere; what arrives over them must be addressed to a
+        customer pinned here. The firewall accepts GRE and IPIP only from the addresses in `tunnel_peers`
+        and the remote ends of the tunnels in `tunnels` and `backhaul`.
+
+
+        Every customer tunnel then gets a `tc` token-bucket shaper holding what goes down it to this
+        node''s share of the tunnel''s clean-traffic allowance: all of it at a pinned tunnel''s location.
+
+
+        The rules assume the `inet scrubline` table with `forward` and `input` chains. The provisioner the
+        install script sets up beside the agent creates it, applies all of this every few seconds, and
+        posts back which tunnels it built.
 
 
         `?format=iproute2` returns the configuration as plain text instead of JSON.'
@@ -155,6 +166,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          description: The agent has not had a program from the control plane since it started, so it
+            does not know what this node should hold. A provisioner leaves the box as it is rather than
+            take this for an empty plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '200':
           description: The return paths, their rendered configuration, and what has been reported about
             them.
@@ -169,10 +188,26 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/NodeTunnel'
+                  backhaul:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Backhaul'
+                    description: Node-to-node tunnels for customers pinned to this node or to another.
+                  pinned:
+                    type: array
+                    items:
+                      type: string
+                    description: Prefixes of the customers pinned to this node.
+                  tunnel_peers:
+                    type: array
+                    items:
+                      type: string
+                    description: Addresses this node accepts GRE and IPIP from.
                   iproute2:
                     type: array
                     items:
                       type: string
+                    description: Everything above as commands, in the order they apply.
                   status:
                     type: array
                     items:
@@ -645,6 +680,29 @@ components:
           type: string
           description: Set when the plan could not be rendered. The datapath keeps running, but this node
             is advertising something other than what the control plane decided.
+    Backhaul:
+      type: object
+      description: A node-to-node GRE tunnel, over which a node helping another forwards the clean traffic
+        it scrubs for a customer pinned there.
+      properties:
+        peer:
+          type: string
+        interface:
+          type: string
+          example: sbh-b981c02c78d
+        local:
+          type: string
+        remote:
+          type: string
+        mtu:
+          type: integer
+        mss_clamp:
+          type: integer
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: What is routed into it. Empty on the location's end, which only receives.
     NodeTunnel:
       type: object
       description: One node's instance of a policy Tunnel, with the local end filled in and the derived

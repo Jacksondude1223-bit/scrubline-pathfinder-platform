@@ -7,6 +7,10 @@ pub const LOW_WATERMARK: f64 = 0.50;
 pub const MIN_DWELL: Duration = Duration::seconds(30);
 pub const MAX_ESCALATION: i64 = 3;
 pub const REPORT_FRESHNESS: Duration = Duration::seconds(15);
+/// How long the fabric keeps helping a node with its pinned customers after it was last measured
+/// overloaded. Help moves traffic off it, which brings its load down; ending help the moment it
+/// recovers would put the traffic straight back and flap the routes with every swing.
+pub const OVERFLOW_HOLD: Duration = Duration::minutes(5);
 #[derive(Debug, Clone, Default)]
 pub struct Sample {
     pub node_id: String,
