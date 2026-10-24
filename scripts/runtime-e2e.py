@@ -7,6 +7,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -240,7 +241,16 @@ with tempfile.TemporaryDirectory() as temporary:
         wait_for(lambda: any(a['node_id']==runtime_id and a['state']=='withdraw'
                              and 'down' in a['reason']
                              for a in call(base,'/v1/fabric',token=OP)['announcements']))
-        stop(api)
+        # A request for a node's program waits at the control plane for the next one; stopping
+        # answers it rather than holding up the shutdown until it times out.
+        held=call(base,f'/v1/nodes/{runtime_id}/program',token=OP)['compiled_at']
+        answered=[]
+        waiter=threading.Thread(target=lambda:answered.append(call(
+            base,f'/v1/nodes/{runtime_id}/program?wait=30s&since={held}',token=OP)))
+        waiter.start(); time.sleep(0.5)
+        stopping=time.monotonic(); stop(api)
+        assert time.monotonic()-stopping<5, 'a held request delayed the shutdown'
+        waiter.join(); assert answered and answered[0]['compiled_at']==held, answered
         api=start('scrub-api','-addr',f'127.0.0.1:{api_port}','-state',state)
         wait_for(lambda:call(base,'/health'))
         assert call(base,'/v1/tenants',token=OP)[0]['id']==tenant['id']

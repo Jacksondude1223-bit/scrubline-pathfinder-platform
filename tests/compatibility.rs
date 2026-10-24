@@ -140,6 +140,8 @@ fn steering_matches_go_dwell_recovery_and_burst_holds() {
                 capacity_pps: round["capacity"].as_i64().unwrap(),
                 pulsing: round["pulsing"].as_bool().unwrap(),
                 fresh: round["fresh"].as_bool().unwrap(),
+                // Go reports no surge rate, and without one shedding goes by the mean, as there.
+                surge_pps: 0,
             }],
             at,
         );

@@ -1,9 +1,10 @@
-//! Node agent: local API, authenticated enrollment, heartbeats and program/model polling.
+//! Node agent: local API, authenticated enrollment, heartbeats, program delivery and model polling.
 use crate::{
     bgp, ml,
     model::*,
     pipeline::Pipeline,
     runtime::{self, Flags},
+    steering,
     telemetry::Metrics,
     tunnel, Result,
 };
@@ -36,6 +37,12 @@ pub struct Agent {
     // Whether a program from the control plane has been installed. Until one has, the agent
     // knows nothing about this node's tunnels, and an empty answer would read as "none".
     installed: bool,
+    // The credential the control plane issued this node, replaced when it enrols again.
+    token: String,
+    // Wakes the heartbeat loop when the last second's load crosses the mark at which the fabric
+    // starts helping, and whether it was past that mark when last looked at.
+    surge: Arc<tokio::sync::Notify>,
+    surging: bool,
 }
 type Shared = Arc<Mutex<Agent>>;
 fn json_response(code: u16, v: Value) -> Response {
@@ -128,6 +135,17 @@ impl Agent {
             }
         }
         rows
+    }
+    /// Tells the heartbeat loop when a surge starts, so the control plane hears of it now rather
+    /// than at the next heartbeat. It tells once per surge: the load has to drop back below the
+    /// mark before it tells again.
+    fn watch_surge(&mut self, now: i64) {
+        let mark = steering::HIGH_WATERMARK * self.node.capacity_pps as f64;
+        let surging = self.node.capacity_pps > 0 && self.pipe.surge(now) as f64 >= mark;
+        if surging && !self.surging {
+            self.surge.notify_one();
+        }
+        self.surging = surging;
     }
     fn report(&mut self) -> Value {
         json!({"node_id":self.node.id,"name":self.node.name,"region":self.node.region,"stats":self.pipe.stats(chrono::Utc::now().timestamp_millis()),"reported_at":chrono::Utc::now()})
@@ -314,6 +332,7 @@ impl Agent {
                 } else {
                     let mut d = self.pipe.decide(&flow, ms);
                     d.node_id = self.node.id.clone();
+                    self.watch_surge(ms);
                     json_response(200, serde_json::to_value(d).unwrap())
                 }
             }
@@ -370,8 +389,17 @@ async fn fetch<T: serde::de::DeserializeOwned>(
     url: &str,
     token: &str,
 ) -> Result<T> {
+    fetch_with(client, url, token, &[]).await
+}
+async fn fetch_with<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    query: &[(&str, &str)],
+) -> Result<T> {
     let r = client
         .get(url)
+        .query(query)
         .bearer_auth(token)
         .send()
         .await
@@ -380,6 +408,52 @@ async fn fetch<T: serde::de::DeserializeOwned>(
         return Err(format!("fetch: {}", r.status()));
     }
     r.json().await.map_err(|e| e.to_string())
+}
+/// How long a request for this node's program waits at the control plane for a new one.
+const PROGRAM_WAIT: Duration = Duration::from_secs(20);
+/// The least time between two heartbeats that surges call for, however often they start.
+const SURGE_GAP: Duration = Duration::from_secs(1);
+/// Keeps the node on the program the control plane last compiled for it. Each request waits at
+/// the control plane until the program differs from the one installed, so a new one is installed
+/// as soon as it is compiled rather than at the next poll.
+async fn programs(s: Shared, client: reqwest::Client, api: String) {
+    loop {
+        let (id, token, since) = {
+            let a = s.lock().unwrap();
+            let since = if a.installed {
+                let at = a.pipe.program.compiled_at;
+                at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+            } else {
+                String::new()
+            };
+            (a.node.id.clone(), a.token.clone(), since)
+        };
+        let asked = tokio::time::Instant::now();
+        let wait = format!("{}s", PROGRAM_WAIT.as_secs());
+        let url = format!("{api}/v1/nodes/{id}/program");
+        let query = [("wait", wait.as_str()), ("since", since.as_str())];
+        let installed = match fetch_with::<Program>(&client, &url, &token, &query).await {
+            Ok(prog) => {
+                let mut a = s.lock().unwrap();
+                // A program fetched for the id this node had before it enrolled again is not its own.
+                let new = a.node.id == id
+                    && (prog.policy_id != a.pipe.program.policy_id
+                        || prog.version != a.pipe.program.version
+                        || prog.compiled_at != a.pipe.program.compiled_at);
+                if new {
+                    a.install(prog);
+                }
+                new
+            }
+            Err(_) => false,
+        };
+        // Nothing new is a wait that ran out, a failure, or a control plane that answers at once.
+        // Counted from when the request went out, the pause lets the first ask again straight
+        // away, and keeps the others from asking in a tight loop.
+        if !installed {
+            tokio::time::sleep_until(asked + runtime::jitter(Duration::from_secs(2))).await;
+        }
+    }
 }
 pub async fn run() -> Result<()> {
     let f = Flags::parse(&[
@@ -459,29 +533,38 @@ pub async fn run() -> Result<()> {
         }
     }
     let reg = registered.unwrap();
-    let node = reg.node;
-    let mut token = reg.token;
+    let surge = Arc::new(tokio::sync::Notify::new());
     let state = Arc::new(Mutex::new(Agent {
         pipe: Pipeline::new(Program {
-            node_id: node.id.clone(),
+            node_id: reg.node.id.clone(),
             ..Default::default()
         }),
-        node,
+        node: reg.node,
         local_token,
         health: vec![],
         local_as,
         next_hop,
         retired: BTreeMap::new(),
         installed: false,
+        token: reg.token,
+        surge: surge.clone(),
+        surging: false,
     }));
+    let waiting = runtime::client(f.get("ca"), PROGRAM_WAIT + Duration::from_secs(10))?;
+    tokio::spawn(programs(state.clone(), waiting, api.clone()));
     let s = state.clone();
     tokio::spawn(async move {
+        let mut surged: Option<tokio::time::Instant> = None;
         loop {
-            let (id, stats, health) = {
+            let (id, mut token, stats, health) = {
                 let mut a = s.lock().unwrap();
+                let now = chrono::Utc::now().timestamp_millis();
+                // A surge that has passed lets the next one wake this loop again.
+                a.watch_surge(now);
                 (
                     a.node.id.clone(),
-                    a.pipe.stats(chrono::Utc::now().timestamp_millis()),
+                    a.token.clone(),
+                    a.pipe.stats(now),
                     a.health.clone(),
                 )
             };
@@ -496,7 +579,9 @@ pub async fn run() -> Result<()> {
                     match enroll(&client, &api, &enroll_token, &desired).await {
                         Ok(reg) => {
                             token = reg.token;
-                            s.lock().unwrap().node = reg.node;
+                            let mut a = s.lock().unwrap();
+                            a.token = token.clone();
+                            a.node = reg.node;
                         }
                         Err(e) => eprintln!("re-enroll: {e}"),
                     }
@@ -504,17 +589,6 @@ pub async fn run() -> Result<()> {
                 Ok(r) if !r.status().is_success() => eprintln!("heartbeat: {}", r.status()),
                 Err(e) => eprintln!("heartbeat: {e}"),
                 _ => {}
-            }
-            if let Ok(prog) =
-                fetch::<Program>(&client, &format!("{api}/v1/nodes/{id}/program"), &token).await
-            {
-                let mut a = s.lock().unwrap();
-                if prog.policy_id != a.pipe.program.policy_id
-                    || prog.version != a.pipe.program.version
-                    || prog.compiled_at != a.pipe.program.compiled_at
-                {
-                    a.install(prog);
-                }
             }
             if let Ok(model) =
                 fetch::<ml::Model>(&client, &format!("{api}/v1/ml/model"), &token).await
@@ -526,7 +600,17 @@ pub async fn run() -> Result<()> {
                     a.pipe.model = ml::Model::default();
                 }
             }
-            tokio::time::sleep(runtime::jitter(Duration::from_secs(2))).await;
+            // The next heartbeat is due in about two seconds, or as soon as a surge starts, though
+            // no sooner than SURGE_GAP after the last one a surge called for.
+            tokio::select! {
+                _ = tokio::time::sleep(runtime::jitter(Duration::from_secs(2))) => {}
+                _ = surge.notified() => {
+                    if let Some(at) = surged {
+                        tokio::time::sleep_until(at + SURGE_GAP).await;
+                    }
+                    surged = Some(tokio::time::Instant::now());
+                }
+            }
         }
     });
     let router = Router::new()
@@ -573,6 +657,9 @@ mod tests {
             next_hop: String::new(),
             retired: BTreeMap::new(),
             installed: false,
+            token: String::new(),
+            surge: Arc::new(tokio::sync::Notify::new()),
+            surging: false,
         }
     }
     fn row(prefix: &str, prepends: i64) -> Announcement {
@@ -625,6 +712,38 @@ mod tests {
         assert_eq!(call(&mut a, "GET", "/tunnels?format=iproute2", b""), 503);
         a.install(Program::default());
         assert_eq!(call(&mut a, "GET", "/tunnels", b""), 200);
+    }
+    #[tokio::test]
+    async fn a_surge_wakes_the_heartbeat_loop_once() {
+        let mut a = agent(vec![]);
+        a.node.capacity_pps = 10_000;
+        a.install(Program {
+            prefixes: vec!["203.0.113.0/24".into()],
+            ..Default::default()
+        });
+        let flow = |pps: i64| {
+            let f = json!({"src_ip":"192.0.2.1","dst_ip":"203.0.113.10","proto":"udp","dport":443,"pps":pps});
+            serde_json::to_vec(&f).unwrap()
+        };
+        let woken = |a: &Agent| {
+            let surge = a.surge.clone();
+            async move {
+                tokio::time::timeout(Duration::from_millis(50), surge.notified())
+                    .await
+                    .is_ok()
+            }
+        };
+        // 7,000 pps over the last second is under the 80% mark, and 9,000 past it.
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(7000)), 200);
+        assert!(!woken(&a).await);
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(2000)), 200);
+        assert!(woken(&a).await);
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(2000)), 200);
+        assert!(!woken(&a).await, "once per surge");
+        // Once the load has dropped back, the next surge wakes it again.
+        a.watch_surge(chrono::Utc::now().timestamp_millis() + 3000);
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(1)), 200);
+        assert!(woken(&a).await);
     }
     #[test]
     fn duplicate_tunnel_reports_are_refused() {

@@ -9,6 +9,7 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::Path,
     pin::Pin,
+    sync::OnceLock,
     task::{Context, Poll},
     time::Duration,
 };
@@ -17,6 +18,16 @@ use tokio::{
     net::TcpStream,
     time::{Instant, Sleep},
 };
+/// Whether the process has been asked to stop.
+fn stop() -> &'static tokio::sync::watch::Sender<bool> {
+    static STOP: OnceLock<tokio::sync::watch::Sender<bool>> = OnceLock::new();
+    STOP.get_or_init(|| tokio::sync::watch::Sender::new(false))
+}
+/// Completes once the process has been asked to stop, for a request held open on something that
+/// will no longer happen: answered then, it lets the server shut down instead of waiting it out.
+pub async fn stopping() {
+    let _ = stop().subscribe().wait_for(|stopping| *stopping).await;
+}
 /// How long a new connection may stay silent before sending its first byte.
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an established connection may go without reading or writing anything.
@@ -247,6 +258,7 @@ pub async fn serve(
         {
             let _ = tokio::signal::ctrl_c().await;
         }
+        stop().send_replace(true);
         shutdown.graceful_shutdown(Some(Duration::from_secs(10)));
     });
     if cert.is_empty() {

@@ -37,12 +37,13 @@ fn equal(a: &Value, b: &Value, path: &str) {
         _ => assert_eq!(a, b, "{path}"),
     }
 }
-/// Stats as the Go datapath reported them: the counters for HTTP rules, which it never had, are
-/// left out of the comparison.
+/// Stats as the Go datapath reported them: the counters for HTTP rules and the surge rate, which
+/// it never had, are left out of the comparison.
 fn go_shape(mut stats: Value) -> Value {
     let top = stats.as_object_mut().unwrap();
     top.remove("game_http_windows");
     top.remove("game_http_windows_max");
+    top.remove("surge_pps");
     for row in stats["games"].as_array_mut().into_iter().flatten() {
         let row = row.as_object_mut().unwrap();
         for key in [
@@ -333,6 +334,32 @@ fn flows_are_counted_under_the_most_specific_protected_prefix() {
     };
     assert_eq!(flows("203.0.113.0/24"), 1);
     assert_eq!(flows("203.0.112.0/22"), 0);
+}
+#[test]
+fn a_flood_shows_in_full_in_the_surge_rate_within_its_first_second() {
+    let mut pipe = Pipeline::new(Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        ..Default::default()
+    });
+    // Five flows at 5,000 pps each, over the first half of a second.
+    for i in 0..5 {
+        let flow = Flow {
+            pps: 5000,
+            ..packet("192.0.2.1", 443, &[])
+        };
+        pipe.decide(&flow, T0 + 100 * i);
+    }
+    let rates = |pipe: &mut Pipeline, at: i64| {
+        let stats = pipe.stats(at);
+        (stats["surge_pps"].clone(), stats["offered_pps"].clone())
+    };
+    // The ten-second mean has a tenth of it so far.
+    assert_eq!(rates(&mut pipe, T0 + 500), (json!(25000), json!(2500)));
+    assert_eq!(pipe.surge(T0 + 500), 25000);
+    // A window ending a quarter into the next second still covers three quarters of this one.
+    assert_eq!(rates(&mut pipe, T0 + 1250), (json!(18750), json!(2500)));
+    // Two seconds on, the flood has left the last second, though not the mean.
+    assert_eq!(rates(&mut pipe, T0 + 2000), (json!(0), json!(2500)));
 }
 
 /// A game server answering HTTP on its game port, as FiveM's does: UDP for play, TCP for its

@@ -86,12 +86,14 @@ burst timed to land between two samples and stop before the next is measured
 as nothing, and a fleet polling in lockstep hands out that schedule for free,
 identically on every node.
 
-The node poll and the control plane's reconcile are therefore spread ±20%
+The node heartbeat and the control plane's reconcile are therefore spread ±20%
 around their nominal intervals, drawn from the system entropy source rather
 than a seeded generator — a schedule recoverable from a node's start time
 would be no better than a fixed one. A train tuned to one interval drifts into
 the next sample instead of hiding between them, and no two nodes are blind at
-the same moment.
+the same moment. A surge does not wait for the schedule at all (see [How fast
+the fabric reacts](#how-fast-the-fabric-reacts)), and nodes do not poll for
+instructions: each program is handed over as it is compiled.
 
 The ZC behavioural cap was a fixed window that reset wholesale, which let a
 source send its whole allowance at the end of one window and again at the
@@ -109,8 +111,13 @@ pair to watch: a wide gap is the attack.
 
 Capacity weighting is static — it says how big a node is, not how busy. The
 control loop adds the reactive half: each node reports the packet rate it is
-carrying, averaged over ten seconds, and a node measured near its ceiling gets
-extra prepends until it recovers.
+carrying, and a node measured near its ceiling gets extra prepends until it
+recovers.
+
+It reports that rate twice: averaged over ten seconds, and over the last second
+alone. Shedding goes by whichever is higher, so it starts within a second of a
+flood arriving rather than once the flood has filled the ten-second mean.
+Recovery waits for both to come down, so letting go is as slow as before.
 
 A node declares its ceiling with `-capacity-pps`. It is separate from
 `-capacity` because the ZC inspect path runs out of packets per second long
@@ -129,7 +136,10 @@ fixing:
 - **Dwell.** A level holds for at least 30 seconds whatever the load does. BGP
   punishes churn — upstreams damp a route that flaps, and a damped route is
   worse than a saturated node. Load that crosses a watermark repeatedly cannot
-  become a stream of updates.
+  become a stream of updates. The exception is a node at twice its ceiling or
+  more: it steps up again 5 seconds after its last change, since it is dropping
+  at least half of what reaches it, which costs more than an extra update.
+  Stepping down always waits the full 30.
 - **Load pads; only death withdraws.** Shedding adds at most 3 prepends, on top
   of the capacity baseline and still bounded at 5 in total. A saturated node is
   never withdrawn: pulling it entirely would dump its whole share on its
@@ -142,15 +152,63 @@ measurement from minutes ago is worse than not acting.
 Each step takes one dwell, so shedding ramps rather than jumps:
 
 ```
-t=12s  offered=152000  scrub-a prepends=1   # crossed 80% of its 100k ceiling
-t=44s  offered=171000  scrub-a prepends=2   # still saturated, one dwell later
-t=+20s offered=0       scrub-a prepends=1   # recovering
-t=+70s offered=0       scrub-a prepends=0   # back to full preference
+t=0.6s  last second=91200   mean=9120    scrub-a prepends=1   # crossed 80% of its 100k ceiling
+t=31s   last second=171000  mean=171000  scrub-a prepends=2   # still saturated, one dwell later
+t=+20s  last second=0       mean=0       scrub-a prepends=1   # recovering
+t=+70s  last second=0       mean=0       scrub-a prepends=0   # back to full preference
 ```
 
-`scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}`
-and `scrubline_offered_pps{node}` show the loop working; without them a
-deliberate shed is indistinguishable from a misconfiguration.
+A flood many times the ceiling takes the short dwell instead:
+
+```
+t=0.1s  last second=120000   scrub-a prepends=1   # a flood at 1.2M pps, 0.1s in
+t=5s    last second=1200000  scrub-a prepends=2   # at twice its ceiling or more, 5s a step
+t=10s   last second=1200000  scrub-a prepends=3
+```
+
+`scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}`,
+`scrubline_offered_pps{node}` and `scrubline_surge_pps{node}` show the loop
+working; without them a deliberate shed is indistinguishable from a
+misconfiguration.
+
+### How fast the fabric reacts
+
+From the first packets of a flood bigger than a node can take to every node
+holding its new instructions is under a second, and BGP propagation is all that
+comes after it:
+
+1. **The node sees it within the second.** The last-second rate crosses 80% of
+   `-capacity-pps` after 0.8 × ceiling ÷ flood rate seconds: 0.4 s for a flood
+   at twice the ceiling, 0.08 s at ten times. The ten-second mean alone took
+   ten times as long.
+2. **It tells the control plane at once.** The agent heartbeats the moment its
+   last-second rate crosses that mark, rather than at its next heartbeat, up to
+   two seconds away. It does so once per surge, and at most once a second however
+   often surges start.
+3. **The control plane decides on that heartbeat.** It moves the node's level
+   and recompiles the fabric while answering it.
+4. **Every node gets its program as it is compiled.** Agents do not poll for
+   instructions: each keeps a request open at the control plane, answered as
+   soon as its program changes. The helpers announce the node's pinned
+   customers, and the node pads its own route, within milliseconds of the
+   heartbeat.
+
+[`scripts/reaction-time.py`](scripts/reaction-time.py) runs a control plane
+and two nodes, floods one, and times it; CI holds it to under a second. On one
+machine, with debug builds and the same flood run three times against each:
+
+| Flood | Before | Now |
+| --- | --- | --- |
+| twice the ceiling | 4.2–5.8 s | 0.39–0.43 s |
+| ten times the ceiling | 1.7–3.8 s | 0.08–0.09 s |
+
+Nearly all of what is left is the last second filling to 80% of the ceiling.
+From there to the other nodes holding their new programs took about a
+millisecond on one machine; across a network it is two round trips more, the
+heartbeat and the answer to each node's waiting request.
+
+That is time to the routes a node serves its BGP speaker; how long the internet
+takes to act on them is up to BGP.
 
 A policy can override the default posture per prefix:
 
@@ -464,7 +522,8 @@ work":
 - `scrubline_*_pps_total` — the same counts weighted by the per-flow rate reported on each decision. A volume indicator, not a packet counter.
 - `scrubline_unowned_flows_total{node}` — flows for a prefix the node does not carry. A rising value means the steering layer and the fabric disagree about who scrubs what.
 - `scrubline_bgp_announced{node,prefix}` and `scrubline_bgp_prepends{node,prefix}` — the steering posture. A prefix with no node at 1 is attracting no traffic to the fabric at all.
-- `scrubline_offered_pps{node}` and `scrubline_dropped_pps{node}` — current packet rates, averaged over the node's load window. These are rates, not totals: they are what load-driven shedding reacts to.
+- `scrubline_offered_pps{node}` and `scrubline_dropped_pps{node}` — current packet rates, averaged over the node's load window. These are rates, not totals.
+- `scrubline_surge_pps{node}` — the offered rate over the last second. Load-driven shedding reacts to it or to `scrubline_offered_pps`, whichever is higher, so it moves within a second of a flood arriving.
 - `scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}` and `scrubline_node_capacity_pps{node}` — the shedding loop. A node at a non-zero escalation is deliberately leaning away from traffic.
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
 - `scrubline_prefix_offered_pps{node,prefix}` and `scrubline_prefix_dropped_pps{node,prefix}` — the same rates broken down by the protected prefix the traffic was aimed at. The node-wide pair cannot answer "which customer is being attacked": a scrubber carries many prefixes at once.
@@ -696,8 +755,9 @@ GRE tunnel, to that node's address:
 
 `PUT /v1/tunnels/{id}/location` with `{"node":"..."}` moves it, which is what
 a panel offering a choice of location calls. Only that node announces the
-customer's prefixes while it copes. When it passes 80% of its `-capacity-pps`,
-or stops heartbeating, the other nodes carrying the prefixes announce them
+customer's prefixes while it copes. When it passes 80% of its `-capacity-pps`
+over the last second or the last ten, or stops heartbeating, the other nodes
+carrying the prefixes announce them
 too, as anycast, to take the load; they forward what they scrub to the
 location over node-to-node GRE, and it delivers everything down the
 customer's one tunnel. Help holds for five minutes after the location was last

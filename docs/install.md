@@ -110,11 +110,11 @@ sudo curl --cacert /etc/scrubline/tls/ca.pem -X PUT -H "Authorization: Bearer $A
 
 That node builds the customer's GRE tunnel from its tunnel IP and announces
 their prefixes; the customer configures one tunnel, to that address. When it
-passes 80% of its `--capacity-pps`, or stops responding, the other nodes
-announce the prefixes too, scrub what that attracts, and forward the clean
-traffic to it over node-to-node GRE. `PUT /v1/tunnels/{id}/location` moves a
-customer to another node. [docs/api.md](api.md#9-getting-the-clean-traffic-back)
-covers the API.
+passes 80% of its `--capacity-pps`, which it reports within a second of a flood
+starting, or stops responding, the other nodes announce the prefixes too, scrub
+what that attracts, and forward the clean traffic to it over node-to-node GRE.
+`PUT /v1/tunnels/{id}/location` moves a customer to another node.
+[docs/api.md](api.md#9-getting-the-clean-traffic-back) covers the API.
 
 ## A replica of the control plane
 
@@ -198,7 +198,11 @@ private CA lasts ten years, and the script warns when it is about to run out.
 
 Upgrade replicas before their primary, and agents before you assign tunnel
 endpoints or pin tunnels: an older control plane drops state it does not know
-about, and an older agent ignores what it was not built to read.
+about, and an older agent ignores what it was not built to read. Agents and the
+control plane otherwise work across versions: an agent asks an older control
+plane for its program every couple of seconds instead of waiting there for it,
+and the control plane sheds for an older agent on its ten-second mean alone,
+which takes seconds rather than one to see a flood.
 
 ## Seeing what it does
 

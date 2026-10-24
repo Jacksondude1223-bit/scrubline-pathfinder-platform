@@ -63,8 +63,9 @@ match; everything else in that fixture is Go's output unchanged.
 Back up the state file and replace the binaries or rebuild the image. A restarted
 control plane reads the existing state, marks nodes stale, and recompiles as
 agents heartbeat. Existing node and tenant credential hashes survive. The node
-agent re-enrolls after an unknown-node or rejected-credential response and polls
-for program updates and explicit model withdrawal.
+agent re-enrolls after an unknown-node or rejected-credential response, keeps a
+request for its next program waiting at the control plane, and polls for
+explicit model withdrawal.
 
 The Docker runtime uses Debian with the Rust binaries and CA roots. Its default
 command is `scrub-api`; Compose selects the correct executable for each service.

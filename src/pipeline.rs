@@ -93,6 +93,22 @@ impl Load {
         }
         (o / 10, d / 10)
     }
+    /// The rate over the one second up to `now`: this second's so far, and the part of the last
+    /// second's that a window ending now still covers. A flood shows in it within a second, where
+    /// the ten-second mean takes ten to show it in full.
+    fn surge(&self, now: i64) -> u64 {
+        let sec = now / 1000;
+        let offered = |s: i64| {
+            let i = s.rem_euclid(10) as usize;
+            if self.slots[i] == s {
+                self.offered[i]
+            } else {
+                0
+            }
+        };
+        let covered = (1000 - now.rem_euclid(1000)) as u128;
+        offered(sec).saturating_add((offered(sec - 1) as u128 * covered / 1000) as u64)
+    }
 }
 pub struct Pipeline {
     pub program: Program,
@@ -583,6 +599,10 @@ impl Pipeline {
             }
         }
     }
+    /// The node's packet rate over the last second, where offered_pps is over the last ten.
+    pub fn surge(&self, now: i64) -> u64 {
+        self.load.surge(now)
+    }
     pub fn stats(&mut self, now: i64) -> Value {
         let (o, d) = self.load.rates(now);
         let stages:Vec<_>=self.stages.iter().enumerate().map(|(i,s)|json!({"stage":(["asic","fpga","zc"][i]),"dropped":s[0],"permitted":s[1],"pps_dropped":s[2],"pps_permitted":s[3]})).collect();
@@ -612,6 +632,6 @@ impl Pipeline {
         if states.as_array().is_some_and(|a| !a.is_empty()) {
             egress["prefix_states"] = states;
         }
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"load_window_seconds":10})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10})
     }
 }
