@@ -102,7 +102,9 @@ pub struct Pipeline {
     buckets: HashMap<(String, String), Rate>,
     last_sweep: i64,
     rule_stats: HashMap<String, (String, [u64; 4])>,
-    game_stats: HashMap<String, (String, [u64; 5])>,
+    /// Per filter: inspected, dropped, challenged, uninspectable, pps dropped, then for its HTTP
+    /// rules requests judged, requests dropped, requests over a rate, and segments with none.
+    game_stats: HashMap<String, (String, [u64; 9])>,
     stages: [[u64; 4]; 3],
     decisions: u64,
     unowned: u64,
@@ -234,7 +236,7 @@ impl Pipeline {
                 .get(&b.id)
                 .filter(|(name, _)| name == &b.profile.name)
                 .cloned()
-                .unwrap_or((b.profile.name.clone(), [0; 5]));
+                .unwrap_or((b.profile.name.clone(), [0; 9]));
             stats.insert(b.id.clone(), old);
         }
         self.game_stats = stats;
@@ -342,11 +344,15 @@ impl Pipeline {
                 "drop" => {
                     s[1] += 1;
                     s[4] = s[4].saturating_add(f.pps.max(0) as u64);
+                    s[6] += r.requests;
+                    s[7] += u64::from(r.limited);
                 }
                 "challenge" => s[2] += 1,
                 "uninspectable" => s[3] += 1,
                 _ => {}
             }
+            s[5] += r.requests;
+            s[8] += u64::from(r.other);
         }
         if r.cleared > 0 {
             self.reputation.promote(&f.src_ip, r.cleared, now);
@@ -582,7 +588,7 @@ impl Pipeline {
         let stages:Vec<_>=self.stages.iter().enumerate().map(|(i,s)|json!({"stage":(["asic","fpga","zc"][i]),"dropped":s[0],"permitted":s[1],"pps_dropped":s[2],"pps_permitted":s[3]})).collect();
         let mut rules:Vec<_>=self.rule_stats.iter().map(|(id,(stage,s))|json!({"rule_id":id,"stage":stage,"matches":s[0],"drops":s[1],"pps_seen":s[2],"pps_dropped":s[3]})).collect();
         rules.sort_by(|a, b| a["rule_id"].as_str().cmp(&b["rule_id"].as_str()));
-        let mut games:Vec<_>=self.game_stats.iter().map(|(id,(profile,s))|json!({"filter_id":id,"profile":profile,"inspected":s[0],"dropped":s[1],"challenged":s[2],"uninspectable":s[3],"pps_dropped":s[4]})).collect();
+        let mut games:Vec<_>=self.game_stats.iter().map(|(id,(profile,s))|json!({"filter_id":id,"profile":profile,"inspected":s[0],"dropped":s[1],"challenged":s[2],"uninspectable":s[3],"pps_dropped":s[4],"http_requests":s[5],"http_dropped":s[6],"http_rate_limited":s[7],"http_other":s[8]})).collect();
         games.sort_by(|a, b| a["filter_id"].as_str().cmp(&b["filter_id"].as_str()));
         let mut pulsing = false;
         let mut peak = 0;
@@ -606,6 +612,6 @@ impl Pipeline {
         if states.as_array().is_some_and(|a| !a.is_empty()) {
             egress["prefix_states"] = states;
         }
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"load_window_seconds":10})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"load_window_seconds":10})
     }
 }

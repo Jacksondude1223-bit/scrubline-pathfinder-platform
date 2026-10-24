@@ -460,6 +460,9 @@ pub struct GameFilter {
     pub profile: String,
     #[serde(skip_serializing_if = "is_zero")]
     pub custom: Option<GameSignature>,
+    /// Layer-7 rules for the HTTP the game server answers on the same address.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub http: Option<GameHttp>,
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub observe: bool,
@@ -488,6 +491,62 @@ pub struct GameSignature {
     pub opener_ids: Vec<i64>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub complete_ids: Vec<i64>,
+}
+
+/// What a game filter allows of the HTTP its server answers: on TCP to the filter's address, on
+/// the filter's port unless `ports` names others.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GameHttp {
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub ports: Vec<i64>,
+    /// Methods allowed; GET, HEAD and POST when empty.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub methods: Vec<String>,
+    /// Prefixes one of which a request's User-Agent must start with; any client when empty.
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub user_agents: Vec<String>,
+    /// Requests a second one source may make across the whole filter; no limit at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub rate_per_source: i64,
+    /// The largest body a request may declare; no limit at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub max_body_bytes: i64,
+    /// What a path no rule names gets: allow, the default, or drop.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub default: String,
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub paths: Vec<GameHttpPath>,
+}
+
+/// A rule for one path, or every path under a prefix. Anything it leaves unset comes from the
+/// filter's `http`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GameHttpPath {
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub path: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub prefix: String,
+    /// allow, the default, or drop.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub action: String,
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub methods: Vec<String>,
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub user_agents: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub rate_per_source: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub max_body_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

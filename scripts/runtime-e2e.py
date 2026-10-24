@@ -94,10 +94,17 @@ with tempfile.TemporaryDirectory() as temporary:
                             'match':{'sport':53}},
                            {'id':'inspect', 'stage':'zc', 'action':'inspect',
                             'pps':1000000, 'match':{}}],
-                  'games':[{'id':'a2s', 'profile':'a2s', 'dport':27015, 'proto':'udp'}],
+                  'games':[{'id':'a2s', 'profile':'a2s', 'dport':27015, 'proto':'udp'},
+                           # HTTP on a game server's own port, held to its rules.
+                           {'id':'web', 'dst_cidr':'203.0.113.20/32', 'dport':30120,
+                            'http':{'default':'drop',
+                                    'paths':[{'path':'/players.json', 'rate_per_source':1}]}}],
                   'tunnels':[{'id':'customer', 'prefixes':['203.0.113.0/24'],
                               'remote':'192.0.2.100', 'required':True}],
                   'reputation':{'fast_pass':'challenge','penalty_box':True}}
+        bad_http = dict(policy['games'][1], http={'default':'block'})
+        call(base, '/v1/policies', 'POST', OP,
+             dict(policy, games=[policy['games'][0], bad_http]), expected=400)
         for bad_rule in [dict(policy['rules'][1], action='count'),
                          dict(policy['rules'][1], stage='asic', action='rate_limit'),
                          dict(policy['rules'][1], pps=-1),
@@ -176,6 +183,16 @@ with tempfile.TemporaryDirectory() as temporary:
         for _ in range(4): call(local, '/decide', 'POST', LOCAL, invalid)
         assert call(local, '/decide', 'POST', LOCAL, invalid)['reason']=='source is in the penalty box'
         assert call(local, '/reputation', 'POST', LOCAL, {'release':['192.0.2.88']})['released']==1
+        def request(src, path, pps=1):
+            raw = f'GET {path} HTTP/1.1\r\nHost: 203.0.113.20:30120\r\n\r\n'.encode()
+            return dict(flow, src_ip=src, dst_ip='203.0.113.20', proto='tcp', dport=30120,
+                        pps=pps, payload=base64.b64encode(raw).decode())
+        assert call(local, '/decide', 'POST', LOCAL, request('192.0.2.50', '/players.json'))['action']=='permit'
+        limited = call(local, '/decide', 'POST', LOCAL, request('192.0.2.50', '/players.json', pps=5))
+        assert limited['action']=='drop' and limited['filter']=='web', limited
+        assert limited['reason'].endswith('/players.json: more than 1 request a second to this path from this source'), limited
+        unlisted = call(local, '/decide', 'POST', LOCAL, request('192.0.2.51', '/%2E%2E/secret'))
+        assert unlisted['reason'].endswith('GET /secret: not a path this server allows'), unlisted
         call(local, '/reputation?limit=5', token=LOCAL)
         for _ in range(3):
             call(local, '/egress','POST',LOCAL,
@@ -210,7 +227,8 @@ with tempfile.TemporaryDirectory() as temporary:
         metrics=call(base,'/metrics',token=OP)
         assert 'scrubline_api_requests_total' in metrics and 'scrubline_prefix_offered_total' in metrics
         call(base,'/metrics',token=node_token,expected=403)
-        call(local,'/metrics',token=LOCAL)
+        node_metrics = call(local,'/metrics',token=LOCAL)
+        assert 'scrubline_game_http_rate_limited_total{' in node_metrics, node_metrics
         traffic=start('scrub-traffic','-nodes',local,'-interval','50ms','-seed','42')
         time.sleep(1); assert traffic.poll() is None; stop(traffic)
         snapshot=call(base,'/v1/state',token=OP)

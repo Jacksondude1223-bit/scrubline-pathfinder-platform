@@ -91,6 +91,22 @@
     "kind": "counter",
     "help": "Sum of the per-flow rates reported on packets a game filter dropped."
   },
+  "scrubline_game_http_requests_total": {
+    "kind": "counter",
+    "help": "HTTP requests a game filter's layer-7 rules judged."
+  },
+  "scrubline_game_http_dropped_total": {
+    "kind": "counter",
+    "help": "HTTP requests dropped by a game filter's layer-7 rules: a blocked or unknown path, a method, client or body it does not allow, a rate, or a malformed request."
+  },
+  "scrubline_game_http_rate_limited_total": {
+    "kind": "counter",
+    "help": "HTTP requests dropped because their source went over a game filter's requests-a-second limit for the path or the server."
+  },
+  "scrubline_game_http_other_total": {
+    "kind": "counter",
+    "help": "Segments on a game filter's HTTP ports that started no request: the rest of a request, TLS, or another protocol. They pass."
+  },
   "scrubline_game_sessions": {
     "kind": "gauge",
     "help": "Sources the game filter is tracking through a gate."
@@ -98,6 +114,14 @@
   "scrubline_game_sessions_max": {
     "kind": "gauge",
     "help": "Bound on the game filter's session table. At the bound it admits without tracking rather than evicting connected players."
+  },
+  "scrubline_game_http_windows": {
+    "kind": "gauge",
+    "help": "Pairs of HTTP rule and source the game filters' request-rate limits are tracking."
+  },
+  "scrubline_game_http_windows_max": {
+    "kind": "gauge",
+    "help": "Bound on the request-rate table. At the bound a new source is not rate limited rather than another being forgotten."
   },
   "scrubline_pulse_active": {
     "kind": "gauge",

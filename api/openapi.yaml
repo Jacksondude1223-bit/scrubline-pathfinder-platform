@@ -1506,12 +1506,99 @@ components:
             maximum: 255
           description: Packet ids that finish the handshake and admit the source. Required with a handshake
             gate.
+    GameHttpPath:
+      type: object
+      description: A rule for one path, or every path under a prefix. Set exactly one of path and prefix.
+        Paths match after percent-decoding, with backslashes read as slashes, runs of slashes and dot
+        segments resolved, and without regard to case. A request takes the rule with its exact path,
+        else the one with the longest prefix it starts with. Anything a rule leaves unset comes from
+        the block.
+      properties:
+        path:
+          type: string
+          example: /players.json
+        prefix:
+          type: string
+          example: /files/
+        action:
+          type: string
+          enum:
+          - allow
+          - drop
+          description: drop refuses every request the rule covers, and then takes none of the other
+            settings.
+        methods:
+          type: array
+          items:
+            type: string
+        user_agents:
+          type: array
+          items:
+            type: string
+          description: Prefixes one of which a request's User-Agent must start with, in any case. The
+            header has to be in the segment that starts the request.
+        rate_per_source:
+          type: integer
+          minimum: 0
+          description: Requests a second one source may make on this rule, over the last second. None at
+            zero; the block's own limit applies on top.
+        max_body_bytes:
+          type: integer
+          minimum: 0
+          description: The largest Content-Length allowed; a chunked body is refused under a limit.
+            Zero takes the block's.
+    GameHttp:
+      type: object
+      description: 'Layer-7 rules for the HTTP a game server answers on its own address: TCP to the filter''s
+        dst_cidr, on its dport or on ports when set. A request is judged in the segment carrying its
+        request line, whether at the segment''s start, pipelined behind another or after a line break
+        in a segment that continues a body; the rest of a request, TLS and other protocols pass. A
+        malformed request, one with folded headers, disagreeing Content-Length headers or a
+        Content-Length beside Transfer-Encoding, a request line cut short in a short segment, and
+        cleartext HTTP/2 by preface or upgrade are dropped.'
+      properties:
+        ports:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          description: TCP ports to judge. Empty takes the filter's dport, or every port when it has none.
+        methods:
+          type: array
+          items:
+            type: string
+          description: Methods allowed. GET, HEAD and POST when empty.
+        user_agents:
+          type: array
+          items:
+            type: string
+          description: Prefixes one of which a request's User-Agent must start with. Any client when empty.
+        rate_per_source:
+          type: integer
+          minimum: 0
+          description: Requests a second one source may make across every path. No limit at zero.
+        max_body_bytes:
+          type: integer
+          minimum: 0
+          description: The largest Content-Length allowed. No limit at zero.
+        default:
+          type: string
+          enum:
+          - allow
+          - drop
+          description: What a path no rule names gets. drop makes the rules an allow list.
+        paths:
+          type: array
+          items:
+            $ref: '#/components/schemas/GameHttpPath'
     GameFilter:
       type: object
       required:
       - id
-      description: Admits traffic to a game port only if it looks like that game. Bound to a port on a
-        protected address, not to a game the platform knows about.
+      description: Admits traffic to a game port only if it looks like that game, and holds the HTTP the
+        server answers on the same address to rules. Bound to a port on a protected address, not to a
+        game the platform knows about.
       properties:
         id:
           type: string
@@ -1534,8 +1621,12 @@ components:
           - raknet
           - a2s
           description: A built-in protocol. Omit when custom describes one inline; setting both is refused.
+            A filter with http rules may carry neither, and then judges only its HTTP. On TCP the http rules
+            take their ports, so a tcp profile on the same port is refused.
         custom:
           $ref: '#/components/schemas/GameSignature'
+        http:
+          $ref: '#/components/schemas/GameHttp'
         observe:
           type: boolean
           description: Record what the filter would have done without acting on it.
@@ -1972,6 +2063,19 @@ components:
             value means the datapath is not supplying payloads and the filter is doing nothing.
         pps_dropped:
           type: integer
+        http_requests:
+          type: integer
+          description: HTTP requests the filter's layer-7 rules judged.
+        http_dropped:
+          type: integer
+          description: HTTP requests those rules dropped, for any reason.
+        http_rate_limited:
+          type: integer
+          description: HTTP requests dropped because their source went over a rate.
+        http_other:
+          type: integer
+          description: Segments on the HTTP ports that started no request (the rest of one, TLS, another
+            protocol). They pass.
     PrefixStats:
       type: object
       description: 'Everything one node knows about the traffic aimed at one protected prefix. Reported
@@ -2065,6 +2169,13 @@ components:
           type: integer
         game_sessions_max:
           type: integer
+        game_http_windows:
+          type: integer
+          description: Pairs of HTTP rule and source the request-rate limits are tracking.
+        game_http_windows_max:
+          type: integer
+          description: Bound on that table. At the bound a new source goes unlimited rather than another
+            being forgotten.
         reputation:
           $ref: '#/components/schemas/ReputationStats'
         egress:

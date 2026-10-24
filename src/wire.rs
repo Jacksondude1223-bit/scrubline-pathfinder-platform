@@ -83,6 +83,10 @@ pub struct Stats {
     #[serde(deserialize_with = "null_default")]
     pub game_sessions_max: i64,
     #[serde(deserialize_with = "null_default")]
+    pub game_http_windows: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub game_http_windows_max: i64,
+    #[serde(deserialize_with = "null_default")]
     pub reputation: ReputationStats,
     #[serde(deserialize_with = "null_default")]
     pub egress: EgressStats,
@@ -192,6 +196,14 @@ pub struct GameStats {
     pub uninspectable: u64,
     #[serde(deserialize_with = "null_default")]
     pub pps_dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_requests: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_rate_limited: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_other: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
