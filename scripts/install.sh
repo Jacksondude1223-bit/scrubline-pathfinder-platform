@@ -32,11 +32,7 @@ die() {
 # Keys and certificates are made here on their way into place, and it goes however the script
 # exits.
 SCRATCH=''
-# shellcheck disable=SC2317 # run by the trap
-cleanup() {
-	if [[ -n $SCRATCH ]]; then rm -rf "$SCRATCH"; fi
-}
-trap cleanup EXIT
+trap 'if [[ -n $SCRATCH ]]; then rm -rf "$SCRATCH"; fi' EXIT
 
 usage() {
 	cat <<'USAGE'
