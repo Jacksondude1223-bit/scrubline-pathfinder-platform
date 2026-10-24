@@ -216,6 +216,24 @@ $ curl -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json'
 accumulate across calls, so repeated calls can trip a behavioural cap or clear
 a game filter's gate.
 
+A game filter with an `http` block judges the requests sent to its address,
+on TCP to its port or the block's own `ports`. With
+`{"path": "/players.json", "rate_per_source": 1}` among its paths, a second
+request for the player list inside a second is dropped:
+
+```console
+$ curl -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"node_id":"'$NODE'","flow":{"src_ip":"198.51.100.9","dst_ip":"203.0.113.20",
+         "proto":"tcp","dport":30120,"pps":1,
+         "payload":"R0VUIC9wbGF5ZXJzLmpzb24gSFRUUC8xLjENCkhvc3Q6IDIwMy4wLjExMy4yMDozMDEyMA0KDQo="}}' \
+    $API/v1/decide
+{"action":"drop","stage":"zc","filter":"fivem-30120","node_id":"node-469acf20d30b58d4",
+ "reason":"game filter http: GET /players.json: more than 1 request a second to this path from this source"}
+```
+
+The README's [game filtering](../README.md#http-on-the-servers-own-address-layer-7)
+section covers the rules.
+
 ### 7. The classifier
 
 ```console

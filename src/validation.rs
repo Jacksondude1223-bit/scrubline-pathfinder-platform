@@ -95,8 +95,11 @@ pub fn policy(p: &Policy) -> Result<()> {
         if !["", "any", "udp", "tcp"].contains(&g.proto.to_ascii_lowercase().as_str()) {
             return Err("unknown game proto".into());
         }
-        if g.dst_cidr.is_empty() && g.dport == 0 {
-            return Err("game filter needs a dst_cidr or dport".into());
+        if g.dst_cidr.is_empty()
+            && g.dport == 0
+            && g.http.as_ref().is_none_or(|h| h.ports.is_empty())
+        {
+            return Err("game filter needs a dst_cidr, a dport or http ports".into());
         }
     }
     gamefilter::compile(&p.games)?;

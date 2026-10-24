@@ -1,8 +1,12 @@
 use pathfinder::{
     ml,
-    model::{Flow, GameFilter, Match, Program, ReputationPolicy, ZCEntry},
+    model::{
+        Flow, GameFilter, GameHttp, GameHttpPath, GameSignature, Match, Program, ReputationPolicy,
+        ZCEntry,
+    },
     pipeline::Pipeline,
     state::{Egress, Pulse, Reputation},
+    validation,
 };
 use serde_json::{json, Value};
 fn equal(a: &Value, b: &Value, path: &str) {
@@ -33,6 +37,25 @@ fn equal(a: &Value, b: &Value, path: &str) {
         _ => assert_eq!(a, b, "{path}"),
     }
 }
+/// Stats as the Go datapath reported them: the counters for HTTP rules, which it never had, are
+/// left out of the comparison.
+fn go_shape(mut stats: Value) -> Value {
+    let top = stats.as_object_mut().unwrap();
+    top.remove("game_http_windows");
+    top.remove("game_http_windows_max");
+    for row in stats["games"].as_array_mut().into_iter().flatten() {
+        let row = row.as_object_mut().unwrap();
+        for key in [
+            "http_requests",
+            "http_dropped",
+            "http_rate_limited",
+            "http_other",
+        ] {
+            row.remove(key);
+        }
+    }
+    stats
+}
 #[test]
 fn complete_pipeline_matches_go_recorded_sequences() {
     let cases: Value = serde_json::from_str(include_str!("fixtures/go-datapath.json")).unwrap();
@@ -55,7 +78,11 @@ fn complete_pipeline_matches_go_recorded_sequences() {
                 let d = pipe.decide(&serde_json::from_value::<Flow>(flow.clone()).unwrap(), at);
                 equal(&json!(d), &step["decision"], &format!("{label}.decision"));
             }
-            equal(&pipe.stats(at), &step["stats"], &format!("{label}.stats"));
+            equal(
+                &go_shape(pipe.stats(at)),
+                &step["stats"],
+                &format!("{label}.stats"),
+            );
         }
     }
 }
@@ -306,4 +333,446 @@ fn flows_are_counted_under_the_most_specific_protected_prefix() {
     };
     assert_eq!(flows("203.0.113.0/24"), 1);
     assert_eq!(flows("203.0.112.0/22"), 0);
+}
+
+/// A game server answering HTTP on its game port, as FiveM's does: UDP for play, TCP for its
+/// player list, resources and its own handlers.
+fn http_server(paths: Vec<GameHttpPath>, http: GameHttp, penalty_box: bool) -> Program {
+    Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        games: vec![GameFilter {
+            id: "server".into(),
+            dst_cidr: "203.0.113.20/32".into(),
+            proto: "udp".into(),
+            dport: 30120,
+            custom: Some(GameSignature {
+                min_len: 4,
+                ..Default::default()
+            }),
+            http: Some(GameHttp { paths, ..http }),
+            ..Default::default()
+        }],
+        challenge_secret: "secret".into(),
+        reputation: Some(ReputationPolicy {
+            fast_pass: "egress".into(),
+            penalty_box,
+        }),
+        ..Default::default()
+    }
+}
+fn path(path: &str, rate: i64) -> GameHttpPath {
+    GameHttpPath {
+        path: path.into(),
+        rate_per_source: rate,
+        ..Default::default()
+    }
+}
+fn request(src: &str, payload: &str) -> Flow {
+    Flow {
+        src_ip: src.into(),
+        dst_ip: "203.0.113.20".into(),
+        proto: "tcp".into(),
+        sport: 50000,
+        dport: 30120,
+        pps: 1,
+        payload: payload.as_bytes().to_vec(),
+        has_payload: true,
+        ..Default::default()
+    }
+}
+fn get(target: &str) -> String {
+    format!("GET {target} HTTP/1.1\r\nHost: 203.0.113.20:30120\r\nUser-Agent: curl/8\r\n\r\n")
+}
+#[test]
+fn http_requests_are_held_to_their_paths_methods_clients_and_rates() {
+    let paths = vec![
+        path("/players.json", 1),
+        GameHttpPath {
+            path: "/client".into(),
+            methods: vec!["POST".into()],
+            user_agents: vec!["CitizenFX/".into()],
+            max_body_bytes: 2048,
+            ..Default::default()
+        },
+        GameHttpPath {
+            prefix: "/admin/".into(),
+            action: "drop".into(),
+            ..Default::default()
+        },
+    ];
+    let mut pipe = Pipeline::new(http_server(paths, GameHttp::default(), false));
+    let a = "192.0.2.1";
+    let decide = |pipe: &mut Pipeline, src: &str, payload: &str, at: i64| {
+        let d = pipe.decide(&request(src, payload), T0 + at);
+        (d.action.to_string(), d.reason)
+    };
+    assert_eq!(decide(&mut pipe, a, &get("/players.json"), 0).0, "permit");
+    let (action, reason) = decide(&mut pipe, a, &get("/players.json"), 100);
+    assert_eq!(action, "drop");
+    assert_eq!(
+        reason,
+        "game filter http: GET /players.json: more than 1 request a second to this path from this source"
+    );
+    // Another spelling of the path counts against the same limit.
+    assert_eq!(
+        decide(&mut pipe, a, &get("/%70layers.JSON?x=1"), 200).0,
+        "drop"
+    );
+    // Other sources have their own budget, and this one's comes back a second later.
+    assert_eq!(
+        decide(&mut pipe, "192.0.2.2", &get("/players.json"), 300).0,
+        "permit"
+    );
+    assert_eq!(
+        decide(&mut pipe, a, &get("/players.json"), 1300).0,
+        "permit"
+    );
+    let (action, reason) = decide(&mut pipe, a, &get("/admin/kick?id=1"), 1400);
+    assert_eq!(action, "drop");
+    assert!(
+        reason.ends_with("GET /admin/kick: the path is blocked"),
+        "{reason}"
+    );
+    assert_eq!(
+        decide(&mut pipe, a, &get("/files/../admin/x"), 1400).0,
+        "drop"
+    );
+    let (action, reason) = decide(&mut pipe, a, "DELETE /info.json HTTP/1.1\r\n\r\n", 1500);
+    assert_eq!(action, "drop");
+    assert!(
+        reason.ends_with("DELETE /info.json: not a method this path allows"),
+        "{reason}"
+    );
+    let client = |ua: &str, len: usize| {
+        format!("POST /client HTTP/1.1\r\nUser-Agent: {ua}\r\nContent-Length: {len}\r\n\r\nmethod=initConnect")
+    };
+    let (action, reason) = decide(&mut pipe, a, &client("curl/8", 18), 1600);
+    assert_eq!(action, "drop");
+    assert!(
+        reason.ends_with("User-Agent curl/8 is not one this path allows"),
+        "{reason}"
+    );
+    assert_eq!(
+        decide(&mut pipe, a, &client("CitizenFX/1", 18), 1700).0,
+        "permit"
+    );
+    let (action, reason) = decide(&mut pipe, a, &client("CitizenFX/1", 99999), 1800);
+    assert_eq!(action, "drop");
+    assert!(
+        reason.ends_with("a 99999-byte body, over the 2048 bytes allowed"),
+        "{reason}"
+    );
+    assert_eq!(
+        decide(&mut pipe, a, &get("/client"), 1900).0,
+        "drop",
+        "GET on a POST endpoint"
+    );
+    let (action, reason) = decide(&mut pipe, a, "GET /info.json HTTP/9.9\r\n\r\n", 2000);
+    assert_eq!(action, "drop");
+    assert!(reason.contains("a malformed request"), "{reason}");
+    let stats = pipe.stats(T0 + 2000);
+    let row = &stats["games"][0];
+    assert_eq!(row["filter_id"], "server");
+    assert_eq!(row["http_requests"], 13);
+    assert_eq!(row["http_dropped"], 9);
+    assert_eq!(row["http_rate_limited"], 2);
+    assert_eq!(stats["game_http_windows"], 2);
+}
+#[test]
+fn a_server_can_allow_only_the_paths_it_names_and_cap_each_source() {
+    let mut pipe = Pipeline::new(http_server(
+        vec![path("/info.json", 0)],
+        GameHttp {
+            default: "drop".into(),
+            rate_per_source: 2,
+            ..Default::default()
+        },
+        false,
+    ));
+    let d = pipe.decide(&request("192.0.2.1", &get("/resource/handler")), T0);
+    assert_eq!(d.action, "drop");
+    assert!(
+        d.reason
+            .ends_with("GET /resource/handler: not a path this server allows"),
+        "{}",
+        d.reason
+    );
+    for i in 0..2 {
+        assert_eq!(
+            pipe.decide(&request("192.0.2.1", &get("/info.json")), T0 + i)
+                .action,
+            "permit"
+        );
+    }
+    let d = pipe.decide(&request("192.0.2.1", &get("/info.json")), T0 + 2);
+    assert!(
+        d.reason
+            .ends_with("more than 2 requests a second to this server from this source"),
+        "{}",
+        d.reason
+    );
+}
+#[test]
+fn http_rules_look_only_where_their_filter_is_bound() {
+    let mut pipe = Pipeline::new(http_server(
+        vec![GameHttpPath {
+            prefix: "/".into(),
+            action: "drop".into(),
+            ..Default::default()
+        }],
+        GameHttp::default(),
+        false,
+    ));
+    let blocked = get("/anything");
+    assert_eq!(
+        pipe.decide(&request("192.0.2.1", &blocked), T0).action,
+        "drop"
+    );
+    let mut elsewhere = request("192.0.2.1", &blocked);
+    elsewhere.dst_ip = "203.0.113.21".into();
+    assert_eq!(
+        pipe.decide(&elsewhere, T0).action,
+        "permit",
+        "another address"
+    );
+    let mut other_port = request("192.0.2.1", &blocked);
+    other_port.dport = 80;
+    assert_eq!(
+        pipe.decide(&other_port, T0).action,
+        "permit",
+        "another port"
+    );
+    // UDP on the game port is still the profile's to judge.
+    let mut play = request("192.0.2.1", "ab");
+    play.proto = "udp".into();
+    let d = pipe.decide(&play, T0);
+    assert_eq!(d.action, "drop");
+    assert!(d.reason.starts_with("game filter custom:"), "{}", d.reason);
+    // Ports of its own move the HTTP rules off the game port.
+    let mut own = http_server(vec![], GameHttp::default(), false);
+    own.games[0].http.as_mut().unwrap().ports = vec![8080];
+    own.games[0].http.as_mut().unwrap().default = "drop".into();
+    let mut pipe = Pipeline::new(own);
+    assert_eq!(
+        pipe.decide(&request("192.0.2.1", &blocked), T0).action,
+        "permit"
+    );
+    assert_eq!(pipe.decide(&other_port, T0).action, "permit");
+    let mut web = request("192.0.2.1", &blocked);
+    web.dport = 8080;
+    assert_eq!(pipe.decide(&web, T0).action, "drop");
+}
+#[test]
+fn segments_that_start_no_request_pass() {
+    let mut pipe = Pipeline::new(http_server(
+        vec![],
+        GameHttp {
+            default: "drop".into(),
+            ..Default::default()
+        },
+        false,
+    ));
+    let tls = String::from_utf8_lossy(&[0x16, 0x03, 0x01, 0x00, 0x05]).into_owned();
+    for payload in [
+        "the rest of a body",
+        tls.as_str(),
+        "",
+        "OK then: a body that starts with capitals",
+    ] {
+        let d = pipe.decide(&request("192.0.2.1", payload), T0);
+        assert_eq!(d.action, "permit", "{payload:?}: {}", d.reason);
+    }
+    // A request line hidden behind a body in the same segment is still found.
+    let d = pipe.decide(
+        &request("192.0.2.1", "more body\r\nGET /secret HTTP/1.1\r\n\r\n"),
+        T0,
+    );
+    assert_eq!(d.action, "drop");
+    // So is one split across segments to hide its path.
+    let d = pipe.decide(&request("192.0.2.1", "GET /sec"), T0);
+    assert_eq!(d.action, "drop");
+    assert!(d.reason.contains("split across segments"), "{}", d.reason);
+    // Cleartext HTTP/2 would carry requests no rule could read, even on a path that is allowed.
+    let mut open = Pipeline::new(http_server(vec![], GameHttp::default(), false));
+    for h2c in [
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        "GET / HTTP/1.1\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n\r\n",
+    ] {
+        let d = open.decide(&request("192.0.2.1", h2c), T0);
+        assert_eq!(d.action, "drop", "{h2c:?}");
+        assert!(d.reason.contains("HTTP/2"), "{}", d.reason);
+    }
+    let websocket = "GET /ws HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    assert_eq!(
+        open.decide(&request("192.0.2.1", websocket), T0).action,
+        "permit"
+    );
+    let mut unsupplied = request("192.0.2.1", "");
+    unsupplied.has_payload = false;
+    assert_eq!(pipe.decide(&unsupplied, T0).action, "permit");
+    let row = &pipe.stats(T0)["games"][0];
+    assert_eq!(row["http_other"], 3);
+    assert_eq!(row["uninspectable"], 1);
+}
+#[test]
+fn an_observing_filter_only_reports_what_it_would_drop() {
+    let mut program = http_server(vec![path("/players.json", 1)], GameHttp::default(), false);
+    program.games[0].observe = true;
+    let mut pipe = Pipeline::new(program);
+    for i in 0..3 {
+        let d = pipe.decide(&request("192.0.2.1", &get("/players.json")), T0 + i);
+        assert_eq!(d.action, "permit");
+    }
+    let row = &pipe.stats(T0)["games"][0];
+    assert_eq!(
+        (row["http_requests"].as_u64(), row["http_dropped"].as_u64()),
+        (Some(3), Some(0))
+    );
+}
+#[test]
+fn verified_sources_are_held_to_http_rates_and_abusers_are_boxed() {
+    let mut pipe = Pipeline::new(http_server(
+        vec![path("/players.json", 1)],
+        GameHttp::default(),
+        true,
+    ));
+    // A source the origin answers is trusted, and still held to the rate.
+    let reply = Flow {
+        src_ip: "203.0.113.20".into(),
+        dst_ip: "192.0.2.9".into(),
+        proto: "udp".into(),
+        pps: 4,
+        ..Default::default()
+    };
+    pipe.observe_return(&reply, T0);
+    assert_eq!(
+        pipe.decide(&request("192.0.2.9", &get("/players.json")), T0 + 1)
+            .action,
+        "permit"
+    );
+    let d = pipe.decide(&request("192.0.2.9", &get("/players.json")), T0 + 2);
+    assert_eq!(d.action, "drop", "{}", d.reason);
+    // An untrusted source that keeps going over lands in the penalty box, game traffic and all.
+    for i in 0..5 {
+        pipe.decide(&request("192.0.2.66", &get("/players.json")), T0 + 10 + i);
+    }
+    let mut play = request("192.0.2.66", "abcd");
+    play.proto = "udp".into();
+    assert_eq!(
+        pipe.decide(&play, T0 + 20).reason,
+        "source is in the penalty box"
+    );
+}
+#[test]
+fn http_rules_are_validated_with_the_policy() {
+    let base = |http: GameHttp| pathfinder::model::Policy {
+        name: "p".into(),
+        protected: vec!["203.0.113.0/24".into()],
+        games: vec![GameFilter {
+            id: "web".into(),
+            dst_cidr: "203.0.113.20/32".into(),
+            dport: 30120,
+            http: Some(http),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // HTTP rules on their own are a filter.
+    validation::policy(&base(GameHttp::default())).unwrap();
+    let mut only_ports = base(GameHttp {
+        ports: vec![80],
+        ..Default::default()
+    });
+    only_ports.games[0].dst_cidr.clear();
+    only_ports.games[0].dport = 0;
+    validation::policy(&only_ports).unwrap();
+    let refused = |http: GameHttp| validation::policy(&base(http)).unwrap_err();
+    for (http, want) in [
+        (
+            GameHttp {
+                ports: vec![70000],
+                ..Default::default()
+            },
+            "is not a port",
+        ),
+        (
+            GameHttp {
+                methods: vec!["G3T".into()],
+                ..Default::default()
+            },
+            "is not an HTTP method",
+        ),
+        (
+            GameHttp {
+                default: "block".into(),
+                ..Default::default()
+            },
+            "must be allow or drop",
+        ),
+        (
+            GameHttp {
+                rate_per_source: -1,
+                ..Default::default()
+            },
+            "must not be negative",
+        ),
+        (
+            GameHttp {
+                paths: vec![GameHttpPath {
+                    path: "/a".into(),
+                    prefix: "/a".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "set either path or prefix",
+        ),
+        (
+            GameHttp {
+                paths: vec![GameHttpPath {
+                    path: "players.json".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "must start with /",
+        ),
+        (
+            GameHttp {
+                paths: vec![path("/Players.json", 1), path("/players.json", 2)],
+                ..Default::default()
+            },
+            "the same path as an earlier rule",
+        ),
+        (
+            GameHttp {
+                paths: vec![GameHttpPath {
+                    prefix: "/admin".into(),
+                    action: "drop".into(),
+                    rate_per_source: 5,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "a path that drops takes no methods",
+        ),
+    ] {
+        let e = refused(http);
+        assert!(e.contains(want), "{e}");
+    }
+    // A TCP profile on the port the HTTP rules judge would never see a packet; one on every
+    // port still judges the ports the rules leave it.
+    let mut shadowed = base(GameHttp::default());
+    shadowed.games[0].proto = "tcp".into();
+    shadowed.games[0].profile = "raknet".into();
+    let e = validation::policy(&shadowed).unwrap_err();
+    assert!(e.contains("would judge the same TCP port"), "{e}");
+    let mut beside = base(GameHttp {
+        ports: vec![8080],
+        ..Default::default()
+    });
+    beside.games[0].proto = "tcp".into();
+    beside.games[0].profile = "raknet".into();
+    beside.games[0].dport = 0;
+    validation::policy(&beside).unwrap();
 }

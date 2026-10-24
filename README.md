@@ -254,6 +254,84 @@ answering one means emitting protocol-correct bytes, and a wrong guess at
 that framing breaks every client rather than failing closed. Challenge gates
 come from built-in profiles only.
 
+### HTTP on the server's own address (layer 7)
+
+Plenty of game servers answer HTTP on the address players connect to, often on
+the game's own port. FiveM, for one, serves its server info, player list and
+resource downloads over TCP on its game port, along with any handler a script
+registers under its resource's name. That is where application abuse lands: a
+flood of well-formed requests for the player list, a bot hammering a script's
+handler, a downloader pulling the same resource over and over. Every one of
+those is valid HTTP, so no stage before this one can tell it from players.
+
+A filter's `http` block holds that traffic to rules, and **the filter's own
+binding decides what the rules look at**: TCP to the filter's `dst_cidr`, on
+its `dport`, or on the block's own `ports` if it names some. A `profile` or
+`custom` signature on the same filter keeps judging the game traffic beside it;
+without one the filter carries HTTP rules alone.
+
+```json
+"games": [
+  {"id": "fivem-30120", "dst_cidr": "203.0.113.20/32", "dport": 30120,
+   "http": {
+     "rate_per_source": 30,
+     "paths": [
+       {"path": "/players.json", "rate_per_source": 1},
+       {"path": "/info.json", "rate_per_source": 2},
+       {"path": "/dynamic.json", "rate_per_source": 2},
+       {"path": "/client", "methods": ["POST"], "user_agents": ["CitizenFX/"],
+        "max_body_bytes": 8192, "rate_per_source": 5},
+       {"prefix": "/files/", "methods": ["GET", "HEAD"], "rate_per_source": 50},
+       {"prefix": "/myresource/", "methods": ["POST"], "rate_per_source": 2},
+       {"prefix": "/myresource/admin/", "action": "drop"}
+     ]}}
+]
+```
+
+A request's path picks its rule: an exact `path` first, otherwise the longest
+matching `prefix`. A rule either drops everything it covers or narrows what is
+allowed there: `methods`, `user_agents` (prefixes a client's User-Agent must
+start with, in any case), `max_body_bytes`, and `rate_per_source` in requests
+a second. Whatever a rule leaves unset comes from the block, whose own defaults
+are GET, HEAD and POST, any client, any body and no rate. `"default": "drop"`
+turns the rules into an allow list, so a path no rule names is dropped; that
+is what stops a flood aimed at handlers nobody thought to list.
+
+- **Paths match the way a server might read them**: percent-decoded, with
+  backslashes as slashes, runs of slashes and dot segments resolved, and
+  without regard to case. `/files/../%70layers.JSON` is `/players.json` here,
+  so spelling a path another way gets no request past its rule.
+- **Rates are per source**, over the last second, for each rule and for the
+  block as a whole. A verified source is held to them as well: trust skips a
+  game's gate, not the HTTP rules.
+- **What no client sends is dropped**: a malformed request line, folded
+  headers, Content-Length headers that disagree, or one beside
+  Transfer-Encoding. So is cleartext HTTP/2, by preface or by upgrade, since
+  its binary frames would carry requests no rule could read; a WebSocket
+  upgrade passes.
+- **A drop counts against the source** like any other the filter makes, so
+  with `penalty_box` on, a source that keeps abusing an endpoint loses its
+  game traffic for a while too. `observe` works here as everywhere: the rules
+  record what they would have dropped and drop nothing.
+
+The rules read requests packet by packet, without reassembling TCP streams. A
+request is judged in the segment that carries its request line: at the start
+of a segment, pipelined behind other requests in it, or after a line break in
+a segment that continues a body. The rest of a request passes, and so does
+TLS, which the filter cannot read; `scrubline_game_http_other_total` counts
+those segments. A request line cut short in a short segment is dropped, since
+a client writes a line whole and only someone hiding a path splits it. But a
+client that controls its own segmentation can still split a request line where
+the filter cannot see it whole, and a rule that needs a User-Agent needs it in
+the segment that starts the request. For HTTPS, or for an attacker that crafts
+its own segments, terminate the connections in a proxy instead.
+
+`scrubline_game_http_requests_total{filter}`, `_dropped_total`,
+`_rate_limited_total` and `_other_total` say what the rules are doing.
+`scrubline_game_http_windows` against `_max` shows the rate table; at the bound
+a new source goes unlimited rather than another being forgotten. Judging a
+request costs about half a microsecond on top of the rest of the pipeline.
+
 ### What it will not do
 
 The filter never drops a packet it was given no payload for. A datapath that

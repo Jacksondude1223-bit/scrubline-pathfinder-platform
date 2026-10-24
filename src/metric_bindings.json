@@ -116,6 +116,20 @@
     ]
   },
   {
+    "name": "scrubline_game_http_windows",
+    "group": "",
+    "path": [
+      "game_http_windows"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_windows_max",
+    "group": "",
+    "path": [
+      "game_http_windows_max"
+    ]
+  },
+  {
     "name": "scrubline_prefix_offered_pps",
     "group": "prefixes",
     "path": [
@@ -239,6 +253,34 @@
     "group": "games",
     "path": [
       "pps_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_requests_total",
+    "group": "games",
+    "path": [
+      "http_requests"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_dropped_total",
+    "group": "games",
+    "path": [
+      "http_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_rate_limited_total",
+    "group": "games",
+    "path": [
+      "http_rate_limited"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_other_total",
+    "group": "games",
+    "path": [
+      "http_other"
     ]
   },
   {

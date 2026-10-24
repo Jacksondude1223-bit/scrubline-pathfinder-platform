@@ -1,5 +1,7 @@
-//! Protocol framing, handshake admission, and stateless HMAC challenge cookies.
+//! Protocol framing, handshake admission, stateless HMAC challenge cookies, and the layer-7 rules
+//! for the HTTP a game server answers on its own address.
 use crate::{
+    httpfilter,
     model::{Flow, GameFilter, GameSignature},
     Result,
 };
@@ -9,6 +11,7 @@ use sha2::Sha256;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
+    sync::Arc,
 };
 use subtle::ConstantTimeEq;
 #[derive(Clone, Default)]
@@ -30,6 +33,10 @@ pub struct Binding {
     pub dst: Option<IpNet>,
     pub observe: bool,
     pub profile: Profile,
+    /// Whether the profile judges the filter's traffic: a filter may carry HTTP rules alone.
+    pub l4: bool,
+    /// The HTTP rules, judging TCP to the filter's address on their ports.
+    pub http: Option<Arc<httpfilter::Policy>>,
 }
 #[derive(Default, Debug, Clone)]
 pub struct Inspection {
@@ -39,6 +46,11 @@ pub struct Inspection {
     pub profile: String,
     pub reply: Vec<u8>,
     pub cleared: u8,
+    /// For a segment the HTTP rules looked at: the requests in it, whether a rate held one back,
+    /// and whether it carried no request at all.
+    pub requests: u64,
+    pub limited: bool,
+    pub other: bool,
 }
 fn bytes(v: &[i64], name: &str) -> Result<Vec<u8>> {
     v.iter()
@@ -91,7 +103,34 @@ pub fn compile(filters: &[GameFilter]) -> Result<Vec<Binding>> {
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let p = if let Some(s) = &f.custom {
+            let http = f
+                .http
+                .as_ref()
+                .map(|h| httpfilter::compile(&f.id, h, f.dport))
+                .transpose()
+                .map_err(|e| format!("games[{i}] ({}): {e}", f.id))?;
+            let l4 = f.custom.is_some() || !f.profile.is_empty() || http.is_none();
+            if let Some(h) = http.as_ref().filter(|_| l4) {
+                // On TCP the HTTP rules judge their ports, so a TCP profile bound only to ports
+                // they cover would never see a packet.
+                let shadowed = if f.dport == 0 {
+                    h.ports.is_empty()
+                } else {
+                    h.covers(f.dport)
+                };
+                if f.proto.eq_ignore_ascii_case("tcp") && shadowed {
+                    return Err(format!(
+                        "games[{i}] ({}): the profile and the http rules would judge the same TCP port; bind the profile to udp or give http ports of its own",
+                        f.id
+                    ));
+                }
+            }
+            let p = if !l4 {
+                Profile {
+                    name: "http".into(),
+                    ..Default::default()
+                }
+            } else if let Some(s) = &f.custom {
                 if !f.profile.is_empty() {
                     return Err("set either profile or a custom signature, not both".into());
                 }
@@ -134,6 +173,8 @@ pub fn compile(filters: &[GameFilter]) -> Result<Vec<Binding>> {
                 },
                 observe: f.observe,
                 profile: p,
+                l4,
+                http: http.map(Arc::new),
             })
         })
         .collect()
@@ -182,6 +223,9 @@ pub struct Engine {
     pending: HashMap<(String, String), i64>,
     order: VecDeque<(String, String)>,
     last_sweep: i64,
+    windows: httpfilter::Windows,
+    /// Where request paths are normalised, kept so a request costs no allocation for it.
+    scratch: Vec<u8>,
 }
 impl Engine {
     pub fn load(&mut self, bindings: Vec<Binding>, secret: &str) {
@@ -195,16 +239,67 @@ impl Engine {
     pub fn sessions(&self) -> usize {
         self.sessions.len()
     }
+    /// (rule, source) pairs the HTTP rate limits are tracking.
+    pub fn windows(&self) -> usize {
+        self.windows.len()
+    }
     fn binding(&self, f: &Flow) -> Option<Binding> {
         let ip = f.dst_ip.parse::<IpAddr>().ok();
         self.bindings
             .iter()
             .find(|b| {
-                (b.proto.is_empty() || b.proto == "any" || b.proto.eq_ignore_ascii_case(&f.proto))
+                b.l4 && (b.proto.is_empty()
+                    || b.proto == "any"
+                    || b.proto.eq_ignore_ascii_case(&f.proto))
                     && (b.dport == 0 || b.dport == f.dport)
                     && b.dst.is_none_or(|p| ip.is_some_and(|a| p.contains(&a)))
             })
             .cloned()
+    }
+    /// The filter whose HTTP rules judge a TCP packet: one whose address it is sent to, on one of
+    /// its HTTP ports.
+    fn http_binding(&self, f: &Flow) -> Option<usize> {
+        if !f.proto.eq_ignore_ascii_case("tcp") {
+            return None;
+        }
+        let ip = f.dst_ip.parse::<IpAddr>().ok();
+        self.bindings.iter().position(|b| {
+            b.http.as_ref().is_some_and(|h| h.covers(f.dport))
+                && b.dst.is_none_or(|p| ip.is_some_and(|a| p.contains(&a)))
+        })
+    }
+    fn inspect_http(&mut self, i: usize, f: &Flow, now: i64) -> Inspection {
+        let b = &self.bindings[i];
+        let mut r = Inspection {
+            filter: b.id.clone(),
+            profile: "http".into(),
+            ..Default::default()
+        };
+        if f.payload.is_empty() {
+            if f.has_payload {
+                // A segment with no data (a handshake, an acknowledgement) carries no request.
+                return Inspection {
+                    verdict: "pass".into(),
+                    ..Default::default()
+                };
+            }
+            r.verdict = "uninspectable".into();
+            r.reason = "no payload supplied, nothing to inspect".into();
+            return r;
+        }
+        let policy = b.http.as_ref().expect("an HTTP binding has HTTP rules");
+        let j = policy.judge(&mut self.windows, &mut self.scratch, f, now);
+        r.requests = j.requests;
+        r.limited = j.drop && j.limited;
+        r.other = j.requests == 0;
+        r.verdict = if j.drop { "drop" } else { "pass" }.into();
+        r.reason = j.reason;
+        if b.observe && j.drop {
+            r.reason = format!("observe only: would have drop ({})", r.reason);
+            r.verdict = "pass".into();
+            r.limited = false;
+        }
+        r
     }
     fn admit(&mut self, key: (String, String), now: i64) -> bool {
         if !self.sessions.contains_key(&key) && self.sessions.len() >= 65536 {
@@ -232,6 +327,10 @@ impl Engine {
         mac.finalize().into_bytes()[..4].to_vec()
     }
     pub fn inspect(&mut self, f: &Flow, now: i64, validate_only: bool) -> Inspection {
+        // HTTP has no gate to skip, so a verified source is held to its rules like anyone else.
+        if let Some(i) = self.http_binding(f) {
+            return self.inspect_http(i, f, now);
+        }
         let Some(b) = self.binding(f) else {
             return Inspection {
                 verdict: "pass".into(),
