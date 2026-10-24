@@ -98,10 +98,12 @@ finishes by printing the node's id, which is what the panel pins tunnels to.
 ## Then
 
 Deploy a policy, and pin each customer's tunnel to the node they should
-connect to (`node` is the id from `GET /v1/nodes`):
+connect to (`node` is the id from `GET /v1/nodes`). On the control plane's own
+server the CA certificate is readable by root only; elsewhere, use the copy of
+`ca.pem` you gave the nodes:
 
 ```sh
-curl --cacert /etc/scrubline/tls/ca.pem -X PUT -H "Authorization: Bearer $API_TOKEN" \
+sudo curl --cacert /etc/scrubline/tls/ca.pem -X PUT -H "Authorization: Bearer $API_TOKEN" \
     https://10.0.0.5:8080/v1/tunnels/northwind \
     -d '{"remote":"198.18.0.9","tenant":"ten-…","rate_mbps":1000,"node":"node-…"}'
 ```
