@@ -123,6 +123,74 @@ fn training_does_not_hold_the_control_plane() {
     assert_eq!(stored["epochs"], 50);
 }
 #[test]
+fn http_samples_publish_a_request_model_that_scores_requests() {
+    use base64::Engine;
+    let base = serve(Store::open("").unwrap());
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    let client =
+        "GET /players.json HTTP/1.1\r\nHost: s\r\nUser-Agent: CitizenFX/1\r\nAccept: */*\r\n\r\n";
+    let flood = "GET /players.json?x=9 HTTP/1.0\r\n\r\n";
+    let http =
+        |payload: &str, pps| json!({"proto":"tcp","dport":30120,"pps":pps,"payload":b64(payload)});
+    let flow = |proto: &str, pps| json!({"proto":proto,"pps":pps,"dport":443});
+    let samples = json!({"samples":[
+        {"flow":flow("udp",900000),"label":1},
+        {"flow":flow("tcp",40),"label":0},
+        {"flow":http(client,2),"label":0},
+        {"flow":http(flood,500),"label":1},
+    ]});
+    assert_eq!(
+        call(&base, "POST", "/v1/ml/samples", Some(OP), samples).0,
+        200
+    );
+    let (status, model) = call(
+        &base,
+        "POST",
+        "/v1/ml/train",
+        Some(OP),
+        json!({"epochs":200}),
+    );
+    assert_eq!(status, 200, "{model}");
+    // Each model is fitted to its own samples.
+    assert_eq!(
+        (&model["samples"], &model["http"]["samples"]),
+        (&json!(2), &json!(2))
+    );
+    assert_eq!(model["http"]["ready"], true);
+    let (_, scored) = call(
+        &base,
+        "POST",
+        "/v1/ml/score",
+        Some(OP),
+        http(&format!("{client}{flood}"), 500),
+    );
+    assert_eq!(
+        scored["http"]["scores"].as_array().unwrap().len(),
+        2,
+        "{scored}"
+    );
+    assert_eq!(
+        (&scored["http"]["ready"], &scored["http"]["label"]),
+        (&json!(true), &json!(1))
+    );
+    let (_, plain) = call(&base, "POST", "/v1/ml/score", Some(OP), flow("tcp", 40));
+    assert!(plain.get("http").is_none(), "{plain}");
+    // Where the models run is the policy's to say.
+    let policy = |ml: Value| json!({"id":"p","name":"p","protected":["203.0.113.0/24"],"ml":ml});
+    for bad in [json!({"scope":"everything"}), json!({"mode":"shadow"})] {
+        let (status, body) = call(&base, "POST", "/v1/policies", Some(OP), policy(bad));
+        assert_eq!(status, 400, "{body}");
+    }
+    let (status, saved) = call(
+        &base,
+        "POST",
+        "/v1/policies",
+        Some(OP),
+        policy(json!({"scope":"inspect","mode":"observe"})),
+    );
+    assert_eq!((status, &saved["ml"]["mode"]), (200, &json!("observe")));
+}
+#[test]
 fn sub_minute_windows_report_the_current_minute() {
     let now = 1767225630000;
     let mut c = Collector::default();

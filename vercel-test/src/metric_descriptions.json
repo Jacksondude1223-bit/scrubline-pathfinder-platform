@@ -41,7 +41,7 @@
   },
   "scrubline_ml_scored_total": {
     "kind": "counter",
-    "help": "Flows scored by the ZC classifier."
+    "help": "Flows scored by the flow model: those a ZC inspect rule sends it, and under scope all whatever the stages let through."
   },
   "scrubline_ml_drops_total": {
     "kind": "counter",
@@ -53,7 +53,27 @@
   },
   "scrubline_ml_model_ready": {
     "kind": "gauge",
-    "help": "1 when a fitted classifier is installed on this node's ZC path."
+    "help": "1 when a fitted flow model is installed on this node."
+  },
+  "scrubline_ml_observed_total": {
+    "kind": "counter",
+    "help": "Flows the flow model scored at or above the threshold and let through, because the policy has it observe only."
+  },
+  "scrubline_ml_http_scored_total": {
+    "kind": "counter",
+    "help": "HTTP requests the layer-7 rules allowed that the request model then scored."
+  },
+  "scrubline_ml_http_drops_total": {
+    "kind": "counter",
+    "help": "Segments dropped because the request model scored a request in them at or above the threshold."
+  },
+  "scrubline_ml_http_observed_total": {
+    "kind": "counter",
+    "help": "Segments the request model would have dropped, let through because the policy or the filter only observes."
+  },
+  "scrubline_ml_http_model_ready": {
+    "kind": "gauge",
+    "help": "1 when a fitted request model is installed on this node."
   },
   "scrubline_rate_buckets": {
     "kind": "gauge",
@@ -321,11 +341,11 @@
   },
   "scrubline_control_ml_model_ready": {
     "kind": "gauge",
-    "help": "1 when the control plane is publishing a fitted classifier."
+    "help": "1 when the control plane is publishing a fitted flow model."
   },
   "scrubline_control_ml_samples": {
     "kind": "gauge",
-    "help": "Labeled samples held for training."
+    "help": "Labeled samples the published flow model was fitted to and measured on. Samples carrying an HTTP request train the request model instead."
   },
   "scrubline_control_ml_validation_samples": {
     "kind": "gauge",
@@ -333,15 +353,39 @@
   },
   "scrubline_control_ml_accuracy": {
     "kind": "gauge",
-    "help": "Holdout accuracy of the published model."
+    "help": "Holdout accuracy of the published flow model."
   },
   "scrubline_control_ml_precision": {
     "kind": "gauge",
-    "help": "Holdout precision of the published model. A false positive here is dropped customer traffic."
+    "help": "Holdout precision of the published flow model. A false positive here is dropped customer traffic."
   },
   "scrubline_control_ml_recall": {
     "kind": "gauge",
-    "help": "Holdout recall of the published model."
+    "help": "Holdout recall of the published flow model."
+  },
+  "scrubline_control_ml_http_model_ready": {
+    "kind": "gauge",
+    "help": "1 when the control plane is publishing a fitted request model, which needs clean and attack HTTP samples both."
+  },
+  "scrubline_control_ml_http_samples": {
+    "kind": "gauge",
+    "help": "HTTP requests the published request model was fitted to and measured on."
+  },
+  "scrubline_control_ml_http_validation_samples": {
+    "kind": "gauge",
+    "help": "HTTP requests held out of the request model's fit and scored against. Zero means there were too few samples to split."
+  },
+  "scrubline_control_ml_http_accuracy": {
+    "kind": "gauge",
+    "help": "Holdout accuracy of the published request model."
+  },
+  "scrubline_control_ml_http_precision": {
+    "kind": "gauge",
+    "help": "Holdout precision of the published request model. A false positive here is a dropped request."
+  },
+  "scrubline_control_ml_http_recall": {
+    "kind": "gauge",
+    "help": "Holdout recall of the published request model."
   },
   "scrubline_steering_escalation": {
     "kind": "gauge",

@@ -219,10 +219,23 @@ with tempfile.TemporaryDirectory() as temporary:
         samples=json.loads((ROOT/'configs/ml.samples.json').read_text())
         call(base,'/v1/ml/samples','POST',OP,samples)
         model=call(base,'/v1/ml/train','POST',OP,{'epochs':30,'lr':0.2,'threshold':0.65})
-        assert model['ready']
+        assert model['ready'] and model['http']['ready'], model
         call(base,'/v1/ml/score','POST',OP,dict(flow,payload=''))
         call(base,'/v1/ml/model',token=node_token)
         wait_for(lambda:call(base,f'/v1/nodes/{runtime_id}/stats',token=OP)['stats']['ml']['ready'])
+        # The node installs the request model with the flow model, and the HTTP rules hand it what
+        # they allow: a game client's request passes, and one shaped like the flood samples, which
+        # no rule refuses, is dropped by it.
+        def http_flow(src, raw):
+            return dict(flow, src_ip=src, dst_ip='203.0.113.20', proto='tcp', dport=30120, pps=1,
+                        payload=base64.b64encode(raw).decode())
+        client=http_flow('192.0.2.77', b'GET /players.json HTTP/1.1\r\nHost: 203.0.113.20:30120\r\n'
+                         b'User-Agent: CitizenFX/1\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n\r\n')
+        assert call(local,'/decide','POST',LOCAL,client)['action']=='permit'
+        flooding=http_flow('192.0.2.78', b'GET /players.json?_=3c9e HTTP/1.0\r\n\r\n')
+        judged=call(local,'/decide','POST',LOCAL,flooding)
+        assert judged['action']=='drop' and 'by the request model' in judged['reason'], judged
+        assert call(local,'/metrics',token=LOCAL).count('scrubline_ml_http_drops_total{')==1
         call(base,'/v1/ml/model','DELETE',OP)
         wait_for(lambda:not call(base,f'/v1/nodes/{runtime_id}/stats',token=OP)['stats']['ml']['ready'])
         metrics=call(base,'/metrics',token=OP)

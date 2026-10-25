@@ -152,6 +152,17 @@ pub fn policy(p: &Policy) -> Result<()> {
             return Err("invalid reputation.fast_pass".into());
         }
     }
+    if let Some(m) = &p.ml {
+        if !["", "all", "inspect"].contains(&m.scope.as_str()) {
+            return Err(format!(
+                "ml.scope {:?}: use all, or inspect for only what zc inspect rules send the model",
+                m.scope
+            ));
+        }
+        if !["", "enforce", "observe"].contains(&m.mode.as_str()) {
+            return Err(format!("ml.mode {:?}: use enforce or observe", m.mode));
+        }
+    }
     if let Some(e) = &p.egress {
         if !["", "off", "limit", "drop"].contains(&e.lockdown.as_str())
             || e.lockdown_pps < 0

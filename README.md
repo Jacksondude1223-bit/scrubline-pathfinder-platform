@@ -371,6 +371,12 @@ is what stops a flood aimed at handlers nobody thought to list.
   with `penalty_box` on, a source that keeps abusing an endpoint loses its
   game traffic for a while too. `observe` works here as everywhere: the rules
   record what they would have dropped and drop nothing.
+- **What the rules allow, the request model then judges**, once one is
+  published: a request it scores at its threshold drops the segment, with a
+  reason such as `GET /players.json: scored 0.97 by the request model, which
+  drops at 0.70`. It catches what no rule names, such as a client that sends
+  none of a browser's headers, or asks for HTTP/1.0 with a fresh query string
+  on every request. See [The classifiers](#the-classifiers).
 
 The rules read requests packet by packet, without reassembling TCP streams. A
 request is judged in the segment that carries its request line: at the start
@@ -419,13 +425,78 @@ Payload inspection belongs to the ZC stage alone; see
 
 1. ASIC / TCAM ACL. Longest-prefix and port ACLs. Terminal drops never leave the chip.
 2. FPGA. Line-rate meters and flag matches for what the TCAM did not already drop.
-3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path. A logistic classifier trained from the control API scores this stage and drops flows over the threshold.
-
-The model is flow-level only: rate, protocol, ports, and TCP flags. It does not inspect payloads. Train it with labeled samples, then nodes pull the weights on the same poll as the hardware program.
-
-One sample in five is held out of the fit, and the reported `accuracy`, `precision`, and `recall` are measured on that holdout. Watch precision: a false positive here is dropped customer traffic. Sets below ten samples are too small to split and report training metrics with `validation: 0`. `DELETE /v1/ml/model` retires a published model; agents clear their copy on the next poll, which is the only way to pull a bad model without restarting the fleet.
+3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path. The game filters and their HTTP rules run here, and the classifiers trained from the control API have the last word (see [The classifiers](#the-classifiers)).
 
 Hardware programming is represented as compiled programs the node agent pulls. A node without a switch ASIC, FPGA, or PF_RING license still enforces the same decision order in the software pipeline so the control plane can be tested. On an appliance, the agent writes the TCAM key, FPGA table, and `zc:<node>` cluster from that program.
+
+### The classifiers
+
+Two logistic models are trained from one labelled set and published together:
+
+- **The flow model** judges what every packet carries: its rate, protocol,
+  ports and TCP flags.
+- **The request model** judges the HTTP requests a game filter's [layer-7
+  rules](#http-on-the-servers-own-address-layer-7) allow: the method and
+  version, how long and deep the path and query are, how many headers there
+  are and which of a browser's usual ones it sends (User-Agent, Accept,
+  Accept-Language, Accept-Encoding, Cookie, Referer), the body it declares,
+  how far into a pipelined segment it sits, and the rate it arrives at.
+
+A sample whose payload is an HTTP request trains the request model, and every
+other sample trains the flow model. What makes an HTTP sample an attack may be
+in the request, where the flow model cannot see it, so it is kept out of the
+flow model's fit. The request model is published once the set holds clean and
+attack requests both.
+
+**By default they judge everything the rest of the datapath lets through:**
+
+- a flow that a zc `inspect` or `rate_limit` rule sends the flow model;
+- a flow that a game filter passes, and one that no rule decides, before it is
+  let through;
+- every request that a filter's HTTP rules allow, where a request scored at the
+  threshold drops the segment carrying it.
+
+A `permit` rule on the asic or fpga stage ends evaluation before either has a
+say. One on the zc stage comes after the game filters, so it spares a flow the
+flow model but not the HTTP rules or the request model. A verified source skips
+the flow model; the request model judges verified sources too, as the HTTP
+rules do. A drop by either counts against the source like any other, so
+with `penalty_box` on, a source the models keep flagging is boxed. Scoring
+costs about 40 ns a flow and 60 ns a request.
+
+The policy says where they run and whether they drop:
+
+```json
+"ml": {"scope": "all", "mode": "observe"}
+```
+
+`"scope": "inspect"` keeps the flow model to what zc `inspect` and
+`rate_limit` rules send it, with the request model off, which is how the
+classifier worked before it judged the rest. `"mode": "observe"` scores
+everything and drops nothing: a decision reads `PF_RING ZC ml score 0.93,
+observed only`, and `scrubline_ml_observed_total` and
+`scrubline_ml_http_observed_total` count what would have been dropped. That is
+how a model is tried before it is trusted. A filter's own `observe` does the
+same for the request model on that filter's traffic.
+
+Train with labelled samples, then nodes pull both models on their next poll.
+An HTTP sample is a TCP flow whose `payload` is the request, base64-encoded as
+any payload is; [`configs/ml.samples.json`](configs/ml.samples.json) has both
+kinds. One sample in five is held out of each fit, an HTTP sample with all the
+requests in it, and the reported `accuracy`, `precision`, and `recall` are
+measured on that holdout. Watch precision: a false positive here is dropped
+customer traffic. Sets below ten samples are too small to split and report
+training metrics with `validation: 0`. `DELETE /v1/ml/model` retires both
+models; agents clear their copy on the next poll, which is the only way to pull
+a bad model without restarting the fleet.
+
+`scrubline_ml_scored_total`, `_drops_total`, `_passes_total` and
+`_observed_total` count the flow model's verdicts on each node, and
+`scrubline_ml_http_scored_total`, `_http_drops_total` and
+`_http_observed_total` the request model's. `scrubline_ml_model_ready` and
+`scrubline_ml_http_model_ready` say which a node has installed. The control
+plane reports each published model's holdout metrics as
+`scrubline_control_ml_*` and `scrubline_control_ml_http_*`.
 
 ## Run
 
@@ -1114,10 +1185,11 @@ Policies are validated on save. A prefix or match CIDR that does not parse is re
 - `GET /metrics` Prometheus exposition for the control plane and the fleet
 - `GET /v1/nodes/{id}/program` what a node agent installs
 - `POST /v1/decide` run a flow record through a node's pipeline
-- `POST /v1/ml/samples` labeled flow records (`label` 0 clean, 1 attack)
-- `POST /v1/ml/train` fit the ZC logistic model
+- `POST /v1/ml/samples` labeled flow records (`label` 0 clean, 1 attack); one whose payload is an HTTP request trains the request model
+- `POST /v1/ml/train` fit the flow and request models
 - `GET /v1/ml/model` weights the node agent installs
-- `DELETE /v1/ml/model` retire the published model; agents clear it on the next poll
+- `POST /v1/ml/score` score a flow, and the HTTP requests it carries
+- `DELETE /v1/ml/model` retire the published models; agents clear them on the next poll
 - `POST /v1/nodes/{id}/heartbeat` also carries `tunnels`: what this node's provisioner says about its return paths
 - `PUT /v1/nodes/{id}/tunnel-endpoint`, `DELETE ...` assign or clear the address a node's tunnels terminate on (operator only)
 - `GET /v1/tunnels` every tunnel of the deployed policy, node by node (operator only)

@@ -124,7 +124,12 @@ pub struct Pipeline {
     stages: [[u64; 4]; 3],
     decisions: u64,
     unowned: u64,
-    ml_counts: [u64; 3],
+    /// The flow model: flows scored, dropped, passed, and over its threshold but only observed.
+    ml_counts: [u64; 4],
+    /// The request model: requests scored, segments it dropped, and segments it would have.
+    http_counts: [u64; 3],
+    /// Where the classifiers run and whether they drop, from the program.
+    ml: MlPolicy,
     returns: [u64; 3],
     games: gamefilter::Engine,
     pulses: Pulse,
@@ -159,7 +164,9 @@ impl Pipeline {
             stages: [[0; 4]; 3],
             decisions: 0,
             unowned: 0,
-            ml_counts: [0; 3],
+            ml_counts: [0; 4],
+            http_counts: [0; 3],
+            ml: MlPolicy::default(),
             returns: [0; 3],
             games: Default::default(),
             pulses: Default::default(),
@@ -286,6 +293,7 @@ impl Pipeline {
                 self.grace = e.grace_millis;
             }
         }
+        self.ml = program.ml.clone().unwrap_or_default();
         self.program = program;
     }
     fn over_rate(&mut self, id: &str, limit: i64, f: &Flow, now: i64) -> bool {
@@ -347,7 +355,14 @@ impl Pipeline {
         }
     }
     fn inspect_game(&mut self, f: &Flow, now: i64, trusted: bool) -> Option<Decision> {
-        let r = self.games.inspect(f, now, trusted);
+        let everywhere = self.ml.everywhere();
+        let model = self.model.http.as_deref().filter(|m| m.ready && everywhere);
+        let r = self
+            .games
+            .inspect(f, now, trusted, model, self.ml.enforcing());
+        self.http_counts[0] += r.scored;
+        self.http_counts[1] += u64::from(r.classified);
+        self.http_counts[2] += u64::from(r.observed);
         if r.filter.is_empty() {
             return None;
         }
@@ -385,9 +400,47 @@ impl Pipeline {
             );
             d.filter = r.filter;
             d.reply = r.reply;
+            if r.classified {
+                d.score = r.score;
+            }
             return Some(d);
         }
         None
+    }
+    /// The flow model's verdict, if it is published: a drop at its threshold, unless the policy
+    /// only observes, or a pass.
+    fn classify(&mut self, f: &Flow, now: i64, rule: &str) -> Option<Decision> {
+        if !self.model.ready {
+            return None;
+        }
+        let score = ml::score(&self.model, f);
+        let over = score >= self.model.threshold;
+        let drop = over && self.ml.enforcing();
+        self.ml_counts[0] += 1;
+        self.ml_counts[if drop {
+            1
+        } else if over {
+            3
+        } else {
+            2
+        }] += 1;
+        if drop {
+            self.reputation.strike(&f.src_ip, now);
+        }
+        let mut d = decision(
+            if drop { "drop" } else { "permit" },
+            2,
+            rule,
+            if drop {
+                format!("PF_RING ZC ml score {score:.2}")
+            } else if over {
+                format!("PF_RING ZC ml score {score:.2}, observed only")
+            } else {
+                "PF_RING ZC ml pass".into()
+            },
+        );
+        d.score = score;
+        Some(d)
     }
     fn evaluate(&mut self, f: &Flow, now: i64, trusted: bool) -> (Decision, Option<String>) {
         for stage in 0..3 {
@@ -481,28 +534,18 @@ impl Pipeline {
                         id,
                     );
                 }
-                if self.model.ready {
-                    let score = ml::score(&self.model, f);
-                    self.ml_counts[0] += 1;
-                    let drop = score >= self.model.threshold;
-                    self.ml_counts[if drop { 1 } else { 2 }] += 1;
-                    if drop {
-                        self.reputation.strike(&f.src_ip, now);
-                    }
-                    let mut d = decision(
-                        if drop { "drop" } else { "permit" },
-                        2,
-                        &r.id,
-                        if drop {
-                            format!("PF_RING ZC ml score {score:.2}")
-                        } else {
-                            "PF_RING ZC ml pass".into()
-                        },
-                    );
-                    d.score = score;
+                if let Some(d) = self.classify(f, now, &r.id) {
                     return (d, id);
                 }
                 return (decision("permit", 2, &r.id, "PF_RING ZC inspect pass"), id);
+            }
+        }
+        // Under scope all the flow model has the last word on whatever the stages let through:
+        // what a game filter or the HTTP rules passed, and what no rule decided. A permit rule,
+        // which ends evaluation, and a verified source skip it.
+        if !trusted && self.ml.everywhere() {
+            if let Some(d) = self.classify(f, now, "") {
+                return (d, None);
             }
         }
         (
@@ -632,6 +675,6 @@ impl Pipeline {
         if states.as_array().is_some_and(|a| !a.is_empty()) {
             egress["prefix_states"] = states;
         }
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"}},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10})
     }
 }

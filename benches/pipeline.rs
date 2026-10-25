@@ -1,6 +1,27 @@
-use pathfinder::{model::*, pipeline::Pipeline};
+use pathfinder::{ml, model::*, pipeline::Pipeline};
 use std::{hint::black_box, time::Instant};
-fn run(verified: bool) {
+/// Both classifiers published, at a threshold nothing reaches, so every flow and request is scored
+/// and nothing is dropped for it.
+fn models() -> ml::Model {
+    let fitted = |n| ml::Model {
+        weights: vec![0.1; n],
+        threshold: 0.999,
+        ready: true,
+        ..Default::default()
+    };
+    ml::Model {
+        http: Some(Box::new(fitted(ml::REQUEST_FEATURES))),
+        ..fitted(ml::FEATURE_COUNT)
+    }
+}
+fn label(what: &str, scored: bool) -> String {
+    if scored {
+        format!("{what}, scored by the models")
+    } else {
+        what.into()
+    }
+}
+fn run(verified: bool, scored: bool) {
     let mut p = Pipeline::new(Program {
         prefixes: vec!["203.0.113.0/24".into()],
         games: vec![GameFilter {
@@ -15,6 +36,9 @@ fn run(verified: bool) {
         }),
         ..Default::default()
     });
+    if scored {
+        p.model = models();
+    }
     let now = 1767225600000;
     let mut f = Flow {
         src_ip: "192.0.2.1".into(),
@@ -36,12 +60,12 @@ fn run(verified: bool) {
     }
     println!(
         "{}: {:.1} ns/flow",
-        if verified { "verified" } else { "unverified" },
+        label(if verified { "verified" } else { "unverified" }, scored),
         start.elapsed().as_nanos() as f64 / count as f64
     );
 }
 /// A request held to a server's HTTP rules: a path with no rate, then one over its rate.
-fn http(path: &str) {
+fn http(path: &str, scored: bool) {
     let mut p = Pipeline::new(Program {
         prefixes: vec!["203.0.113.0/24".into()],
         games: vec![GameFilter {
@@ -68,6 +92,9 @@ fn http(path: &str) {
         }],
         ..Default::default()
     });
+    if scored {
+        p.model = models();
+    }
     let now = 1767225600000;
     let f = Flow {
         src_ip: "192.0.2.1".into(),
@@ -88,13 +115,16 @@ fn http(path: &str) {
         black_box(p.decide(black_box(&f), now));
     }
     println!(
-        "http {path}: {:.1} ns/request",
+        "{}: {:.1} ns/request",
+        label(&format!("http {path}"), scored),
         start.elapsed().as_nanos() as f64 / count as f64
     );
 }
 fn main() {
-    run(false);
-    run(true);
-    http("/files/map/stream.rpf");
-    http("/players.json");
+    for scored in [false, true] {
+        run(false, scored);
+        run(true, scored);
+        http("/files/map/stream.rpf", scored);
+        http("/players.json", scored);
+    }
 }

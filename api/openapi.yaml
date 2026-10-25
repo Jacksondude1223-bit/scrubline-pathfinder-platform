@@ -685,6 +685,25 @@ paths:
                     - 1
                   ready:
                     type: boolean
+                  http:
+                    type: object
+                    description: Present when the flow carries HTTP requests, which the request model
+                      scores one by one, as the layer-7 rules would hand them to it.
+                    properties:
+                      ready:
+                        type: boolean
+                      scores:
+                        type: array
+                        items:
+                          type: number
+                      score:
+                        type: number
+                        description: The highest.
+                      label:
+                        type: integer
+                        enum:
+                        - 0
+                        - 1
         '400':
           description: The flow will not validate.
           content:
@@ -1695,6 +1714,8 @@ components:
           $ref: '#/components/schemas/ReputationPolicy'
         egress:
           $ref: '#/components/schemas/EgressPolicy'
+        ml:
+          $ref: '#/components/schemas/MlPolicy'
         tunnels:
           type: array
           items:
@@ -1890,6 +1911,8 @@ components:
           $ref: '#/components/schemas/ReputationPolicy'
         egress:
           $ref: '#/components/schemas/EgressPolicy'
+        ml:
+          $ref: '#/components/schemas/MlPolicy'
         tunnels:
           type: array
           items:
@@ -1959,7 +1982,8 @@ components:
           type: string
           format: byte
           description: 'Packet bytes, base64. Only the ZC stage sees it. Without one the game filter reports
-            the packet uninspectable and never drops it: it refuses to judge what it was not given.'
+            the packet uninspectable and never drops it: it refuses to judge what it was not given. In a
+            training sample, an HTTP request here makes it a sample for the request model.'
     Decision:
       type: object
       properties:
@@ -2030,6 +2054,13 @@ components:
           type: boolean
           description: Set by DELETE /v1/ml/model. Agents clear their copy when they see it; the zero
             model cannot signal this because it is indistinguishable from never trained.
+        http:
+          description: The request model, fitted to the samples whose payload is an HTTP request, which
+            are left out of the flow model's fit. Its samples and validation count requests, and every
+            fifth HTTP sample is held out with all the requests in it. Absent until the training set
+            holds clean and attack HTTP samples both.
+          allOf:
+          - $ref: '#/components/schemas/MLModel'
     Sample:
       type: object
       required:
@@ -2043,7 +2074,8 @@ components:
           enum:
           - 0
           - 1
-          description: 0 clean, 1 attack.
+          description: 0 clean, 1 attack. A TCP flow whose payload is an HTTP request trains the request
+            model; any other trains the flow model.
     StageStats:
       type: object
       properties:
@@ -2151,6 +2183,8 @@ components:
           type: number
     MLStats:
       type: object
+      description: ready to passes and observed are the flow model's; the http_ fields are the request
+        model's.
       properties:
         ready:
           type: boolean
@@ -2160,6 +2194,33 @@ components:
           type: integer
         passes:
           type: integer
+        observed:
+          type: integer
+          description: Flows scored at or above the threshold and let through, because the policy has the
+            models observe.
+        http_ready:
+          type: boolean
+        http_scored:
+          type: integer
+          description: Requests the HTTP rules allowed that the request model scored.
+        http_drops:
+          type: integer
+          description: Segments dropped because the request model scored a request in them at or above
+            its threshold.
+        http_observed:
+          type: integer
+          description: Segments it would have dropped, let through because the policy or the filter
+            observes.
+        scope:
+          type: string
+          enum:
+          - all
+          - inspect
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
     Stats:
       type: object
       description: A node's datapath counters. Most are monotonic totals; the fields documented as rates
@@ -2325,6 +2386,29 @@ components:
             them walk every stage to the same verdict. Off by default: it is an escalation of consequence
             beyond what one packet earned. With it off, strikes and would-be demotions are still counted
             and exposed, which is how it is sized before being switched on.'
+    MlPolicy:
+      type: object
+      description: Where the published classifiers judge traffic, and whether they drop what they score
+        at their threshold. A drop by either counts against the source like any other.
+      properties:
+        scope:
+          type: string
+          enum:
+          - all
+          - inspect
+          description: 'all, the default: the flow model scores every flow the stages let through (what
+            a zc inspect or rate_limit rule sends it, what a game filter passes, and what no rule decides),
+            and the request model every request a filter''s HTTP rules allow. An asic or fpga permit rule
+            skips both; a zc one, which comes after the game filters, and a verified source skip the flow
+            model. inspect: only the flows zc inspect and rate_limit rules send the flow model, and the
+            request model off.'
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          description: enforce, the default, drops what a model scores at its threshold. observe scores
+            and counts it, and drops nothing, which is how a model is tried before it is trusted.
     EgressPolicy:
       type: object
       description: What the fabric does with the return path it can see. Watching what the origin sends

@@ -218,4 +218,18 @@ pub struct MLStats {
     pub drops: u64,
     #[serde(deserialize_with = "null_default")]
     pub passes: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_ready: bool,
+    #[serde(deserialize_with = "null_default")]
+    pub http_scored: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_drops: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub scope: String,
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
 }

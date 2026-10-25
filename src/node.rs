@@ -594,7 +594,7 @@ pub async fn run() -> Result<()> {
                 fetch::<ml::Model>(&client, &format!("{api}/v1/ml/model"), &token).await
             {
                 let mut a = s.lock().unwrap();
-                if model.ready {
+                if model.usable() {
                     a.pipe.model = model;
                 } else if model.withdrawn {
                     a.pipe.model = ml::Model::default();
