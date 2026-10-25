@@ -357,6 +357,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Program'
+        '400':
+          description: A wait that is not a duration, or a since that is not an RFC 3339 time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '404':
           description: No program has been deployed for this node yet.
           content:
@@ -366,8 +372,30 @@ paths:
         '401': *id002
         '403': *id003
       description: A program names the prefixes a node scrubs and what it announces, so a node may fetch
-        only its own.
-      parameters: *id005
+        only its own. With wait, the request is held while the node's program is still the one compiled
+        at since (or, with since empty, while it has none) until the fabric compiles it a new one, which
+        differs in more than compiled_at, or wait runs out, then answered with the program as it stands. A node keeps one such request open instead
+        of polling, so what the control plane decides reaches it at once.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: since
+        in: query
+        required: false
+        description: The compiled_at of the program the node holds; empty for a node that holds none.
+        schema:
+          type: string
+          format: date-time
+      - name: wait
+        in: query
+        required: false
+        description: How long to hold the request for a new program, as a duration such as 20s. At most
+          30s; without it the program is answered at once.
+        schema:
+          type: string
   /v1/nodes/{id}/stats:
     get:
       summary: The counters a node last reported
@@ -2190,6 +2218,10 @@ components:
         dropped_pps:
           type: integer
           description: Moving average over load_window_seconds, not a total.
+        surge_pps:
+          type: integer
+          description: The offered rate over the last second. Load-driven shedding goes by the higher of
+            this and offered_pps, so it moves within a second of a flood arriving.
         load_window_seconds:
           type: integer
     Report:

@@ -99,6 +99,8 @@ pub struct Stats {
     #[serde(deserialize_with = "null_default")]
     pub dropped_pps: u64,
     #[serde(deserialize_with = "null_default")]
+    pub surge_pps: u64,
+    #[serde(deserialize_with = "null_default")]
     pub load_window_seconds: i64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

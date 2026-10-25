@@ -67,6 +67,13 @@
     ]
   },
   {
+    "name": "scrubline_surge_pps",
+    "group": "",
+    "path": [
+      "surge_pps"
+    ]
+  },
+  {
     "name": "scrubline_rate_buckets_max",
     "group": "",
     "path": [

@@ -143,6 +143,8 @@ pub struct Api {
     /// Since when this process has been taking heartbeats: from its first compile, or from its
     /// promotion. A node it has not heard from in that time is stale only for want of news.
     watching_since: Option<DateTime<Utc>>,
+    /// Counts compiles for the nodes waiting on their next program, which it wakes.
+    compiled: tokio::sync::watch::Sender<u64>,
 }
 pub type Shared = Arc<Mutex<Api>>;
 pub type MetricState<'a> = (
@@ -167,6 +169,7 @@ impl Api {
             overflow_until: HashMap::new(),
             overflowing: HashSet::new(),
             watching_since: None,
+            compiled: tokio::sync::watch::Sender::new(0),
         }
     }
     fn auth(&self, headers: &HeaderMap) -> Answer<Who> {
@@ -599,6 +602,7 @@ impl Api {
                     node_id: n.id.clone(),
                     capacity_pps: n.capacity_pps,
                     offered_pps: stats.map(|s| analytics::n(s, "offered_pps")).unwrap_or(0),
+                    surge_pps: stats.map(|s| analytics::n(s, "surge_pps")).unwrap_or(0),
                     pulsing: stats.is_some_and(|s| s["pulsing"] == true),
                     peak_pps: stats
                         .map(|s| analytics::n(s, "pulse_peak_pps"))
@@ -679,6 +683,7 @@ impl Api {
             .forget(&policy.protected.iter().cloned().collect());
         self.last_key = key;
         self.recompiles += 1;
+        self.compiled.send_replace(self.recompiles);
         Ok(())
     }
     fn visible(&self, who: &Who) -> Vec<String> {
@@ -1590,6 +1595,11 @@ async fn handler(
                 .collect()
         })
         .unwrap_or_default();
+    if method == Method::GET {
+        if let Err(e) = hold(&s, &path, &query, &headers).await {
+            return response(Err(e));
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         let (mut a, result) = if method == Method::POST && path == "/v1/ml/train" {
             let result = train(&s, &headers, &body);
@@ -1606,6 +1616,99 @@ async fn handler(
     })
     .await;
     response(result.unwrap_or_else(|_| Err((500, "request worker failed".into()))))
+}
+/// The longest a node's request for its program is held.
+const LONGEST_WAIT: i64 = 30_000;
+/// Whether a node holding `held` has something to fetch: a program that differs from it in more
+/// than when it was compiled, one where it had none or none where it had one, or tunnel reports
+/// ignored until it fetches again.
+fn news(a: &Api, id: &str, held: &Option<Program>) -> bool {
+    a.fences.contains_key(id)
+        || match (a.store.programs.get(id), held) {
+            (Some(now), Some(held)) => {
+                *held
+                    != Program {
+                        compiled_at: held.compiled_at,
+                        ..now.clone()
+                    }
+            }
+            (None, None) => false,
+            _ => true,
+        }
+}
+/// Holds a request for a node's program while the program is still the one the node has, the one
+/// compiled at `since`, or none for a node that has none yet: until the fabric compiles it a new
+/// one or `wait` runs out. What the control plane decides then reaches the node as it is decided
+/// rather than at its next poll, and a compile that leaves a node's program as it was, restamped,
+/// leaves that node waiting. A request it does not apply to, or one the caller may not make, goes
+/// through at once and is answered as usual.
+async fn hold(
+    s: &Shared,
+    path: &str,
+    query: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Answer<()> {
+    let Some(wait) = query.get("wait").filter(|w| !w.is_empty()) else {
+        return Ok(());
+    };
+    let Some(id) = path
+        .strip_prefix("/v1/nodes/")
+        .and_then(|p| p.strip_suffix("/program"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+    else {
+        return Ok(());
+    };
+    let wait = duration(wait)
+        .map_err(|e| bad(format!("wait: {e}")))?
+        .min(LONGEST_WAIT);
+    let since = match query.get("since").map(String::as_str).unwrap_or("") {
+        "" => None,
+        raw => Some(
+            DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| bad("since must be an RFC 3339 time, the compiled_at of a program"))?
+                .to_utc(),
+        ),
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait as u64);
+    let (shared, node, headers) = (s.clone(), id.to_string(), headers.clone());
+    let waiting = tokio::task::spawn_blocking(move || {
+        let a = shared.lock().ok()?;
+        if !a.auth(&headers).is_ok_and(|who| who.acts(&node)) {
+            return None;
+        }
+        let held = a.store.programs.get(&node).cloned();
+        let current = held.as_ref().map(|p| p.compiled_at) == since;
+        (current && !news(&a, &node, &held)).then(|| (a.compiled.subscribe(), held))
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some((mut changed, mut held)) = waiting else {
+        return Ok(());
+    };
+    loop {
+        tokio::select! {
+            compiled = tokio::time::timeout_at(deadline, changed.changed()) => {
+                if !matches!(compiled, Ok(Ok(()))) {
+                    return Ok(());
+                }
+            }
+            _ = crate::runtime::stopping() => return Ok(()),
+        }
+        let (shared, node) = (s.clone(), id.to_string());
+        let looked = tokio::task::spawn_blocking(move || {
+            let fresh = shared
+                .lock()
+                .map(|a| news(&a, &node, &held))
+                .unwrap_or(true);
+            (fresh, held)
+        })
+        .await;
+        match looked {
+            Ok((false, back)) => held = back,
+            _ => return Ok(()),
+        }
+    }
 }
 /// Fitting a full training set takes seconds. Holding the lock for that long stalls every
 /// heartbeat and program fetch behind it, so only reading the set and storing the model take it.
@@ -2284,6 +2387,123 @@ mod tests {
         agent(&mut a, 5, &fra, &fra_token);
         agent(&mut a, 6, &fra, &fra_token);
         assert_eq!(state(&a, &fra).0, "announce");
+    }
+    #[tokio::test]
+    async fn a_node_waiting_on_its_program_gets_the_next_as_soon_as_a_surge_compiles_it() {
+        let mut a = api();
+        let reg = |a: &mut Api, name: &str, src: &str| {
+            let body =
+                json!({"name":name,"region":"iad","tunnel_src":src,"capacity_pps":1_000_000});
+            let (_, r) = call(a, 0, "POST", "/v1/nodes/register", ENROLL, body);
+            (
+                r["node"]["id"].as_str().unwrap().to_string(),
+                r["token"].as_str().unwrap().to_string(),
+            )
+        };
+        let (lhr, lhr_token) = reg(&mut a, "lhr", "192.0.2.1");
+        let (fra, fra_token) = reg(&mut a, "fra", "192.0.2.2");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":lhr}),
+        );
+        for (node, token) in [(&lhr, &lhr_token), (&fra, &fra_token)] {
+            let path = format!("/v1/nodes/{node}/heartbeat");
+            assert_eq!(call(&mut a, 1, "POST", &path, token, json!({})).0, 200);
+        }
+        assert_eq!(state(&a, &fra).0, "withdraw");
+        let held = a.store.programs[&fra].compiled_at.to_rfc3339();
+        let s: Shared = Arc::new(Mutex::new(a));
+        let path = format!("/v1/nodes/{fra}/program");
+        let ask = |wait: &str, since: &str| {
+            HashMap::from([
+                ("wait".to_string(), wait.to_string()),
+                ("since".to_string(), since.to_string()),
+            ])
+        };
+        let by = |token: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            h
+        };
+        let quick = |started: std::time::Instant| started.elapsed().as_millis() < 1000;
+        // A node without this program, and a caller that may not read it, are answered at once.
+        let started = std::time::Instant::now();
+        hold(&s, &path, &ask("10s", ""), &by(&fra_token))
+            .await
+            .unwrap();
+        hold(&s, &path, &ask("10s", &held), &by(&lhr_token))
+            .await
+            .unwrap();
+        assert!(quick(started));
+        for (wait, since) in [("soon", ""), ("10s", "yesterday")] {
+            let e = hold(&s, &path, &ask(wait, since), &by(&fra_token)).await;
+            assert_eq!(e.unwrap_err().0, 400);
+        }
+        // fra holds the program it has, so it waits for the next one.
+        let waiting = tokio::spawn({
+            let (s, path, query, headers) =
+                (s.clone(), path.clone(), ask("10s", &held), by(&fra_token));
+            async move { hold(&s, &path, &query, &headers).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        // lhr's provisioner reports its customer's tunnel up: the fabric compiles again, but
+        // fra's program comes out as it was, so fra goes on waiting.
+        let compiled = {
+            let mut a = s.lock().unwrap();
+            let before = a.recompiles;
+            let body = json!({"tunnels":[{"tunnel_id":"nw","state":"up"}]});
+            let path = format!("/v1/nodes/{lhr}/heartbeat");
+            assert_eq!(call(&mut a, 2, "POST", &path, &lhr_token, body).0, 200);
+            a.recompiles - before
+        };
+        assert_eq!(compiled, 1);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished(), "a restamped program is nothing new");
+        // A second into a flood, lhr's mean is a tenth of its last second, which is enough.
+        let started = std::time::Instant::now();
+        {
+            let mut a = s.lock().unwrap();
+            let body = json!({"stats":{"offered_pps":90_000,"surge_pps":900_000}});
+            let path = format!("/v1/nodes/{lhr}/heartbeat");
+            assert_eq!(call(&mut a, 3, "POST", &path, &lhr_token, body).0, 200);
+        }
+        waiting.await.unwrap().unwrap();
+        assert!(quick(started));
+        let a = s.lock().unwrap();
+        assert_eq!(state(&a, &fra).0, "announce");
+        assert_ne!(a.store.programs[&fra].compiled_at.to_rfc3339(), held);
+        assert_eq!(
+            a.steering.levels()[&lhr].reason,
+            "shedding: the last second's load is 90% of capacity, above the 80% mark"
+        );
+    }
+    #[test]
+    fn a_waiting_node_is_answered_for_a_new_program_or_a_fence_but_not_a_restamp() {
+        let mut a = api();
+        let (node, _) = register(&mut a, 0, "edge-a", "192.0.2.1");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}),
+        );
+        let held = a.store.programs.get(&node).cloned();
+        assert!(!news(&a, &node, &held));
+        let mut restamped = held.clone().unwrap();
+        restamped.compiled_at = at(9);
+        a.store.programs.insert(node.clone(), restamped.clone());
+        assert!(!news(&a, &node, &held));
+        assert!(news(&a, &node, &None), "a first program");
+        restamped.announcements.clear();
+        a.store.programs.insert(node.clone(), restamped);
+        assert!(news(&a, &node, &held));
+        a.store.programs.remove(&node);
+        assert!(news(&a, &node, &held), "a program withdrawn");
+        assert!(!news(&a, &node, &None));
+        // Its tunnel reports are ignored until it fetches again, so it is told to.
+        a.fences.entry(node.clone()).or_default().insert(None);
+        assert!(news(&a, &node, &None));
     }
     #[test]
     fn nodes_get_a_heartbeat_timeout_to_check_in_before_they_are_helped() {

@@ -29,6 +29,10 @@ jobs:
         env:
           PATHFINDER_BIN_DIR: target/release
         run: python3 scripts/runtime-e2e.py
+      - name: Time from a flood to the fabric helping
+        env:
+          PATHFINDER_BIN_DIR: target/release
+        run: python3 scripts/reaction-time.py
       - name: All CLI commands
         run: python3 scripts/rust-cli-e2e.py
   snapshot:
@@ -99,7 +103,8 @@ jobs:
       - name: Check what it started
         run: |
           systemctl is-active scrubline-api scrubline-node scrubline-provision
-          curl -fsS --cacert /etc/scrubline/tls/ca.pem https://127.0.0.1:18443/health
+          # The CA lives under /etc/scrubline, which only root and the service account can read.
+          sudo curl -fsS --cacert /etc/scrubline/tls/ca.pem https://127.0.0.1:18443/health
           sudo /usr/local/bin/scrubline-ctl nodes | grep -q '"region":"ci"'
           # With nothing deployed there is nothing to apply, and the provisioner says so.
           sudo grep '^waiting' /run/scrubline-provision/status
@@ -123,7 +128,7 @@ jobs:
           # The provisioner's report reaches the control plane.
           token=$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)
           for attempt in $(seq 1 30); do
-            if curl -fsS --cacert /etc/scrubline/tls/ca.pem -H "Authorization: Bearer $token" \
+            if sudo curl -fsS --cacert /etc/scrubline/tls/ca.pem -H "Authorization: Bearer $token" \
               https://127.0.0.1:18443/v1/tunnels | grep -q '"state":"up"'; then exit 0; fi
             sleep 1
           done

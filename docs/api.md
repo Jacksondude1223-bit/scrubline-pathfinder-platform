@@ -201,6 +201,20 @@ should be scrubbed rather than waved through.
 without bumping the policy version. **Key your reload on it**, not on
 `version` alone.
 
+A node does not have to poll for it. Pass the `compiled_at` it holds as `since`,
+and a `wait`, and the control plane holds the request until it compiles that
+node a new program, or until `wait` (30s at most) runs out and it answers with
+the program as it stands. A recompile that leaves the node's program as it was,
+but for `compiled_at`, does not count. With `since` empty, it waits for a node
+that has no program yet to be given one. The agent keeps one such request open,
+which is how a location's overload reaches the nodes helping it within
+milliseconds:
+
+```console
+$ curl -H "Authorization: Bearer $NODE_TOKEN" \
+    "$API/v1/nodes/$NODE/program?since=2026-10-17T10:59:56.066780193Z&wait=20s"
+```
+
 ### 6. Ask what a policy would do
 
 ```console
@@ -515,14 +529,18 @@ PREFIX          NODE  REGION  STATE     PREPENDS  WHY
 203.0.113.0/24  lhr   eu      announce  0         anycast member at full preference
 ```
 
-When the location passes 80% of its `-capacity-pps`, the same mark that pads
-it for load, or stops heartbeating, the other nodes carrying the prefixes
-announce them too, and anycast spreads the attack across them. They scrub what
-they attract and forward the clean traffic to the location over node-to-node
-GRE (`sbh-*` interfaces), which delivers all of it down the customer's one
-tunnel. Help holds for five minutes after the location was last measured
-overloaded: help takes load off it, and ending help the moment it recovers
-would put the traffic straight back and flap the routes with every swing.
+When the location passes 80% of its `-capacity-pps` over the last second or the
+last ten, the same mark that pads it for load, or stops heartbeating, the other
+nodes carrying the prefixes announce them too, and anycast spreads the attack
+across them. They hear of it within a second of the flood starting, since the
+location heartbeats as soon as its last second crosses the mark and each node's
+request for its program is answered as soon as that program changes ([section
+5](#5-what-a-node-installs)). They scrub what they attract and forward the
+clean traffic to the location over node-to-node GRE (`sbh-*` interfaces), which
+delivers all of it down the customer's one tunnel. Help holds for five minutes
+after the location was last measured overloaded: help takes load off it, and
+ending help the moment it recovers would put the traffic straight back and flap
+the routes with every swing.
 
 The node-to-node tunnels stay up while the others stand by, so help starts the
 moment BGP moves traffic, and traffic still arriving after it moves back is

@@ -80,6 +80,7 @@ rust-check:
 runtime-test:
 	cargo build --locked --bins
 	python3 scripts/runtime-e2e.py
+	python3 scripts/reaction-time.py
 
 snapshot-check:
 	sh vercel-test/sync.sh

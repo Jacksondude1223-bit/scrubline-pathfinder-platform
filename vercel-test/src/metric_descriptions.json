@@ -65,11 +65,15 @@
   },
   "scrubline_offered_pps": {
     "kind": "gauge",
-    "help": "Packet rate currently offered to a node, averaged over its load window. This is the number load-driven steering reacts to."
+    "help": "Packet rate currently offered to a node, averaged over its load window. Load-driven steering reacts to this or to scrubline_surge_pps, whichever is higher."
   },
   "scrubline_dropped_pps": {
     "kind": "gauge",
     "help": "Packet rate a node is currently dropping, averaged over its load window."
+  },
+  "scrubline_surge_pps": {
+    "kind": "gauge",
+    "help": "Packet rate offered to a node over the last second. A flood shows here within a second, while the load window's average is still catching up."
   },
   "scrubline_game_inspected_total": {
     "kind": "counter",
