@@ -2728,10 +2728,10 @@ components:
           description: 'always, the default: every node filters the customer''s traffic all the time.
             on_demand: each node holding the tunnel only watches the traffic to its prefixes until it reaches
             attack_pps or attack_mbps over the last second, then applies its whole policy to it until the
-            traffic has stayed under both for five minutes. A node helping a pinned tunnel''s location
-            holds no tunnel for it, so it watches nothing and filters from the first packet. While idle
-            nothing is filtered, so an attack under the thresholds, such as HTTP abuse at a few requests a
-            second, passes.'
+            traffic has stayed under both for five minutes. A game filter''s HTTP rules, and the request
+            model behind them, judge it throughout. A node helping a pinned tunnel''s location holds no
+            tunnel for it, so it watches nothing and filters from the first packet. While idle nothing else
+            is filtered, so an attack under the thresholds passes.'
         attack_pps:
           type: integer
           minimum: 0
@@ -2882,7 +2882,7 @@ components:
           enum:
           - on_demand
           description: Present when the node only watches the tunnel's traffic until it reaches attack_pps
-            or attack_kbps. Absent, it filters it always.
+            or attack_kbps, a game filter's HTTP rules apart. Absent, it filters it always.
         attack_pps:
           type: integer
           description: This node's share of the tunnel's packet-rate threshold, split like rate_kbps.

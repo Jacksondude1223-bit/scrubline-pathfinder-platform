@@ -824,7 +824,8 @@ naming the tunnel.
 A tunnel with `"mitigation": "on_demand"` is only watched until the traffic to
 its prefixes reaches `attack_pps` or `attack_mbps` over the last second; then
 the node applies its whole policy to it until the traffic has stayed under both
-for five minutes. Each node watches only the tunnels it holds, against its
+for five minutes. A game filter's HTTP rules, and the request model behind them,
+judge its traffic throughout. Each node watches only the tunnels it holds, against its
 share of the thresholds, so a customer pinned to a location is watched there
 and nowhere else; a node helping that location filters what it scrubs for them
 from the first packet. Unset, the thresholds are half the clean-traffic
@@ -842,10 +843,9 @@ $ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels
 ```
 
 `mitigating` is what the node holding the tunnel last reported, which it does
-the moment a mitigation starts. While a tunnel is idle nothing is filtered,
-including its game filters' HTTP rules: an attack under the thresholds, such as
-abuse of a game server's HTTP at a few requests a second, passes. A threshold
-without `"mitigation": "on_demand"` is refused rather than ignored.
+the moment a mitigation starts. While a tunnel is idle nothing but the HTTP
+rules filters it, so an attack under the thresholds passes. A threshold without
+`"mitigation": "on_demand"` is refused rather than ignored.
 
 #### The MTU and the clamp are not decoration
 

@@ -183,6 +183,10 @@ impl Watch {
         self.since.is_some() && now <= self.until
     }
 }
+/// The request model a game filter's HTTP rules consult, if the policy has them consult one.
+fn consulted<'a>(model: &'a ml::Model, ml: &MlPolicy) -> Option<&'a ml::Model> {
+    model.http.as_deref().filter(|m| m.ready && ml.everywhere())
+}
 /// A flow's bit rate: the one its record carries, or its packets' headers and payload.
 fn bits(f: &Flow) -> u64 {
     if f.bps > 0 {
@@ -422,15 +426,29 @@ impl Pipeline {
     pub fn mitigations(&self) -> u64 {
         self.watches.iter().map(|w| w.mitigations).sum()
     }
-    /// Lets a flow to an idle on-demand tunnel through unfiltered. Its game filter still sees it,
-    /// so a player who connects now is known when mitigation starts, but nothing it would drop is
-    /// dropped and no source is held to account.
+    /// Judges a flow to an idle on-demand tunnel. A game filter's HTTP rules, and the request
+    /// model behind them, hold whether or not the tunnel is being mitigated: application abuse
+    /// takes a few requests a second, far under any attack threshold. Everything else passes
+    /// unfiltered, though the other game filters still see it, so a player who connects now is
+    /// known when mitigation starts.
     fn watch_only(&mut self, f: &Flow, now: i64, i: usize) -> Decision {
-        let r = self.games.inspect(f, now, false, None, false);
-        if r.cleared > 0 {
-            self.reputation.promote(&f.src_ip, r.cleared, now);
+        let r = self.games.inspect(
+            f,
+            now,
+            false,
+            consulted(&self.model, &self.ml),
+            self.ml.enforcing(),
+        );
+        if r.profile == "http" {
+            if let Some(d) = self.judged(r, f, now, false) {
+                return d;
+            }
+        } else {
+            if r.cleared > 0 {
+                self.reputation.promote(&f.src_ip, r.cleared, now);
+            }
+            self.watches[i].unfiltered += 1;
         }
-        self.watches[i].unfiltered += 1;
         decision(
             "permit",
             0,
@@ -500,11 +518,24 @@ impl Pipeline {
         }
     }
     fn inspect_game(&mut self, f: &Flow, now: i64, trusted: bool) -> Option<Decision> {
-        let everywhere = self.ml.everywhere();
-        let model = self.model.http.as_deref().filter(|m| m.ready && everywhere);
-        let r = self
-            .games
-            .inspect(f, now, trusted, model, self.ml.enforcing());
+        let r = self.games.inspect(
+            f,
+            now,
+            trusted,
+            consulted(&self.model, &self.ml),
+            self.ml.enforcing(),
+        );
+        self.judged(r, f, now, trusted)
+    }
+    /// Counts what a game filter made of a flow, holds the source to it, and turns a drop or a
+    /// challenge into the decision.
+    fn judged(
+        &mut self,
+        r: gamefilter::Inspection,
+        f: &Flow,
+        now: i64,
+        trusted: bool,
+    ) -> Option<Decision> {
         self.http_counts[0] += r.scored;
         self.http_counts[1] += u64::from(r.classified);
         self.http_counts[2] += u64::from(r.observed);

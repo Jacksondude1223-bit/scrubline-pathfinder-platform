@@ -895,7 +895,8 @@ the speed.
 
 By default a node filters a customer's traffic all the time. A tunnel can
 instead be mitigated on demand, so that each node holding it watches the
-customer's traffic and only applies the rules once an attack starts:
+customer's traffic and only applies the rest of its policy once an attack
+starts. A game filter's HTTP rules stay on throughout:
 
 ```json
 "tunnels": [{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],
@@ -909,15 +910,18 @@ customer's traffic and only applies the rules once an attack starts:
   helping another with a pinned customer holds no tunnel for them, so it
   watches nothing for them and filters what it scrubs for them from the first
   packet.
-- **Until the traffic reaches a threshold it is only watched.** Nothing is
-  dropped, not even what a rule would drop, and decisions read `watching
-  only: tunnel northwind is under its attack thresholds`. The game filters
-  still see the traffic, so a player who connects in the meantime is known
-  when mitigation starts and is not dropped as a stranger.
+- **Until the traffic reaches a threshold it is only watched,** except by the
+  game filters' [HTTP rules](#http-on-the-servers-own-address-layer-7), and
+  the request model behind them, which hold all the time: application abuse
+  takes a few requests a second, far under any attack threshold. Nothing else
+  is dropped, not even what a rule would drop, and decisions read `watching
+  only: tunnel northwind is under its attack thresholds`. The other game
+  filters still see the traffic, so a player who connects in the meantime is
+  known when mitigation starts and is not dropped as a stranger.
 - **The first flow that takes the traffic to `attack_pps` or `attack_mbps`**,
   over the last second, starts mitigation, and the node's whole policy applies
-  from that flow on: the rules, the game filters and their HTTP rules, the
-  classifiers and the penalty box. It lasts until the traffic has stayed under
+  from that flow on: the rules, the game filters, the classifiers and the
+  penalty box, which also counts what the HTTP rules dropped while idle. It lasts until the traffic has stayed under
   both thresholds for five minutes, since attacks come in waves and stopping
   between them would let the start of every wave through. The fabric
   recompiling does not interrupt it.
@@ -927,12 +931,9 @@ customer's traffic and only applies the rules once an attack starts:
   gives its bit rate; without one a node counts the packets' headers and
   payload.
 
-The trade-off is what passes while a tunnel is idle: an attack smaller than
-its thresholds is never filtered, and that includes the abuse of a game
-server's HTTP that the [layer-7 rules](#http-on-the-servers-own-address-layer-7)
-are for, which takes only a few requests a second. So does the traffic of an
-attack in the moments before it reaches a threshold. Keep `always` for a
-customer whose threat is application abuse.
+The trade-off is what passes while a tunnel is idle: beyond the HTTP rules, an
+attack smaller than its thresholds is never filtered, and nor is the traffic
+of an attack in the moments before it reaches a threshold.
 
 `PUT /v1/tunnels/{id}/mitigation` with `{"mitigation":"on_demand"}`, and any
 thresholds, switches a tunnel without restating it. The node heartbeats as soon
