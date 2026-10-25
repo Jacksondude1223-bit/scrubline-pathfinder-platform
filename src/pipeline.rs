@@ -110,6 +110,94 @@ impl Load {
         offered(sec).saturating_add((offered(sec - 1) as u128 * covered / 1000) as u64)
     }
 }
+/// How long an on-demand tunnel's mitigation lasts after its traffic was last at a threshold.
+/// Attacks come in waves, and stopping between them would let the start of every wave through.
+pub const MITIGATION_HOLD: i64 = 300_000;
+/// What reaches a tunnel's prefixes, in packets and bits, over the last two seconds.
+#[derive(Default)]
+struct Meter {
+    slots: [i64; 2],
+    packets: [u64; 2],
+    bits: [u64; 2],
+}
+impl Meter {
+    fn observe(&mut self, now: i64, packets: u64, bits: u64) {
+        let sec = now / 1000;
+        let i = sec.rem_euclid(2) as usize;
+        if self.slots[i] != sec {
+            self.slots[i] = sec;
+            self.packets[i] = 0;
+            self.bits[i] = 0;
+        }
+        self.packets[i] = self.packets[i].saturating_add(packets);
+        self.bits[i] = self.bits[i].saturating_add(bits);
+    }
+    /// Packets and bits a second over the one second up to `now`, read the way Load::surge reads
+    /// its rate.
+    fn rates(&self, now: i64) -> (u64, u64) {
+        let sec = now / 1000;
+        let covered = (1000 - now.rem_euclid(1000)) as u128;
+        let rate = |v: &[u64; 2]| {
+            let at = |s: i64| {
+                let i = s.rem_euclid(2) as usize;
+                if self.slots[i] == s {
+                    v[i]
+                } else {
+                    0
+                }
+            };
+            at(sec).saturating_add((at(sec - 1) as u128 * covered / 1000) as u64)
+        };
+        (rate(&self.packets), rate(&self.bits))
+    }
+}
+/// An on-demand tunnel this node holds: the thresholds its traffic starts mitigation at, what
+/// reaches it, and since and until when it is being mitigated.
+struct Watch {
+    tunnel: String,
+    attack_pps: u64,
+    attack_bps: u64,
+    meter: Meter,
+    since: Option<i64>,
+    until: i64,
+    /// Mitigations started, and flows let through unfiltered while it was idle.
+    mitigations: u64,
+    unfiltered: u64,
+}
+impl Watch {
+    /// Counts a flow to the tunnel and says whether the tunnel is being mitigated: from the moment
+    /// its traffic reaches either threshold until it has stayed under both for MITIGATION_HOLD.
+    fn mitigating(&mut self, now: i64, packets: u64, bits: u64) -> bool {
+        self.meter.observe(now, packets, bits);
+        let (pps, bps) = self.meter.rates(now);
+        if pps >= self.attack_pps || bps >= self.attack_bps {
+            if !self.active(now) {
+                self.since = Some(now);
+                self.mitigations += 1;
+            }
+            self.until = now + MITIGATION_HOLD;
+        }
+        self.active(now)
+    }
+    fn active(&self, now: i64) -> bool {
+        self.since.is_some() && now <= self.until
+    }
+}
+/// A flow's bit rate: the one its record carries, or its packets' headers and payload.
+fn bits(f: &Flow) -> u64 {
+    if f.bps > 0 {
+        return f.bps as u64;
+    }
+    let ip = if f.dst_ip.contains(':') { 40 } else { 20 };
+    let l4 = if f.proto.eq_ignore_ascii_case("tcp") {
+        20
+    } else if f.proto.eq_ignore_ascii_case("udp") || f.proto.eq_ignore_ascii_case("icmp") {
+        8
+    } else {
+        0
+    };
+    (f.pps.max(0) as u64).saturating_mul((ip + l4 + f.payload.len() as u64) * 8)
+}
 pub struct Pipeline {
     pub program: Program,
     pub model: ml::Model,
@@ -130,6 +218,9 @@ pub struct Pipeline {
     http_counts: [u64; 3],
     /// Where the classifiers run and whether they drop, from the program.
     ml: MlPolicy,
+    /// The on-demand tunnels this node holds, and which of them each of its prefixes is.
+    watches: Vec<Watch>,
+    watched: HashMap<String, usize>,
     returns: [u64; 3],
     games: gamefilter::Engine,
     pulses: Pulse,
@@ -167,6 +258,8 @@ impl Pipeline {
             ml_counts: [0; 4],
             http_counts: [0; 3],
             ml: MlPolicy::default(),
+            watches: Vec::new(),
+            watched: HashMap::new(),
             returns: [0; 3],
             games: Default::default(),
             pulses: Default::default(),
@@ -294,7 +387,59 @@ impl Pipeline {
             }
         }
         self.ml = program.ml.clone().unwrap_or_default();
+        // Programs are recompiled whenever the fabric changes, so a tunnel being mitigated stays
+        // mitigated, and its meter keeps counting, across a reload.
+        let mut kept: HashMap<String, Watch> = std::mem::take(&mut self.watches)
+            .into_iter()
+            .map(|w| (w.tunnel.clone(), w))
+            .collect();
+        self.watched.clear();
+        for t in program
+            .tunnels
+            .iter()
+            .filter(|t| t.mitigation == "on_demand")
+        {
+            let mut w = kept.remove(&t.id).unwrap_or_else(|| Watch {
+                tunnel: t.id.clone(),
+                attack_pps: 0,
+                attack_bps: 0,
+                meter: Meter::default(),
+                since: None,
+                until: 0,
+                mitigations: 0,
+                unfiltered: 0,
+            });
+            w.attack_pps = t.attack_pps.max(1) as u64;
+            w.attack_bps = (t.attack_kbps.max(1) as u64).saturating_mul(1000);
+            for prefix in &t.prefixes {
+                self.watched.insert(prefix.clone(), self.watches.len());
+            }
+            self.watches.push(w);
+        }
         self.program = program;
+    }
+    /// Mitigations started on this node's on-demand tunnels, for whoever wants to know at once.
+    pub fn mitigations(&self) -> u64 {
+        self.watches.iter().map(|w| w.mitigations).sum()
+    }
+    /// Lets a flow to an idle on-demand tunnel through unfiltered. Its game filter still sees it,
+    /// so a player who connects now is known when mitigation starts, but nothing it would drop is
+    /// dropped and no source is held to account.
+    fn watch_only(&mut self, f: &Flow, now: i64, i: usize) -> Decision {
+        let r = self.games.inspect(f, now, false, None, false);
+        if r.cleared > 0 {
+            self.reputation.promote(&f.src_ip, r.cleared, now);
+        }
+        self.watches[i].unfiltered += 1;
+        decision(
+            "permit",
+            0,
+            "",
+            format!(
+                "watching only: tunnel {} is under its attack thresholds",
+                self.watches[i].tunnel
+            ),
+        )
     }
     fn over_rate(&mut self, id: &str, limit: i64, f: &Flow, now: i64) -> bool {
         if limit <= 0 {
@@ -575,6 +720,19 @@ impl Pipeline {
         if self.lockdown != "off" {
             self.egress.ingress(&owner, now);
         }
+        // An on-demand tunnel's traffic is only watched until it reaches the tunnel's thresholds.
+        if let Some(&i) = self.watched.get(&owner) {
+            if !self.watches[i].mitigating(now, pps, bits(f)) {
+                let d = self.watch_only(f, now, i);
+                self.record(&d, None, f);
+                self.load.observe(now, pps, false);
+                self.loads
+                    .entry(owner)
+                    .or_default()
+                    .observe(now, pps, false);
+                return d;
+            }
+        }
         let state = self.reputation.check(&f.src_ip, now);
         let (d, by) = if state == 2 {
             (
@@ -675,6 +833,7 @@ impl Pipeline {
         if states.as_array().is_some_and(|a| !a.is_empty()) {
             egress["prefix_states"] = states;
         }
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"}},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10})
+        let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"}},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }

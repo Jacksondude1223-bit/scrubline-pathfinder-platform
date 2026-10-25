@@ -891,6 +891,57 @@ share; since anycast rarely spreads traffic evenly, a node can be held to its
 share while others sit under theirs. `PUT /v1/tunnels/{id}/rate` changes only
 the speed.
 
+### On-demand mitigation
+
+By default a node filters a customer's traffic all the time. A tunnel can
+instead be mitigated on demand, so that each node holding it watches the
+customer's traffic and only applies the rules once an attack starts:
+
+```json
+"tunnels": [{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],
+             "node":"node-a1b2c3d4e5f60718","rate_mbps":1000,
+             "mitigation":"on_demand","attack_pps":150000,"attack_mbps":400}]
+```
+
+- **Each node watches only the tunnels it holds.** For a pinned customer that
+  is their location; for a fanned-out one, every node holding the tunnel, each
+  against its share of the thresholds, split the way `rate_mbps` is. A node
+  helping another with a pinned customer holds no tunnel for them, so it
+  watches nothing for them and filters what it scrubs for them from the first
+  packet.
+- **Until the traffic reaches a threshold it is only watched.** Nothing is
+  dropped, not even what a rule would drop, and decisions read `watching
+  only: tunnel northwind is under its attack thresholds`. The game filters
+  still see the traffic, so a player who connects in the meantime is known
+  when mitigation starts and is not dropped as a stranger.
+- **The first flow that takes the traffic to `attack_pps` or `attack_mbps`**,
+  over the last second, starts mitigation, and the node's whole policy applies
+  from that flow on: the rules, the game filters and their HTTP rules, the
+  classifiers and the penalty box. It lasts until the traffic has stayed under
+  both thresholds for five minutes, since attacks come in waves and stopping
+  between them would let the start of every wave through. The fabric
+  recompiling does not interrupt it.
+- **Unset, the thresholds are half the clean-traffic allowance**, and the
+  packet rate that is at 512-byte packets, so a flood of small packets reaches
+  the packet threshold long before the bandwidth one. A flow record's `bps`
+  gives its bit rate; without one a node counts the packets' headers and
+  payload.
+
+The trade-off is what passes while a tunnel is idle: an attack smaller than
+its thresholds is never filtered, and that includes the abuse of a game
+server's HTTP that the [layer-7 rules](#http-on-the-servers-own-address-layer-7)
+are for, which takes only a few requests a second. So does the traffic of an
+attack in the moments before it reaches a threshold. Keep `always` for a
+customer whose threat is application abuse.
+
+`PUT /v1/tunnels/{id}/mitigation` with `{"mitigation":"on_demand"}`, and any
+thresholds, switches a tunnel without restating it. The node heartbeats as soon
+as a mitigation starts, and `GET /v1/tunnels` shows on each node's row whether
+it is `mitigating`, since when, and what reaches it. On the node,
+`scrubline_tunnel_mitigating{tunnel}`, `scrubline_tunnel_ingress_pps`,
+`_ingress_bits_per_second`, `_attack_pps`, `_attack_bits_per_second`,
+`_mitigations_total` and `_unfiltered_total` say the same.
+
 ### A dead tunnel withdraws the prefix
 
 This is the failure the design is actually for. A node announcing a prefix it

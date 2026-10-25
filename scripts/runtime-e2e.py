@@ -184,6 +184,21 @@ with tempfile.TemporaryDirectory() as temporary:
         for _ in range(4): call(local, '/decide', 'POST', LOCAL, invalid)
         assert call(local, '/decide', 'POST', LOCAL, invalid)['reason']=='source is in the penalty box'
         assert call(local, '/reputation', 'POST', LOCAL, {'release':['192.0.2.88']})['released']==1
+        # On demand, the node only watches the customer's traffic until it reaches the tunnel's
+        # thresholds, and filters it from then on; the control plane hears of it at once.
+        call(base, '/v1/tunnels/customer/mitigation', 'PUT', OP, {'mitigation':'on_demand','attack_pps':5000})
+        wait_for(lambda: call(local, '/tunnels', token=LOCAL)['tunnels'][0].get('mitigation')=='on_demand')
+        reflected = dict(flow, src_ip='198.51.100.70', sport=53)
+        idle = call(local, '/decide', 'POST', LOCAL, reflected)
+        assert idle['action']=='permit' and idle['reason'].startswith('watching only'), idle
+        flooded = call(local, '/decide', 'POST', LOCAL, dict(reflected, pps=6000))
+        assert flooded['action']=='drop' and flooded['stage']=='asic', flooded
+        def mitigating():
+            rows = call(base, '/v1/tunnels', token=OP)['tunnels'][0]['nodes']
+            return [r for r in rows if r['node_id']==runtime_id and r.get('mitigating')]
+        assert wait_for(mitigating, seconds=5)[0]['mitigating_since']
+        call(base, '/v1/tunnels/customer/mitigation', 'PUT', OP, {'mitigation':'always'})
+        wait_for(lambda: 'mitigation' not in call(local, '/tunnels', token=LOCAL)['tunnels'][0])
         def request(src, path, pps=1):
             raw = f'GET {path} HTTP/1.1\r\nHost: 203.0.113.20:30120\r\n\r\n'.encode()
             return dict(flow, src_ip=src, dst_ip='203.0.113.20', proto='tcp', dport=30120,
@@ -212,7 +227,8 @@ with tempfile.TemporaryDirectory() as temporary:
         overview = call(base,'/v1/analytics/overview?window=1h',token=tenant_token)
         assert all(p['prefix']=='203.0.113.0/24' for p in overview['prefixes'])
         call(base,'/v1/analytics/series?prefix=203.0.113.0/24&window=1h&step=5m',token=tenant_token)
-        assert call(base,'/v1/analytics/events?prefix=203.0.113.0/24',token=tenant_token)['events']
+        # The flood reaches analytics with the node's next heartbeat.
+        wait_for(lambda:call(base,'/v1/analytics/events?prefix=203.0.113.0/24',token=tenant_token)['events'])
         rotated = call(base, '/v1/tenants/customer-a/token','POST',OP,{})['token']
         call(base,'/v1/analytics/overview',token=tenant_token,expected=401)
         tenant_token = rotated

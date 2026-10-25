@@ -264,6 +264,10 @@ pub struct Flow {
     #[serde(skip_serializing_if = "is_zero")]
     pub flags: String,
     pub pps: i64,
+    /// The flow's bit rate, when the record carries one. Without it a node counts the packets'
+    /// headers and whatever payload the record holds.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bps: i64,
     #[serde(with = "base64_bytes", skip_serializing_if = "is_zero")]
     pub payload: Vec<u8>,
     #[serde(skip)]
@@ -470,6 +474,18 @@ pub struct NodeTunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub rate_kbps: i64,
+    /// "on_demand" when the node only watches the tunnel's traffic until it reaches either
+    /// threshold, this node's share of the tunnel's, and filters it from then on. Empty filters
+    /// it always.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mitigation: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub attack_pps: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub attack_kbps: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -641,6 +657,21 @@ pub struct Tunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub node: String,
+    /// "always" (the default when empty): every node filters the customer's traffic all the
+    /// time. "on_demand": each node holding the tunnel only watches its traffic until it reaches
+    /// attack_pps or attack_mbps, then filters it until it has stayed under both for a while.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mitigation: String,
+    /// The traffic to the tunnel's prefixes at which on-demand mitigation starts, summed like
+    /// rate_mbps. Zero takes the default: half the clean-traffic allowance, and the packet rate
+    /// that is at 512-byte packets.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub attack_pps: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub attack_mbps: i64,
 }
 
 /// A node-to-node GRE tunnel. A node that helps another with a customer pinned there forwards
@@ -809,6 +840,8 @@ impl<'de> Deserialize<'de> for Flow {
             flags: String,
             #[serde(deserialize_with = "null_default")]
             pps: i64,
+            #[serde(deserialize_with = "null_default")]
+            bps: i64,
             payload: Option<String>,
         }
         use base64::Engine;
@@ -831,6 +864,7 @@ impl<'de> Deserialize<'de> for Flow {
             dport: w.dport,
             flags: w.flags,
             pps: w.pps,
+            bps: w.bps,
             payload,
             has_payload,
         })

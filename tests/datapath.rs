@@ -1,10 +1,10 @@
 use pathfinder::{
     ml,
     model::{
-        Flow, GameFilter, GameHttp, GameHttpPath, GameSignature, Match, MlPolicy, Program,
-        ReputationPolicy, ZCEntry,
+        ACLEntry, Flow, GameFilter, GameHttp, GameHttpPath, GameSignature, Match, MlPolicy,
+        NodeTunnel, Program, ReputationPolicy, ZCEntry,
     },
-    pipeline::Pipeline,
+    pipeline::{Pipeline, MITIGATION_HOLD},
     state::{Egress, Pulse, Reputation},
     validation,
 };
@@ -37,14 +37,15 @@ fn equal(a: &Value, b: &Value, path: &str) {
         _ => assert_eq!(a, b, "{path}"),
     }
 }
-/// Stats as the Go datapath reported them: the counters for HTTP rules, the surge rate, and what
-/// the classifiers report beyond the flow model's counts, none of which it had, are left out of
-/// the comparison.
+/// Stats as the Go datapath reported them: the counters for HTTP rules, the surge rate, what the
+/// classifiers report beyond the flow model's counts, and on-demand mitigation, none of which it
+/// had, are left out of the comparison.
 fn go_shape(mut stats: Value) -> Value {
     let top = stats.as_object_mut().unwrap();
     top.remove("game_http_windows");
     top.remove("game_http_windows_max");
     top.remove("surge_pps");
+    top.remove("mitigation");
     let ml = top["ml"].as_object_mut().unwrap();
     for key in [
         "observed",
@@ -1084,4 +1085,154 @@ fn the_request_model_judges_each_request_the_http_rules_allow() {
     );
     assert_ne!(d.action, "drop");
     assert_eq!(pipe.stats(T0)["ml"]["http_observed"], 1);
+}
+
+/// A customer's tunnel held on this node and mitigated on demand.
+fn on_demand(attack_pps: i64, attack_kbps: i64) -> NodeTunnel {
+    NodeTunnel {
+        id: "northwind".into(),
+        prefixes: vec!["203.0.113.0/24".into()],
+        mitigation: "on_demand".into(),
+        attack_pps,
+        attack_kbps,
+        ..Default::default()
+    }
+}
+/// A node that drops DNS reflected at the customer, holding these tunnels.
+fn reflection_guard(tunnels: Vec<NodeTunnel>) -> Program {
+    Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        asic: vec![ACLEntry {
+            rule_id: "dns".into(),
+            action: "drop".into(),
+            r#match: Match {
+                sport: 53,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        tunnels,
+        ..Default::default()
+    }
+}
+fn reflected(pps: i64) -> Flow {
+    Flow {
+        src_ip: "198.51.100.53".into(),
+        dst_ip: "203.0.113.10".into(),
+        proto: "udp".into(),
+        sport: 53,
+        dport: 40000,
+        pps,
+        ..Default::default()
+    }
+}
+#[test]
+fn an_on_demand_tunnel_is_only_watched_until_its_traffic_reaches_a_threshold() {
+    let mut pipe = Pipeline::new(reflection_guard(vec![on_demand(1000, 1_000_000)]));
+    // Under its thresholds nothing is filtered, not even what a rule would drop.
+    let d = pipe.decide(&reflected(10), T0);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        (
+            "permit",
+            "watching only: tunnel northwind is under its attack thresholds"
+        )
+    );
+    // 990 pps more within the second makes 1,000, and mitigation starts with that flow.
+    let d = pipe.decide(&reflected(990), T0 + 100);
+    assert_eq!((d.action.as_str(), d.rule_id.as_str()), ("drop", "dns"));
+    // It holds after the flood eases, while the rules do their work.
+    assert_eq!(pipe.decide(&reflected(1), T0 + 60_000).action, "drop");
+    let row = pipe.stats(T0 + 60_000)["mitigation"][0].clone();
+    assert_eq!(
+        (
+            &row["active"],
+            &row["since"],
+            &row["mitigations"],
+            &row["unfiltered"]
+        ),
+        (
+            &json!(true),
+            &json!("2026-01-01T00:00:00.100Z"),
+            &json!(1),
+            &json!(1)
+        )
+    );
+    // Five minutes under both thresholds ends it.
+    let quiet = T0 + 100 + MITIGATION_HOLD + 1;
+    assert_eq!(pipe.decide(&reflected(1), quiet).action, "permit");
+    let row = pipe.stats(quiet)["mitigation"][0].clone();
+    assert_eq!(
+        (&row["active"], &row["since"]),
+        (&json!(false), &Value::Null)
+    );
+}
+#[test]
+fn either_threshold_starts_mitigation_and_a_flow_without_a_bit_rate_counts_its_bytes() {
+    // 10 Mbit/s, and a packet rate nothing here reaches.
+    let tunnel = on_demand(1_000_000, 10_000);
+    let mut pipe = Pipeline::new(reflection_guard(vec![tunnel.clone()]));
+    // A record that carries its bit rate is taken at its word.
+    let d = pipe.decide(
+        &Flow {
+            bps: 20_000_000,
+            ..reflected(10)
+        },
+        T0,
+    );
+    assert_eq!(d.action, "drop");
+    // One that does not is counted by its headers and payload: 800 pps of 1,400-byte UDP
+    // payloads is 9.1 Mbit/s, and 900 is 10.3.
+    let mut pipe = Pipeline::new(reflection_guard(vec![tunnel]));
+    let big = Flow {
+        payload: vec![0; 1400],
+        has_payload: true,
+        ..reflected(800)
+    };
+    assert_eq!(pipe.decide(&big, T0).action, "permit");
+    assert_eq!(
+        pipe.decide(&Flow { pps: 100, ..big }, T0 + 10).action,
+        "drop"
+    );
+}
+#[test]
+fn mitigation_carries_over_a_reload_and_ends_with_the_tunnel() {
+    let program = reflection_guard(vec![on_demand(1000, 1_000_000)]);
+    let mut pipe = Pipeline::new(program.clone());
+    assert_eq!(pipe.decide(&reflected(5000), T0).action, "drop");
+    // The fabric recompiles all the time, and a tunnel being mitigated stays mitigated.
+    pipe.load(program);
+    assert_eq!(pipe.decide(&reflected(1), T0 + 1000).action, "drop");
+    // A node helping another with this customer holds no tunnel for it, so it filters from the
+    // first packet and watches nothing.
+    let mut helper = Pipeline::new(reflection_guard(vec![]));
+    assert_eq!(helper.decide(&reflected(1), T0).action, "drop");
+    assert!(helper.stats(T0)["mitigation"].is_null());
+    // Taken off on-demand mitigation, the tunnel is filtered always.
+    pipe.load(reflection_guard(vec![]));
+    assert_eq!(
+        pipe.decide(&reflected(1), T0 + 2 * MITIGATION_HOLD).action,
+        "drop"
+    );
+}
+#[test]
+fn players_who_connect_while_a_tunnel_is_idle_are_known_when_its_mitigation_starts() {
+    let mut program = gated(vec![game("game", 19132, "raknet")], "handshake");
+    program.tunnels = vec![on_demand(1000, 1_000_000)];
+    let mut pipe = Pipeline::new(program);
+    // A player connects while the tunnel is idle, when anything would pass.
+    pipe.decide(&packet("192.0.2.1", 19132, &[0x05]), T0);
+    pipe.decide(&packet("192.0.2.1", 19132, &[0x07]), T0 + 1);
+    let stranger = packet("192.0.2.2", 19132, &[0x84, 0, 0]);
+    assert_eq!(pipe.decide(&stranger, T0 + 2).action, "permit");
+    // A flood starts mitigation...
+    let flood = Flow {
+        pps: 5000,
+        ..packet("198.51.100.9", 19132, &[0x84, 0, 0])
+    };
+    assert_eq!(pipe.decide(&flood, T0 + 3).action, "drop");
+    // ...and the player plays on, while gameplay from a source that never connected is dropped.
+    let playing = packet("192.0.2.1", 19132, &[0x84, 0, 0]);
+    assert_eq!(pipe.decide(&playing, T0 + 4).action, "permit");
+    assert_eq!(pipe.decide(&stranger, T0 + 5).action, "drop");
 }

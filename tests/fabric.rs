@@ -364,6 +364,90 @@ fn a_tunnels_clean_traffic_allowance_is_capped_and_validated() {
     assert_eq!(whole(1000), 1_000_000);
 }
 #[test]
+fn on_demand_tunnels_carry_thresholds_split_like_the_allowance() {
+    let t = Tunnel {
+        id: "t".into(),
+        remote: "198.51.100.1".into(),
+        prefixes: vec!["203.0.113.0/24".into()],
+        rate_mbps: 1000,
+        mitigation: "on_demand".into(),
+        ..Default::default()
+    };
+    // Unset, half the allowance, and the packet rate that is at 512-byte packets.
+    assert_eq!(tunnel::attack_thresholds(&t), (122_070, 500_000));
+    let set = Tunnel {
+        attack_pps: 80_000,
+        attack_mbps: 300,
+        ..t.clone()
+    };
+    assert_eq!(tunnel::attack_thresholds(&set), (80_000, 300_000));
+    for bad in [
+        Tunnel {
+            mitigation: "sometimes".into(),
+            ..t.clone()
+        },
+        Tunnel {
+            mitigation: "always".into(),
+            attack_pps: 1,
+            ..t.clone()
+        },
+        Tunnel {
+            mitigation: String::new(),
+            attack_mbps: 1,
+            ..t.clone()
+        },
+        Tunnel {
+            attack_pps: -1,
+            ..t.clone()
+        },
+    ] {
+        assert!(tunnel::validate(&bad, None).is_err(), "{bad:?}");
+    }
+    tunnel::validate(&set, None).unwrap();
+    // Fanned out, each node sending the tunnel watches its share of the customer's traffic.
+    let policy = Policy {
+        protected: t.prefixes.clone(),
+        tunnels: vec![Tunnel {
+            attack_mbps: 300,
+            ..set.clone()
+        }],
+        ..Default::default()
+    };
+    let nodes: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| Node {
+            tunnel_src: format!("192.0.2.{}", i + 1),
+            ..node(id, "iad", 100.0, "")
+        })
+        .collect();
+    let plan = compiler::plan(&policy, &nodes, &HashMap::new(), &HashMap::new());
+    for prog in compiler::compile(&policy, &nodes, &plan).values() {
+        let built = &prog.tunnels[0];
+        assert_eq!(built.mitigation, "on_demand");
+        assert_eq!((built.attack_pps, built.attack_kbps), (26_666, 100_000));
+    }
+    // A tunnel mitigated always carries no thresholds.
+    let n = &nodes[0];
+    let always = tunnel::for_node(
+        &Tunnel {
+            mitigation: String::new(),
+            ..t.clone()
+        },
+        n,
+        &t.prefixes,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            always.mitigation.as_str(),
+            always.attack_pps,
+            always.attack_kbps
+        ),
+        ("", 0, 0)
+    );
+}
+#[test]
 fn the_allowance_is_split_across_the_nodes_sending_the_tunnel() {
     let prefix = "203.0.113.0/24";
     let policy = |rate_mbps, disabled: &[&str]| Policy {
