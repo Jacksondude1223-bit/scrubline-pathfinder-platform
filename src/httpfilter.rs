@@ -8,7 +8,11 @@
 //! continues a body. The rest of a request, and anything that is not HTTP, passes: without the
 //! stream reassembled there is nothing to hold it to, and dropping a body's later segments would
 //! only break requests that were allowed.
+//!
+//! A request the rules allow is then scored by the request model, when one is published and the
+//! policy has the classifiers run on everything.
 use crate::{
+    ml,
     model::{Flow, GameHttp},
     Result,
 };
@@ -302,6 +306,43 @@ struct Head<'a> {
     h2c: bool,
     /// Bytes from the request line through the blank line.
     len: usize,
+    /// What the request model looks at besides: the version, how many header lines there are,
+    /// and which of the headers a browser sends it carries.
+    http10: bool,
+    headers: usize,
+    accept: bool,
+    accept_language: bool,
+    accept_encoding: bool,
+    cookie: bool,
+    referer: bool,
+}
+impl Head<'_> {
+    /// The request as the request model sees it, `position` into its segment.
+    fn request(&self, position: u64) -> ml::Request {
+        let (path, query) = match self.target.iter().position(|&c| c == b'?') {
+            Some(q) => (&self.target[..q], self.target.len() - q - 1),
+            None => (self.target, 0),
+        };
+        ml::Request {
+            get: self.method == b"GET" || self.method == b"HEAD",
+            post: self.method == b"POST",
+            http10: self.http10,
+            path: path.len(),
+            depth: path.iter().filter(|&&c| c == b'/').count(),
+            query,
+            headers: self.headers,
+            user_agent: self.user_agent.is_some(),
+            accept: self.accept,
+            accept_language: self.accept_language,
+            accept_encoding: self.accept_encoding,
+            cookie: self.cookie,
+            referer: self.referer,
+            body: self.content_length.unwrap_or(0),
+            chunked: self.chunked,
+            complete: self.complete,
+            position,
+        }
+    }
 }
 
 /// Methods common enough that one followed by a path starts a request even before the line is
@@ -400,6 +441,7 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
     let mut h = Head {
         method: &s[..m],
         target,
+        http10: version == b"HTTP/1.0",
         ..Default::default()
     };
     let mut encoded = false;
@@ -409,6 +451,7 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
             h.complete = true;
             break;
         }
+        h.headers += 1;
         if field[0] == b' ' || field[0] == b'\t' {
             return Err("a folded header line".into());
         }
@@ -441,6 +484,16 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
             h.chunked |= value.windows(7).any(|w| w.eq_ignore_ascii_case(b"chunked"));
         } else if name.eq_ignore_ascii_case(b"upgrade") {
             h.h2c |= value.windows(3).any(|w| w.eq_ignore_ascii_case(b"h2c"));
+        } else if name.eq_ignore_ascii_case(b"accept") {
+            h.accept = true;
+        } else if name.eq_ignore_ascii_case(b"accept-language") {
+            h.accept_language = true;
+        } else if name.eq_ignore_ascii_case(b"accept-encoding") {
+            h.accept_encoding = true;
+        } else if name.eq_ignore_ascii_case(b"cookie") {
+            h.cookie = true;
+        } else if name.eq_ignore_ascii_case(b"referer") {
+            h.referer = true;
         }
     }
     if encoded && h.content_length.is_some() {
@@ -450,6 +503,51 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
     }
     h.len = at;
     Ok(h)
+}
+/// Where the request after `h`, which starts at `at` in `s`, starts: right after it when its body
+/// length is declared, or at a request line found after a chunked one. None when the segment ends
+/// first.
+fn next(s: &[u8], at: usize, h: &Head) -> Option<usize> {
+    if !h.complete {
+        return None;
+    }
+    let after = at + h.len;
+    if h.chunked {
+        return embedded(s, after);
+    }
+    let body = usize::try_from(h.content_length.unwrap_or(0)).unwrap_or(usize::MAX);
+    match after.checked_add(body).filter(|next| *next < s.len()) {
+        None => None,
+        Some(next) if starts(&s[next..]) => Some(next),
+        Some(next) => embedded(s, next),
+    }
+}
+/// Whether a segment is the start of a TLS record, which the filter cannot read.
+fn tls(s: &[u8]) -> bool {
+    s.len() >= 3 && s[0] == 0x16 && s[1] == 0x03 && s[2] <= 0x04
+}
+/// The requests a TCP segment carries, as the request model sees them: each one that starts in it,
+/// as the rules would find them, up to the first that does not parse.
+pub fn requests(f: &Flow) -> Vec<ml::Request> {
+    let s = &f.payload[..];
+    let mut out = Vec::new();
+    if !f.proto.eq_ignore_ascii_case("tcp") || s.starts_with(b"PRI * HTTP/2.0") || tls(s) {
+        return out;
+    }
+    let Some(mut at) = (if starts(s) { Some(0) } else { embedded(s, 0) }) else {
+        return out;
+    };
+    while out.len() < PIPELINED_MAX as usize {
+        let Ok(h) = head(&s[at..], s.len()) else {
+            break;
+        };
+        out.push(h.request(out.len() as u64 + 1));
+        match next(s, at, &h) {
+            Some(n) => at = n,
+            None => break,
+        }
+    }
+    out
 }
 /// Where the next request line starts after a line break at or after `from`. Only a complete,
 /// well-formed request line counts, so a body that merely mentions a method does not.
@@ -536,6 +634,11 @@ pub struct Judgement {
     pub requests: u64,
     /// Whether the drop was for a rate.
     pub limited: bool,
+    /// Of the requests the rules allowed, how many the request model scored, the highest score,
+    /// and why the first it would drop should be, if it would drop any.
+    pub scored: u64,
+    pub score: f64,
+    pub flagged: String,
 }
 
 impl Policy {
@@ -658,13 +761,15 @@ impl Policy {
     }
     /// Judges a segment with a payload: every request that starts in it, at its start, pipelined
     /// after another or after a line break in one that continues a body. The first request the
-    /// rules refuse drops the segment.
+    /// rules refuse drops the segment. Those they allow are scored by `model`, if given, and
+    /// whether it would drop one is left to the caller.
     pub fn judge(
         &self,
         windows: &mut Windows,
         scratch: &mut Vec<u8>,
         f: &Flow,
         now: i64,
+        model: Option<&ml::Model>,
     ) -> Judgement {
         let s = &f.payload[..];
         let mut j = Judgement::default();
@@ -676,7 +781,7 @@ impl Policy {
         }
         let mut at = if starts(s) {
             0
-        } else if s.len() >= 3 && s[0] == 0x16 && s[1] == 0x03 && s[2] <= 0x04 {
+        } else if tls(s) {
             j.reason = "TLS, which the filter cannot read".into();
             return j;
         } else if let Some(at) = embedded(s, 0) {
@@ -708,28 +813,24 @@ impl Policy {
                 j.reason = why;
                 return j;
             }
-            // Another request in the segment starts after this one's body: right after it when
-            // its length is declared, or at a request line found after a chunked one.
-            if !h.complete {
-                break;
+            if let Some(m) = model {
+                let score = ml::score_request(m, &h.request(j.requests), f.pps);
+                j.scored += 1;
+                j.score = j.score.max(score);
+                if score >= m.threshold && j.flagged.is_empty() {
+                    // check() left the request's normalised path in scratch.
+                    j.flagged = format!(
+                        "{} {}: scored {score:.2} by the request model, which drops at {:.2}",
+                        show(h.method),
+                        show(scratch),
+                        m.threshold
+                    );
+                }
             }
-            let after = at + h.len;
-            at = if h.chunked {
-                match embedded(s, after) {
-                    Some(next) => next,
-                    None => break,
-                }
-            } else {
-                let body = usize::try_from(h.content_length.unwrap_or(0)).unwrap_or(usize::MAX);
-                match after.checked_add(body).filter(|next| *next < s.len()) {
-                    None => break,
-                    Some(next) if starts(&s[next..]) => next,
-                    Some(next) => match embedded(s, next) {
-                        Some(found) => found,
-                        None => break,
-                    },
-                }
-            };
+            match next(s, at, &h) {
+                Some(n) => at = n,
+                None => break,
+            }
         }
         j.reason = "HTTP requests allowed".into();
         j
@@ -848,7 +949,7 @@ mod tests {
             ..Default::default()
         });
         let (mut w, mut scratch) = (Windows::default(), Vec::new());
-        let mut judge = |payload: &[u8]| p.judge(&mut w, &mut scratch, &flow(payload), 0);
+        let mut judge = |payload: &[u8]| p.judge(&mut w, &mut scratch, &flow(payload), 0, None);
         let j = judge(b"GET / HTTP/1.1\r\n\r\nGET /players.json HTTP/1.1\r\n\r\n");
         assert!(j.drop && j.requests == 2, "{j:?}");
         let j = judge(
@@ -863,5 +964,82 @@ mod tests {
         assert!(!j.drop && j.requests == 0, "{j:?}");
         let j = judge(&[0x16, 0x03, 0x01, 0x02, 0x00]);
         assert!(!j.drop && j.reason.starts_with("TLS"));
+    }
+    #[test]
+    fn the_request_model_sees_each_request_the_rules_would_find() {
+        let rs = requests(&flow(
+            b"GET /a/b?x=1 HTTP/1.0\r\nUser-Agent: c\r\nAccept: */*\r\nCookie: k=v\r\n\r\n\
+              POST /c HTTP/1.1\r\nContent-Length: 2\r\n\r\nokGET /d HTTP/1.1\r\nHost: x",
+        ));
+        assert_eq!(
+            rs[0],
+            ml::Request {
+                get: true,
+                http10: true,
+                path: 4,
+                depth: 2,
+                query: 3,
+                headers: 3,
+                user_agent: true,
+                accept: true,
+                cookie: true,
+                complete: true,
+                position: 1,
+                ..Default::default()
+            }
+        );
+        assert!(rs[1].post && rs[1].body == 2 && rs[1].position == 2);
+        // The last head runs past the segment, its one header cut short, so what it lacks may
+        // only be cut off.
+        assert!(!rs[2].complete && rs[2].headers == 0 && rs[2].position == 3);
+        assert_eq!(rs.len(), 3);
+        // Nothing that is not HTTP over TCP is a request.
+        assert!(requests(&flow(b"\x16\x03\x01\x00\x05hello")).is_empty());
+        assert!(requests(&Flow {
+            proto: "udp".into(),
+            ..flow(b"GET / HTTP/1.1\r\n\r\n")
+        })
+        .is_empty());
+    }
+    #[test]
+    fn allowed_requests_are_scored_and_the_first_over_the_threshold_named() {
+        let p = policy(GameHttp::default());
+        // A model that only looks at whether a request names its client.
+        let mut weights = vec![0.0; ml::REQUEST_FEATURES];
+        weights[8] = -8.0;
+        let model = ml::Model {
+            weights,
+            bias: 4.0,
+            threshold: 0.5,
+            ready: true,
+            ..Default::default()
+        };
+        let (mut w, mut scratch) = (Windows::default(), Vec::new());
+        let j = p.judge(
+            &mut w,
+            &mut scratch,
+            &flow(b"GET /ok HTTP/1.1\r\nUser-Agent: c\r\n\r\nGET /%61nonymous HTTP/1.1\r\n\r\n"),
+            0,
+            Some(&model),
+        );
+        assert!(!j.drop && j.scored == 2, "{j:?}");
+        assert_eq!(
+            j.flagged,
+            "GET /anonymous: scored 0.98 by the request model, which drops at 0.50"
+        );
+        assert!((j.score - 0.982).abs() < 0.001);
+        // Requests the rules refuse are theirs to drop, not the model's.
+        let p = policy(GameHttp {
+            default: "drop".into(),
+            ..Default::default()
+        });
+        let j = p.judge(
+            &mut w,
+            &mut scratch,
+            &flow(b"GET / HTTP/1.1\r\n\r\n"),
+            0,
+            Some(&model),
+        );
+        assert!(j.drop && j.scored == 0 && j.flagged.is_empty(), "{j:?}");
     }
 }

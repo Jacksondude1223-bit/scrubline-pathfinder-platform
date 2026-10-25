@@ -90,6 +90,8 @@ pub struct Policy {
     #[serde(skip_serializing_if = "is_zero")]
     pub egress: Option<EgressPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
+    pub ml: Option<MlPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub challenge_secret: String,
     #[serde(deserialize_with = "null_time")]
@@ -111,6 +113,7 @@ impl Default for Policy {
             pulse_floor_pps: Default::default(),
             reputation: None,
             egress: None,
+            ml: None,
             challenge_secret: Default::default(),
             updated_at: zero_time(),
             version: Default::default(),
@@ -128,6 +131,31 @@ pub struct ReputationPolicy {
     pub penalty_box: bool,
 }
 
+/// Where the published classifiers judge traffic, and whether they drop what they score at their
+/// threshold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MlPolicy {
+    /// "all", the default: the flow model has the last word on everything the stages let
+    /// through, and the request model on every request the HTTP rules allow. "inspect": only the
+    /// flows a zc inspect or rate_limit rule sends the flow model.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub scope: String,
+    /// "enforce", the default, or "observe": score and count what would be dropped, and drop
+    /// nothing.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+}
+impl MlPolicy {
+    pub fn everywhere(&self) -> bool {
+        self.scope != "inspect"
+    }
+    pub fn enforcing(&self) -> bool {
+        self.mode != "observe"
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct EgressPolicy {
@@ -346,6 +374,8 @@ pub struct Program {
     pub reputation: Option<ReputationPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
     pub egress: Option<EgressPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ml: Option<MlPolicy>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub tunnels: Vec<NodeTunnel>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
@@ -386,6 +416,7 @@ impl Default for Program {
             pulse_floor_pps: Default::default(),
             reputation: None,
             egress: None,
+            ml: None,
             tunnels: Vec::new(),
             sessions: Vec::new(),
             tunnel_src: Default::default(),

@@ -58,6 +58,16 @@ policy using one was never announced. They now render as `large-community [ ]`,
 and the affected `commands` in `tests/fixtures/go-reference.json` were updated to
 match; everything else in that fixture is Go's output unchanged.
 
+The classifier has since grown past what Go had, without changing what Go
+recorded. A training sample whose payload is an HTTP request now trains a
+separate request model and is left out of the flow model's fit, where Go would
+have fitted it like any other; the reference samples carry no HTTP, so the flow
+model still matches Go's weights exactly. By default the flow model also judges
+what Go let through unscored, a flow a game filter passed or no rule decided;
+`"ml": {"scope": "inspect"}` in a policy restores Go's reach, and the recorded
+sequences, whose one model-backed flow meets a zc `inspect` rule, pass either
+way.
+
 ## Deployment
 
 Back up the state file and replace the binaries or rebuild the image. A restarted

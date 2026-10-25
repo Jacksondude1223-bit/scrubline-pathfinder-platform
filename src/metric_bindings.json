@@ -46,6 +46,46 @@
     ]
   },
   {
+    "name": "scrubline_ml_observed_total",
+    "group": "",
+    "path": [
+      "ml",
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_ml_http_scored_total",
+    "group": "",
+    "path": [
+      "ml",
+      "http_scored"
+    ]
+  },
+  {
+    "name": "scrubline_ml_http_drops_total",
+    "group": "",
+    "path": [
+      "ml",
+      "http_drops"
+    ]
+  },
+  {
+    "name": "scrubline_ml_http_observed_total",
+    "group": "",
+    "path": [
+      "ml",
+      "http_observed"
+    ]
+  },
+  {
+    "name": "scrubline_ml_http_model_ready",
+    "group": "",
+    "path": [
+      "ml",
+      "http_ready"
+    ]
+  },
+  {
     "name": "scrubline_rate_buckets",
     "group": "",
     "path": [

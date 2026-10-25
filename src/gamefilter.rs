@@ -1,7 +1,7 @@
 //! Protocol framing, handshake admission, stateless HMAC challenge cookies, and the layer-7 rules
 //! for the HTTP a game server answers on its own address.
 use crate::{
-    httpfilter,
+    httpfilter, ml,
     model::{Flow, GameFilter, GameSignature},
     Result,
 };
@@ -51,6 +51,13 @@ pub struct Inspection {
     pub requests: u64,
     pub limited: bool,
     pub other: bool,
+    /// What the request model made of the requests the rules allowed: how many it scored, the
+    /// highest score, whether the drop is its doing, and whether it would have dropped the segment
+    /// but was only observing.
+    pub scored: u64,
+    pub score: f64,
+    pub classified: bool,
+    pub observed: bool,
 }
 fn bytes(v: &[i64], name: &str) -> Result<Vec<u8>> {
     v.iter()
@@ -268,7 +275,14 @@ impl Engine {
                 && b.dst.is_none_or(|p| ip.is_some_and(|a| p.contains(&a)))
         })
     }
-    fn inspect_http(&mut self, i: usize, f: &Flow, now: i64) -> Inspection {
+    fn inspect_http(
+        &mut self,
+        i: usize,
+        f: &Flow,
+        now: i64,
+        model: Option<&ml::Model>,
+        enforce: bool,
+    ) -> Inspection {
         let b = &self.bindings[i];
         let mut r = Inspection {
             filter: b.id.clone(),
@@ -288,16 +302,30 @@ impl Engine {
             return r;
         }
         let policy = b.http.as_ref().expect("an HTTP binding has HTTP rules");
-        let j = policy.judge(&mut self.windows, &mut self.scratch, f, now);
+        let j = policy.judge(&mut self.windows, &mut self.scratch, f, now, model);
         r.requests = j.requests;
         r.limited = j.drop && j.limited;
         r.other = j.requests == 0;
-        r.verdict = if j.drop { "drop" } else { "pass" }.into();
+        r.scored = j.scored;
+        r.score = j.score;
+        let mut drop = j.drop;
         r.reason = j.reason;
-        if b.observe && j.drop {
+        if !drop && !j.flagged.is_empty() {
+            if enforce {
+                drop = true;
+                r.classified = true;
+                r.reason = j.flagged;
+            } else {
+                r.observed = true;
+            }
+        }
+        r.verdict = if drop { "drop" } else { "pass" }.into();
+        if b.observe && drop {
             r.reason = format!("observe only: would have drop ({})", r.reason);
             r.verdict = "pass".into();
             r.limited = false;
+            r.observed |= r.classified;
+            r.classified = false;
         }
         r
     }
@@ -326,10 +354,21 @@ impl Engine {
         mac.update(&((now / 1000 / 120) as u64).to_be_bytes());
         mac.finalize().into_bytes()[..4].to_vec()
     }
-    pub fn inspect(&mut self, f: &Flow, now: i64, validate_only: bool) -> Inspection {
-        // HTTP has no gate to skip, so a verified source is held to its rules like anyone else.
+    /// Judges a flow by the filter bound to where it is going. `model` is the request model the
+    /// HTTP rules consult, if they are to consult one, and `enforce` whether it drops what it
+    /// scores at its threshold or only counts it.
+    pub fn inspect(
+        &mut self,
+        f: &Flow,
+        now: i64,
+        validate_only: bool,
+        model: Option<&ml::Model>,
+        enforce: bool,
+    ) -> Inspection {
+        // HTTP has no gate to skip, so a verified source is held to its rules, and to the request
+        // model, like anyone else.
         if let Some(i) = self.http_binding(f) {
-            return self.inspect_http(i, f, now);
+            return self.inspect_http(i, f, now, model, enforce);
         }
         let Some(b) = self.binding(f) else {
             return Inspection {

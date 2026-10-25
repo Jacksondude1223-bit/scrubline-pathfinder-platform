@@ -531,6 +531,7 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                 pulse_floor_pps: p.pulse_floor_pps,
                 reputation: p.reputation.clone(),
                 egress: p.egress.clone(),
+                ml: p.ml.clone(),
                 tunnels: tunnels_for(p, n, &prefixes),
                 backhaul: backhaul_for(p, nodes, n, &prefixes),
                 pinned: pinned_at(p, n),

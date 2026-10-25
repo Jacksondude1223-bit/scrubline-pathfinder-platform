@@ -188,6 +188,8 @@ pub fn control(api: &Api) -> crate::Result<String> {
         (nodes.len() - ready) as f64,
     );
     let model = &api.store.data.model;
+    let unfitted = crate::ml::Model::default();
+    let http = model.http.as_deref().unwrap_or(&unfitted);
     let (recompiles, requests, levels) = api.metric_state();
     for (name, v) in [
         ("scrubline_policies", api.store.data.policies.len() as f64),
@@ -203,6 +205,18 @@ pub fn control(api: &Api) -> crate::Result<String> {
         ("scrubline_control_ml_accuracy", model.accuracy),
         ("scrubline_control_ml_precision", model.precision),
         ("scrubline_control_ml_recall", model.recall),
+        (
+            "scrubline_control_ml_http_model_ready",
+            f64::from(http.ready),
+        ),
+        ("scrubline_control_ml_http_samples", http.samples as f64),
+        (
+            "scrubline_control_ml_http_validation_samples",
+            http.validation as f64,
+        ),
+        ("scrubline_control_ml_http_accuracy", http.accuracy),
+        ("scrubline_control_ml_http_precision", http.precision),
+        ("scrubline_control_ml_http_recall", http.recall),
     ] {
         m.add(name, vec![], v);
     }

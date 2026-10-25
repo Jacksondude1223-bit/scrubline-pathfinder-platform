@@ -248,23 +248,54 @@ $ curl -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json'
 The README's [game filtering](../README.md#http-on-the-servers-own-address-layer-7)
 section covers the rules.
 
-### 7. The classifier
+### 7. The classifiers
 
 ```console
 $ scrubctl ml-load configs/ml.samples.json
-{"stored":40}
+{"stored":52}
 
 $ scrubctl ml-train
-{"ready":true,"accuracy":1,"precision":1,"recall":1,"validation":8,"samples":40,
- "threshold":0.65,"epochs":300}
+{"ready":true,"accuracy":1.0,"precision":1.0,"recall":1.0,"validation":8,"samples":40,
+ "threshold":0.65,"epochs":300,"weights":[6.13,-1.62,0.46,0.64,2.26,-0.10,-8.88],…,
+ "http":{"ready":true,"accuracy":1.0,"precision":1.0,"recall":1.0,"validation":2,
+         "samples":19,"threshold":0.65,"epochs":300,"weights":[2.77,2.07,…],…}}
 ```
 
+One training set fits two models. A sample whose payload is an HTTP request
+trains the **request model** under `http`, and is left out of the **flow
+model**'s fit: what makes it an attack may be in the request, which the flow
+model cannot see. `http` appears once the set holds clean and attack HTTP
+samples both; its `samples` and `validation` count requests, since one sample
+can pipeline several.
+
 `accuracy`, `precision` and `recall` are measured on the **holdout**, not on the
-samples the model was fitted on. One in five is held out; sets under ten samples
-are too small to split and report `validation: 0`.
+samples the model was fitted on. One in five is held out, an HTTP sample with
+all its requests; sets under ten samples are too small to split and report
+`validation: 0`.
 
 Watch precision rather than accuracy: a false positive here is dropped customer
 traffic.
+
+Scoring a flow that carries HTTP shows both models' verdicts, the request
+model's request by request:
+
+```console
+$ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/ml/score \
+    -d '{"proto":"tcp","dport":30120,"pps":600,"payload":"R0VUIC9wbGF5ZXJzLmpzb24/Xz0zYzllIEhUVFAvMS4wDQoNCg=="}'
+{"score":0.749,"label":1,"ready":true,
+ "http":{"ready":true,"scores":[0.9999],"score":0.9999,"label":1}}
+```
+
+Where the models run is the policy's `ml` block. By default, `scope` `all`,
+the flow model has the last word on every flow the stages let through (what a
+zc `inspect` or `rate_limit` rule sends it, what a game filter passes, and what
+no rule decides), and the request model on every request a filter's HTTP rules
+allow. `inspect` keeps the flow model to the zc rules and the request model off.
+`mode` `observe` scores and counts without dropping:
+
+```json
+"ml": {"scope": "all", "mode": "observe"}
+```
 
 ```console
 $ curl -X DELETE -H "Authorization: Bearer $API_TOKEN" $API/v1/ml/model
@@ -273,7 +304,7 @@ $ curl -X DELETE -H "Authorization: Bearer $API_TOKEN" $API/v1/ml/model
 
 `withdrawn` is an explicit signal. Agents clear their installed copy when they
 see it — the zero model cannot say this, because it is indistinguishable from
-"never trained".
+"never trained". It retires both models.
 
 ### 8. Customer analytics
 

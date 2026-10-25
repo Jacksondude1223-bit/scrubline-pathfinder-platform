@@ -1,8 +1,8 @@
 use pathfinder::{
     ml,
     model::{
-        Flow, GameFilter, GameHttp, GameHttpPath, GameSignature, Match, Program, ReputationPolicy,
-        ZCEntry,
+        Flow, GameFilter, GameHttp, GameHttpPath, GameSignature, Match, MlPolicy, Program,
+        ReputationPolicy, ZCEntry,
     },
     pipeline::Pipeline,
     state::{Egress, Pulse, Reputation},
@@ -37,13 +37,26 @@ fn equal(a: &Value, b: &Value, path: &str) {
         _ => assert_eq!(a, b, "{path}"),
     }
 }
-/// Stats as the Go datapath reported them: the counters for HTTP rules and the surge rate, which
-/// it never had, are left out of the comparison.
+/// Stats as the Go datapath reported them: the counters for HTTP rules, the surge rate, and what
+/// the classifiers report beyond the flow model's counts, none of which it had, are left out of
+/// the comparison.
 fn go_shape(mut stats: Value) -> Value {
     let top = stats.as_object_mut().unwrap();
     top.remove("game_http_windows");
     top.remove("game_http_windows_max");
     top.remove("surge_pps");
+    let ml = top["ml"].as_object_mut().unwrap();
+    for key in [
+        "observed",
+        "http_ready",
+        "http_scored",
+        "http_drops",
+        "http_observed",
+        "scope",
+        "mode",
+    ] {
+        ml.remove(key);
+    }
     for row in stats["games"].as_array_mut().into_iter().flatten() {
         let row = row.as_object_mut().unwrap();
         for key in [
@@ -802,4 +815,273 @@ fn http_rules_are_validated_with_the_policy() {
     beside.games[0].profile = "raknet".into();
     beside.games[0].dport = 0;
     validation::policy(&beside).unwrap();
+}
+
+/// A flow model that goes by rate alone: 1,000 pps scores 0.5, its threshold.
+fn rate_model() -> ml::Model {
+    let mut weights = vec![0.0; ml::FEATURE_COUNT];
+    weights[0] = 12.0;
+    ml::Model {
+        weights,
+        bias: -(1001f64).ln(),
+        threshold: 0.5,
+        ready: true,
+        ..Default::default()
+    }
+}
+/// A request model that goes by whether a request names its client: one that does not scores
+/// 0.98, against a threshold of 0.5.
+fn client_model() -> ml::Model {
+    let mut weights = vec![0.0; ml::REQUEST_FEATURES];
+    weights[8] = -8.0;
+    ml::Model {
+        weights,
+        bias: 4.0,
+        threshold: 0.5,
+        ready: true,
+        ..Default::default()
+    }
+}
+fn with_ml(program: Program, scope: &str, mode: &str) -> Program {
+    Program {
+        ml: Some(MlPolicy {
+            scope: scope.into(),
+            mode: mode.into(),
+        }),
+        ..program
+    }
+}
+fn at_rate(src: &str, dport: i64, pps: i64) -> Flow {
+    Flow {
+        pps,
+        ..packet(src, dport, &[1, 2, 3, 4])
+    }
+}
+#[test]
+fn the_flow_model_has_the_last_word_on_whatever_the_stages_let_through() {
+    let mut pipe = Pipeline::new(http_server(vec![], GameHttp::default(), true));
+    pipe.model = rate_model();
+    // Nothing matches a flood to a port no rule names, so the model decides it.
+    let d = pipe.decide(&at_rate("192.0.2.1", 9000, 100_000), T0);
+    assert_eq!(
+        (d.action.as_str(), d.stage.as_str(), d.reason.as_str()),
+        ("drop", "zc", "PF_RING ZC ml score 0.99")
+    );
+    let d = pipe.decide(&at_rate("192.0.2.2", 9000, 10), T0);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        ("permit", "PF_RING ZC ml pass")
+    );
+    assert!(d.score > 0.0 && d.score < 0.5);
+    // Well-formed game traffic passes its filter, and then the model.
+    let mut game = at_rate("192.0.2.3", 30120, 100_000);
+    game.dst_ip = "203.0.113.20".into();
+    assert_eq!(pipe.decide(&game, T0).reason, "PF_RING ZC ml score 0.99");
+    let stats = pipe.stats(T0);
+    assert_eq!(
+        (
+            &stats["ml"]["scored"],
+            &stats["ml"]["drops"],
+            &stats["ml"]["passes"]
+        ),
+        (&json!(3), &json!(2), &json!(1))
+    );
+    assert_eq!(
+        (&stats["ml"]["scope"], &stats["ml"]["mode"]),
+        (&json!("all"), &json!("enforce"))
+    );
+    // Its drops count against the source like any other.
+    for _ in 0..4 {
+        pipe.decide(&at_rate("192.0.2.1", 9000, 100_000), T0);
+    }
+    assert_eq!(
+        pipe.decide(&at_rate("192.0.2.1", 9000, 10), T0).reason,
+        "source is in the penalty box"
+    );
+    // A permit rule ends evaluation before the model has a say.
+    let mut program = http_server(vec![], GameHttp::default(), false);
+    program.zc = vec![ZCEntry {
+        rule_id: "allow".into(),
+        action: "permit".into(),
+        r#match: Match {
+            dport: 9000,
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    pipe.load(program);
+    assert_eq!(
+        pipe.decide(&at_rate("192.0.2.4", 9000, 100_000), T0).reason,
+        "PF_RING ZC permit"
+    );
+}
+#[test]
+fn scope_inspect_keeps_the_flow_model_to_what_zc_inspect_rules_send_it() {
+    let mut program = with_ml(
+        http_server(vec![], GameHttp::default(), false),
+        "inspect",
+        "",
+    );
+    program.zc = vec![ZCEntry {
+        rule_id: "behaviour".into(),
+        action: "inspect".into(),
+        r#match: Match {
+            dport: 9000,
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    let mut pipe = Pipeline::new(program);
+    pipe.model = rate_model();
+    let d = pipe.decide(&at_rate("192.0.2.1", 9000, 100_000), T0);
+    assert_eq!(
+        (d.rule_id.as_str(), d.action.as_str()),
+        ("behaviour", "drop")
+    );
+    let d = pipe.decide(&at_rate("192.0.2.2", 9001, 100_000), T0);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        ("permit", "no matching drop rule")
+    );
+    assert_eq!(pipe.stats(T0)["ml"]["scope"], "inspect");
+}
+#[test]
+fn observing_models_count_what_they_would_drop_and_drop_nothing() {
+    let mut pipe = Pipeline::new(with_ml(
+        http_server(vec![], GameHttp::default(), true),
+        "",
+        "observe",
+    ));
+    pipe.model = ml::Model {
+        http: Some(Box::new(client_model())),
+        ..rate_model()
+    };
+    for _ in 0..6 {
+        let d = pipe.decide(&at_rate("192.0.2.1", 9000, 100_000), T0);
+        assert_eq!(
+            (d.action.as_str(), d.reason.as_str()),
+            ("permit", "PF_RING ZC ml score 0.99, observed only")
+        );
+    }
+    let mut anonymous = request("192.0.2.2", "GET /players.json HTTP/1.1\r\n\r\n");
+    anonymous.pps = 1;
+    assert_ne!(pipe.decide(&anonymous, T0).action, "drop");
+    let stats = pipe.stats(T0);
+    // The request, at 1 pps, is under the flow model's threshold.
+    assert_eq!(
+        (
+            &stats["ml"]["drops"],
+            &stats["ml"]["observed"],
+            &stats["ml"]["passes"]
+        ),
+        (&json!(0), &json!(6), &json!(1))
+    );
+    assert_eq!(
+        (
+            &stats["ml"]["http_drops"],
+            &stats["ml"]["http_observed"],
+            &stats["ml"]["mode"]
+        ),
+        (&json!(0), &json!(1), &json!("observe"))
+    );
+}
+#[test]
+fn the_request_model_judges_each_request_the_http_rules_allow() {
+    let mut pipe = Pipeline::new(http_server(
+        vec![path("/players.json", 10)],
+        GameHttp::default(),
+        false,
+    ));
+    // A published request model and no flow model, so what follows is the request model's alone.
+    pipe.model = ml::Model {
+        http: Some(Box::new(client_model())),
+        ..Default::default()
+    };
+    assert_ne!(
+        pipe.decide(&request("192.0.2.1", &get("/players.json")), T0)
+            .action,
+        "drop"
+    );
+    let d = pipe.decide(
+        &request(
+            "192.0.2.1",
+            "GET /players.json HTTP/1.1\r\nHost: 203.0.113.20\r\n\r\n",
+        ),
+        T0,
+    );
+    assert_eq!(
+        (d.action.as_str(), d.filter.as_str(), d.reason.as_str()),
+        (
+            "drop",
+            "server",
+            "game filter http: GET /players.json: scored 0.98 by the request model, which drops at 0.50"
+        )
+    );
+    assert!((d.score - 0.982).abs() < 0.001);
+    // A source the origin vouched for is still held to it, as to the HTTP rules.
+    pipe.observe_return(
+        &Flow {
+            src_ip: "203.0.113.20".into(),
+            dst_ip: "192.0.2.9".into(),
+            proto: "tcp".into(),
+            pps: 1,
+            ..Default::default()
+        },
+        T0,
+    );
+    let d = pipe.decide(
+        &request("192.0.2.9", "GET /players.json HTTP/1.1\r\n\r\n"),
+        T0,
+    );
+    assert_eq!(d.action, "drop");
+    let stats = pipe.stats(T0);
+    assert_eq!(
+        (
+            &stats["ml"]["http_ready"],
+            &stats["ml"]["http_scored"],
+            &stats["ml"]["http_drops"]
+        ),
+        (&json!(true), &json!(3), &json!(2))
+    );
+    assert_eq!(stats["games"][0]["http_dropped"], 2);
+    // A zc permit rule comes after the game filters, so it spares nothing they judge.
+    let mut program = http_server(vec![path("/players.json", 10)], GameHttp::default(), false);
+    program.zc = vec![ZCEntry {
+        rule_id: "allow".into(),
+        action: "permit".into(),
+        r#match: Match {
+            dport: 30120,
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    pipe.load(program);
+    let d = pipe.decide(
+        &request("192.0.2.5", "GET /players.json HTTP/1.1\r\n\r\n"),
+        T0,
+    );
+    assert_eq!(d.action, "drop");
+    assert!(d.reason.contains("by the request model"), "{}", d.reason);
+    // Under scope inspect the HTTP rules judge alone.
+    pipe.load(with_ml(
+        http_server(vec![path("/players.json", 10)], GameHttp::default(), false),
+        "inspect",
+        "",
+    ));
+    let d = pipe.decide(
+        &request("192.0.2.3", "GET /players.json HTTP/1.1\r\n\r\n"),
+        T0,
+    );
+    assert_ne!(d.action, "drop");
+    assert_eq!(pipe.stats(T0)["ml"]["http_scored"], 4);
+    // A filter that only observes lets through what the model would drop, and counts it.
+    let mut program = http_server(vec![path("/players.json", 10)], GameHttp::default(), false);
+    program.games[0].observe = true;
+    pipe.load(program);
+    let d = pipe.decide(
+        &request("192.0.2.4", "GET /players.json HTTP/1.1\r\n\r\n"),
+        T0,
+    );
+    assert_ne!(d.action, "drop");
+    assert_eq!(pipe.stats(T0)["ml"]["http_observed"], 1);
 }

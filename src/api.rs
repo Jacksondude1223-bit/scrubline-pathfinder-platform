@@ -1258,7 +1258,22 @@ impl Api {
                 let f: Flow = parse(body)?;
                 ml::validate_flow(&f).map_err(bad)?;
                 let m = &self.store.data.model;
-                Ok(json!({"score":ml::score(m,&f),"label":ml::predict(m,&f),"ready":m.ready}))
+                let mut v =
+                    json!({"score":ml::score(m,&f),"label":ml::predict(m,&f),"ready":m.ready});
+                // A flow carrying HTTP requests is scored by the request model too, request by
+                // request, the way the layer-7 rules hand them to it.
+                let requests = crate::httpfilter::requests(&f);
+                if !requests.is_empty() {
+                    let unfitted = ml::Model::default();
+                    let h = m.http.as_deref().unwrap_or(&unfitted);
+                    let scores: Vec<f64> = requests
+                        .iter()
+                        .map(|r| ml::score_request(h, r, f.pps))
+                        .collect();
+                    let top = scores.iter().copied().fold(0.0, f64::max);
+                    v["http"] = json!({"ready":h.ready,"scores":scores,"score":top,"label":i64::from(h.ready && top >= h.threshold)});
+                }
+                Ok(v)
             }
             ("POST", ["decide"]) => {
                 who.operator()?;
@@ -2504,6 +2519,20 @@ mod tests {
         // Its tunnel reports are ignored until it fetches again, so it is told to.
         a.fences.entry(node.clone()).or_default().insert(None);
         assert!(news(&a, &node, &None));
+    }
+    #[test]
+    fn programs_carry_where_the_models_run() {
+        let mut a = api();
+        let (node, _) = register(&mut a, 0, "edge-a", "192.0.2.1");
+        let policy = json!({"id":"p","name":"p","protected":["203.0.113.0/24"],"ml":{"scope":"inspect","mode":"observe"}});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, policy).0, 200);
+        let deployed = call(&mut a, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null);
+        assert_eq!(deployed.0, 200);
+        let ml = a.store.programs[&node].ml.clone().unwrap();
+        assert_eq!(
+            (ml.scope.as_str(), ml.mode.as_str()),
+            ("inspect", "observe")
+        );
     }
     #[test]
     fn nodes_get_a_heartbeat_timeout_to_check_in_before_they_are_helped() {
