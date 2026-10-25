@@ -1236,3 +1236,51 @@ fn players_who_connect_while_a_tunnel_is_idle_are_known_when_its_mitigation_star
     assert_eq!(pipe.decide(&playing, T0 + 4).action, "permit");
     assert_eq!(pipe.decide(&stranger, T0 + 5).action, "drop");
 }
+#[test]
+fn a_game_filters_http_rules_hold_while_its_tunnel_is_idle() {
+    let allow_list = GameHttp {
+        default: "drop".into(),
+        ..Default::default()
+    };
+    let mut program = http_server(vec![path("/players.json", 1)], allow_list, false);
+    program.tunnels = vec![on_demand(1000, 1_000_000)];
+    let mut pipe = Pipeline::new(program);
+    let watching = "watching only: tunnel northwind is under its attack thresholds";
+    let d = pipe.decide(&request("192.0.2.1", &get("/players.json")), T0);
+    assert_eq!((d.action.as_str(), d.reason.as_str()), ("permit", watching));
+    // A second request inside the second is over the path's rate, idle tunnel or not.
+    let d = pipe.decide(&request("192.0.2.1", &get("/players.json")), T0 + 1);
+    assert_eq!(d.action, "drop");
+    assert!(
+        d.reason
+            .ends_with("more than 1 request a second to this path from this source"),
+        "{}",
+        d.reason
+    );
+    assert_eq!(
+        pipe.decide(&request("192.0.2.2", &get("/admin")), T0 + 2)
+            .action,
+        "drop"
+    );
+    // So does the request model behind them.
+    pipe.model = ml::Model {
+        http: Some(Box::new(client_model())),
+        ..Default::default()
+    };
+    let d = pipe.decide(
+        &request("192.0.2.3", "GET /players.json HTTP/1.1\r\n\r\n"),
+        T0 + 3,
+    );
+    assert!(d.reason.contains("by the request model"), "{}", d.reason);
+    // Everything else still waits for an attack: a packet the game filter would drop passes.
+    let mut runt = packet("192.0.2.4", 30120, &[1]);
+    runt.dst_ip = "203.0.113.20".into();
+    assert_eq!(pipe.decide(&runt, T0 + 4).reason, watching);
+    let stats = pipe.stats(T0 + 4);
+    assert_eq!(stats["games"][0]["http_dropped"], 3);
+    let row = &stats["mitigation"][0];
+    assert_eq!(
+        (&row["active"], &row["unfiltered"]),
+        (&json!(false), &json!(1))
+    );
+}

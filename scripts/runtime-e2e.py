@@ -191,6 +191,11 @@ with tempfile.TemporaryDirectory() as temporary:
         reflected = dict(flow, src_ip='198.51.100.70', sport=53)
         idle = call(local, '/decide', 'POST', LOCAL, reflected)
         assert idle['action']=='permit' and idle['reason'].startswith('watching only'), idle
+        # A game filter's HTTP rules hold all the same.
+        secret = dict(flow, src_ip='192.0.2.71', dst_ip='203.0.113.20', proto='tcp', dport=30120,
+                      payload=base64.b64encode(b'GET /secret HTTP/1.1\r\nHost: 203.0.113.20\r\n\r\n').decode())
+        refused = call(local, '/decide', 'POST', LOCAL, secret)
+        assert refused['reason'].endswith('GET /secret: not a path this server allows'), refused
         flooded = call(local, '/decide', 'POST', LOCAL, dict(reflected, pps=6000))
         assert flooded['action']=='drop' and flooded['stage']=='asic', flooded
         def mitigating():

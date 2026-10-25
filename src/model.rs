@@ -475,8 +475,8 @@ pub struct NodeTunnel {
     #[serde(deserialize_with = "null_default")]
     pub rate_kbps: i64,
     /// "on_demand" when the node only watches the tunnel's traffic until it reaches either
-    /// threshold, this node's share of the tunnel's, and filters it from then on. Empty filters
-    /// it always.
+    /// threshold, this node's share of the tunnel's, and filters it from then on, a game filter's
+    /// HTTP rules apart, which judge it throughout. Empty filters it always.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub mitigation: String,
@@ -659,7 +659,8 @@ pub struct Tunnel {
     pub node: String,
     /// "always" (the default when empty): every node filters the customer's traffic all the
     /// time. "on_demand": each node holding the tunnel only watches its traffic until it reaches
-    /// attack_pps or attack_mbps, then filters it until it has stayed under both for a while.
+    /// attack_pps or attack_mbps, then filters it until it has stayed under both for a while. A
+    /// game filter's HTTP rules judge it throughout.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub mitigation: String,

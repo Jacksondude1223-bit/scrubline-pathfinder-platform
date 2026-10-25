@@ -771,7 +771,8 @@ components:
           enum:
           - on_demand
           description: Present when the agent only watches the tunnel's traffic until it reaches attack_pps
-            or attack_kbps, and filters it from then on until it has stayed under both for five minutes.
+            or attack_kbps, and filters it from then on until it has stayed under both for five minutes. A
+            game filter's HTTP rules judge it throughout.
         attack_pps:
           type: integer
           description: This node's share of the tunnel's packet-rate threshold.
