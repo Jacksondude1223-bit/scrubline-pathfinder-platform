@@ -40,9 +40,11 @@ pub struct Agent {
     // The credential the control plane issued this node, replaced when it enrols again.
     token: String,
     // Wakes the heartbeat loop when the last second's load crosses the mark at which the fabric
-    // starts helping, and whether it was past that mark when last looked at.
+    // starts helping, or when an on-demand tunnel's mitigation starts; whether the load was past
+    // that mark when last looked at, and how many mitigations had started.
     surge: Arc<tokio::sync::Notify>,
     surging: bool,
+    mitigations: u64,
 }
 type Shared = Arc<Mutex<Agent>>;
 fn json_response(code: u16, v: Value) -> Response {
@@ -136,16 +138,19 @@ impl Agent {
         }
         rows
     }
-    /// Tells the heartbeat loop when a surge starts, so the control plane hears of it now rather
-    /// than at the next heartbeat. It tells once per surge: the load has to drop back below the
-    /// mark before it tells again.
+    /// Tells the heartbeat loop when a surge starts, or the mitigation of one of this node's
+    /// on-demand tunnels does, so the control plane hears of it now rather than at the next
+    /// heartbeat. It tells once per surge: the load has to drop back below the mark before it
+    /// tells again.
     fn watch_surge(&mut self, now: i64) {
         let mark = steering::HIGH_WATERMARK * self.node.capacity_pps as f64;
         let surging = self.node.capacity_pps > 0 && self.pipe.surge(now) as f64 >= mark;
-        if surging && !self.surging {
+        let mitigations = self.pipe.mitigations();
+        if surging && !self.surging || mitigations > self.mitigations {
             self.surge.notify_one();
         }
         self.surging = surging;
+        self.mitigations = mitigations;
     }
     fn report(&mut self) -> Value {
         json!({"node_id":self.node.id,"name":self.node.name,"region":self.node.region,"stats":self.pipe.stats(chrono::Utc::now().timestamp_millis()),"reported_at":chrono::Utc::now()})
@@ -549,6 +554,7 @@ pub async fn run() -> Result<()> {
         token: reg.token,
         surge: surge.clone(),
         surging: false,
+        mitigations: 0,
     }));
     let waiting = runtime::client(f.get("ca"), PROGRAM_WAIT + Duration::from_secs(10))?;
     tokio::spawn(programs(state.clone(), waiting, api.clone()));
@@ -660,6 +666,7 @@ mod tests {
             token: String::new(),
             surge: Arc::new(tokio::sync::Notify::new()),
             surging: false,
+            mitigations: 0,
         }
     }
     fn row(prefix: &str, prepends: i64) -> Announcement {
@@ -744,6 +751,38 @@ mod tests {
         a.watch_surge(chrono::Utc::now().timestamp_millis() + 3000);
         assert_eq!(call(&mut a, "POST", "/decide", &flow(1)), 200);
         assert!(woken(&a).await);
+    }
+    #[tokio::test]
+    async fn a_tunnel_starting_its_mitigation_wakes_the_heartbeat_loop() {
+        let mut a = agent(vec![]);
+        a.install(Program {
+            prefixes: vec!["203.0.113.0/24".into()],
+            tunnels: vec![NodeTunnel {
+                id: "northwind".into(),
+                prefixes: vec!["203.0.113.0/24".into()],
+                mitigation: "on_demand".into(),
+                attack_pps: 100,
+                attack_kbps: 1_000_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let flow = |pps: i64| {
+            let f = json!({"src_ip":"192.0.2.1","dst_ip":"203.0.113.10","proto":"udp","dport":443,"pps":pps});
+            serde_json::to_vec(&f).unwrap()
+        };
+        let surge = a.surge.clone();
+        let woken = || async {
+            tokio::time::timeout(Duration::from_millis(50), surge.notified())
+                .await
+                .is_ok()
+        };
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(10)), 200);
+        assert!(!woken().await);
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(200)), 200);
+        assert!(woken().await, "the control plane hears of it at once");
+        assert_eq!(call(&mut a, "POST", "/decide", &flow(200)), 200);
+        assert!(!woken().await, "once per mitigation");
     }
     #[test]
     fn duplicate_tunnel_reports_are_refused() {

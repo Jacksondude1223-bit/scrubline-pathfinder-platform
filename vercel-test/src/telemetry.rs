@@ -72,6 +72,9 @@ impl Metrics {
                             labels.push(label("filter", s["filter_id"].as_str().unwrap_or("")));
                             labels.push(label("profile", s["profile"].as_str().unwrap_or("")));
                         }
+                        "mitigation" => {
+                            labels.push(label("tunnel", s["tunnel_id"].as_str().unwrap_or("")))
+                        }
                         _ => {}
                     }
                     let mut v = s;

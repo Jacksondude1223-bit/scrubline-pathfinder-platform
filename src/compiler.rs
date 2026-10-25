@@ -474,7 +474,8 @@ fn games_for(p: &Policy, prefixes: &[String], has_zc: bool) -> Vec<GameFilter> {
         .cloned()
         .collect()
 }
-/// Splits each tunnel's clean-traffic allowance evenly across the nodes sending it: those that
+/// Splits each tunnel's clean-traffic allowance, and the thresholds on-demand mitigation starts
+/// at, evenly across the nodes sending it: those that
 /// build it and announce one of its prefixes, so the shares of the nodes attracting the
 /// customer's traffic add up to the allowance. A node still building the tunnel while it withdraws
 /// gets the same share for the traffic BGP has yet to move away, so while that converges the total
@@ -510,6 +511,12 @@ fn share_rates(programs: &mut HashMap<String, Program>, nodes: &[Node]) {
                 .unwrap_or(1)
                 .max(1);
             t.rate_kbps = (t.rate_kbps / n).max(1);
+            // Each node watches its own share of the customer's traffic.
+            for threshold in [&mut t.attack_pps, &mut t.attack_kbps] {
+                if *threshold > 0 {
+                    *threshold = (*threshold / n).max(1);
+                }
+            }
         }
     }
 }

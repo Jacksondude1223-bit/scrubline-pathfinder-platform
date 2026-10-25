@@ -102,6 +102,38 @@ pub struct Stats {
     pub surge_pps: u64,
     #[serde(deserialize_with = "null_default")]
     pub load_window_seconds: i64,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub mitigation: Vec<MitigationStats>,
+}
+/// An on-demand tunnel as the node holding it sees it: whether it is being mitigated, what
+/// reaches it over the last second, and the thresholds that start its mitigation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MitigationStats {
+    #[serde(deserialize_with = "null_default")]
+    pub tunnel_id: String,
+    #[serde(deserialize_with = "null_default")]
+    pub active: bool,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub since: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    pub pps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub bps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub attack_pps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub attack_bps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub mitigations: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub unfiltered: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

@@ -71,6 +71,9 @@ pub fn validate_flow(f: &Flow) -> Result<()> {
     if f.pps < 0 {
         return Err(format!("pps must not be negative, got {}", f.pps));
     }
+    if f.bps < 0 {
+        return Err(format!("bps must not be negative, got {}", f.bps));
+    }
     for (name, port) in [("dport", f.dport), ("sport", f.sport)] {
         if !(0..=MAX_PORT).contains(&port) {
             return Err(format!("{name} must be within 0..{MAX_PORT}, got {port}"));

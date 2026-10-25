@@ -402,5 +402,33 @@
   "scrubline_api_requests_total": {
     "kind": "counter",
     "help": "Control-plane API requests by route and response status."
+  },
+  "scrubline_tunnel_mitigating": {
+    "kind": "gauge",
+    "help": "1 while an on-demand tunnel is being mitigated on this node, from when its traffic reached a threshold until it has stayed under both for five minutes."
+  },
+  "scrubline_tunnel_ingress_pps": {
+    "kind": "gauge",
+    "help": "Packet rate reaching an on-demand tunnel's prefixes on this node over the last second."
+  },
+  "scrubline_tunnel_ingress_bits_per_second": {
+    "kind": "gauge",
+    "help": "Bit rate reaching an on-demand tunnel's prefixes on this node over the last second."
+  },
+  "scrubline_tunnel_attack_pps": {
+    "kind": "gauge",
+    "help": "The packet rate at which this node starts mitigating an on-demand tunnel: its share of the tunnel's threshold."
+  },
+  "scrubline_tunnel_attack_bits_per_second": {
+    "kind": "gauge",
+    "help": "The bit rate at which this node starts mitigating an on-demand tunnel: its share of the tunnel's threshold."
+  },
+  "scrubline_tunnel_mitigations_total": {
+    "kind": "counter",
+    "help": "Mitigations of an on-demand tunnel this node has started."
+  },
+  "scrubline_tunnel_unfiltered_total": {
+    "kind": "counter",
+    "help": "Flows to an on-demand tunnel this node let through unfiltered while the tunnel was under its thresholds."
   }
 }

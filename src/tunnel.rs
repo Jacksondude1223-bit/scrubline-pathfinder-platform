@@ -22,6 +22,26 @@ pub fn rate_mbps(t: &Tunnel) -> i64 {
         t.rate_mbps
     }
 }
+/// The packet size the default packet-rate threshold of on-demand mitigation assumes, so that a
+/// flood of small packets reaches it long before it would fill the bandwidth one.
+pub const ATTACK_PACKET_BYTES: i64 = 512;
+/// The traffic to an on-demand tunnel's prefixes at which its mitigation starts, fabric-wide, in
+/// packets a second and kbit/s: the operator's, or half the clean-traffic allowance and the packet
+/// rate that is at ATTACK_PACKET_BYTES.
+pub fn attack_thresholds(t: &Tunnel) -> (i64, i64) {
+    let mbps = if t.attack_mbps > 0 {
+        t.attack_mbps
+    } else {
+        (rate_mbps(t) / 2).max(1)
+    };
+    let kbps = mbps.saturating_mul(1000);
+    let pps = if t.attack_pps > 0 {
+        t.attack_pps
+    } else {
+        (kbps.saturating_mul(1000) / (8 * ATTACK_PACKET_BYTES)).max(1)
+    };
+    (pps, kbps)
+}
 /// The MTU of a node-to-node tunnel: GRE without a key over a 1500-byte path.
 pub const BACKHAUL_MTU: i64 = 1476;
 /// The largest segment that fits a node-to-node tunnel carrying these prefixes.
@@ -90,6 +110,20 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
             "rate_mbps must be within 1..{MAX_RATE_MBPS} (2.5 Gbit/s); 0 takes the maximum"
         ));
     }
+    if t.attack_pps < 0 || t.attack_mbps < 0 {
+        return Err("attack_pps and attack_mbps must not be negative".into());
+    }
+    match t.mitigation.as_str() {
+        "on_demand" => {}
+        "" | "always" if t.attack_pps != 0 || t.attack_mbps != 0 => {
+            return Err(
+                "attack_pps and attack_mbps start on-demand mitigation; set mitigation to on_demand to use them"
+                    .into(),
+            )
+        }
+        "" | "always" => {}
+        _ => return Err("mitigation must be always or on_demand".into()),
+    }
     let mut disabled = HashSet::new();
     if t.disabled
         .iter()
@@ -134,6 +168,12 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
     let mtu = if t.mtu == 0 { default_mtu(t) } else { t.mtu };
     let mut prefixes = prefixes.to_vec();
     prefixes.sort();
+    let on_demand = t.mitigation == "on_demand";
+    let (attack_pps, attack_kbps) = if on_demand {
+        attack_thresholds(t)
+    } else {
+        (0, 0)
+    };
     Ok(NodeTunnel {
         id: t.id.clone(),
         r#type: if t.r#type.is_empty() {
@@ -164,6 +204,14 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         foreign: Vec::new(),
         // The whole allowance; compiling the fabric splits it among the nodes sending.
         rate_kbps: rate_mbps(t).saturating_mul(1000),
+        mitigation: if on_demand {
+            "on_demand".into()
+        } else {
+            String::new()
+        },
+        // Fabric-wide as well, and split the same way.
+        attack_pps,
+        attack_kbps,
     })
 }
 /// Whether the customer's replies come back up this tunnel to the node.

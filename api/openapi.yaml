@@ -1329,6 +1329,49 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/TunnelRate'
+  /v1/tunnels/{id}/mitigation:
+    put:
+      summary: Choose whether a tunnel is filtered always or only once an attack starts
+      tags:
+      - Tunnels
+      security: *id001
+      responses:
+        '200':
+          description: Saved as a new version of the deployed policy, and deployed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TunnelChange'
+        '400':
+          description: An unknown mitigation, a negative threshold, or a threshold without on_demand.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: The deployed policy has no such tunnel.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: No policy is deployed, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Changes only the tunnel's mitigation and its thresholds, leaving the rest of it as it is.
+        Thresholds left out take their defaults.
+      parameters: *id005
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TunnelMitigation'
   /v1/tunnels/{id}/location:
     put:
       summary: Pin a tunnel to the node the customer's one tunnel ends on
@@ -1978,6 +2021,11 @@ components:
           type: integer
           minimum: 0
           description: The flow's observed packet rate.
+        bps:
+          type: integer
+          minimum: 0
+          description: The flow's observed bit rate, when the record carries one. Without it a node counts
+            the packets' headers and the payload, for an on-demand tunnel's bandwidth threshold.
         payload:
           type: string
           format: byte
@@ -2181,6 +2229,39 @@ components:
           type: integer
         held_for_seconds:
           type: number
+    MitigationStats:
+      type: object
+      description: An on-demand tunnel as the node holding it sees it.
+      properties:
+        tunnel_id:
+          type: string
+        active:
+          type: boolean
+          description: Whether it is being mitigated, from when its traffic reached a threshold until it has
+            stayed under both for five minutes.
+        since:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the current mitigation started; null while idle.
+        pps:
+          type: integer
+          description: Packets a second reaching the tunnel's prefixes over the last second.
+        bps:
+          type: integer
+          description: Bits a second, likewise.
+        attack_pps:
+          type: integer
+          description: This node's packet-rate threshold.
+        attack_bps:
+          type: integer
+          description: This node's bandwidth threshold, in bit/s.
+        mitigations:
+          type: integer
+          description: Mitigations started.
+        unfiltered:
+          type: integer
+          description: Flows let through unfiltered while the tunnel was idle.
     MLStats:
       type: object
       description: ready to passes and observed are the flow model's; the http_ fields are the request
@@ -2285,6 +2366,12 @@ components:
             this and offered_pps, so it moves within a second of a flood arriving.
         load_window_seconds:
           type: integer
+        mitigation:
+          type: array
+          nullable: true
+          description: The on-demand tunnels this node holds. Null when it holds none.
+          items:
+            $ref: '#/components/schemas/MitigationStats'
     Report:
       type: object
       properties:
@@ -2633,6 +2720,29 @@ components:
             to it over node-to-node GRE. Help holds for five minutes after it was last measured overloaded.
             On PUT /v1/tunnels/{id}, a registered node id. Empty fans the tunnel out: every node carrying
             the prefixes holds its own tunnel to the customer and announces them.'
+        mitigation:
+          type: string
+          enum:
+          - always
+          - on_demand
+          description: 'always, the default: every node filters the customer''s traffic all the time.
+            on_demand: each node holding the tunnel only watches the traffic to its prefixes until it reaches
+            attack_pps or attack_mbps over the last second, then applies its whole policy to it until the
+            traffic has stayed under both for five minutes. A node helping a pinned tunnel''s location
+            holds no tunnel for it, so it watches nothing and filters from the first packet. While idle
+            nothing is filtered, so an attack under the thresholds, such as HTTP abuse at a few requests a
+            second, passes.'
+        attack_pps:
+          type: integer
+          minimum: 0
+          description: Packets a second to the tunnel's prefixes that start its mitigation, in total, split
+            across a fanned-out tunnel's nodes the way rate_mbps is. Zero takes the packet rate attack_mbps
+            is at 512-byte packets. Only with on_demand; set otherwise, the tunnel is refused.
+        attack_mbps:
+          type: integer
+          minimum: 0
+          description: Mbit/s to the tunnel's prefixes that start its mitigation, likewise. Zero takes half
+            the clean-traffic allowance. Only with on_demand.
         comment:
           type: string
     Session:
@@ -2767,6 +2877,18 @@ components:
             is split evenly across the nodes announcing the tunnel's prefixes; a node still building it
             while withdrawing gets the same share for the traffic BGP has yet to move away, and with no
             node announcing, the live nodes building it split it.
+        mitigation:
+          type: string
+          enum:
+          - on_demand
+          description: Present when the node only watches the tunnel's traffic until it reaches attack_pps
+            or attack_kbps. Absent, it filters it always.
+        attack_pps:
+          type: integer
+          description: This node's share of the tunnel's packet-rate threshold, split like rate_kbps.
+        attack_kbps:
+          type: integer
+          description: This node's share of the tunnel's bandwidth threshold, in kbit/s.
     TunnelEndpoint:
       type: object
       required:
@@ -2818,6 +2940,22 @@ components:
           maximum: 2500
           example: 1000
           description: Mbit/s. Zero takes the maximum, 2500 (2.5 Gbit/s).
+    TunnelMitigation:
+      type: object
+      required:
+      - mitigation
+      properties:
+        mitigation:
+          type: string
+          enum:
+          - always
+          - on_demand
+        attack_pps:
+          type: integer
+          minimum: 0
+        attack_mbps:
+          type: integer
+          minimum: 0
     TunnelChange:
       type: object
       properties:
@@ -2886,6 +3024,19 @@ components:
         rate_mbps:
           type: integer
           description: The allowance in force, with the default resolved.
+        mitigation:
+          type: string
+          enum:
+          - always
+          - on_demand
+        attack_pps:
+          type: integer
+          nullable: true
+          description: The thresholds in force for an on-demand tunnel, with the defaults resolved, in total.
+            Null when it is mitigated always.
+        attack_mbps:
+          type: integer
+          nullable: true
         node:
           type: string
           description: The node it is pinned to. Empty when it fans out.
@@ -2978,6 +3129,20 @@ components:
           type: integer
           description: This node's share of the allowance, as last compiled. Absent when the node does
             not build the tunnel.
+        mitigating:
+          type: boolean
+          description: For an on-demand tunnel, whether this node, which holds it, was mitigating it when
+            it last reported. A node reports the moment a mitigation starts. Absent on a node that does not
+            watch the tunnel.
+        mitigating_since:
+          type: string
+          format: date-time
+          description: When the mitigation started, while it lasts.
+        ingress_pps:
+          type: integer
+          description: What reached the tunnel's prefixes on this node over the second before it reported.
+        ingress_bps:
+          type: integer
         problem:
           type: string
           description: Why this node is not delivering the tunnel's prefixes, when it is not. A configuration

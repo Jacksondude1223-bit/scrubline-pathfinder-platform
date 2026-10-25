@@ -476,5 +476,54 @@
     "path": [
       "locked_down"
     ]
+  },
+  {
+    "name": "scrubline_tunnel_mitigating",
+    "group": "mitigation",
+    "path": [
+      "active"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_ingress_pps",
+    "group": "mitigation",
+    "path": [
+      "pps"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_ingress_bits_per_second",
+    "group": "mitigation",
+    "path": [
+      "bps"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_attack_pps",
+    "group": "mitigation",
+    "path": [
+      "attack_pps"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_attack_bits_per_second",
+    "group": "mitigation",
+    "path": [
+      "attack_bps"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_mitigations_total",
+    "group": "mitigation",
+    "path": [
+      "mitigations"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_unfiltered_total",
+    "group": "mitigation",
+    "path": [
+      "unfiltered"
+    ]
   }
 ]

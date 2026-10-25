@@ -472,6 +472,19 @@ impl Api {
                         if let Some(r) = report {
                             row["reported_at"] = json!(r.reported_at);
                         }
+                        // What the node holding an on-demand tunnel last said about its traffic.
+                        if let Some(m) = self.store.reports.get(&n.id).and_then(|r| {
+                            analytics::rows(&r["stats"], "mitigation")
+                                .iter()
+                                .find(|m| m["tunnel_id"] == t.id.as_str())
+                        }) {
+                            row["mitigating"] = m["active"].clone();
+                            if m["active"] == true {
+                                row["mitigating_since"] = m["since"].clone();
+                            }
+                            row["ingress_pps"] = m["pps"].clone();
+                            row["ingress_bps"] = m["bps"].clone();
+                        }
                         if let Some(built) = self
                             .store
                             .programs
@@ -557,6 +570,9 @@ impl Api {
                     "disabled": t.disabled,
                     "tenant": t.tenant,
                     "rate_mbps": crate::tunnel::rate_mbps(t),
+                    "mitigation": if t.mitigation == "on_demand" { "on_demand" } else { "always" },
+                    "attack_pps": (t.mitigation == "on_demand").then(|| crate::tunnel::attack_thresholds(t).0),
+                    "attack_mbps": (t.mitigation == "on_demand").then(|| crate::tunnel::attack_thresholds(t).1 / 1000),
                     "node": t.node,
                     "location": nodes.iter().find(|n| n.id == t.node).map(|n| &n.name),
                     "overflow": !t.node.is_empty() && self.overflowing.contains(&t.node),
@@ -1104,6 +1120,29 @@ impl Api {
                         return Err((404, "unknown tunnel".into()));
                     };
                     t.rate_mbps = r.rate_mbps;
+                    Ok(())
+                })?;
+                Ok(tunnel_answer(&p, id))
+            }
+            ("PUT", ["tunnels", _, "mitigation"]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                #[derive(Deserialize)]
+                struct Mitigation {
+                    mitigation: String,
+                    #[serde(default)]
+                    attack_pps: i64,
+                    #[serde(default)]
+                    attack_mbps: i64,
+                }
+                let m: Mitigation = parse(body)?;
+                let p = self.change_tunnels(now, &[], |p| {
+                    let Some(t) = p.tunnels.iter_mut().find(|v| v.id == id) else {
+                        return Err((404, "unknown tunnel".into()));
+                    };
+                    t.mitigation = m.mitigation;
+                    t.attack_pps = m.attack_pps;
+                    t.attack_mbps = m.attack_mbps;
                     Ok(())
                 })?;
                 Ok(tunnel_answer(&p, id))
@@ -1751,7 +1790,9 @@ fn route_label(path: &str) -> String {
         ["tenants", _] => "tenants/delete".into(),
         ["nodes", _, "tunnel-endpoint"] => "nodes/tunnel-endpoint".into(),
         ["tunnels", _] => "tunnels/item".into(),
-        ["tunnels", _, leaf] if ["disable", "enable", "rate", "location"].contains(leaf) => {
+        ["tunnels", _, leaf]
+            if ["disable", "enable", "rate", "location", "mitigation"].contains(leaf) =>
+        {
             format!("tunnels/{leaf}")
         }
         [single]
@@ -2519,6 +2560,67 @@ mod tests {
         // Its tunnel reports are ignored until it fetches again, so it is told to.
         a.fences.entry(node.clone()).or_default().insert(None);
         assert!(news(&a, &node, &None));
+    }
+    #[test]
+    fn the_tunnel_view_shows_where_an_on_demand_customer_is_being_mitigated() {
+        let mut a = api();
+        let (node, token) = register(&mut a, 0, "edge-a", "192.0.2.1");
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"node":node,"rate_mbps":1000,"mitigation":"on_demand"}),
+        );
+        let view =
+            |a: &mut Api| call(a, 1, "GET", "/v1/tunnels", OP, Value::Null).1["tunnels"][0].clone();
+        let t = view(&mut a);
+        assert_eq!(
+            (&t["mitigation"], &t["attack_pps"], &t["attack_mbps"]),
+            (&json!("on_demand"), &json!(122_070), &json!(500))
+        );
+        assert_eq!(
+            (
+                a.store.programs[&node].tunnels[0].attack_kbps,
+                t["nodes"][0].get("mitigating")
+            ),
+            (500_000, None),
+            "nothing is said until the node reports"
+        );
+        let body = json!({"stats":{"mitigation":[{"tunnel_id":"nw","active":true,"since":"2026-01-01T00:00:01Z","pps":400000,"bps":900000000,"attack_pps":122070,"attack_bps":500000000,"mitigations":1}]}});
+        let path = format!("/v1/nodes/{node}/heartbeat");
+        assert_eq!(call(&mut a, 1, "POST", &path, &token, body).0, 200);
+        let row = view(&mut a)["nodes"][0].clone();
+        assert_eq!(
+            (
+                &row["mitigating"],
+                &row["mitigating_since"],
+                &row["ingress_pps"]
+            ),
+            (&json!(true), &json!("2026-01-01T00:00:01Z"), &json!(400000))
+        );
+        // The panel switches it, and sets thresholds, without restating the tunnel.
+        let path = "/v1/tunnels/nw/mitigation";
+        let set = json!({"mitigation":"on_demand","attack_mbps":200});
+        let (status, answer) = call(&mut a, 2, "PUT", path, OP, set);
+        assert_eq!(
+            (status, &answer["tunnel"]["attack_mbps"]),
+            (200, &json!(200)),
+            "{answer}"
+        );
+        let t = view(&mut a);
+        assert_eq!(
+            (&t["attack_pps"], &t["attack_mbps"]),
+            (&json!(48_828), &json!(200))
+        );
+        let wrong = json!({"mitigation":"always","attack_pps":5});
+        assert_eq!(call(&mut a, 2, "PUT", path, OP, wrong).0, 400);
+        let off = json!({"mitigation":"always"});
+        assert_eq!(call(&mut a, 2, "PUT", path, OP, off).0, 200);
+        let t = view(&mut a);
+        assert_eq!(
+            (&t["mitigation"], &t["attack_pps"]),
+            (&json!("always"), &Value::Null)
+        );
+        assert_eq!(a.store.programs[&node].tunnels[0].mitigation, "");
     }
     #[test]
     fn programs_carry_where_the_models_run() {

@@ -729,6 +729,7 @@ and the problem says why — usually that it has no endpoint yet.
 | `POST /v1/tunnels/{id}/disable` | `{"nodes":["…"]}`: those nodes stop building it and withdraw its prefixes. |
 | `POST /v1/tunnels/{id}/enable` | `{"nodes":["…"]}`: undo that. |
 | `PUT /v1/tunnels/{id}/rate` | `{"rate_mbps":1000}`: change only its clean-traffic allowance. |
+| `PUT /v1/tunnels/{id}/mitigation` | `{"mitigation":"on_demand","attack_pps":150000,"attack_mbps":400}`: filter it only once an attack starts, or `{"mitigation":"always"}`. |
 | `PUT /v1/tunnels/{id}/location` | `{"node":"node-…"}`: pin it to the node the customer's one tunnel ends on; `""` fans it out again. |
 
 `GET /v1/tunnels?tenant=ten-…` lists only the tunnels allocated to one
@@ -817,6 +818,34 @@ prefixes to fewer nodes, or pin it.
 A customer with a tunnel allocated cannot be deleted, or have their prefixes
 changed so the tunnel carries something outside them; both answer `409`
 naming the tunnel.
+
+#### Mitigating only when attacked
+
+A tunnel with `"mitigation": "on_demand"` is only watched until the traffic to
+its prefixes reaches `attack_pps` or `attack_mbps` over the last second; then
+the node applies its whole policy to it until the traffic has stayed under both
+for five minutes. Each node watches only the tunnels it holds, against its
+share of the thresholds, so a customer pinned to a location is watched there
+and nowhere else; a node helping that location filters what it scrubs for them
+from the first packet. Unset, the thresholds are half the clean-traffic
+allowance and the packet rate that is at 512-byte packets.
+
+```console
+$ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/mitigation \
+    -d '{"mitigation":"on_demand","attack_mbps":400}'
+{"policy_id":"p","version":4,"tunnel":{"id":"northwind",…,"mitigation":"on_demand","attack_mbps":400}}
+
+$ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels
+{"tunnels":[{"id":"northwind",…,"mitigation":"on_demand","attack_pps":97656,"attack_mbps":400,
+  "nodes":[{"node_id":"node-…","role":"location",…,"mitigating":true,
+            "mitigating_since":"2026-10-25T13:34:42.519Z","ingress_pps":410000,"ingress_bps":1640000000}]}]}
+```
+
+`mitigating` is what the node holding the tunnel last reported, which it does
+the moment a mitigation starts. While a tunnel is idle nothing is filtered,
+including its game filters' HTTP rules: an attack under the thresholds, such as
+abuse of a game server's HTTP at a few requests a second, passes. A threshold
+without `"mitigation": "on_demand"` is refused rather than ignored.
 
 #### The MTU and the clamp are not decoration
 
