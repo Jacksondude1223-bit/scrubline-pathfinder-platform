@@ -334,7 +334,7 @@ without one the filter carries HTTP rules alone.
    "http": {
      "rate_per_source": 30,
      "paths": [
-       {"path": "/players.json", "rate_per_source": 1},
+       {"path": "/players.json", "rate_per_source": 1, "rate_total": 400},
        {"path": "/info.json", "rate_per_source": 2},
        {"path": "/dynamic.json", "rate_per_source": 2},
        {"path": "/client", "methods": ["POST"], "user_agents": ["CitizenFX/"],
@@ -349,9 +349,10 @@ without one the filter carries HTTP rules alone.
 A request's path picks its rule: an exact `path` first, otherwise the longest
 matching `prefix`. A rule either drops everything it covers or narrows what is
 allowed there: `methods`, `user_agents` (prefixes a client's User-Agent must
-start with, in any case), `max_body_bytes`, and `rate_per_source` in requests
-a second. Whatever a rule leaves unset comes from the block, whose own defaults
-are GET, HEAD and POST, any client, any body and no rate. `"default": "drop"`
+start with, in any case), `max_body_bytes`, `rate_per_source` in requests a
+second, and `rate_total`, a budget of requests a second from everyone together.
+Whatever a rule leaves unset comes from the block, whose own defaults are GET,
+HEAD and POST, any client, any body and no rate. `"default": "drop"`
 turns the rules into an allow list, so a path no rule names is dropped; that
 is what stops a flood aimed at handlers nobody thought to list.
 
@@ -362,15 +363,23 @@ is what stops a flood aimed at handlers nobody thought to list.
 - **Rates are per source**, over the last second, for each rule and for the
   block as a whole. A verified source is held to them as well: trust skips a
   game's gate, not the HTTP rules.
+- **A budget is for everyone together.** A flood spread across enough
+  addresses keeps every one of them under `rate_per_source`, so `rate_total`
+  counts every request that got past its own source's rates. Past it, a request
+  from a source the fabric has not verified is dropped, and one from a source
+  that cleared a gate, answered a challenge or had its return traffic confirmed
+  in the last five minutes still gets through. Being turned away for what
+  everyone else sent does not count against the source. See
+  [Attacks that adapt](#attacks-that-adapt).
 - **What no client sends is dropped**: a malformed request line, folded
   headers, Content-Length headers that disagree, or one beside
   Transfer-Encoding. So is cleartext HTTP/2, by preface or by upgrade, since
   its binary frames would carry requests no rule could read; a WebSocket
   upgrade passes.
-- **A drop counts against the source** like any other the filter makes, so
-  with `penalty_box` on, a source that keeps abusing an endpoint loses its
-  game traffic for a while too. `observe` works here as everywhere: the rules
-  record what they would have dropped and drop nothing.
+- **A drop counts against the source** like any other the filter makes, a
+  budget's apart, so with `penalty_box` on, a source that keeps abusing an
+  endpoint loses its game traffic for a while too. `observe` works here as
+  everywhere: the rules record what they would have dropped and drop nothing.
 - **What the rules allow, the request model then judges**, once one is
   published: a request it scores at its threshold drops the segment, with a
   reason such as `GET /players.json: scored 0.97 by the request model, which
@@ -391,7 +400,8 @@ the segment that starts the request. For HTTPS, or for an attacker that crafts
 its own segments, terminate the connections in a proxy instead.
 
 `scrubline_game_http_requests_total{filter}`, `_dropped_total`,
-`_rate_limited_total` and `_other_total` say what the rules are doing.
+`_rate_limited_total`, `_budget_dropped_total` and `_other_total` say what the
+rules are doing.
 `scrubline_game_http_windows` against `_max` shows the rate table; at the bound
 a new source goes unlimited rather than another being forgotten. Judging a
 request costs about half a microsecond on top of the rest of the pipeline.
@@ -479,6 +489,19 @@ observed only`, and `scrubline_ml_observed_total` and
 how a model is tried before it is trusted. A filter's own `observe` does the
 same for the request model on that filter's traffic.
 
+**A model being probed tightens for that target.** Traffic changed until a model
+lets it through stops changing at the first variant that passes, so it scores
+just under the threshold. For each protected prefix the node keeps ten seconds
+of what both models scored there. When 20 or more of those flows landed within
+0.1 under the threshold, and they are a quarter or more of all of them, both
+models drop 0.1 lower for that prefix, and 0.2 lower if it happens again; each
+step lapses five minutes after the probing that set it was last seen. A
+decision reads `PF_RING ZC ml score 0.47, over the 0.40 this target is held to
+while it is being probed`, and other prefixes keep the published thresholds. A
+model whose clean traffic already scores close to its threshold will tighten on
+that traffic too, which `observe` shows before it costs anything;
+`"probing": "ignore"` keeps the thresholds where they are.
+
 Train with labelled samples, then nodes pull both models on their next poll.
 An HTTP sample is a TCP flow whose `payload` is the request, base64-encoded as
 any payload is; [`configs/ml.samples.json`](configs/ml.samples.json) has both
@@ -493,10 +516,56 @@ a bad model without restarting the fleet.
 `scrubline_ml_scored_total`, `_drops_total`, `_passes_total` and
 `_observed_total` count the flow model's verdicts on each node, and
 `scrubline_ml_http_scored_total`, `_http_drops_total` and
-`_http_observed_total` the request model's. `scrubline_ml_model_ready` and
+`_http_observed_total` the request model's. `scrubline_ml_near_misses_total`
+and `_tightened_total` count the probing, and
+`scrubline_prefix_ml_threshold_cut{prefix}` says how far under its thresholds a
+prefix is held. `scrubline_ml_model_ready` and
 `scrubline_ml_http_model_ready` say which a node has installed. The control
 plane reports each published model's holdout metrics as
 `scrubline_control_ml_*` and `scrubline_control_ml_http_*`.
+
+## Attacks that adapt
+
+An attack run by software, AI-driven or otherwise, does not have to repeat what
+failed. It can watch what gets through and change: learn the thresholds and
+holds it has to beat, tune its traffic until a classifier lets it pass, and
+spread a flood over so many addresses that each one stays under its rate.
+Every fixed setting is something it can learn, so three defences make learning
+them pay less.
+
+**Coming back costs more every time.** An on-demand tunnel's mitigation lasts
+five minutes after its traffic was last at a threshold. An attacker that has
+measured that can start each wave just as the last mitigation ends, and have
+the start of every wave let through. So a mitigation that starts within an hour
+of the last one ending counts as that attack's next wave, and holds twice as
+long as the last one did: five minutes, then ten, twenty, forty, and an hour
+from then on. After an hour without one, the next is a first wave again. See
+[On-demand mitigation](#on-demand-mitigation).
+
+**Probing a classifier tightens it.** Traffic tuned against a model stops
+changing at the first variant that gets through, so it scores just under the
+threshold, where ordinary traffic has no reason to gather. When that is where
+much of a customer's traffic lands, both models drop lower for that customer's
+prefix, a step at a time, until the probing stops. See
+[The classifiers](#the-classifiers).
+
+**A flood spread thin runs into a budget for everyone.** A botnet with enough
+addresses keeps each one under `rate_per_source`, and a client written to look
+like a browser sends every header a browser would, so neither the rate nor the
+request model tells it from players. `rate_total` caps what a path, or a whole
+filter, takes from all sources together. Past it, only sources the fabric has
+verified get through: ones that cleared a game's gate, answered a challenge or
+had their return traffic confirmed in the last five minutes. A botnet's fresh
+addresses have done none of that, and every one of them would have to. See
+[HTTP on the server's own address](#http-on-the-servers-own-address-layer-7).
+
+None of this catches traffic that cannot be told from your players, arriving at
+the rate your players do. Past the budget that is load, and what the budget
+decides is who is served first.
+
+`scrubline_tunnel_mitigation_wave{tunnel}`, `scrubline_ml_tightened_total`,
+`scrubline_prefix_ml_threshold_cut{prefix}` and
+`scrubline_game_http_budget_dropped_total{filter}` show each defence at work.
 
 ## Run
 
@@ -604,6 +673,7 @@ work":
 - `scrubline_reputation_trusted{node}` and `scrubline_reputation_penalised{node}` — how many sources are on the short path and how many are in the box.
 - `scrubline_reputation_boxed_total{node}` — packets dropped at the top of the pipeline, which is the load the rest of the stages did not have to carry.
 - `scrubline_reputation_shielded_total{node}` — strikes that landed on an already-verified source and were not acted on. Alert on this: it is a spoofing attempt against a real player, or a verified client misbehaving.
+- `scrubline_prefix_ml_threshold_cut{node,prefix}` and `scrubline_ml_tightened_total{node}` — a customer whose traffic is gathering just under the classifiers' thresholds, which is what tuning an attack against them looks like. A cut that never lapses on ordinary traffic means the model scores that traffic too close to its threshold.
 - `scrubline_tunnel_up{node,tunnel,remote}` — 1 when a return path is reported carrying traffic, 0 when reported down. A never-reported tunnel is **absent**, not zero: `scrubline_tunnel_reported` is how you tell "nothing is reporting" from "it is broken".
 - `scrubline_tunnel_mtu_bytes{node,tunnel}` and `scrubline_tunnel_mss_clamp_bytes{...}` — the derived encapsulation numbers, so a hung-TCP complaint can be checked against them rather than guessed at.
 - `scrubline_tunnel_rate_limit_bits_per_second{node,tunnel}` — the share of the tunnel's clean-traffic allowance this node shapes to.
@@ -925,6 +995,12 @@ starts. A game filter's HTTP rules stay on throughout:
   both thresholds for five minutes, since attacks come in waves and stopping
   between them would let the start of every wave through. The fabric
   recompiling does not interrupt it.
+- **An attack that keeps coming back is held longer each time.** A mitigation
+  that starts within an hour of the last one ending is that attack's next wave,
+  and holds twice as long as the last one did, up to an hour: five minutes,
+  then ten, twenty, forty and sixty. An attacker that times its waves to the
+  hold gets less through with each one. See
+  [Attacks that adapt](#attacks-that-adapt).
 - **Unset, the thresholds are half the clean-traffic allowance**, and the
   packet rate that is at 512-byte packets, so a flood of small packets reaches
   the packet threshold long before the bandwidth one. A flow record's `bps`
@@ -938,10 +1014,12 @@ of an attack in the moments before it reaches a threshold.
 `PUT /v1/tunnels/{id}/mitigation` with `{"mitigation":"on_demand"}`, and any
 thresholds, switches a tunnel without restating it. The node heartbeats as soon
 as a mitigation starts, and `GET /v1/tunnels` shows on each node's row whether
-it is `mitigating`, since when, and what reaches it. On the node,
+it is `mitigating`, since when, which wave it is and how long it holds, and what
+reaches it. On the node,
 `scrubline_tunnel_mitigating{tunnel}`, `scrubline_tunnel_ingress_pps`,
 `_ingress_bits_per_second`, `_attack_pps`, `_attack_bits_per_second`,
-`_mitigations_total` and `_unfiltered_total` say the same.
+`_mitigation_wave`, `_mitigation_hold_seconds`, `_mitigations_total` and
+`_unfiltered_total` say the same.
 
 ### A dead tunnel withdraws the prefix
 

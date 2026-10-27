@@ -109,7 +109,8 @@ pub struct Stats {
     pub mitigation: Vec<MitigationStats>,
 }
 /// An on-demand tunnel as the node holding it sees it: whether it is being mitigated, what
-/// reaches it over the last second, and the thresholds that start its mitigation.
+/// reaches it over the last second, the thresholds that start its mitigation, and which wave of
+/// an attack the last mitigation was, with how long it holds.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MitigationStats {
@@ -130,6 +131,10 @@ pub struct MitigationStats {
     pub attack_pps: u64,
     #[serde(deserialize_with = "null_default")]
     pub attack_bps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub wave: u32,
+    #[serde(deserialize_with = "null_default")]
+    pub hold_seconds: i64,
     #[serde(deserialize_with = "null_default")]
     pub mitigations: u64,
     #[serde(deserialize_with = "null_default")]
@@ -212,6 +217,10 @@ pub struct PrefixStats {
     pub bursts: i64,
     #[serde(deserialize_with = "null_default")]
     pub held_for_seconds: f64,
+    /// How far under their thresholds the classifiers drop for this prefix while it is being
+    /// probed.
+    #[serde(deserialize_with = "null_default")]
+    pub ml_cut: f64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -238,6 +247,8 @@ pub struct GameStats {
     pub http_rate_limited: u64,
     #[serde(deserialize_with = "null_default")]
     pub http_other: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_budget_dropped: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -264,4 +275,10 @@ pub struct MLStats {
     pub scope: String,
     #[serde(deserialize_with = "null_default")]
     pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub probing: String,
+    #[serde(deserialize_with = "null_default")]
+    pub near_misses: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub tightened: u64,
 }

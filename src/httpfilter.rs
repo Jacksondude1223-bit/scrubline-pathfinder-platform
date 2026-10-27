@@ -11,6 +11,10 @@
 //!
 //! A request the rules allow is then scored by the request model, when one is published and the
 //! policy has the classifiers run on everything.
+//!
+//! A flood spread across enough sources keeps each one under its rate, so a filter or a path can
+//! also take a budget of requests a second from everyone together. Over it, only sources the
+//! fabric has verified get through.
 use crate::{
     ml,
     model::{Flow, GameHttp},
@@ -33,6 +37,8 @@ struct Rule {
     methods: Vec<Vec<u8>>,
     user_agents: Vec<Vec<u8>>,
     rate: i64,
+    /// The path's budget from every source together; none at zero.
+    total: i64,
     /// Zero when the filter's applies.
     max_body: i64,
     key: u64,
@@ -47,10 +53,21 @@ pub struct Policy {
     /// Lowercased: a User-Agent matches one without regard to case.
     user_agents: Vec<Vec<u8>>,
     rate: i64,
+    total: i64,
     max_body: i64,
     default_drop: bool,
     rules: Vec<Rule>,
     key: u64,
+}
+
+/// What judging a segment takes besides the rules: whether its source is verified, which a budget
+/// for everyone spares, and the request model, if one is consulted, with the score it drops at
+/// here, which is lower than its own threshold while the segment's target is being probed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Context<'a> {
+    pub verified: bool,
+    pub model: Option<&'a ml::Model>,
+    pub threshold: f64,
 }
 
 fn methods(list: &[String], what: &str) -> Result<Vec<Vec<u8>>> {
@@ -127,6 +144,9 @@ pub fn compile(filter: &str, h: &GameHttp, dport: i64) -> Result<Policy> {
     if h.rate_per_source < 0 {
         return Err("http.rate_per_source must not be negative".into());
     }
+    if h.rate_total < 0 {
+        return Err("http.rate_total must not be negative".into());
+    }
     if h.max_body_bytes < 0 {
         return Err("http.max_body_bytes must not be negative".into());
     }
@@ -150,15 +170,16 @@ pub fn compile(filter: &str, h: &GameHttp, dport: i64) -> Result<Policy> {
             && (!p.methods.is_empty()
                 || !p.user_agents.is_empty()
                 || p.rate_per_source != 0
+                || p.rate_total != 0
                 || p.max_body_bytes != 0)
         {
             return Err(format!(
-                "{what}: a path that drops takes no methods, user agents, rate or body limit"
+                "{what}: a path that drops takes no methods, user agents, rates or body limit"
             ));
         }
-        if p.rate_per_source < 0 || p.max_body_bytes < 0 {
+        if p.rate_per_source < 0 || p.rate_total < 0 || p.max_body_bytes < 0 {
             return Err(format!(
-                "{what}: rate_per_source and max_body_bytes must not be negative"
+                "{what}: rate_per_source, rate_total and max_body_bytes must not be negative"
             ));
         }
         if rules.iter().any(|r| r.exact == exact && r.path == path) {
@@ -175,6 +196,7 @@ pub fn compile(filter: &str, h: &GameHttp, dport: i64) -> Result<Policy> {
             methods: methods(&p.methods, &format!("{what}.methods"))?,
             user_agents: agents(&p.user_agents, &format!("{what}.user_agents"))?,
             rate: p.rate_per_source,
+            total: p.rate_total,
             max_body: p.max_body_bytes,
         });
     }
@@ -183,6 +205,7 @@ pub fn compile(filter: &str, h: &GameHttp, dport: i64) -> Result<Policy> {
         methods: allowed,
         user_agents: agents(&h.user_agents, "http.user_agents")?,
         rate: h.rate_per_source,
+        total: h.rate_total,
         max_body: h.max_body_bytes,
         default_drop: action(&h.default, "http.default")?,
         rules,
@@ -576,16 +599,38 @@ fn starts_with_ignore_case(s: &[u8], prefix: &[u8]) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
-/// Request rates per (rule, source), each over the last second in four quarters.
+/// Request rates per (rule, source), and the rules' budgets for everyone, each over the last
+/// second in four quarters.
 #[derive(Default)]
 pub struct Windows {
     map: HashMap<(u64, IpAddr), Window>,
     last_sweep: i64,
+    /// Keyed by rule, so bounded by the policy; the bound only matters to rules a reload dropped.
+    totals: HashMap<u64, Window>,
 }
 #[derive(Default)]
 struct Window {
     slots: [i64; 4],
     count: [i64; 4],
+}
+impl Window {
+    /// Counts `n` requests in the quarter `slot` and returns the count over the last second.
+    fn add(&mut self, slot: i64, n: i64) -> i64 {
+        let i = slot.rem_euclid(4) as usize;
+        if self.slots[i] != slot {
+            self.slots[i] = slot;
+            self.count[i] = 0;
+        }
+        self.count[i] = self.count[i].saturating_add(n);
+        self.count
+            .iter()
+            .zip(self.slots)
+            .filter(|(_, at)| *at >= slot - 3 && *at <= slot)
+            .fold(0i64, |t, (v, _)| t.saturating_add(*v))
+    }
+    fn live(&self, slot: i64) -> bool {
+        self.slots.iter().any(|at| *at >= slot - 3)
+    }
 }
 impl Windows {
     pub fn len(&self) -> usize {
@@ -603,25 +648,21 @@ impl Windows {
                 return false;
             }
             self.last_sweep = now;
-            self.map
-                .retain(|_, w| w.slots.iter().any(|at| *at >= slot - 3));
+            self.map.retain(|_, w| w.live(slot));
             if self.map.len() >= WINDOWS_MAX {
                 return false;
             }
         }
-        let w = self.map.entry((key, src)).or_default();
-        let i = slot.rem_euclid(4) as usize;
-        if w.slots[i] != slot {
-            w.slots[i] = slot;
-            w.count[i] = 0;
+        self.map.entry((key, src)).or_default().add(slot, n) > limit
+    }
+    /// Counts `n` requests against a rule's budget for everyone and says whether they take it
+    /// over `limit` a second.
+    fn over_total(&mut self, key: u64, n: i64, limit: i64, now: i64) -> bool {
+        let slot = now.div_euclid(250);
+        if !self.totals.contains_key(&key) && self.totals.len() >= 4096 {
+            self.totals.retain(|_, w| w.live(slot));
         }
-        w.count[i] = w.count[i].saturating_add(n);
-        w.count
-            .iter()
-            .zip(w.slots)
-            .filter(|(_, at)| *at >= slot - 3 && *at <= slot)
-            .fold(0i64, |t, (v, _)| t.saturating_add(*v))
-            > limit
+        self.totals.entry(key).or_default().add(slot, n) > limit
     }
 }
 
@@ -632,19 +673,41 @@ pub struct Judgement {
     pub reason: String,
     /// Requests judged in the segment.
     pub requests: u64,
-    /// Whether the drop was for a rate.
+    /// Whether the drop was for a rate, and whether that was a budget for everyone, which the
+    /// source was not verified to be spared.
     pub limited: bool,
+    pub budget: bool,
     /// Of the requests the rules allowed, how many the request model scored, the highest score,
     /// and why the first it would drop should be, if it would drop any.
     pub scored: u64,
     pub score: f64,
     pub flagged: String,
 }
+/// What check() refused a request for, if a rate: its source's own, or a budget for everyone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Limit {
+    None,
+    Source,
+    Everyone,
+}
+/// A segment's requests as the rates count them: the source, whether it is verified, how many
+/// requests each one counts as, and when they arrived.
+#[derive(Clone, Copy)]
+struct Arrival {
+    src: Option<IpAddr>,
+    verified: bool,
+    n: i64,
+    now: i64,
+}
 
 impl Policy {
     /// Whether this policy judges a TCP port.
     pub fn covers(&self, dport: i64) -> bool {
         self.ports.is_empty() || self.ports.contains(&dport)
+    }
+    /// Whether the filter or any of its paths holds a budget for everyone.
+    pub fn budgeted(&self) -> bool {
+        self.total > 0 || self.rules.iter().any(|r| r.total > 0)
     }
     fn rule(&self, path: &[u8]) -> Option<&Rule> {
         self.rules
@@ -657,28 +720,30 @@ impl Policy {
                     .max_by_key(|r| r.path.len())
             })
     }
-    /// Holds one request to the rules for its path. Err carries why it is dropped, and whether
-    /// for a rate.
+    /// Holds one request to the rules for its path. Err carries why it is dropped, and which rate
+    /// it was over, if one.
     fn check(
         &self,
         h: &Head,
         windows: &mut Windows,
         scratch: &mut Vec<u8>,
-        src: Option<IpAddr>,
-        n: i64,
-        now: i64,
-    ) -> std::result::Result<(), (String, bool)> {
-        normalise_from(h.target, h.cut, scratch)
-            .map_err(|e| (format!("a malformed request: its target has {e}"), false))?;
+        a: Arrival,
+    ) -> std::result::Result<(), (String, Limit)> {
+        normalise_from(h.target, h.cut, scratch).map_err(|e| {
+            (
+                format!("a malformed request: its target has {e}"),
+                Limit::None,
+            )
+        })?;
         let path = &scratch[..];
-        let refuse = |why: String, limited: bool| {
-            Err((format!("{} {}: {why}", show(h.method), show(path)), limited))
+        let refuse = |why: String, limit: Limit| {
+            Err((format!("{} {}: {why}", show(h.method), show(path)), limit))
         };
         let rule = self.rule(path);
         match rule {
-            Some(r) if r.drop => return refuse("the path is blocked".into(), false),
+            Some(r) if r.drop => return refuse("the path is blocked".into(), Limit::None),
             None if self.default_drop => {
-                return refuse("not a path this server allows".into(), false)
+                return refuse("not a path this server allows".into(), Limit::None)
             }
             _ => {}
         }
@@ -686,31 +751,31 @@ impl Policy {
             // Past the switch the connection speaks binary frames, which no rule could read.
             return refuse(
                 "asks for cleartext HTTP/2, which the rules could not read".into(),
-                false,
+                Limit::None,
             );
         }
         let methods = rule
             .filter(|r| !r.methods.is_empty())
             .map_or(&self.methods, |r| &r.methods);
         if !methods.iter().any(|m| m == h.method) {
-            return refuse("not a method this path allows".into(), false);
+            return refuse("not a method this path allows".into(), Limit::None);
         }
         let agents = rule
             .filter(|r| !r.user_agents.is_empty())
             .map_or(&self.user_agents, |r| &r.user_agents);
         if !agents.is_empty() {
             match h.user_agent {
-                None if h.complete => return refuse("no User-Agent".into(), false),
+                None if h.complete => return refuse("no User-Agent".into(), Limit::None),
                 None => {
                     return refuse(
                         "no User-Agent in the segment that starts the request".into(),
-                        false,
+                        Limit::None,
                     )
                 }
                 Some(ua) if !agents.iter().any(|a| starts_with_ignore_case(ua, a)) => {
                     return refuse(
                         format!("User-Agent {} is not one this path allows", show(ua)),
-                        false,
+                        Limit::None,
                     )
                 }
                 _ => {}
@@ -724,52 +789,74 @@ impl Policy {
             if h.chunked {
                 return refuse(
                     format!("a chunked body, which cannot be held to the {max} bytes allowed"),
-                    false,
+                    Limit::None,
                 );
             }
             if let Some(len) = h.content_length.filter(|len| *len > max as u64) {
                 return refuse(
                     format!("a {len}-byte body, over the {max} bytes allowed"),
-                    false,
+                    Limit::None,
                 );
             }
         }
         let requests = |n: i64| format!("{n} request{}", if n == 1 { "" } else { "s" });
-        if let Some(src) = src {
+        if let Some(src) = a.src {
             if let Some(r) = rule.filter(|r| r.rate > 0) {
-                if windows.over(r.key, src, n, r.rate, now) {
+                if windows.over(r.key, src, a.n, r.rate, a.now) {
                     return refuse(
                         format!(
                             "more than {} a second to this path from this source",
                             requests(r.rate)
                         ),
-                        true,
+                        Limit::Source,
                     );
                 }
             }
-            if self.rate > 0 && windows.over(self.key, src, n, self.rate, now) {
+            if self.rate > 0 && windows.over(self.key, src, a.n, self.rate, a.now) {
                 return refuse(
                     format!(
                         "more than {} a second to this server from this source",
                         requests(self.rate)
                     ),
-                    true,
+                    Limit::Source,
                 );
             }
+        }
+        // A flood spread across enough sources keeps each one under its rate, so a budget counts
+        // every request that got this far. Over it, only a verified source's get through.
+        if let Some(r) = rule.filter(|r| r.total > 0) {
+            if windows.over_total(r.key, a.n, r.total, a.now) && !a.verified {
+                return refuse(
+                    format!(
+                        "more than {} a second to this path from everyone, and this source is not verified",
+                        requests(r.total)
+                    ),
+                    Limit::Everyone,
+                );
+            }
+        }
+        if self.total > 0 && windows.over_total(self.key, a.n, self.total, a.now) && !a.verified {
+            return refuse(
+                format!(
+                    "more than {} a second to this server from everyone, and this source is not verified",
+                    requests(self.total)
+                ),
+                Limit::Everyone,
+            );
         }
         Ok(())
     }
     /// Judges a segment with a payload: every request that starts in it, at its start, pipelined
     /// after another or after a line break in one that continues a body. The first request the
-    /// rules refuse drops the segment. Those they allow are scored by `model`, if given, and
-    /// whether it would drop one is left to the caller.
+    /// rules refuse drops the segment. Those they allow are scored by the context's model, if it
+    /// has one, and whether it would drop one is left to the caller.
     pub fn judge(
         &self,
         windows: &mut Windows,
         scratch: &mut Vec<u8>,
         f: &Flow,
         now: i64,
-        model: Option<&ml::Model>,
+        cx: Context,
     ) -> Judgement {
         let s = &f.payload[..];
         let mut j = Judgement::default();
@@ -790,8 +877,12 @@ impl Policy {
             j.reason = "not the start of an HTTP request".into();
             return j;
         };
-        let src = f.src_ip.parse::<IpAddr>().ok();
-        let n = f.pps.max(1);
+        let arrival = Arrival {
+            src: f.src_ip.parse::<IpAddr>().ok(),
+            verified: cx.verified,
+            n: f.pps.max(1),
+            now,
+        };
         loop {
             j.requests += 1;
             if j.requests > PIPELINED_MAX {
@@ -807,23 +898,29 @@ impl Policy {
                     return j;
                 }
             };
-            if let Err((why, limited)) = self.check(&h, windows, scratch, src, n, now) {
+            if let Err((why, limit)) = self.check(&h, windows, scratch, arrival) {
                 j.drop = true;
-                j.limited = limited;
+                j.limited = limit != Limit::None;
+                j.budget = limit == Limit::Everyone;
                 j.reason = why;
                 return j;
             }
-            if let Some(m) = model {
+            if let Some(m) = cx.model {
                 let score = ml::score_request(m, &h.request(j.requests), f.pps);
                 j.scored += 1;
                 j.score = j.score.max(score);
-                if score >= m.threshold && j.flagged.is_empty() {
+                if score >= cx.threshold && j.flagged.is_empty() {
                     // check() left the request's normalised path in scratch.
                     j.flagged = format!(
-                        "{} {}: scored {score:.2} by the request model, which drops at {:.2}",
+                        "{} {}: scored {score:.2} by the request model, which drops at {:.2}{}",
                         show(h.method),
                         show(scratch),
-                        m.threshold
+                        cx.threshold,
+                        if cx.threshold < m.threshold {
+                            " while this target is being probed"
+                        } else {
+                            ""
+                        }
                     );
                 }
             }
@@ -900,6 +997,13 @@ mod tests {
     fn policy(h: GameHttp) -> Policy {
         compile("f", &h, 30120).unwrap()
     }
+    fn consulting(model: &ml::Model) -> Context<'_> {
+        Context {
+            model: Some(model),
+            threshold: model.threshold,
+            ..Default::default()
+        }
+    }
     fn flow(payload: &[u8]) -> Flow {
         Flow {
             src_ip: "192.0.2.1".into(),
@@ -949,7 +1053,8 @@ mod tests {
             ..Default::default()
         });
         let (mut w, mut scratch) = (Windows::default(), Vec::new());
-        let mut judge = |payload: &[u8]| p.judge(&mut w, &mut scratch, &flow(payload), 0, None);
+        let mut judge =
+            |payload: &[u8]| p.judge(&mut w, &mut scratch, &flow(payload), 0, Context::default());
         let j = judge(b"GET / HTTP/1.1\r\n\r\nGET /players.json HTTP/1.1\r\n\r\n");
         assert!(j.drop && j.requests == 2, "{j:?}");
         let j = judge(
@@ -964,6 +1069,41 @@ mod tests {
         assert!(!j.drop && j.requests == 0, "{j:?}");
         let j = judge(&[0x16, 0x03, 0x01, 0x02, 0x00]);
         assert!(!j.drop && j.reason.starts_with("TLS"));
+    }
+    #[test]
+    fn a_budget_counts_what_got_past_each_sources_rate_and_spares_the_verified() {
+        let p = policy(GameHttp {
+            rate_per_source: 2,
+            rate_total: 3,
+            ..Default::default()
+        });
+        let (mut w, mut scratch) = (Windows::default(), Vec::new());
+        let stranger = Context::default();
+        let mut judge = |src: &str, cx: Context| {
+            let f = Flow {
+                src_ip: src.into(),
+                ..flow(b"GET / HTTP/1.1\r\n\r\n")
+            };
+            p.judge(&mut w, &mut scratch, &f, 0, cx)
+        };
+        // A source over its own rate is held back by it, and does not spend the budget.
+        assert!(!judge("192.0.2.1", stranger).drop);
+        assert!(!judge("192.0.2.1", stranger).drop);
+        let j = judge("192.0.2.1", stranger);
+        assert!(j.drop && j.limited && !j.budget, "{j:?}");
+        assert!(!judge("192.0.2.2", stranger).drop);
+        // A fourth request that got past its source's rate is over the budget of three.
+        let j = judge("192.0.2.3", stranger);
+        assert!(j.drop && j.limited && j.budget, "{j:?}");
+        assert_eq!(
+            j.reason,
+            "GET /: more than 3 requests a second to this server from everyone, and this source is not verified"
+        );
+        let verified = Context {
+            verified: true,
+            ..Default::default()
+        };
+        assert!(!judge("192.0.2.4", verified).drop);
     }
     #[test]
     fn the_request_model_sees_each_request_the_rules_would_find() {
@@ -1020,7 +1160,7 @@ mod tests {
             &mut scratch,
             &flow(b"GET /ok HTTP/1.1\r\nUser-Agent: c\r\n\r\nGET /%61nonymous HTTP/1.1\r\n\r\n"),
             0,
-            Some(&model),
+            consulting(&model),
         );
         assert!(!j.drop && j.scored == 2, "{j:?}");
         assert_eq!(
@@ -1038,7 +1178,7 @@ mod tests {
             &mut scratch,
             &flow(b"GET / HTTP/1.1\r\n\r\n"),
             0,
-            Some(&model),
+            consulting(&model),
         );
         assert!(j.drop && j.scored == 0 && j.flagged.is_empty(), "{j:?}");
     }

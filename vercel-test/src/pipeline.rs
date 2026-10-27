@@ -1,6 +1,6 @@
 //! Serialized per-node packet decisions and bounded counters/state.
 use crate::{
-    gamefilter, ml,
+    gamefilter, httpfilter, ml,
     model::*,
     state::{Egress, Pulse, Reputation},
 };
@@ -113,6 +113,13 @@ impl Load {
 /// How long an on-demand tunnel's mitigation lasts after its traffic was last at a threshold.
 /// Attacks come in waves, and stopping between them would let the start of every wave through.
 pub const MITIGATION_HOLD: i64 = 300_000;
+/// A mitigation that starts within this long of the last one ending is another wave of the same
+/// attack, and holds twice as long as the wave before it, up to MITIGATION_HOLD_MAX. An attacker
+/// that learns how long mitigation lasts, and times each wave to start as it ends, gets less
+/// through with every wave instead of the same again.
+pub const CAMPAIGN: i64 = 3_600_000;
+/// The longest any wave's mitigation holds.
+pub const MITIGATION_HOLD_MAX: i64 = 3_600_000;
 /// What reaches a tunnel's prefixes, in packets and bits, over the last two seconds.
 #[derive(Default)]
 struct Meter {
@@ -160,32 +167,141 @@ struct Watch {
     meter: Meter,
     since: Option<i64>,
     until: i64,
+    /// Which wave of an attack the last mitigation was: 1 for one that started more than CAMPAIGN
+    /// after the one before it ended.
+    wave: u32,
     /// Mitigations started, and flows let through unfiltered while it was idle.
     mitigations: u64,
     unfiltered: u64,
 }
 impl Watch {
     /// Counts a flow to the tunnel and says whether the tunnel is being mitigated: from the moment
-    /// its traffic reaches either threshold until it has stayed under both for MITIGATION_HOLD.
+    /// its traffic reaches either threshold until it has stayed under both for the wave's hold.
     fn mitigating(&mut self, now: i64, packets: u64, bits: u64) -> bool {
         self.meter.observe(now, packets, bits);
         let (pps, bps) = self.meter.rates(now);
         if pps >= self.attack_pps || bps >= self.attack_bps {
             if !self.active(now) {
+                self.wave = if self.since.is_some() && now - self.until <= CAMPAIGN {
+                    self.wave.saturating_add(1)
+                } else {
+                    1
+                };
                 self.since = Some(now);
                 self.mitigations += 1;
             }
-            self.until = now + MITIGATION_HOLD;
+            self.until = now + self.hold();
         }
         self.active(now)
     }
     fn active(&self, now: i64) -> bool {
         self.since.is_some() && now <= self.until
     }
+    /// How long the traffic has to stay under both thresholds before this wave's mitigation ends:
+    /// MITIGATION_HOLD for the first wave, doubling with each one after it.
+    fn hold(&self) -> i64 {
+        (MITIGATION_HOLD << self.wave.saturating_sub(1).min(4)).min(MITIGATION_HOLD_MAX)
+    }
+}
+/// How far under its threshold a score is a near miss, and how far each step of tightening lowers
+/// the thresholds a target being probed is held to.
+const PROBE_MARGIN: f64 = 0.1;
+/// How many steps a target's thresholds can be lowered.
+const PROBE_STEPS: u8 = 2;
+/// How long a step holds after the probing that set it was last seen.
+pub const PROBE_HOLD: i64 = 300_000;
+/// Near misses over the last ten seconds that say a target is being probed, when they are also a
+/// quarter or more of what the classifiers scored for it.
+const PROBE_MIN: u64 = 20;
+/// What the classifiers scored for one protected prefix over the last ten seconds, how much of
+/// that was a near miss, and how many steps the prefix's thresholds are lowered.
+///
+/// Traffic an attacker has tuned against a model, changing it until it gets through, scores just
+/// under the threshold: it stops changing at the first variant that passes. Ordinary traffic has
+/// no reason to gather there.
+#[derive(Default)]
+struct Probe {
+    slots: [i64; 10],
+    scored: [u64; 10],
+    near: [u64; 10],
+    step: u8,
+    until: i64,
+}
+impl Probe {
+    /// How far under their thresholds the classifiers drop for this prefix: a step for each level
+    /// of probing seen, each lapsing PROBE_HOLD after the probing was last seen.
+    fn cut(&mut self, now: i64) -> f64 {
+        while self.step > 0 && now > self.until {
+            self.step -= 1;
+            self.until += PROBE_HOLD;
+        }
+        f64::from(self.step) * PROBE_MARGIN
+    }
+    /// Counts a flow the classifiers scored, and whether it was a near miss. Near misses at
+    /// PROBE_MIN or more, and at a quarter or more of what was scored, are probing: with `tighten`
+    /// they lower the thresholds a step, or hold them at the last. Says whether they lowered them.
+    fn observe(&mut self, now: i64, near: bool, tighten: bool) -> bool {
+        let sec = now / 1000;
+        let i = sec.rem_euclid(10) as usize;
+        if self.slots[i] != sec {
+            self.slots[i] = sec;
+            self.scored[i] = 0;
+            self.near[i] = 0;
+        }
+        self.scored[i] += 1;
+        if !near {
+            return false;
+        }
+        self.near[i] += 1;
+        let live = |v: &[u64; 10]| -> u64 {
+            (0..10)
+                .filter(|&j| self.slots[j] > sec - 10 && self.slots[j] <= sec)
+                .map(|j| v[j])
+                .sum()
+        };
+        let (scored, near) = (live(&self.scored), live(&self.near));
+        if !tighten || near < PROBE_MIN || near * 4 < scored {
+            return false;
+        }
+        self.until = now + PROBE_HOLD;
+        if self.step >= PROBE_STEPS {
+            return false;
+        }
+        self.step += 1;
+        // The next step takes near misses under the threshold this one sets.
+        self.scored = [0; 10];
+        self.near = [0; 10];
+        true
+    }
+}
+/// What the classifiers made of the flow being decided, for its target's probe watch: how far
+/// under their thresholds they drop for that target, whether either scored the flow, and whether
+/// a score fell just under the threshold.
+#[derive(Default)]
+struct Scoring {
+    cut: f64,
+    scored: bool,
+    near: bool,
 }
 /// The request model a game filter's HTTP rules consult, if the policy has them consult one.
 fn consulted<'a>(model: &'a ml::Model, ml: &MlPolicy) -> Option<&'a ml::Model> {
     model.http.as_deref().filter(|m| m.ready && ml.everywhere())
+}
+/// What a game filter's HTTP rules judge a flow with besides themselves: whether its source is
+/// verified, and the request model, if they consult one, with the score it drops at for the
+/// flow's target, `cut` under its own threshold.
+fn http_context<'a>(
+    model: &'a ml::Model,
+    ml: &MlPolicy,
+    cut: f64,
+    verified: bool,
+) -> httpfilter::Context<'a> {
+    let model = consulted(model, ml);
+    httpfilter::Context {
+        verified,
+        model,
+        threshold: model.map_or(0.0, |m| m.threshold - cut),
+    }
 }
 /// A flow's bit rate: the one its record carries, or its packets' headers and payload.
 fn bits(f: &Flow) -> u64 {
@@ -211,8 +327,9 @@ pub struct Pipeline {
     last_sweep: i64,
     rule_stats: HashMap<String, (String, [u64; 4])>,
     /// Per filter: inspected, dropped, challenged, uninspectable, pps dropped, then for its HTTP
-    /// rules requests judged, requests dropped, requests over a rate, and segments with none.
-    game_stats: HashMap<String, (String, [u64; 9])>,
+    /// rules requests judged, requests dropped, requests over a rate, segments with none, and
+    /// segments dropped for a budget for everyone.
+    game_stats: HashMap<String, (String, [u64; 10])>,
     stages: [[u64; 4]; 3],
     decisions: u64,
     unowned: u64,
@@ -220,8 +337,15 @@ pub struct Pipeline {
     ml_counts: [u64; 4],
     /// The request model: requests scored, segments it dropped, and segments it would have.
     http_counts: [u64; 3],
+    /// Flows either classifier scored just under the threshold in force, and the times a
+    /// prefix's thresholds were lowered for it.
+    probe_counts: [u64; 2],
     /// Where the classifiers run and whether they drop, from the program.
     ml: MlPolicy,
+    /// Each protected prefix's probe watch, and what the classifiers made of the flow being
+    /// decided.
+    probes: HashMap<String, Probe>,
+    scoring: Scoring,
     /// The on-demand tunnels this node holds, and which of them each of its prefixes is.
     watches: Vec<Watch>,
     watched: HashMap<String, usize>,
@@ -261,7 +385,10 @@ impl Pipeline {
             unowned: 0,
             ml_counts: [0; 4],
             http_counts: [0; 3],
+            probe_counts: [0; 2],
             ml: MlPolicy::default(),
+            probes: HashMap::new(),
+            scoring: Scoring::default(),
             watches: Vec::new(),
             watched: HashMap::new(),
             returns: [0; 3],
@@ -290,8 +417,10 @@ impl Pipeline {
             .sort_by_key(|(_, net)| std::cmp::Reverse(net.prefix_len()));
         let live: HashSet<_> = program.prefixes.iter().cloned().collect();
         self.loads.retain(|p, _| live.contains(p));
+        self.probes.retain(|p, _| live.contains(p));
         for prefix in &program.prefixes {
             self.loads.entry(prefix.clone()).or_default();
+            self.probes.entry(prefix.clone()).or_default();
         }
         self.pulses.forget(&live);
         self.egress.forget(&live);
@@ -356,7 +485,7 @@ impl Pipeline {
                 .get(&b.id)
                 .filter(|(name, _)| name == &b.profile.name)
                 .cloned()
-                .unwrap_or((b.profile.name.clone(), [0; 9]));
+                .unwrap_or((b.profile.name.clone(), [0; 10]));
             stats.insert(b.id.clone(), old);
         }
         self.game_stats = stats;
@@ -410,6 +539,7 @@ impl Pipeline {
                 meter: Meter::default(),
                 since: None,
                 until: 0,
+                wave: 0,
                 mitigations: 0,
                 unfiltered: 0,
             });
@@ -432,11 +562,12 @@ impl Pipeline {
     /// unfiltered, though the other game filters still see it, so a player who connects now is
     /// known when mitigation starts.
     fn watch_only(&mut self, f: &Flow, now: i64, i: usize) -> Decision {
+        let verified = self.verified(f, now);
         let r = self.games.inspect(
             f,
             now,
             false,
-            consulted(&self.model, &self.ml),
+            http_context(&self.model, &self.ml, self.scoring.cut, verified),
             self.ml.enforcing(),
         );
         if r.profile == "http" {
@@ -517,12 +648,19 @@ impl Pipeline {
             self.stages[i][3] = self.stages[i][3].saturating_add(pps);
         }
     }
+    /// Whether a flow's source holds a proof, which only a budget for everyone, on HTTP, asks.
+    fn verified(&self, f: &Flow, now: i64) -> bool {
+        self.games.budgeted()
+            && f.proto.eq_ignore_ascii_case("tcp")
+            && self.reputation.verified(&f.src_ip, now)
+    }
     fn inspect_game(&mut self, f: &Flow, now: i64, trusted: bool) -> Option<Decision> {
+        let verified = self.verified(f, now);
         let r = self.games.inspect(
             f,
             now,
             trusted,
-            consulted(&self.model, &self.ml),
+            http_context(&self.model, &self.ml, self.scoring.cut, verified),
             self.ml.enforcing(),
         );
         self.judged(r, f, now, trusted)
@@ -539,6 +677,17 @@ impl Pipeline {
         self.http_counts[0] += r.scored;
         self.http_counts[1] += u64::from(r.classified);
         self.http_counts[2] += u64::from(r.observed);
+        if r.scored > 0 {
+            // Scored only when the request model is consulted, so it is there to read.
+            let threshold = self
+                .model
+                .http
+                .as_ref()
+                .map_or(f64::INFINITY, |m| m.threshold)
+                - self.scoring.cut;
+            self.scoring.scored = true;
+            self.scoring.near |= r.score < threshold && r.score >= threshold - PROBE_MARGIN;
+        }
         if r.filter.is_empty() {
             return None;
         }
@@ -553,6 +702,7 @@ impl Pipeline {
                     s[4] = s[4].saturating_add(f.pps.max(0) as u64);
                     s[6] += r.requests;
                     s[7] += u64::from(r.limited);
+                    s[9] += u64::from(r.budget);
                 }
                 "challenge" => s[2] += 1,
                 "uninspectable" => s[3] += 1,
@@ -564,7 +714,9 @@ impl Pipeline {
         if r.cleared > 0 {
             self.reputation.promote(&f.src_ip, r.cleared, now);
         }
-        if r.verdict == "drop" {
+        // Turned away because everyone together spent a budget is nothing the source did, and a
+        // player loading the server list mid-flood must not be boxed for it.
+        if r.verdict == "drop" && !r.budget {
             self.reputation.strike(&f.src_ip, now);
         }
         if r.verdict == "drop" || r.verdict == "challenge" {
@@ -590,7 +742,10 @@ impl Pipeline {
             return None;
         }
         let score = ml::score(&self.model, f);
-        let over = score >= self.model.threshold;
+        let threshold = self.model.threshold - self.scoring.cut;
+        let over = score >= threshold;
+        self.scoring.scored = true;
+        self.scoring.near |= !over && score >= threshold - PROBE_MARGIN;
         let drop = over && self.ml.enforcing();
         self.ml_counts[0] += 1;
         self.ml_counts[if drop {
@@ -603,14 +758,19 @@ impl Pipeline {
         if drop {
             self.reputation.strike(&f.src_ip, now);
         }
+        let probed = if self.scoring.cut > 0.0 {
+            format!(", over the {threshold:.2} this target is held to while it is being probed")
+        } else {
+            String::new()
+        };
         let mut d = decision(
             if drop { "drop" } else { "permit" },
             2,
             rule,
             if drop {
-                format!("PF_RING ZC ml score {score:.2}")
+                format!("PF_RING ZC ml score {score:.2}{probed}")
             } else if over {
-                format!("PF_RING ZC ml score {score:.2}, observed only")
+                format!("PF_RING ZC ml score {score:.2}{probed}, observed only")
             } else {
                 "PF_RING ZC ml pass".into()
             },
@@ -751,10 +911,21 @@ impl Pipeline {
         if self.lockdown != "off" {
             self.egress.ingress(&owner, now);
         }
+        // Without a model there is nothing to score, and nothing to look up for it.
+        let tighten = self.ml.tightens() && self.model.usable();
+        self.scoring = Scoring {
+            cut: self
+                .probes
+                .get_mut(&owner)
+                .filter(|_| tighten)
+                .map_or(0.0, |p| p.cut(now)),
+            ..Default::default()
+        };
         // An on-demand tunnel's traffic is only watched until it reaches the tunnel's thresholds.
         if let Some(&i) = self.watched.get(&owner) {
             if !self.watches[i].mitigating(now, pps, bits(f)) {
                 let d = self.watch_only(f, now, i);
+                self.probed(&owner, now);
                 self.record(&d, None, f);
                 self.load.observe(now, pps, false);
                 self.loads
@@ -800,6 +971,7 @@ impl Pipeline {
                 self.evaluate(f, now, false)
             }
         };
+        self.probed(&owner, now);
         self.record(&d, by.as_deref(), f);
         let mitigated = d.action == "drop" || d.action == "challenge";
         self.load.observe(now, pps, mitigated);
@@ -808,6 +980,17 @@ impl Pipeline {
             .or_default()
             .observe(now, pps, mitigated);
         d
+    }
+    /// Counts what the classifiers made of the flow just decided against its target's probe watch.
+    fn probed(&mut self, owner: &str, now: i64) {
+        if !self.scoring.scored {
+            return;
+        }
+        let tighten = self.ml.tightens();
+        if let Some(p) = self.probes.get_mut(owner) {
+            self.probe_counts[0] += u64::from(self.scoring.near);
+            self.probe_counts[1] += u64::from(p.observe(now, self.scoring.near, tighten));
+        }
     }
     pub fn observe_return(&mut self, f: &Flow, now: i64) {
         let prefix = f.src_ip.parse::<IpAddr>().ok().and_then(|a| {
@@ -840,19 +1023,25 @@ impl Pipeline {
         let stages:Vec<_>=self.stages.iter().enumerate().map(|(i,s)|json!({"stage":(["asic","fpga","zc"][i]),"dropped":s[0],"permitted":s[1],"pps_dropped":s[2],"pps_permitted":s[3]})).collect();
         let mut rules:Vec<_>=self.rule_stats.iter().map(|(id,(stage,s))|json!({"rule_id":id,"stage":stage,"matches":s[0],"drops":s[1],"pps_seen":s[2],"pps_dropped":s[3]})).collect();
         rules.sort_by(|a, b| a["rule_id"].as_str().cmp(&b["rule_id"].as_str()));
-        let mut games:Vec<_>=self.game_stats.iter().map(|(id,(profile,s))|json!({"filter_id":id,"profile":profile,"inspected":s[0],"dropped":s[1],"challenged":s[2],"uninspectable":s[3],"pps_dropped":s[4],"http_requests":s[5],"http_dropped":s[6],"http_rate_limited":s[7],"http_other":s[8]})).collect();
+        let mut games:Vec<_>=self.game_stats.iter().map(|(id,(profile,s))|json!({"filter_id":id,"profile":profile,"inspected":s[0],"dropped":s[1],"challenged":s[2],"uninspectable":s[3],"pps_dropped":s[4],"http_requests":s[5],"http_dropped":s[6],"http_rate_limited":s[7],"http_other":s[8],"http_budget_dropped":s[9]})).collect();
         games.sort_by(|a, b| a["filter_id"].as_str().cmp(&b["filter_id"].as_str()));
         let mut pulsing = false;
         let mut peak = 0;
         let mut prefixes = Vec::new();
+        let tighten = self.ml.tightens();
         for (prefix, l) in &self.loads {
             let a = self.pulses.assess(prefix, now);
+            let cut = self
+                .probes
+                .get_mut(prefix)
+                .filter(|_| tighten)
+                .map_or(0.0, |p| p.cut(now));
             let (o, d) = l.rates(now);
             if a["pulsing"] == true {
                 pulsing = true;
                 peak = peak.max(a["peak_pps"].as_u64().unwrap_or(0));
             }
-            prefixes.push(json!({"prefix":prefix,"flows":l.flows,"flows_dropped":l.flows_dropped,"offered":l.total,"dropped":l.total_dropped,"offered_pps":o,"dropped_pps":d,"pulsing":a["pulsing"],"peak_pps":a["peak_pps"],"mean_pps":a["mean_pps"],"crest":a["crest"],"duty_cycle":a["duty_cycle"],"bursts":a["bursts"],"held_for_seconds":a["held_for"].as_f64().unwrap_or(0.0)/1e9}));
+            prefixes.push(json!({"prefix":prefix,"flows":l.flows,"flows_dropped":l.flows_dropped,"offered":l.total,"dropped":l.total_dropped,"offered_pps":o,"dropped_pps":d,"pulsing":a["pulsing"],"peak_pps":a["peak_pps"],"mean_pps":a["mean_pps"],"crest":a["crest"],"duty_cycle":a["duty_cycle"],"bursts":a["bursts"],"held_for_seconds":a["held_for"].as_f64().unwrap_or(0.0)/1e9,"ml_cut":cut}));
         }
         prefixes.sort_by(|a, b| a["prefix"].as_str().cmp(&b["prefix"].as_str()));
         let mut egress = self.egress.stats(now);
@@ -864,7 +1053,7 @@ impl Pipeline {
         if states.as_array().is_some_and(|a| !a.is_empty()) {
             egress["prefix_states"] = states;
         }
-        let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"}},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
+        let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"wave":w.wave,"hold_seconds":w.hold()/1000,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }

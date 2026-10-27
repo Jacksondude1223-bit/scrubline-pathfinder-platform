@@ -162,6 +162,9 @@ pub fn policy(p: &Policy) -> Result<()> {
         if !["", "enforce", "observe"].contains(&m.mode.as_str()) {
             return Err(format!("ml.mode {:?}: use enforce or observe", m.mode));
         }
+        if !["", "tighten", "ignore"].contains(&m.probing.as_str()) {
+            return Err(format!("ml.probing {:?}: use tighten or ignore", m.probing));
+        }
     }
     if let Some(e) = &p.egress {
         if !["", "off", "limit", "drop"].contains(&e.lockdown.as_str())

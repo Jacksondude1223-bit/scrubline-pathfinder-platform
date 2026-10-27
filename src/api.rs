@@ -481,6 +481,8 @@ impl Api {
                             row["mitigating"] = m["active"].clone();
                             if m["active"] == true {
                                 row["mitigating_since"] = m["since"].clone();
+                                row["mitigation_wave"] = m["wave"].clone();
+                                row["mitigation_hold_seconds"] = m["hold_seconds"].clone();
                             }
                             row["ingress_pps"] = m["pps"].clone();
                             row["ingress_bps"] = m["bps"].clone();
@@ -2585,7 +2587,7 @@ mod tests {
             (500_000, None),
             "nothing is said until the node reports"
         );
-        let body = json!({"stats":{"mitigation":[{"tunnel_id":"nw","active":true,"since":"2026-01-01T00:00:01Z","pps":400000,"bps":900000000,"attack_pps":122070,"attack_bps":500000000,"mitigations":1}]}});
+        let body = json!({"stats":{"mitigation":[{"tunnel_id":"nw","active":true,"since":"2026-01-01T00:00:01Z","pps":400000,"bps":900000000,"attack_pps":122070,"attack_bps":500000000,"wave":2,"hold_seconds":600,"mitigations":2}]}});
         let path = format!("/v1/nodes/{node}/heartbeat");
         assert_eq!(call(&mut a, 1, "POST", &path, &token, body).0, 200);
         let row = view(&mut a)["nodes"][0].clone();
@@ -2593,9 +2595,17 @@ mod tests {
             (
                 &row["mitigating"],
                 &row["mitigating_since"],
-                &row["ingress_pps"]
+                &row["ingress_pps"],
+                &row["mitigation_wave"],
+                &row["mitigation_hold_seconds"]
             ),
-            (&json!(true), &json!("2026-01-01T00:00:01Z"), &json!(400000))
+            (
+                &json!(true),
+                &json!("2026-01-01T00:00:01Z"),
+                &json!(400000),
+                &json!(2),
+                &json!(600)
+            )
         );
         // The panel switches it, and sets thresholds, without restating the tunnel.
         let path = "/v1/tunnels/nw/mitigation";
@@ -2626,14 +2636,27 @@ mod tests {
     fn programs_carry_where_the_models_run() {
         let mut a = api();
         let (node, _) = register(&mut a, 0, "edge-a", "192.0.2.1");
-        let policy = json!({"id":"p","name":"p","protected":["203.0.113.0/24"],"ml":{"scope":"inspect","mode":"observe"}});
+        let wrong =
+            json!({"id":"p","name":"p","protected":["203.0.113.0/24"],"ml":{"probing":"loosen"}});
+        let refused = call(&mut a, 0, "POST", "/v1/policies", OP, wrong);
+        assert_eq!(refused.0, 400);
+        assert!(
+            refused
+                .1
+                .as_str()
+                .unwrap()
+                .contains("use tighten or ignore"),
+            "{}",
+            refused.1
+        );
+        let policy = json!({"id":"p","name":"p","protected":["203.0.113.0/24"],"ml":{"scope":"inspect","mode":"observe","probing":"ignore"}});
         assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, policy).0, 200);
         let deployed = call(&mut a, 0, "POST", "/v1/policies/p/deploy", OP, Value::Null);
         assert_eq!(deployed.0, 200);
         let ml = a.store.programs[&node].ml.clone().unwrap();
         assert_eq!(
-            (ml.scope.as_str(), ml.mode.as_str()),
-            ("inspect", "observe")
+            (ml.scope.as_str(), ml.mode.as_str(), ml.probing.as_str()),
+            ("inspect", "observe", "ignore")
         );
     }
     #[test]

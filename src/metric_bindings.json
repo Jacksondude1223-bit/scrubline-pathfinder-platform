@@ -86,6 +86,22 @@
     ]
   },
   {
+    "name": "scrubline_ml_near_misses_total",
+    "group": "",
+    "path": [
+      "ml",
+      "near_misses"
+    ]
+  },
+  {
+    "name": "scrubline_ml_tightened_total",
+    "group": "",
+    "path": [
+      "ml",
+      "tightened"
+    ]
+  },
+  {
     "name": "scrubline_rate_buckets",
     "group": "",
     "path": [
@@ -268,6 +284,13 @@
     ]
   },
   {
+    "name": "scrubline_prefix_ml_threshold_cut",
+    "group": "prefixes",
+    "path": [
+      "ml_cut"
+    ]
+  },
+  {
     "name": "scrubline_game_inspected_total",
     "group": "games",
     "path": [
@@ -328,6 +351,13 @@
     "group": "games",
     "path": [
       "http_other"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_budget_dropped_total",
+    "group": "games",
+    "path": [
+      "http_budget_dropped"
     ]
   },
   {
@@ -510,6 +540,20 @@
     "group": "mitigation",
     "path": [
       "attack_bps"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_mitigation_wave",
+    "group": "mitigation",
+    "path": [
+      "wave"
+    ]
+  },
+  {
+    "name": "scrubline_tunnel_mitigation_hold_seconds",
+    "group": "mitigation",
+    "path": [
+      "hold_seconds"
     ]
   },
   {

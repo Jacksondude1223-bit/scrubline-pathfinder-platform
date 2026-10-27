@@ -245,6 +245,22 @@ $ curl -H "Authorization: Bearer $API_TOKEN" -H 'Content-Type: application/json'
  "reason":"game filter http: GET /players.json: more than 1 request a second to this path from this source"}
 ```
 
+A flood spread across enough sources keeps every one of them under that rate,
+so a rule can also hold a `rate_total`: requests a second from everyone
+together. With `{"path": "/players.json", "rate_per_source": 1, "rate_total":
+500}`, once 500 requests that got past their own sources' rates have arrived
+inside a second, the next one from a source the fabric has not verified is
+dropped:
+
+```console
+{"action":"drop","stage":"zc","filter":"fivem-30120","node_id":"node-469acf20d30b58d4",
+ "reason":"game filter http: GET /players.json: more than 500 requests a second to this path from everyone, and this source is not verified"}
+```
+
+A source that cleared a game filter's gate, answered a challenge or had its
+return traffic confirmed in the last five minutes still gets through. The
+block's own `rate_total` does the same across every path.
+
 The README's [game filtering](../README.md#http-on-the-servers-own-address-layer-7)
 section covers the rules.
 
@@ -295,6 +311,20 @@ allow. `inspect` keeps the flow model to the zc rules and the request model off.
 
 ```json
 "ml": {"scope": "all", "mode": "observe"}
+```
+
+`probing` is what the models do when traffic is being tuned to get past them.
+Such traffic stops changing at the first variant that gets through, so it
+scores just under the threshold. By default, `tighten`, when 20 or more of the
+flows scored for a protected prefix over the last ten seconds land within 0.1
+under the threshold, and they are a quarter or more of all scored there, both
+models drop 0.1 lower for that prefix, and 0.2 lower if it happens again. Each
+step lapses five minutes after the probing was last seen. A decision then says
+so: `PF_RING ZC ml score 0.47, over the 0.40 this target is held to while it is
+being probed`. `ignore` keeps the thresholds where they are:
+
+```json
+"ml": {"scope": "all", "mode": "enforce", "probing": "ignore"}
 ```
 
 ```console
@@ -824,7 +854,10 @@ naming the tunnel.
 A tunnel with `"mitigation": "on_demand"` is only watched until the traffic to
 its prefixes reaches `attack_pps` or `attack_mbps` over the last second; then
 the node applies its whole policy to it until the traffic has stayed under both
-for five minutes. A game filter's HTTP rules, and the request model behind them,
+for five minutes. An attack that keeps coming back is held longer each time:
+a mitigation that starts within an hour of the last one ending is its next
+wave, and holds twice as long as that one did, up to an hour. A game filter's
+HTTP rules, and the request model behind them,
 judge its traffic throughout. Each node watches only the tunnels it holds, against its
 share of the thresholds, so a customer pinned to a location is watched there
 and nowhere else; a node helping that location filters what it scrubs for them
@@ -839,11 +872,13 @@ $ curl -X PUT -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels/northwind/mi
 $ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/tunnels
 {"tunnels":[{"id":"northwind",…,"mitigation":"on_demand","attack_pps":97656,"attack_mbps":400,
   "nodes":[{"node_id":"node-…","role":"location",…,"mitigating":true,
-            "mitigating_since":"2026-10-25T13:34:42.519Z","ingress_pps":410000,"ingress_bps":1640000000}]}]}
+            "mitigating_since":"2026-10-25T13:34:42.519Z","mitigation_wave":2,
+            "mitigation_hold_seconds":600,"ingress_pps":410000,"ingress_bps":1640000000}]}]}
 ```
 
 `mitigating` is what the node holding the tunnel last reported, which it does
-the moment a mitigation starts. While a tunnel is idle nothing but the HTTP
+the moment a mitigation starts; `mitigation_wave` and `mitigation_hold_seconds`
+say which wave it is and how long it holds. While a tunnel is idle nothing but the HTTP
 rules filters it, so an attack under the thresholds passes. A threshold without
 `"mitigation": "on_demand"` is refused rather than ignored.
 
