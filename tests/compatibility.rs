@@ -79,7 +79,7 @@ fn compiler_and_renderers_match_go() {
 fn classifier_matches_go_training_features_and_predictions() {
     let r = reference();
     let samples: Vec<ml::Sample> = serde_json::from_value(r["samples"].clone()).unwrap();
-    let model = ml::train(&samples, 300, 0.2, 0.65).unwrap();
+    let model = ml::train(&samples, 300, 0.2, 0.65, ml::FALSE_POSITIVE_LIMIT).unwrap();
     let expected: ml::Model = serde_json::from_value(r["model"].clone()).unwrap();
     for (a, b) in model.weights.iter().zip(expected.weights.iter()) {
         assert!((a - b).abs() < 1e-10, "{a} != {b}");
@@ -102,13 +102,14 @@ fn classifier_matches_go_training_features_and_predictions() {
         }
         assert!((ml::score(&model, f) - r["scores"][i].as_f64().unwrap()).abs() < 1e-10);
     }
-    assert!(ml::train(&[], 0, 0.0, 0.0).is_err());
+    assert!(ml::train(&[], 0, 0.0, 0.0, 0.0).is_err());
     assert!(ml::train(
         &[ml::Sample {
             label: 2,
             ..Default::default()
         }],
         0,
+        0.0,
         0.0,
         0.0
     )

@@ -203,12 +203,9 @@ impl Watch {
         (MITIGATION_HOLD << self.wave.saturating_sub(1).min(4)).min(MITIGATION_HOLD_MAX)
     }
 }
-/// How far under its threshold a score is a near miss, and how far each step of tightening lowers
-/// the thresholds a target being probed is held to.
-const PROBE_MARGIN: f64 = 0.1;
-/// How many steps a target's thresholds can be lowered.
-const PROBE_STEPS: u8 = 2;
-/// How long a step holds after the probing that set it was last seen.
+/// How long a step of tightening holds after the probing that set it was last seen. A score
+/// within ml::PROBE_MARGIN under the threshold in force is a near miss, and each step lowers the
+/// thresholds by as much, ml::PROBE_STEPS at most.
 pub const PROBE_HOLD: i64 = 300_000;
 /// Near misses over the last ten seconds that say a target is being probed, when they are also a
 /// quarter or more of what the classifiers scored for it.
@@ -235,7 +232,7 @@ impl Probe {
             self.step -= 1;
             self.until += PROBE_HOLD;
         }
-        f64::from(self.step) * PROBE_MARGIN
+        f64::from(self.step) * ml::PROBE_MARGIN
     }
     /// Counts a flow the classifiers scored, and whether it was a near miss. Near misses at
     /// PROBE_MIN or more, and at a quarter or more of what was scored, are probing: with `tighten`
@@ -264,7 +261,7 @@ impl Probe {
             return false;
         }
         self.until = now + PROBE_HOLD;
-        if self.step >= PROBE_STEPS {
+        if self.step >= ml::PROBE_STEPS {
             return false;
         }
         self.step += 1;
@@ -287,6 +284,11 @@ struct Scoring {
 fn consulted<'a>(model: &'a ml::Model, ml: &MlPolicy) -> Option<&'a ml::Model> {
     model.http.as_deref().filter(|m| m.ready && ml.everywhere())
 }
+/// The score a model drops at for a target `cut` under the thresholds while it is being probed:
+/// no further under its own than training showed it could go without dropping clean traffic.
+fn held_to(m: &ml::Model, cut: f64) -> f64 {
+    m.threshold - cut.min(m.max_cut)
+}
 /// What a game filter's HTTP rules judge a flow with besides themselves: whether its source is
 /// verified, and the request model, if they consult one, with the score it drops at for the
 /// flow's target, `cut` under its own threshold.
@@ -300,7 +302,7 @@ fn http_context<'a>(
     httpfilter::Context {
         verified,
         model,
-        threshold: model.map_or(0.0, |m| m.threshold - cut),
+        threshold: model.map_or(0.0, |m| held_to(m, cut)),
     }
 }
 /// A flow's bit rate: the one its record carries, or its packets' headers and payload.
@@ -682,11 +684,10 @@ impl Pipeline {
             let threshold = self
                 .model
                 .http
-                .as_ref()
-                .map_or(f64::INFINITY, |m| m.threshold)
-                - self.scoring.cut;
+                .as_deref()
+                .map_or(f64::INFINITY, |m| held_to(m, self.scoring.cut));
             self.scoring.scored = true;
-            self.scoring.near |= r.score < threshold && r.score >= threshold - PROBE_MARGIN;
+            self.scoring.near |= r.score < threshold && r.score >= threshold - ml::PROBE_MARGIN;
         }
         if r.filter.is_empty() {
             return None;
@@ -715,8 +716,9 @@ impl Pipeline {
             self.reputation.promote(&f.src_ip, r.cleared, now);
         }
         // Turned away because everyone together spent a budget is nothing the source did, and a
-        // player loading the server list mid-flood must not be boxed for it.
-        if r.verdict == "drop" && !r.budget {
+        // player loading the server list mid-flood must not be boxed for it. Nor is a model's
+        // score proof of anything: the box would turn one wrong score into every packet dropped.
+        if r.verdict == "drop" && !r.budget && !r.classified {
             self.reputation.strike(&f.src_ip, now);
         }
         if r.verdict == "drop" || r.verdict == "challenge" {
@@ -736,16 +738,17 @@ impl Pipeline {
         None
     }
     /// The flow model's verdict, if it is published: a drop at its threshold, unless the policy
-    /// only observes, or a pass.
-    fn classify(&mut self, f: &Flow, now: i64, rule: &str) -> Option<Decision> {
+    /// only observes, or a pass. A drop is no strike against the source, which the penalty box
+    /// takes only on what a rule, a gate or a rate proved.
+    fn classify(&mut self, f: &Flow, rule: &str) -> Option<Decision> {
         if !self.model.ready {
             return None;
         }
         let score = ml::score(&self.model, f);
-        let threshold = self.model.threshold - self.scoring.cut;
+        let threshold = held_to(&self.model, self.scoring.cut);
         let over = score >= threshold;
         self.scoring.scored = true;
-        self.scoring.near |= !over && score >= threshold - PROBE_MARGIN;
+        self.scoring.near |= !over && score >= threshold - ml::PROBE_MARGIN;
         let drop = over && self.ml.enforcing();
         self.ml_counts[0] += 1;
         self.ml_counts[if drop {
@@ -755,10 +758,7 @@ impl Pipeline {
         } else {
             2
         }] += 1;
-        if drop {
-            self.reputation.strike(&f.src_ip, now);
-        }
-        let probed = if self.scoring.cut > 0.0 {
+        let probed = if threshold < self.model.threshold {
             format!(", over the {threshold:.2} this target is held to while it is being probed")
         } else {
             String::new()
@@ -870,7 +870,7 @@ impl Pipeline {
                         id,
                     );
                 }
-                if let Some(d) = self.classify(f, now, &r.id) {
+                if let Some(d) = self.classify(f, &r.id) {
                     return (d, id);
                 }
                 return (decision("permit", 2, &r.id, "PF_RING ZC inspect pass"), id);
@@ -880,7 +880,7 @@ impl Pipeline {
         // what a game filter or the HTTP rules passed, and what no rule decided. A permit rule,
         // which ends evaluation, and a verified source skip it.
         if !trusted && self.ml.everywhere() {
-            if let Some(d) = self.classify(f, now, "") {
+            if let Some(d) = self.classify(f, "") {
                 return (d, None);
             }
         }

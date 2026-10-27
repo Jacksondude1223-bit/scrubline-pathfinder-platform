@@ -459,6 +459,13 @@
     ]
   },
   {
+    "name": "scrubline_reputation_freed_total",
+    "group": "reputation",
+    "path": [
+      "freed"
+    ]
+  },
+  {
     "name": "scrubline_reputation_full_total",
     "group": "reputation",
     "path": [

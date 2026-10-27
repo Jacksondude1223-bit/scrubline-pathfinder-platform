@@ -80,12 +80,31 @@ struct Training {
     epochs: i64,
     lr: f64,
     threshold: f64,
+    /// The share of the clean samples it is measured on that a model may drop, at its threshold or
+    /// any a node tightens it to; ml::FALSE_POSITIVE_LIMIT unless set.
+    max_false_positive_rate: Option<f64>,
+    /// Publishes a model that drops more than that, or a known-good sample, all the same.
+    force: bool,
     #[serde(skip)]
     samples: Vec<ml::Sample>,
 }
 impl Training {
+    /// Fits both models and holds them to what they must not drop. A fit that would drop too much
+    /// clean traffic, or any known-good sample, is refused with what it would have been, and the
+    /// published model stays.
     fn fit(&self) -> Answer<ml::Model> {
-        ml::train(&self.samples, self.epochs, self.lr, self.threshold).map_err(bad)
+        let limit = self
+            .max_false_positive_rate
+            .unwrap_or(ml::FALSE_POSITIVE_LIMIT);
+        let mut m =
+            ml::train(&self.samples, self.epochs, self.lr, self.threshold, limit).map_err(bad)?;
+        match ml::vet(&mut m, &self.samples, limit) {
+            Err(why) if !self.force => Err((
+                422,
+                json!({"error":format!("not published: {why}"),"model":m}),
+            )),
+            _ => Ok(m),
+        }
     }
 }
 #[derive(Clone)]
@@ -248,6 +267,11 @@ impl Api {
         } else {
             parse(body)?
         };
+        if t.max_false_positive_rate
+            .is_some_and(|v| !(0.0..=1.0).contains(&v))
+        {
+            return Err(bad("max_false_positive_rate must be between 0 and 1"));
+        }
         if self.store.data.samples.len() < 2 {
             return Err(bad("need at least two labeled samples"));
         }
@@ -2631,6 +2655,56 @@ mod tests {
             (&json!("always"), &Value::Null)
         );
         assert_eq!(a.store.programs[&node].tunnels[0].mitigation, "");
+    }
+    #[test]
+    fn training_refuses_a_model_that_would_drop_clean_traffic() {
+        let mut a = api();
+        let flow = |proto: &str, pps| json!({"proto":proto,"pps":pps,"dport":443});
+        let wrong = json!({"samples":[{"flow":flow("udp",900000),"label":1,"known_good":true}]});
+        let refused = call(&mut a, 0, "POST", "/v1/ml/samples", OP, wrong);
+        assert_eq!(refused.0, 400, "{}", refused.1);
+        // A clean sample that looks just like the attacks outnumbering it.
+        let samples = json!({"samples":[
+            {"flow":flow("udp",900000),"label":1},
+            {"flow":flow("udp",900000),"label":1},
+            {"flow":flow("udp",900000),"label":1},
+            {"flow":flow("udp",900000),"label":0},
+            {"flow":flow("tcp",40),"label":0},
+        ]});
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/ml/samples", OP, samples).0,
+            200
+        );
+        let fit = json!({"epochs":300,"threshold":0.6});
+        let (status, refused) = call(&mut a, 0, "POST", "/v1/ml/train", OP, fit.clone());
+        assert_eq!(status, 422, "{refused}");
+        assert_eq!(
+            refused["error"],
+            "not published: the flow model drops 50.0% of the clean samples it was measured on, over the 1.0% limit"
+        );
+        assert_eq!(refused["model"]["false_positive_rate"], 0.5);
+        assert!(!a.store.data.model.ready, "nothing was published");
+        let bad = json!({"max_false_positive_rate":1.5});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/ml/train", OP, bad).0, 400);
+        // A limit of its own publishes it, to be tightened as far as it stays within that limit.
+        let mut lenient = fit.clone();
+        lenient["max_false_positive_rate"] = json!(0.5);
+        let (status, published) = call(&mut a, 0, "POST", "/v1/ml/train", OP, lenient);
+        assert_eq!(
+            (status, &published["max_cut"]),
+            (200, &json!(0.2)),
+            "{published}"
+        );
+        // Forced past the default limit, it is published but never tightened.
+        let mut forced = fit;
+        forced["force"] = json!(true);
+        let (status, published) = call(&mut a, 0, "POST", "/v1/ml/train", OP, forced);
+        assert_eq!(
+            (status, &published["max_cut"]),
+            (200, &json!(0.0)),
+            "{published}"
+        );
+        assert!(a.store.data.model.ready);
     }
     #[test]
     fn programs_carry_where_the_models_run() {

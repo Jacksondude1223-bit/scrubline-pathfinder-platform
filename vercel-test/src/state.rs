@@ -127,7 +127,7 @@ pub struct Reputation {
     pub no_fast: bool,
     pub boxing: bool,
     last_sweep: i64,
-    counts: [u64; 7],
+    counts: [u64; 8],
 }
 impl Reputation {
     fn create(&mut self, src: &str, now: i64) -> bool {
@@ -177,6 +177,14 @@ impl Reputation {
             return;
         }
         let e = self.entries.get_mut(src).unwrap();
+        // An address that answers for itself, by echoing a challenge or being answered at length
+        // by the origin, belongs to a real client, which the box would only cut off: it is
+        // released, as a trusted source could never have been boxed. A handshake can be completed
+        // blind, so it frees nobody, or a spoofer could free any address it liked.
+        if proof >= 2 && now < e.penalised {
+            e.penalised = 0;
+            self.counts[7] += 1;
+        }
         // Trust is held at the proof that earned it. A weaker proof, such as a blind handshake
         // or spoofed return traffic, neither raises nor prolongs trust a challenge earned, and
         // once trust lapses the old proof is gone rather than re-armed by whatever comes next.
@@ -238,7 +246,7 @@ impl Reputation {
         }
     }
     pub fn stats(&self, now: i64) -> Value {
-        json!({"tracked":self.entries.len(),"max":65536,"trusted":self.entries.values().filter(|e|now<e.trusted).count(),"penalised":self.entries.values().filter(|e|now<e.penalised).count(),"fast_passed":self.counts[0],"boxed":self.counts[1],"promotions":self.counts[2],"demotions":self.counts[3],"strikes":self.counts[4],"shielded":self.counts[5],"full":self.counts[6]})
+        json!({"tracked":self.entries.len(),"max":65536,"trusted":self.entries.values().filter(|e|now<e.trusted).count(),"penalised":self.entries.values().filter(|e|now<e.penalised).count(),"fast_passed":self.counts[0],"boxed":self.counts[1],"promotions":self.counts[2],"demotions":self.counts[3],"strikes":self.counts[4],"shielded":self.counts[5],"full":self.counts[6],"freed":self.counts[7]})
     }
     pub fn sources(&self, limit: usize, now: i64) -> Value {
         let mut rows:Vec<_>=self.entries.iter().map(|(src,e)|{let(state,until)=if now<e.trusted{("trusted",e.trusted)}else if now<e.penalised{("penalised",e.penalised)}else{("tracked",now)};let mut r=json!({"source":src,"proof":(["none","handshake","egress","challenge"][e.proof.min(3)as usize]),"state":state});if until>now{r["expires_in_seconds"]=json!((until-now)as f64/1000.0);}

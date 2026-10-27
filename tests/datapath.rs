@@ -76,6 +76,7 @@ fn go_shape(mut stats: Value) -> Value {
     for row in stats["prefixes"].as_array_mut().into_iter().flatten() {
         row.as_object_mut().unwrap().remove("ml_cut");
     }
+    stats["reputation"].as_object_mut().unwrap().remove("freed");
     stats
 }
 #[test]
@@ -928,14 +929,16 @@ fn the_flow_model_has_the_last_word_on_whatever_the_stages_let_through() {
         (&stats["ml"]["scope"], &stats["ml"]["mode"]),
         (&json!("all"), &json!("enforce"))
     );
-    // Its drops count against the source like any other.
+    // Its drops are no strike against the source: a score proves nothing, and the box would
+    // turn one wrong score into every packet from it dropped.
     for _ in 0..4 {
         pipe.decide(&at_rate("192.0.2.1", 9000, 100_000), T0);
     }
     assert_eq!(
         pipe.decide(&at_rate("192.0.2.1", 9000, 10), T0).reason,
-        "source is in the penalty box"
+        "PF_RING ZC ml pass"
     );
+    assert_eq!(pipe.stats(T0)["reputation"]["strikes"], 0);
     // A permit rule ends evaluation before the model has a say.
     let mut program = http_server(vec![], GameHttp::default(), false);
     program.zc = vec![ZCEntry {
@@ -1449,8 +1452,13 @@ fn traffic_tuned_to_score_just_under_a_threshold_tightens_it_for_its_target() {
     );
     program.prefixes.push("198.18.0.0/24".into());
     let mut pipe = Pipeline::new(program);
+    // Models whose training showed they stay clean of ordinary traffic two steps down.
     pipe.model = ml::Model {
-        http: Some(Box::new(request_rate_model())),
+        http: Some(Box::new(ml::Model {
+            max_cut: 0.2,
+            ..request_rate_model()
+        })),
+        max_cut: 0.2,
         ..rate_model()
     };
     // Ordinary traffic scores far under the threshold.
@@ -1559,4 +1567,91 @@ fn a_policy_can_keep_the_thresholds_where_they_are() {
         ),
         (&json!("ignore"), &json!(40), &json!(0), &json!(0.0))
     );
+}
+#[test]
+fn a_model_tightens_no_further_than_its_training_showed_it_could() {
+    let mut pipe = Pipeline::new(with_ml(
+        http_server(vec![], GameHttp::default(), false),
+        "all",
+        "enforce",
+    ));
+    // A flow model training showed was safe a step under its threshold, and a request model,
+    // fitted before that was measured, that scores a request at 400 pps 0.44.
+    pipe.model = ml::Model {
+        http: Some(Box::new(ml::Model {
+            bias: -(501f64).ln(),
+            ..request_rate_model()
+        })),
+        max_cut: 0.1,
+        ..rate_model()
+    };
+    for i in 0..20 {
+        pipe.decide(&at_rate(&format!("198.51.100.{i}"), 9000, 900), T0);
+    }
+    // The prefix is being probed, so the flow model drops a step under its threshold...
+    let d = pipe.decide(&at_rate("198.51.100.100", 9000, 900), T0 + 1);
+    assert_eq!(
+        d.reason,
+        "PF_RING ZC ml score 0.47, over the 0.40 this target is held to while it is being probed"
+    );
+    // ...and the request model keeps its own.
+    let asked = Flow {
+        pps: 400,
+        ..request("198.51.100.101", &get("/players.json"))
+    };
+    let d = pipe.decide(&asked, T0 + 2);
+    assert_eq!(d.action, "permit", "{}", d.reason);
+    // Probing under that step takes the prefix a step further, and the flow model no further.
+    for i in 0..20 {
+        pipe.decide(&at_rate(&format!("198.51.101.{i}"), 9000, 600), T0 + 3);
+    }
+    assert_eq!(pipe.stats(T0 + 4)["prefixes"][0]["ml_cut"], json!(0.2));
+    let d = pipe.decide(&at_rate("198.51.101.100", 9000, 600), T0 + 4);
+    assert_eq!(d.reason, "PF_RING ZC ml pass");
+}
+#[test]
+fn a_boxed_source_the_origin_keeps_answering_is_freed() {
+    let mut pipe = Pipeline::new(http_server(
+        vec![path("/players.json", 1)],
+        GameHttp::default(),
+        true,
+    ));
+    // Four requests over its rate inside thirty seconds, and a source is boxed...
+    for i in 0..5 {
+        pipe.decide(&request("192.0.2.9", &get("/players.json")), T0 + i);
+    }
+    let mut play = request("192.0.2.9", "abcd");
+    play.proto = "udp".into();
+    assert_eq!(
+        pipe.decide(&play, T0 + 10).reason,
+        "source is in the penalty box"
+    );
+    // ...until the server it was talking to is seen still answering it: a real client.
+    answered(&mut pipe, "192.0.2.9", T0 + 20);
+    let d = pipe.decide(&play, T0 + 600);
+    assert_eq!(d.action, "permit", "{}", d.reason);
+    let stats = pipe.stats(T0 + 600);
+    assert_eq!(
+        (
+            &stats["reputation"]["freed"],
+            &stats["reputation"]["penalised"]
+        ),
+        (&json!(1), &json!(0))
+    );
+}
+#[test]
+fn only_an_address_that_answers_for_itself_leaves_the_box() {
+    let mut r = Reputation::default();
+    r.boxing = true;
+    for i in 0..4 {
+        r.strike("192.0.2.9", T0 + i);
+    }
+    assert_eq!(r.check("192.0.2.9", T0 + 10), 2);
+    // A handshake can be completed blind, by anyone claiming the address.
+    r.promote("192.0.2.9", 1, T0 + 20);
+    assert_eq!(r.check("192.0.2.9", T0 + 30), 2);
+    // Return traffic and an answered challenge cannot be.
+    r.promote("192.0.2.9", 2, T0 + 40);
+    assert_eq!(r.check("192.0.2.9", T0 + 50), 1);
+    assert_eq!(r.stats(T0 + 50)["freed"], 1);
 }

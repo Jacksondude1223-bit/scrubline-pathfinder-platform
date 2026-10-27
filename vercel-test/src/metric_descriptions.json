@@ -295,6 +295,10 @@
     "kind": "counter",
     "help": "Strikes that landed on an already-verified source and were not acted on. Source addresses are attacker-controlled, so acting on one would let anyone get a real player banned. A rising value is a spoofing attempt or a misbehaving verified client, and both want a human."
   },
+  "scrubline_reputation_freed_total": {
+    "kind": "counter",
+    "help": "Boxed sources released because their address answered for itself: the origin kept replying to them, or they answered a challenge. Each is a penalty that was cutting off a real client."
+  },
   "scrubline_reputation_full_total": {
     "kind": "counter",
     "help": "Sources the reputation table had no room for."
@@ -379,6 +383,14 @@
     "kind": "gauge",
     "help": "Holdout recall of the published flow model."
   },
+  "scrubline_control_ml_false_positive_rate": {
+    "kind": "gauge",
+    "help": "Share of the clean holdout samples the published flow model drops. Training refuses a model over its limit unless forced."
+  },
+  "scrubline_control_ml_max_cut": {
+    "kind": "gauge",
+    "help": "How far under its threshold nodes may hold the published flow model for a target being probed: as far as it stayed within the false-positive limit on clean holdout samples and dropped no known-good one."
+  },
   "scrubline_control_ml_http_model_ready": {
     "kind": "gauge",
     "help": "1 when the control plane is publishing a fitted request model, which needs clean and attack HTTP samples both."
@@ -402,6 +414,14 @@
   "scrubline_control_ml_http_recall": {
     "kind": "gauge",
     "help": "Holdout recall of the published request model."
+  },
+  "scrubline_control_ml_http_false_positive_rate": {
+    "kind": "gauge",
+    "help": "Share of the clean holdout requests the published request model drops."
+  },
+  "scrubline_control_ml_http_max_cut": {
+    "kind": "gauge",
+    "help": "How far under its threshold nodes may hold the published request model for a target being probed."
   },
   "scrubline_steering_escalation": {
     "kind": "gauge",

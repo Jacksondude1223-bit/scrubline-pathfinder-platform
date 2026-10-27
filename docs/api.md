@@ -46,6 +46,7 @@ to open the control plane.
 | `404` | The thing genuinely is not there. |
 | `409` | A conflict: a duplicate live node, no live nodes to deploy onto, a tunnel address another node holds, a tunnel change with no deployed policy, a customer a tunnel is still allocated to, or a write sent to a replica. |
 | `413` | The sample batch would push the training set past its limit. |
+| `422` | A fitted model would drop too much clean traffic, or a known-good sample, so it was not published. The answer carries the model that would have been. |
 | `503` | Durable state could not be written. **The change was rolled back and did not take effect.** |
 
 `503` is the one worth internalising: a write is durable before it is
@@ -271,10 +272,12 @@ $ scrubctl ml-load configs/ml.samples.json
 {"stored":52}
 
 $ scrubctl ml-train
-{"ready":true,"accuracy":1.0,"precision":1.0,"recall":1.0,"validation":8,"samples":40,
- "threshold":0.65,"epochs":300,"weights":[6.13,-1.62,0.46,0.64,2.26,-0.10,-8.88],…,
- "http":{"ready":true,"accuracy":1.0,"precision":1.0,"recall":1.0,"validation":2,
-         "samples":19,"threshold":0.65,"epochs":300,"weights":[2.77,2.07,…],…}}
+{"ready":true,"accuracy":1.0,"precision":1.0,"recall":1.0,"false_positive_rate":0.0,
+ "max_cut":0.2,"validation":8,"samples":40,"threshold":0.65,"epochs":300,
+ "weights":[6.13,-1.62,0.46,0.64,2.26,-0.10,-8.88],…,
+ "http":{"ready":true,"accuracy":1.0,"precision":1.0,"recall":1.0,"false_positive_rate":0.0,
+         "max_cut":0.2,"validation":2,"samples":19,"threshold":0.65,"epochs":300,
+         "weights":[2.77,2.07,…],…}}
 ```
 
 One training set fits two models. A sample whose payload is an HTTP request
@@ -291,6 +294,28 @@ all its requests; sets under ten samples are too small to split and report
 
 Watch precision rather than accuracy: a false positive here is dropped customer
 traffic.
+
+`false_positive_rate` is the share of the clean samples a model was measured on
+that it drops, and training will not publish a model over 1%, or one that drops
+any sample marked `"known_good": true`. Mark a false positive you have seen
+that way, or traffic the models must never touch, and no model that drops it
+can be published:
+
+```console
+$ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/ml/samples \
+    -d '{"samples":[{"flow":{"proto":"udp","dport":27015,"pps":9000},"label":0,"known_good":true}]}'
+{"stored":53}
+
+$ curl -H "Authorization: Bearer $API_TOKEN" $API/v1/ml/train -d '{}'
+{"error":"not published: known-good sample 52 scores 0.81 by the flow model, over its 0.65 threshold",
+ "model":{"ready":true,…}}                                             # 422
+```
+
+The model already published stays. `"max_false_positive_rate"` in the training
+request sets another limit, and `"force": true` publishes the model all the
+same. `max_cut` is how far under its threshold a node may hold the model while
+a target is being probed: 0.1 or 0.2 if it stays within the limit and clear of
+every known-good sample there, otherwise 0, so a forced model never tightens.
 
 Scoring a flow that carries HTTP shows both models' verdicts, the request
 model's request by request:
@@ -318,8 +343,9 @@ Such traffic stops changing at the first variant that gets through, so it
 scores just under the threshold. By default, `tighten`, when 20 or more of the
 flows scored for a protected prefix over the last ten seconds land within 0.1
 under the threshold, and they are a quarter or more of all scored there, both
-models drop 0.1 lower for that prefix, and 0.2 lower if it happens again. Each
-step lapses five minutes after the probing was last seen. A decision then says
+models drop 0.1 lower for that prefix, and 0.2 lower if it happens again, each
+no further than its `max_cut`. Each step lapses five minutes after the probing
+was last seen. A decision then says
 so: `PF_RING ZC ml score 0.47, over the 0.40 this target is held to while it is
 being probed`. `ignore` keeps the thresholds where they are:
 
@@ -1041,7 +1067,7 @@ as good behaviour.
 ```console
 $ curl -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/reputation
 {"node":"node-…","stats":{"tracked":2,"trusted":1,"penalised":1,"fast_passed":3,
- "boxed":1,"promotions":1,"demotions":1,"strikes":11,"shielded":10,"full":0},
+ "boxed":1,"promotions":1,"demotions":1,"strikes":11,"shielded":10,"full":0,"freed":0},
  "sources":[{"source":"198.51.100.9","state":"penalised","proof":"none",
              "expires_in_seconds":59.2,"level":1}, …]}
 
@@ -1051,9 +1077,15 @@ $ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/reputation \
 ```
 
 A boxed source cannot promote itself out — it is dropped before it reaches a
-gate — so this is the only way back, and it is an operator's call. The
-escalation level survives a release: the next offence should not start from
-scratch because this one was forgiven.
+gate — so beyond this, the only way back is for its address to answer for
+itself. A boxed source the origin keeps answering is confirmed like any other
+client and released at once, which the `freed` count in the stats records. The
+escalation level survives a release either way: the next offence should not
+start from scratch because this one was forgiven.
+
+The box only takes what was proved: a rule's drop, a gate's or a source's own
+rate. A model's score and a budget for everyone are no strike against a
+source.
 
 ### 11. Return-traffic confirmation
 
