@@ -4,7 +4,7 @@ use pathfinder::{
         ACLEntry, Flow, GameFilter, GameHttp, GameHttpPath, GameSignature, Match, MlPolicy,
         NodeTunnel, Program, ReputationPolicy, ZCEntry,
     },
-    pipeline::{Pipeline, MITIGATION_HOLD},
+    pipeline::{Pipeline, CAMPAIGN, MITIGATION_HOLD, MITIGATION_HOLD_MAX, PROBE_HOLD},
     state::{Egress, Pulse, Reputation},
     validation,
 };
@@ -55,6 +55,9 @@ fn go_shape(mut stats: Value) -> Value {
         "http_observed",
         "scope",
         "mode",
+        "probing",
+        "near_misses",
+        "tightened",
     ] {
         ml.remove(key);
     }
@@ -65,9 +68,13 @@ fn go_shape(mut stats: Value) -> Value {
             "http_dropped",
             "http_rate_limited",
             "http_other",
+            "http_budget_dropped",
         ] {
             row.remove(key);
         }
+    }
+    for row in stats["prefixes"].as_array_mut().into_iter().flatten() {
+        row.as_object_mut().unwrap().remove("ml_cut");
     }
     stats
 }
@@ -759,6 +766,35 @@ fn http_rules_are_validated_with_the_policy() {
         ),
         (
             GameHttp {
+                rate_total: -1,
+                ..Default::default()
+            },
+            "http.rate_total must not be negative",
+        ),
+        (
+            GameHttp {
+                paths: vec![GameHttpPath {
+                    rate_total: -1,
+                    ..path("/players.json", 1)
+                }],
+                ..Default::default()
+            },
+            "rate_per_source, rate_total and max_body_bytes must not be negative",
+        ),
+        (
+            GameHttp {
+                paths: vec![GameHttpPath {
+                    prefix: "/admin".into(),
+                    action: "drop".into(),
+                    rate_total: 5,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "a path that drops takes no methods, user agents, rates or body limit",
+        ),
+        (
+            GameHttp {
                 paths: vec![GameHttpPath {
                     path: "/a".into(),
                     prefix: "/a".into(),
@@ -848,6 +884,7 @@ fn with_ml(program: Program, scope: &str, mode: &str) -> Program {
         ml: Some(MlPolicy {
             scope: scope.into(),
             mode: mode.into(),
+            ..Default::default()
         }),
         ..program
     }
@@ -1282,5 +1319,244 @@ fn a_game_filters_http_rules_hold_while_its_tunnel_is_idle() {
     assert_eq!(
         (&row["active"], &row["unfiltered"]),
         (&json!(false), &json!(1))
+    );
+}
+#[test]
+fn each_wave_of_an_attack_holds_mitigation_twice_as_long_as_the_last() {
+    let mut pipe = Pipeline::new(reflection_guard(vec![on_demand(1000, 1_000_000)]));
+    // An attacker that has learned how long mitigation lasts starts each wave a second after the
+    // last one's mitigation ends.
+    let mut at = T0;
+    for (wave, hold) in [
+        (1, 300),
+        (2, 600),
+        (3, 1200),
+        (4, 2400),
+        (5, 3600),
+        (6, 3600),
+    ] {
+        assert_eq!(
+            pipe.decide(&reflected(1000), at).action,
+            "drop",
+            "wave {wave}"
+        );
+        let row = pipe.stats(at)["mitigation"][0].clone();
+        assert_eq!(
+            (&row["wave"], &row["hold_seconds"]),
+            (&json!(wave), &json!(hold)),
+            "wave {wave}"
+        );
+        // Each wave's mitigation lasts its own hold after the traffic was last at a threshold...
+        assert_eq!(pipe.decide(&reflected(1), at + hold * 1000).action, "drop");
+        // ...and not a moment longer.
+        at += hold * 1000 + 1;
+        assert_eq!(
+            pipe.decide(&reflected(1), at).action,
+            "permit",
+            "wave {wave}"
+        );
+        at += 1000;
+    }
+    assert_eq!(MITIGATION_HOLD_MAX, 12 * MITIGATION_HOLD);
+    // After an hour without one, the next mitigation is a first wave again.
+    at += CAMPAIGN;
+    pipe.decide(&reflected(1000), at);
+    let row = pipe.stats(at)["mitigation"][0].clone();
+    assert_eq!(
+        (&row["wave"], &row["hold_seconds"], &row["mitigations"]),
+        (&json!(1), &json!(300), &json!(7))
+    );
+}
+/// Has the origin answer a client enough times to confirm it, which verifies it.
+fn answered(pipe: &mut Pipeline, client: &str, at: i64) {
+    let reply = Flow {
+        src_ip: "203.0.113.20".into(),
+        dst_ip: client.into(),
+        proto: "tcp".into(),
+        pps: 4,
+        ..Default::default()
+    };
+    for tick in 0..3 {
+        pipe.observe_return(&reply, at + tick * 250);
+    }
+}
+#[test]
+fn a_flood_spread_thin_spends_a_budget_that_verified_sources_are_spared() {
+    let players = GameHttpPath {
+        rate_total: 50,
+        ..path("/players.json", 2)
+    };
+    let mut pipe = Pipeline::new(http_server(vec![players], GameHttp::default(), false));
+    answered(&mut pipe, "192.0.2.9", T0);
+    let t = T0 + 1000;
+    // Fifty sources, each well under its own rate, take the path to its budget.
+    for i in 0..50 {
+        let d = pipe.decide(
+            &request(&format!("198.51.100.{i}"), &get("/players.json")),
+            t,
+        );
+        assert_eq!(d.action, "permit", "{}", d.reason);
+    }
+    // Past it, a source the fabric has not verified is turned away...
+    let d = pipe.decide(&request("198.51.100.77", &get("/players.json")), t + 1);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        (
+            "drop",
+            "game filter http: GET /players.json: more than 50 requests a second to this path from everyone, and this source is not verified"
+        )
+    );
+    // ...while one the origin has been answering gets through.
+    let d = pipe.decide(&request("192.0.2.9", &get("/players.json")), t + 2);
+    assert_eq!(d.action, "permit", "{}", d.reason);
+    // A path without a budget is not held to this one.
+    let d = pipe.decide(&request("198.51.100.78", &get("/info.json")), t + 3);
+    assert_eq!(d.action, "permit", "{}", d.reason);
+    // And once the flood has passed, strangers are back.
+    let d = pipe.decide(&request("198.51.100.79", &get("/players.json")), t + 1001);
+    assert_eq!(d.action, "permit", "{}", d.reason);
+    let stats = pipe.stats(t + 1001);
+    let row = &stats["games"][0];
+    assert_eq!(
+        (
+            &row["http_dropped"],
+            &row["http_rate_limited"],
+            &row["http_budget_dropped"]
+        ),
+        (&json!(1), &json!(1), &json!(1))
+    );
+    // Being turned away for what everyone else sent is no strike against the source.
+    assert_eq!(stats["reputation"]["strikes"], 0);
+}
+/// A request model that goes by rate alone, as rate_model does for flows.
+fn request_rate_model() -> ml::Model {
+    let mut weights = vec![0.0; ml::REQUEST_FEATURES];
+    weights[0] = 12.0;
+    ml::Model {
+        weights,
+        bias: -(1001f64).ln(),
+        threshold: 0.5,
+        ready: true,
+        ..Default::default()
+    }
+}
+#[test]
+fn traffic_tuned_to_score_just_under_a_threshold_tightens_it_for_its_target() {
+    let mut program = with_ml(
+        http_server(vec![], GameHttp::default(), false),
+        "all",
+        "enforce",
+    );
+    program.prefixes.push("198.18.0.0/24".into());
+    let mut pipe = Pipeline::new(program);
+    pipe.model = ml::Model {
+        http: Some(Box::new(request_rate_model())),
+        ..rate_model()
+    };
+    // Ordinary traffic scores far under the threshold.
+    for i in 0..100 {
+        let d = pipe.decide(&at_rate(&format!("192.0.2.{i}"), 9000, 10), T0);
+        assert_eq!(d.reason, "PF_RING ZC ml pass");
+    }
+    // An attacker changes its flood until it gets through: at 900 pps it scores 0.47, under the
+    // 0.50 the model drops at. Once near misses are a quarter of what the model scored for the
+    // prefix, it is being probed.
+    for i in 0..34 {
+        let d = pipe.decide(&at_rate(&format!("198.51.100.{i}"), 9000, 900), T0 + 1);
+        assert_eq!(d.action, "permit", "flow {i}: {}", d.reason);
+    }
+    let d = pipe.decide(&at_rate("198.51.100.200", 9000, 900), T0 + 2);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        (
+            "drop",
+            "PF_RING ZC ml score 0.47, over the 0.40 this target is held to while it is being probed"
+        )
+    );
+    // The request model is held a step lower for the prefix too.
+    let flood = Flow {
+        pps: 900,
+        ..request("198.51.100.201", &get("/players.json"))
+    };
+    assert_eq!(
+        pipe.decide(&flood, T0 + 3).reason,
+        "game filter http: GET /players.json: scored 0.47 by the request model, which drops at 0.40 while this target is being probed"
+    );
+    // Another customer's prefix is not, and ordinary traffic still passes.
+    let elsewhere = Flow {
+        dst_ip: "198.18.0.10".into(),
+        ..at_rate("198.51.100.202", 9000, 900)
+    };
+    assert_eq!(pipe.decide(&elsewhere, T0 + 4).reason, "PF_RING ZC ml pass");
+    assert_eq!(
+        pipe.decide(&at_rate("192.0.2.1", 9000, 10), T0 + 5).action,
+        "permit"
+    );
+    let stats = pipe.stats(T0 + 5);
+    let cut = |stats: &Value, prefix: &str| {
+        stats["prefixes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["prefix"] == prefix)
+            .unwrap()["ml_cut"]
+            .clone()
+    };
+    assert_eq!(cut(&stats, "203.0.113.0/24"), json!(0.1));
+    assert_eq!(cut(&stats, "198.18.0.0/24"), json!(0.0));
+    assert_eq!(
+        (&stats["ml"]["near_misses"], &stats["ml"]["tightened"]),
+        (&json!(35), &json!(1))
+    );
+    // Tuned again, to 600 pps and a score of 0.38, the flood lowers the threshold another step.
+    for i in 0..20 {
+        let d = pipe.decide(&at_rate(&format!("198.51.101.{i}"), 9000, 600), T0 + 10);
+        assert_eq!(d.action, "permit", "flow {i}: {}", d.reason);
+    }
+    let d = pipe.decide(&at_rate("198.51.101.200", 9000, 600), T0 + 11);
+    assert_eq!(
+        d.reason,
+        "PF_RING ZC ml score 0.38, over the 0.30 this target is held to while it is being probed"
+    );
+    // That is as far as it goes: probing under it holds the thresholds where they are.
+    for i in 0..40 {
+        pipe.decide(&at_rate(&format!("198.51.102.{i}"), 9000, 400), T0 + 20);
+    }
+    let stats = pipe.stats(T0 + 20);
+    assert_eq!(cut(&stats, "203.0.113.0/24"), json!(0.2));
+    assert_eq!(stats["ml"]["tightened"], 2);
+    // Each step lapses five minutes after the probing was last seen.
+    assert_eq!(
+        cut(&pipe.stats(T0 + 20 + PROBE_HOLD + 1), "203.0.113.0/24"),
+        json!(0.1)
+    );
+    assert_eq!(
+        cut(&pipe.stats(T0 + 20 + 2 * PROBE_HOLD + 1), "203.0.113.0/24"),
+        json!(0.0)
+    );
+}
+#[test]
+fn a_policy_can_keep_the_thresholds_where_they_are() {
+    let mut program = with_ml(
+        http_server(vec![], GameHttp::default(), false),
+        "all",
+        "enforce",
+    );
+    program.ml.as_mut().unwrap().probing = "ignore".into();
+    let mut pipe = Pipeline::new(program);
+    pipe.model = rate_model();
+    for i in 0..40 {
+        let d = pipe.decide(&at_rate(&format!("198.51.100.{i}"), 9000, 900), T0);
+        assert_eq!(d.action, "permit", "flow {i}: {}", d.reason);
+    }
+    let stats = pipe.stats(T0);
+    assert_eq!(
+        (
+            &stats["ml"]["probing"],
+            &stats["ml"]["near_misses"],
+            &stats["ml"]["tightened"],
+            &stats["prefixes"][0]["ml_cut"]
+        ),
+        (&json!("ignore"), &json!(40), &json!(0), &json!(0.0))
     );
 }

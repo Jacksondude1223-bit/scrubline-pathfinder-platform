@@ -99,7 +99,8 @@ with tempfile.TemporaryDirectory() as temporary:
                            # HTTP on a game server's own port, held to its rules.
                            {'id':'web', 'dst_cidr':'203.0.113.20/32', 'dport':30120,
                             'http':{'default':'drop',
-                                    'paths':[{'path':'/players.json', 'rate_per_source':1}]}}],
+                                    'paths':[{'path':'/players.json', 'rate_per_source':1},
+                                             {'path':'/info.json', 'rate_total':100}]}}],
                   'tunnels':[{'id':'customer', 'prefixes':['203.0.113.0/24'],
                               'remote':'192.0.2.100', 'required':True}],
                   'reputation':{'fast_pass':'challenge','penalty_box':True}}
@@ -219,6 +220,17 @@ with tempfile.TemporaryDirectory() as temporary:
             call(local, '/egress','POST',LOCAL,
                  {'src_ip':'203.0.113.10','dst_ip':'192.0.2.10','proto':'udp','pps':4})
             time.sleep(0.26)
+        # Past a budget for everyone, a stranger is turned away, and the client the origin has just
+        # been answering is not.
+        over = call(local, '/decide', 'POST', LOCAL, request('192.0.2.52', '/info.json', pps=150))
+        assert over['action']=='drop' and over['reason'].endswith('GET /info.json: more than 100 '
+            'requests a second to this path from everyone, and this source is not verified'), over
+        spared = call(local, '/decide', 'POST', LOCAL, request('192.0.2.10', '/info.json', pps=150))
+        assert spared['action']=='permit', spared
+        def budget_drops():
+            games = call(base, f'/v1/nodes/{runtime_id}/stats', token=OP)['stats']['games']
+            return next(g for g in games if g['filter_id']=='web')['http_budget_dropped']
+        assert wait_for(budget_drops) == 1
         for i in range(3):
             call(local, '/decide','POST',LOCAL,
                  dict(flow,src_ip=f'192.0.2.{100+i}',sport=53,pps=100000))
@@ -264,6 +276,7 @@ with tempfile.TemporaryDirectory() as temporary:
         call(base,'/metrics',token=node_token,expected=403)
         node_metrics = call(local,'/metrics',token=LOCAL)
         assert 'scrubline_game_http_rate_limited_total{' in node_metrics, node_metrics
+        assert 'scrubline_game_http_budget_dropped_total{' in metrics, metrics
         traffic=start('scrub-traffic','-nodes',local,'-interval','50ms','-seed','42')
         time.sleep(1); assert traffic.poll() is None; stop(traffic)
         snapshot=call(base,'/v1/state',token=OP)

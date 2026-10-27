@@ -147,6 +147,12 @@ pub struct MlPolicy {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub mode: String,
+    /// "tighten", the default: when much of what the models score for a protected prefix lands
+    /// just under their thresholds, as traffic shaped to slip past them does, they drop at lower
+    /// thresholds for that prefix for a while. "ignore" keeps the thresholds where they are.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub probing: String,
 }
 impl MlPolicy {
     pub fn everywhere(&self) -> bool {
@@ -154,6 +160,9 @@ impl MlPolicy {
     }
     pub fn enforcing(&self) -> bool {
         self.mode != "observe"
+    }
+    pub fn tightens(&self) -> bool {
+        self.probing != "ignore"
     }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -557,6 +566,11 @@ pub struct GameHttp {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub rate_per_source: i64,
+    /// Requests a second the whole filter takes from every source together, past which only
+    /// sources the fabric has verified get through; no budget at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub rate_total: i64,
     /// The largest body a request may declare; no limit at zero.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
@@ -591,6 +605,9 @@ pub struct GameHttpPath {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub rate_per_source: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub rate_total: i64,
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub max_body_bytes: i64,

@@ -166,6 +166,12 @@ impl Reputation {
         }
         0
     }
+    /// Whether a source holds any proof right now, whether or not it is enough for the fast path:
+    /// it cleared a gate, answered a challenge or had its return traffic confirmed, in the last
+    /// five minutes. A budget for everyone lets such a source through.
+    pub fn verified(&self, src: &str, now: i64) -> bool {
+        self.entries.get(src).is_some_and(|e| now < e.trusted)
+    }
     pub fn promote(&mut self, src: &str, proof: u8, now: i64) {
         if src.is_empty() || proof == 0 || !self.create(src, now) {
             return;

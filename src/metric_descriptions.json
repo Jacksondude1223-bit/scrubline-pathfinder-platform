@@ -75,6 +75,14 @@
     "kind": "gauge",
     "help": "1 when a fitted request model is installed on this node."
   },
+  "scrubline_ml_near_misses_total": {
+    "kind": "counter",
+    "help": "Flows either classifier scored just under the threshold in force here, within 0.1 of it: where traffic tuned to slip past a model lands."
+  },
+  "scrubline_ml_tightened_total": {
+    "kind": "counter",
+    "help": "Times the classifiers' thresholds were lowered a step for a protected prefix because near misses made up a quarter or more of what they scored for it."
+  },
   "scrubline_rate_buckets": {
     "kind": "gauge",
     "help": "Sources currently tracked by the ZC behavioral cap."
@@ -131,6 +139,10 @@
     "kind": "counter",
     "help": "Segments on a game filter's HTTP ports that started no request: the rest of a request, TLS, or another protocol. They pass."
   },
+  "scrubline_game_http_budget_dropped_total": {
+    "kind": "counter",
+    "help": "Segments a game filter's HTTP rules dropped because everyone together was over a budget and the source held no proof."
+  },
   "scrubline_game_sessions": {
     "kind": "gauge",
     "help": "Sources the game filter is tracking through a gate."
@@ -174,6 +186,10 @@
   "scrubline_pulse_hold_seconds": {
     "kind": "gauge",
     "help": "How much longer the pulse flag stands without another burst. While this is above zero, mitigation does not disengage."
+  },
+  "scrubline_prefix_ml_threshold_cut": {
+    "kind": "gauge",
+    "help": "How far under their published thresholds the classifiers drop for this prefix while it is being probed: 0, 0.1 or 0.2."
   },
   "scrubline_prefix_offered_pps": {
     "kind": "gauge",
@@ -405,7 +421,15 @@
   },
   "scrubline_tunnel_mitigating": {
     "kind": "gauge",
-    "help": "1 while an on-demand tunnel is being mitigated on this node, from when its traffic reached a threshold until it has stayed under both for five minutes."
+    "help": "1 while an on-demand tunnel is being mitigated on this node, from when its traffic reached a threshold until it has stayed under both for the wave's hold."
+  },
+  "scrubline_tunnel_mitigation_wave": {
+    "kind": "gauge",
+    "help": "Which wave of an attack an on-demand tunnel's last mitigation on this node was: 1, and one more for each that started within an hour of the last one ending."
+  },
+  "scrubline_tunnel_mitigation_hold_seconds": {
+    "kind": "gauge",
+    "help": "How long an on-demand tunnel's traffic has to stay under both thresholds before the wave's mitigation ends: five minutes for the first wave, doubling with each after it, up to an hour."
   },
   "scrubline_tunnel_ingress_pps": {
     "kind": "gauge",

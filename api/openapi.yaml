@@ -1632,6 +1632,15 @@ components:
           minimum: 0
           description: Requests a second one source may make on this rule, over the last second. None at
             zero; the block's own limit applies on top.
+        rate_total:
+          type: integer
+          minimum: 0
+          description: Requests a second this rule takes from every source together, counting each
+            request that got past its source's own rates. Over it, a request from a source the fabric
+            has not verified (one that cleared a gate, answered a challenge or had its return traffic
+            confirmed in the last five minutes) is dropped, and one from a verified source passes.
+            Such a drop is no strike against the source. None at zero; the block's own budget applies
+            on top.
         max_body_bytes:
           type: integer
           minimum: 0
@@ -1668,6 +1677,12 @@ components:
           type: integer
           minimum: 0
           description: Requests a second one source may make across every path. No limit at zero.
+        rate_total:
+          type: integer
+          minimum: 0
+          description: Requests a second the filter takes from every source together, across every
+            path. Over it, only sources the fabric has verified get through, as for a path's
+            rate_total. No budget at zero.
         max_body_bytes:
           type: integer
           minimum: 0
@@ -2179,11 +2194,16 @@ components:
           description: HTTP requests those rules dropped, for any reason.
         http_rate_limited:
           type: integer
-          description: HTTP requests dropped because their source went over a rate.
+          description: HTTP requests dropped because their source went over a rate, or because everyone
+            together went over a budget and their source was not verified.
         http_other:
           type: integer
           description: Segments on the HTTP ports that started no request (the rest of one, TLS, another
             protocol). They pass.
+        http_budget_dropped:
+          type: integer
+          description: Segments dropped because everyone together went over a rate_total and their source
+            held no proof. Counted in http_rate_limited too.
     PrefixStats:
       type: object
       description: 'Everything one node knows about the traffic aimed at one protected prefix. Reported
@@ -2229,6 +2249,11 @@ components:
           type: integer
         held_for_seconds:
           type: number
+        ml_cut:
+          type: number
+          description: How far under their published thresholds the classifiers drop for this prefix,
+            because what they scored for it gathered just under them. 0, 0.1 or 0.2; each step lapses
+            five minutes after the probing that set it was last seen.
     MitigationStats:
       type: object
       description: An on-demand tunnel as the node holding it sees it.
@@ -2238,7 +2263,7 @@ components:
         active:
           type: boolean
           description: Whether it is being mitigated, from when its traffic reached a threshold until it has
-            stayed under both for five minutes.
+            stayed under both for the wave's hold.
         since:
           type: string
           format: date-time
@@ -2256,6 +2281,14 @@ components:
         attack_bps:
           type: integer
           description: This node's bandwidth threshold, in bit/s.
+        wave:
+          type: integer
+          description: Which wave of an attack the last mitigation was. 1 for one that started more than
+            an hour after the last one ended, and one more for each that started sooner. 0 before any.
+        hold_seconds:
+          type: integer
+          description: How long the traffic has to stay under both thresholds before that wave's
+            mitigation ends. 300 for the first wave, doubling with each after it, up to 3600.
         mitigations:
           type: integer
           description: Mitigations started.
@@ -2302,6 +2335,19 @@ components:
           enum:
           - enforce
           - observe
+        probing:
+          type: string
+          enum:
+          - tighten
+          - ignore
+        near_misses:
+          type: integer
+          description: Flows either model scored within 0.1 under the threshold in force for their
+            prefix.
+        tightened:
+          type: integer
+          description: Times a prefix's thresholds were lowered a step because near misses made up a
+            quarter or more of what the models scored for it.
     Stats:
       type: object
       description: A node's datapath counters. Most are monotonic totals; the fields documented as rates
@@ -2496,6 +2542,17 @@ components:
           - observe
           description: enforce, the default, drops what a model scores at its threshold. observe scores
             and counts it, and drops nothing, which is how a model is tried before it is trusted.
+        probing:
+          type: string
+          enum:
+          - tighten
+          - ignore
+          description: 'tighten, the default: traffic tuned to get past a model scores just under its
+            threshold, so when near misses (within 0.1 under the threshold in force) are 20 or more,
+            and a quarter or more of what the models scored for a protected prefix over the last ten
+            seconds, both models drop 0.1 lower for that prefix, and 0.2 lower if it happens again
+            there. Each step lapses five minutes after the probing that set it was last seen. ignore
+            keeps the thresholds where they are.'
     EgressPolicy:
       type: object
       description: What the fabric does with the return path it can see. Watching what the origin sends
@@ -2728,7 +2785,9 @@ components:
           description: 'always, the default: every node filters the customer''s traffic all the time.
             on_demand: each node holding the tunnel only watches the traffic to its prefixes until it reaches
             attack_pps or attack_mbps over the last second, then applies its whole policy to it until the
-            traffic has stayed under both for five minutes. A game filter''s HTTP rules, and the request
+            traffic has stayed under both for five minutes, or for longer when the attack keeps coming
+            back: each mitigation that starts within an hour of the last one ending holds twice as long
+            as that one did, up to an hour. A game filter''s HTTP rules, and the request
             model behind them, judge it throughout. A node helping a pinned tunnel''s location holds no
             tunnel for it, so it watches nothing and filters from the first packet. While idle nothing else
             is filtered, so an attack under the thresholds passes.'
@@ -3138,6 +3197,14 @@ components:
           type: string
           format: date-time
           description: When the mitigation started, while it lasts.
+        mitigation_wave:
+          type: integer
+          description: Which wave of an attack the mitigation is, while it lasts. 1, or one more than
+            the last when that ended less than an hour before this one started.
+        mitigation_hold_seconds:
+          type: integer
+          description: How long the traffic has to stay under both thresholds before this mitigation
+            ends. 300 for a first wave, doubling with each after it, up to 3600.
         ingress_pps:
           type: integer
           description: What reached the tunnel's prefixes on this node over the second before it reported.

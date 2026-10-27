@@ -1,7 +1,7 @@
 //! Protocol framing, handshake admission, stateless HMAC challenge cookies, and the layer-7 rules
 //! for the HTTP a game server answers on its own address.
 use crate::{
-    httpfilter, ml,
+    httpfilter,
     model::{Flow, GameFilter, GameSignature},
     Result,
 };
@@ -47,9 +47,10 @@ pub struct Inspection {
     pub reply: Vec<u8>,
     pub cleared: u8,
     /// For a segment the HTTP rules looked at: the requests in it, whether a rate held one back,
-    /// and whether it carried no request at all.
+    /// and whether that was a budget for everyone, and whether it carried no request at all.
     pub requests: u64,
     pub limited: bool,
+    pub budget: bool,
     pub other: bool,
     /// What the request model made of the requests the rules allowed: how many it scored, the
     /// highest score, whether the drop is its doing, and whether it would have dropped the segment
@@ -233,6 +234,9 @@ pub struct Engine {
     windows: httpfilter::Windows,
     /// Where request paths are normalised, kept so a request costs no allocation for it.
     scratch: Vec<u8>,
+    /// Whether any filter's HTTP rules hold a budget for everyone, the one thing that asks
+    /// whether a source is verified.
+    budgets: bool,
 }
 impl Engine {
     pub fn load(&mut self, bindings: Vec<Binding>, secret: &str) {
@@ -240,6 +244,9 @@ impl Engine {
         self.sessions.retain(|(b, _), _| live.contains(b));
         self.pending.retain(|(b, _), _| live.contains(b));
         self.order.retain(|(b, _)| live.contains(b));
+        self.budgets = bindings
+            .iter()
+            .any(|b| b.http.as_ref().is_some_and(|h| h.budgeted()));
         self.bindings = bindings;
         self.secret = secret.as_bytes().to_vec();
     }
@@ -249,6 +256,10 @@ impl Engine {
     /// (rule, source) pairs the HTTP rate limits are tracking.
     pub fn windows(&self) -> usize {
         self.windows.len()
+    }
+    /// Whether any filter's HTTP rules hold a budget for everyone.
+    pub fn budgeted(&self) -> bool {
+        self.budgets
     }
     fn binding(&self, f: &Flow) -> Option<Binding> {
         let ip = f.dst_ip.parse::<IpAddr>().ok();
@@ -280,7 +291,7 @@ impl Engine {
         i: usize,
         f: &Flow,
         now: i64,
-        model: Option<&ml::Model>,
+        cx: httpfilter::Context,
         enforce: bool,
     ) -> Inspection {
         let b = &self.bindings[i];
@@ -302,9 +313,10 @@ impl Engine {
             return r;
         }
         let policy = b.http.as_ref().expect("an HTTP binding has HTTP rules");
-        let j = policy.judge(&mut self.windows, &mut self.scratch, f, now, model);
+        let j = policy.judge(&mut self.windows, &mut self.scratch, f, now, cx);
         r.requests = j.requests;
         r.limited = j.drop && j.limited;
+        r.budget = j.drop && j.budget;
         r.other = j.requests == 0;
         r.scored = j.scored;
         r.score = j.score;
@@ -324,6 +336,7 @@ impl Engine {
             r.reason = format!("observe only: would have drop ({})", r.reason);
             r.verdict = "pass".into();
             r.limited = false;
+            r.budget = false;
             r.observed |= r.classified;
             r.classified = false;
         }
@@ -354,21 +367,22 @@ impl Engine {
         mac.update(&((now / 1000 / 120) as u64).to_be_bytes());
         mac.finalize().into_bytes()[..4].to_vec()
     }
-    /// Judges a flow by the filter bound to where it is going. `model` is the request model the
-    /// HTTP rules consult, if they are to consult one, and `enforce` whether it drops what it
-    /// scores at its threshold or only counts it.
+    /// Judges a flow by the filter bound to where it is going. `cx` is what the HTTP rules judge
+    /// with besides themselves: whether the source is verified, and the request model they
+    /// consult, if they are to consult one. `enforce` is whether that model drops what it scores
+    /// at the threshold or only counts it.
     pub fn inspect(
         &mut self,
         f: &Flow,
         now: i64,
         validate_only: bool,
-        model: Option<&ml::Model>,
+        cx: httpfilter::Context,
         enforce: bool,
     ) -> Inspection {
         // HTTP has no gate to skip, so a verified source is held to its rules, and to the request
         // model, like anyone else.
         if let Some(i) = self.http_binding(f) {
-            return self.inspect_http(i, f, now, model, enforce);
+            return self.inspect_http(i, f, now, cx, enforce);
         }
         let Some(b) = self.binding(f) else {
             return Inspection {
