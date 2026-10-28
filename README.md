@@ -238,7 +238,10 @@ withdraw route 203.0.113.0/24 next-hop 198.51.100.1
 Give the agent `-local-as` so it can pad the path, and `-bgp-next-hop` when the
 address upstreams should route to differs from the one peers reach the node on,
 or when `-advertise` is a hostname: only an address can be a next hop, so a
-hostname leaves it off the commands and the agent warns at startup.
+hostname leaves it off the commands and the agent warns at startup. An address
+is a next hop only for routes of its own family: a node with an IPv4 next hop
+announces its IPv6 prefixes without one, as it does for a hostname, rather
+than with one a peer without extended next hops would refuse.
 Communities are validated when the policy is saved, not at the speaker: these
 lines are written into a routing daemon's control pipe, so an unchecked value
 would be a command injection into the thing that decides where the internet
@@ -283,6 +286,14 @@ built-in or a signature written in the policy:
 A filter only reaches nodes that carry the address it protects, and only
 nodes that advertised a `zc` backend. `observe` records what a filter would
 have done without acting on it, which is how a binding is rolled out.
+
+A packet goes to the first filter bound to it, in policy order, so a policy is
+refused when an earlier filter takes every packet a later one is bound to (a
+whole prefix on every port ahead of one address on one port), or when an
+earlier filter's HTTP rules cover every request a later one's would judge: put
+the narrower one first. A `dst_cidr` outside every protected prefix is refused
+too, since no node carries it. A node handed a program compiled before these
+checks still loads it, and the filter that takes the packets judges them.
 
 ### Gates
 
@@ -428,6 +439,10 @@ bound it admits without tracking rather than evicting connected players.
 
 Within a stage the first matching rule decides: `drop` and `permit` are both terminal, so a `permit` rule acts as an allow-list that exempts a source from the stages behind it. A TCAM entry carries no meter, so `rate_limit` is rejected on the `asic` stage.
 
+The allow list holds wherever a source is judged, not only in the stages. When the first `asic` rule that drops or permits a flow, or failing one there the first `fpga` rule, is a `permit`, the flow passes the penalty box, lockdown and an idle on-demand tunnel's HTTP rules as well, and a verified source's permit ends evaluation as anyone's does. A permit written for a source already in the box takes effect on its next packet.
+
+Each TCAM key names the table it belongs in: `v4` or `v6` by the addresses the rule matches, or `any` for a rule matching no address, which a switch installs in both. A rule whose source and destination are different families would match nothing and is refused, as is one whose `dst_cidr` is outside every protected prefix.
+
 Rules are ordered by `priority` on every stage, not just the ASIC, and the ordering is stable, so rules sharing a priority keep policy order and compile identically on every node. A node is only given entries for the backends it advertised at registration.
 
 Payload inspection belongs to the ZC stage alone; see
@@ -438,6 +453,8 @@ Payload inspection belongs to the ZC stage alone; see
 3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path. The game filters and their HTTP rules run here, and the classifiers trained from the control API have the last word (see [The classifiers](#the-classifiers)).
 
 Hardware programming is represented as compiled programs the node agent pulls. A node without a switch ASIC, FPGA, or PF_RING license still enforces the same decision order in the software pipeline so the control plane can be tested. On an appliance, the agent writes the TCAM key, FPGA table, and `zc:<node>` cluster from that program.
+
+The fabric recompiles all the time, so a reload keeps what each source has spent: of an FPGA meter, of a ZC behavioral cap and of lockdown's trickle, for every rule the new program keeps. A recompile hands nobody a fresh allowance, and a game filter's sessions and an HTTP rule's rate windows carry over the same way.
 
 ### The classifiers
 
@@ -608,7 +625,8 @@ back from doing more harm than it must:
 - **Nothing is dropped for want of a look.** A game filter given no payload
   passes the packet and counts it as uninspectable.
 - **Your own traffic can be taken out of the question.** A `permit` rule on the
-  asic stage takes a source past every stage behind it.
+  asic stage takes a source past every stage behind it, and past the penalty
+  box, lockdown and an idle on-demand tunnel's HTTP rules too.
 
 When one gets through anyway, mark it `known_good` among the samples and
 retrain: no model that would drop it again can be published.
@@ -645,6 +663,25 @@ cargo run --release --bin scrub-node -- -name scrub-b -region fra -capacity 80 -
 cargo run --release --bin scrub-node -- -name scrub-c -region sin -capacity 40 -listen 127.0.0.1:9093
 sh scripts/demo.sh
 cargo run --release --bin scrubctl -- fabric
+```
+
+### Every feature on one node
+
+[`configs/policy.everything.json`](configs/policy.everything.json) turns on
+everything a policy can at once: TCAM, FPGA and ZC rules with a permit for
+monitoring, RakNet, A2S and custom game filters, HTTP rules with budgets, IPv4
+and IPv6 prefixes with communities, three tunnels (one on-demand, one IPv6
+whose replies leave by the customer's own transit), a customer BGP session,
+the penalty box, return-traffic confirmation with lockdown, and both
+classifiers enforcing and tightening under probing.
+[`tests/node.rs`](tests/node.rs) deploys it to one node through the API and
+checks that the features decide together, report together, render together
+and survive a policy change; the real binaries do the same, through the API
+restarting from its state:
+
+```sh
+cargo build --release --bins
+PATHFINDER_BIN_DIR=target/release python3 scripts/everything-e2e.py
 ```
 
 ### A demo fabric in containers

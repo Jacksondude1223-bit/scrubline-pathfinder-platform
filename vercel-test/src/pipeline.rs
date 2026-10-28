@@ -362,6 +362,20 @@ pub struct Pipeline {
     lockdown_pps: i64,
     grace: i64,
 }
+/// Whether an operator's permit lets a flow through the stages before anything else judges it:
+/// the first rule on the asic stage, or failing one there the fpga stage, that matches it and drops
+/// or permits, permits. The checks made before the stages, lockdown and the penalty box, and an
+/// idle tunnel's HTTP rules honour it as the stages behind the rule do.
+fn allowed(rules: &[Vec<Entry>; 3], f: &Flow) -> bool {
+    rules[..2]
+        .iter()
+        .find_map(|stage| {
+            stage
+                .iter()
+                .find(|r| (r.action == "drop" || r.action == "permit") && r.matcher.matches(f))
+        })
+        .is_some_and(|r| r.action == "permit")
+}
 fn decision(action: &str, stage: usize, id: &str, reason: impl Into<String>) -> Decision {
     Decision {
         action: action.into(),
@@ -460,8 +474,18 @@ impl Pipeline {
                 })
                 .collect(),
         ];
-        let bucket_live: HashSet<_> = program.zc.iter().map(|r| r.rule_id.clone()).collect();
-        self.buckets.retain(|(r, _), _| bucket_live.contains(r));
+        // A behavioural cap, an FPGA meter on the trusted path and lockdown's trickle all count per
+        // source, and the fabric recompiles all the time: a reload must not hand every source a
+        // fresh allowance for the rules it keeps.
+        let bucket_live: HashSet<&str> = program
+            .zc
+            .iter()
+            .map(|r| r.rule_id.as_str())
+            .chain(program.fpga.iter().map(|r| r.rule_id.as_str()))
+            .chain(["|lockdown"])
+            .collect();
+        self.buckets
+            .retain(|(r, _), _| bucket_live.contains(r.as_str()));
         let mut stats = HashMap::new();
         for (i, rules) in self.rules.iter().enumerate() {
             for r in rules {
@@ -564,6 +588,23 @@ impl Pipeline {
     /// unfiltered, though the other game filters still see it, so a player who connects now is
     /// known when mitigation starts.
     fn watch_only(&mut self, f: &Flow, now: i64, i: usize) -> Decision {
+        let watching = |w: &Watch| {
+            decision(
+                "permit",
+                0,
+                "",
+                format!(
+                    "watching only: tunnel {} is under its attack thresholds",
+                    w.tunnel
+                ),
+            )
+        };
+        // What an operator permits passes a mitigating tunnel's stages unjudged, so it passes an
+        // idle one's HTTP rules too.
+        if allowed(&self.rules, f) {
+            self.watches[i].unfiltered += 1;
+            return watching(&self.watches[i]);
+        }
         let verified = self.verified(f, now);
         let r = self.games.inspect(
             f,
@@ -582,15 +623,7 @@ impl Pipeline {
             }
             self.watches[i].unfiltered += 1;
         }
-        decision(
-            "permit",
-            0,
-            "",
-            format!(
-                "watching only: tunnel {} is under its attack thresholds",
-                self.watches[i].tunnel
-            ),
-        )
+        watching(&self.watches[i])
     }
     fn over_rate(&mut self, id: &str, limit: i64, f: &Flow, now: i64) -> bool {
         if limit <= 0 {
@@ -793,21 +826,24 @@ impl Pipeline {
                 if trusted {
                     // Trust skips the challenge and the classifier, nothing else. A count is still
                     // observe-only and the behavioural cap still applies, so a match that decides
-                    // nothing must not end the stage and hide the rules behind it.
+                    // nothing must not end the stage and hide the rules behind it. A drop or a
+                    // permit ends evaluation, as it does for everyone: a permit is an operator's
+                    // allow list, and trust is no reason to hold a source to the stages behind it.
                     self.seen(&r.id, f);
-                    if r.action == "drop" {
+                    if r.action == "drop" || r.action == "permit" {
                         return (
                             decision(
-                                "drop",
+                                &r.action,
                                 stage,
                                 &r.id,
-                                ["TCAM ACL drop", "FPGA drop", "PF_RING ZC drop"][stage],
+                                format!(
+                                    "{} {}",
+                                    ["TCAM ACL", "FPGA", "PF_RING ZC"][stage],
+                                    r.action
+                                ),
                             ),
                             None,
                         );
-                    }
-                    if r.action == "permit" {
-                        break;
                     }
                     if r.limit > 0 && self.over_rate(&r.id, r.limit, f, now) {
                         return (
@@ -935,7 +971,10 @@ impl Pipeline {
                 return d;
             }
         }
-        let state = self.reputation.check(&f.src_ip, now);
+        let rules = &self.rules;
+        let state = self
+            .reputation
+            .check_sparing(&f.src_ip, now, || allowed(rules, f));
         let (d, by) = if state == 2 {
             (
                 decision("drop", 0, "", "source is in the penalty box"),
@@ -950,7 +989,8 @@ impl Pipeline {
                     .unwrap_or(false)
                 && self.egress.visibility(&owner, now) == "visible"
                 && !self.egress.confirmed(&owner, &f.src_ip, now)
-                && !self.egress.grace(&owner, &f.src_ip, self.grace, now);
+                && !self.egress.grace(&owner, &f.src_ip, self.grace, now)
+                && !allowed(&self.rules, f);
             if held {
                 self.returns[2] += 1;
             }

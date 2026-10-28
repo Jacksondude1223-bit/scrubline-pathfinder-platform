@@ -1223,6 +1223,19 @@ signal would let anyone get a real player banned by spoofing their address.
 Those strikes are counted as `shielded` instead; the junk is still dropped,
 the player stays online. Alert on `scrubline_reputation_shielded_total`.
 
+**A permit is an allow list everywhere a source is judged.** When the first
+`asic` rule that drops or permits a flow, or failing one there the first
+`fpga` rule, is a `permit`, the flow passes the penalty box, lockdown and an
+idle on-demand tunnel's HTTP rules as it passes the stages. It ends
+evaluation for a verified source too, so no rate cap behind it applies to
+anything it matches.
+
+**What no node would ever judge is refused.** A game filter or rule whose
+`dst_cidr` is outside every protected prefix, a rule whose source and
+destination are different address families, and a game filter that an
+earlier one takes every packet or request from would each be accepted and
+never apply. Put the narrower filter first.
+
 **A prefix has exactly one return path.** Two tunnels carrying one prefix is
 refused: backup paths are not modelled, so there would be no answer to which
 one is authoritative. Redundancy comes from the fabric — other nodes keep

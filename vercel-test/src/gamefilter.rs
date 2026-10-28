@@ -106,6 +106,27 @@ fn custom(s: &GameSignature) -> Result<Profile> {
     }
     Ok(p)
 }
+/// Whether every packet `b` is bound to reaches `a` first, by its address and port and, for a
+/// profile, its protocol.
+fn covers(a: &Binding, b: &Binding) -> bool {
+    a.dst.is_none_or(|x| b.dst.is_some_and(|y| x.contains(&y)))
+}
+fn covers_l4(a: &Binding, b: &Binding) -> bool {
+    a.l4 && b.l4
+        && covers(a, b)
+        && (a.dport == 0 || a.dport == b.dport)
+        && (a.proto.is_empty() || a.proto == "any" || a.proto == b.proto)
+}
+fn covers_http(a: &Binding, b: &Binding) -> bool {
+    match (&a.http, &b.http) {
+        (Some(x), Some(y)) => {
+            covers(a, b)
+                && (x.ports.is_empty()
+                    || !y.ports.is_empty() && y.ports.iter().all(|p| x.covers(*p)))
+        }
+        _ => false,
+    }
+}
 pub fn compile(filters: &[GameFilter]) -> Result<Vec<Binding>> {
     filters
         .iter()
@@ -186,6 +207,34 @@ pub fn compile(filters: &[GameFilter]) -> Result<Vec<Binding>> {
             })
         })
         .collect()
+}
+/// A filter takes the packets bound to it in policy order, so one bound to everything a later one
+/// is would leave it nothing to judge, and nothing to say so. The API refuses such a policy; a node
+/// still loads a program compiled before it did, whose later filter simply never matches.
+pub fn unshadowed(bindings: &[Binding]) -> Result<()> {
+    for (j, b) in bindings.iter().enumerate() {
+        if let Some((i, a)) = bindings[..j]
+            .iter()
+            .enumerate()
+            .find(|(_, a)| covers_l4(a, b))
+        {
+            return Err(format!(
+                "games[{j}] ({}): games[{i}] ({}) is bound to every packet it is, so it would never judge one; narrow one of them",
+                b.id, a.id
+            ));
+        }
+        if let Some((i, a)) = bindings[..j]
+            .iter()
+            .enumerate()
+            .find(|(_, a)| covers_http(a, b))
+        {
+            return Err(format!(
+                "games[{j}] ({}): the HTTP rules of games[{i}] ({}) cover every request its own would judge, so they would never judge one; narrow one of them",
+                b.id, a.id
+            ));
+        }
+    }
+    Ok(())
 }
 fn framing(p: &Profile, payload: &[u8]) -> Result<()> {
     let n = payload.len() as i64;

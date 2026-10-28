@@ -654,6 +654,8 @@ components:
             type: string
         next_hop:
           type: string
+          description: The address the node announces its routes towards. The text form leaves it off
+            a route of the other address family, which a peer without extended next hops would refuse.
         reason:
           type: string
     NodeHealth:

@@ -1655,3 +1655,143 @@ fn only_an_address_that_answers_for_itself_leaves_the_box() {
     assert_eq!(r.check("192.0.2.9", T0 + 50), 1);
     assert_eq!(r.stats(T0 + 50)["freed"], 1);
 }
+/// A RakNet server whose players take the short path once they have connected, with an allow
+/// list for one source and a meter on everything else.
+fn allow_listed(meter_pps: i64) -> Program {
+    let mut program = gated(vec![game("game", 19132, "raknet")], "handshake");
+    program.asic = vec![ACLEntry {
+        rule_id: "partner".into(),
+        action: "permit".into(),
+        r#match: Match {
+            src_cidr: "192.0.2.7/32".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    program.fpga = vec![pathfinder::model::FPGAEntry {
+        rule_id: "meter".into(),
+        action: "rate_limit".into(),
+        meter_pps,
+        ..Default::default()
+    }];
+    program
+}
+#[test]
+fn a_permit_ends_evaluation_for_a_verified_source_as_for_anyone() {
+    let mut unlisted = allow_listed(100);
+    unlisted.asic.clear();
+    let mut pipe = Pipeline::new(unlisted);
+    for (src, at) in [("192.0.2.7", T0), ("192.0.2.8", T0 + 1)] {
+        pipe.decide(&packet(src, 19132, &[0x05]), at);
+        pipe.decide(&packet(src, 19132, &[0x07]), at + 1);
+    }
+    // Both connected and are on the short path, which meters a verified source per source, when
+    // the operator allow-lists one of them...
+    pipe.load(allow_listed(100));
+    let busy = |src: &str| Flow {
+        pps: 1000,
+        ..packet(src, 19132, &[0x84, 0, 0])
+    };
+    let d = pipe.decide(&busy("192.0.2.8"), T0 + 10);
+    assert_eq!(d.reason, "FPGA meter 100 pps exceeded");
+    // ...whose permit ends evaluation, trust or no trust.
+    let d = pipe.decide(&busy("192.0.2.7"), T0 + 11);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        ("permit", "TCAM ACL permit")
+    );
+}
+#[test]
+fn a_reload_keeps_what_each_source_has_spent_of_its_meters() {
+    let program = allow_listed(100);
+    let mut pipe = Pipeline::new(program.clone());
+    pipe.decide(&packet("192.0.2.8", 19132, &[0x05]), T0);
+    pipe.decide(&packet("192.0.2.8", 19132, &[0x07]), T0 + 1);
+    let half = Flow {
+        pps: 80,
+        ..packet("192.0.2.8", 19132, &[0x84, 0, 0])
+    };
+    assert_eq!(pipe.decide(&half, T0 + 10).action, "permit");
+    // The fabric recompiles in the same second, and the second half is still over the meter.
+    pipe.load(program);
+    let d = pipe.decide(&half, T0 + 20);
+    assert_eq!(d.reason, "FPGA meter 100 pps exceeded");
+}
+#[test]
+fn a_permit_written_for_a_boxed_source_takes_effect_at_once() {
+    let mut program = allow_listed(1_000_000);
+    program.asic.clear();
+    let mut pipe = Pipeline::new(program.clone());
+    for i in 0..4 {
+        pipe.decide(&packet("192.0.2.7", 19132, &[0x84]), T0 + i);
+    }
+    assert_eq!(
+        pipe.decide(&packet("192.0.2.7", 19132, &[0x84]), T0 + 10)
+            .reason,
+        "source is in the penalty box"
+    );
+    // The operator allow-lists it, and the box lets it go to the rule.
+    pipe.load(allow_listed(1_000_000));
+    let d = pipe.decide(&packet("192.0.2.7", 19132, &[0x84]), T0 + 20);
+    assert_eq!(
+        (d.action.as_str(), d.reason.as_str()),
+        ("permit", "TCAM ACL permit")
+    );
+    assert_eq!(pipe.stats(T0 + 20)["reputation"]["boxed"], 1);
+}
+#[test]
+fn a_filter_that_an_earlier_one_takes_every_packet_from_is_refused() {
+    let filter = |id: &str, dst: &str, dport: i64| GameFilter {
+        id: id.into(),
+        dst_cidr: dst.into(),
+        proto: "udp".into(),
+        dport,
+        profile: "raknet".into(),
+        ..Default::default()
+    };
+    let policy = |games: Vec<GameFilter>| pathfinder::model::Policy {
+        name: "p".into(),
+        protected: vec!["203.0.113.0/24".into()],
+        games,
+        ..Default::default()
+    };
+    let wide = filter("wide", "203.0.113.0/24", 0);
+    let narrow = filter("narrow", "203.0.113.10/32", 19132);
+    // A whole prefix on every port takes what one address on one port would have judged...
+    let e = validation::policy(&policy(vec![wide.clone(), narrow.clone()])).unwrap_err();
+    assert!(
+        e.contains("games[1] (narrow): games[0] (wide) is bound to every packet it is"),
+        "{e}"
+    );
+    // ...though a node handed such a program, compiled before the API refused one, still judges
+    // with the filter that takes the packets rather than with none...
+    let mut pipe = Pipeline::new(gated(vec![wide.clone(), narrow.clone()], "handshake"));
+    let d = pipe.decide(&packet("192.0.2.1", 19132, &[0x84, 0, 0]), T0);
+    assert_eq!((d.action.as_str(), d.filter.as_str()), ("drop", "wide"));
+    // ...while the other way round each has its own: the address's port, then everything else.
+    validation::policy(&policy(vec![narrow, wide])).unwrap();
+    // HTTP rules on every port of a prefix leave none for rules on one port of an address in it.
+    let http = |id: &str, dst: &str, ports: Vec<i64>| GameFilter {
+        id: id.into(),
+        dst_cidr: dst.into(),
+        http: Some(GameHttp {
+            ports,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let e = validation::policy(&policy(vec![
+        http("site", "203.0.113.0/24", vec![]),
+        http("api", "203.0.113.20/32", vec![8080]),
+    ]))
+    .unwrap_err();
+    assert!(
+        e.contains("the HTTP rules of games[0] (site) cover every request"),
+        "{e}"
+    );
+    validation::policy(&policy(vec![
+        http("site", "203.0.113.0/24", vec![80]),
+        http("api", "203.0.113.20/32", vec![8080]),
+    ]))
+    .unwrap();
+}

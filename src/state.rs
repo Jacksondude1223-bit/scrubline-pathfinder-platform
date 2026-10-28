@@ -153,10 +153,15 @@ impl Reputation {
         true
     }
     pub fn check(&mut self, src: &str, now: i64) -> u8 {
+        self.check_sparing(src, now, || false)
+    }
+    /// As check(), for a source `spared` may exempt from the box: an operator's permit rule for
+    /// it, which takes effect at once even for a source boxed before the rule was written.
+    pub fn check_sparing(&mut self, src: &str, now: i64, spared: impl FnOnce() -> bool) -> u8 {
         let Some(e) = self.entries.get(src) else {
             return 0;
         };
-        if self.boxing && now < e.penalised {
+        if self.boxing && now < e.penalised && !spared() {
             self.counts[1] += 1;
             return 2;
         }

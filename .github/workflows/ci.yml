@@ -33,6 +33,10 @@ jobs:
         env:
           PATHFINDER_BIN_DIR: target/release
         run: python3 scripts/reaction-time.py
+      - name: Every feature on one node
+        env:
+          PATHFINDER_BIN_DIR: target/release
+        run: python3 scripts/everything-e2e.py
       - name: All CLI commands
         run: python3 scripts/rust-cli-e2e.py
   snapshot:

@@ -1902,6 +1902,8 @@ components:
             type: string
         next_hop:
           type: string
+          description: The address the node announces its routes towards. The text form leaves it off
+            a route of the other address family, which a peer without extended next hops would refuse.
         reason:
           type: string
     ACLEntry:
@@ -1917,6 +1919,9 @@ components:
           type: string
         tcam_key:
           type: string
+          description: The rule as a TCAM entry. The first word is the table it belongs in, v4 or v6 by
+            the addresses it matches, or any for a rule matching no address, which a switch installs
+            in both.
     FPGAEntry:
       type: object
       properties:

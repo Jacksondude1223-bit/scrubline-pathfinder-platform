@@ -87,8 +87,23 @@ pub fn policy(p: &Policy) -> Result<()> {
             bgp::validate_community(c)?;
         }
     }
+    // A node judges only traffic to the prefixes it carries, so a filter or rule aimed anywhere
+    // else would be accepted and never apply.
+    let reaches = |cidr: &str| {
+        cidr.parse::<IpNet>().is_ok_and(|target| {
+            networks
+                .keys()
+                .any(|p: &IpNet| p.contains(&target.addr()) || target.contains(&p.addr()))
+        })
+    };
     unique(p.games.iter().map(|g| g.id.as_str()), "games")?;
     for g in &p.games {
+        if !g.dst_cidr.is_empty() && g.dst_cidr.parse::<IpNet>().is_ok() && !reaches(&g.dst_cidr) {
+            return Err(format!(
+                "game filter {:?}: dst_cidr {} is outside every protected prefix, so no node would ever judge it",
+                g.id, g.dst_cidr
+            ));
+        }
         if !(0..=65535).contains(&g.dport) {
             return Err("game dport must be within 0..65535".into());
         }
@@ -102,7 +117,7 @@ pub fn policy(p: &Policy) -> Result<()> {
             return Err("game filter needs a dst_cidr, a dport or http ports".into());
         }
     }
-    gamefilter::compile(&p.games)?;
+    gamefilter::unshadowed(&gamefilter::compile(&p.games)?)?;
     unique(p.tunnels.iter().map(|t| t.id.as_str()), "tunnels")?;
     let mut carried = HashSet::new();
     let mut ends = HashMap::new();
@@ -219,10 +234,24 @@ pub fn policy(p: &Policy) -> Result<()> {
                 r.id
             ));
         }
+        let mut families = Vec::new();
         for cidr in [&r.r#match.src_cidr, &r.r#match.dst_cidr] {
             if !cidr.is_empty() {
-                cidr.parse::<IpNet>().map_err(|e| e.to_string())?;
+                let net = cidr.parse::<IpNet>().map_err(|e| e.to_string())?;
+                families.push(net.addr().is_ipv4());
             }
+        }
+        if !r.r#match.dst_cidr.is_empty() && !reaches(&r.r#match.dst_cidr) {
+            return Err(format!(
+                "rule {:?}: dst_cidr {} is outside every protected prefix, so it would never match",
+                r.id, r.r#match.dst_cidr
+            ));
+        }
+        if families.len() == 2 && families[0] != families[1] {
+            return Err(format!(
+                "rule {:?}: src_cidr and dst_cidr are different address families, so it would never match",
+                r.id
+            ));
         }
         if !(0..=65535).contains(&r.r#match.dport) || !(0..=65535).contains(&r.r#match.sport) {
             return Err("match ports must be within 0..65535".into());
