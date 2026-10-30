@@ -55,6 +55,7 @@ impl Metrics {
                 let sources: Vec<&Value> = match group {
                     "" => vec![stats],
                     "reputation" | "egress" => vec![&stats[group]],
+                    "crafted" => rows(&stats["crafted"], "checks").iter().collect(),
                     _ => rows(stats, group).iter().collect(),
                 };
                 for s in sources {
@@ -74,6 +75,10 @@ impl Metrics {
                         }
                         "mitigation" => {
                             labels.push(label("tunnel", s["tunnel_id"].as_str().unwrap_or("")))
+                        }
+                        "crafted" => {
+                            labels.push(label("check", s["check"].as_str().unwrap_or("")));
+                            labels.push(label("class", s["class"].as_str().unwrap_or("")));
                         }
                         _ => {}
                     }
@@ -106,6 +111,17 @@ impl Metrics {
                 labels.push(label("mode", candidate));
                 self.add(
                     "scrubline_egress_lockdown",
+                    labels,
+                    f64::from(candidate == mode),
+                );
+            }
+            // A node from before the checks reports no mode, and has none running.
+            let mode = stats["crafted"]["mode"].as_str().unwrap_or("off");
+            for candidate in ["enforce", "observe", "off"] {
+                let mut labels = id.clone();
+                labels.push(label("mode", candidate));
+                self.add(
+                    "scrubline_crafted_mode",
                     labels,
                     f64::from(candidate == mode),
                 );

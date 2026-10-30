@@ -2,6 +2,7 @@
 use crate::{
     gamefilter, httpfilter, ml,
     model::*,
+    packet,
     state::{Egress, Pulse, Reputation},
 };
 use ipnet::IpNet;
@@ -15,15 +16,33 @@ struct Matcher {
     m: Match,
     src: Option<IpNet>,
     dst: Option<IpNet>,
+    flags: Option<u16>,
     never: bool,
 }
 impl Matcher {
     fn new(m: Match) -> Self {
         let src = m.src_cidr.parse().ok();
         let dst = m.dst_cidr.parse().ok();
+        let flags = packet::tcp_flags(&m.tcp_flags);
         let never =
             !m.src_cidr.is_empty() && src.is_none() || !m.dst_cidr.is_empty() && dst.is_none();
-        Self { m, src, dst, never }
+        Self {
+            m,
+            src,
+            dst,
+            flags,
+            never,
+        }
+    }
+    /// Flags named on both sides compare as sets (see packet::flags_meet); anything else as text.
+    fn flags(&self, f: &Flow) -> bool {
+        if self.m.tcp_flags.is_empty() {
+            return true;
+        }
+        match (self.flags, packet::tcp_flags(&f.flags)) {
+            (Some(rule), Some(segment)) => packet::flags_meet(rule, segment),
+            _ => self.m.tcp_flags.eq_ignore_ascii_case(&f.flags),
+        }
     }
     fn matches(&self, f: &Flow) -> bool {
         !self.never
@@ -38,7 +57,7 @@ impl Matcher {
                 || self.m.proto.eq_ignore_ascii_case(&f.proto))
             && (self.m.dport == 0 || self.m.dport == f.dport)
             && (self.m.sport == 0 || self.m.sport == f.sport)
-            && (self.m.tcp_flags.is_empty() || self.m.tcp_flags.eq_ignore_ascii_case(&f.flags))
+            && self.flags(f)
     }
 }
 #[derive(Clone)]
@@ -62,6 +81,9 @@ struct Load {
     flows_dropped: u64,
     total: u64,
     total_dropped: u64,
+    /// Flows and their packets the crafted-packet checks dropped, per class: stack, protocol and
+    /// buffer.
+    crafted: [[u64; 2]; 3],
 }
 impl Load {
     fn observe(&mut self, now: i64, pps: u64, dropped: bool) {
@@ -310,6 +332,9 @@ fn bits(f: &Flow) -> u64 {
     if f.bps > 0 {
         return f.bps as u64;
     }
+    if !f.packet.is_empty() {
+        return (f.pps.max(0) as u64).saturating_mul(f.packet.len() as u64 * 8);
+    }
     let ip = if f.dst_ip.contains(':') { 40 } else { 20 };
     let l4 = if f.proto.eq_ignore_ascii_case("tcp") {
         20
@@ -361,6 +386,32 @@ pub struct Pipeline {
     lockdown: String,
     lockdown_pps: i64,
     grace: i64,
+    crafted: Crafted,
+}
+/// The crafted-packet checks: whether they drop, only count or are off, what each check dropped
+/// and observed, in packet::Check order, and the fragments in reassembly.
+struct Crafted {
+    mode: String,
+    dropped: [u64; 17],
+    observed: [u64; 17],
+    fragments: packet::Fragments,
+}
+impl Default for Crafted {
+    fn default() -> Self {
+        Self {
+            mode: "enforce".into(),
+            dropped: [0; 17],
+            observed: [0; 17],
+            fragments: Default::default(),
+        }
+    }
+}
+fn class(check: packet::Check) -> usize {
+    match check.class() {
+        "stack" => 0,
+        "protocol" => 1,
+        _ => 2,
+    }
 }
 /// Whether an operator's permit lets a flow through the stages before anything else judges it:
 /// the first rule on the asic stage, or failing one there the fpga stage, that matches it and drops
@@ -417,6 +468,7 @@ impl Pipeline {
             lockdown: "off".into(),
             lockdown_pps: 500,
             grace: 500,
+            crafted: Crafted::default(),
         };
         p.load(program);
         p
@@ -546,6 +598,10 @@ impl Pipeline {
             }
         }
         self.ml = program.ml.clone().unwrap_or_default();
+        self.crafted.mode = match program.crafted.as_ref().map(|c| c.mode.as_str()) {
+            Some(mode @ ("observe" | "off")) => mode.into(),
+            _ => "enforce".into(),
+        };
         // Programs are recompiled whenever the fabric changes, so a tunnel being mitigated stays
         // mitigated, and its meter keeps counting, across a reload.
         let mut kept: HashMap<String, Watch> = std::mem::take(&mut self.watches)
@@ -929,16 +985,66 @@ impl Pipeline {
             None,
         )
     }
+    /// Holds a flow to what a packet can legitimately be, and returns the drop and the check it
+    /// broke if it is crafted. It is judged whoever sent it: a permit or a verified source vouches
+    /// for an address, which a crafted packet forges as easily as the rest of itself. Nor is its
+    /// source boxed for it, since that address is as likely to be the forgery.
+    fn crafted(
+        &mut self,
+        f: &Flow,
+        dst: Option<IpAddr>,
+        now: i64,
+    ) -> Option<(Decision, packet::Check)> {
+        if self.crafted.mode == "off" {
+            return None;
+        }
+        let (found, stage) = if f.packet.is_empty() {
+            (packet::record(f, dst), 0)
+        } else {
+            let (p, found) = packet::parse(&f.packet);
+            match found {
+                Some(a) => (Some(a), 0),
+                // Telling one datagram's fragments from another's takes memory a switch does not
+                // have, so overlaps are judged in software.
+                None if p.fragment() => (self.crafted.fragments.observe(&p, now), 2),
+                None => (None, 0),
+            }
+        };
+        let a = found?;
+        let i = a.check as usize;
+        if self.crafted.mode == "observe" {
+            self.crafted.observed[i] += 1;
+            return None;
+        }
+        self.crafted.dropped[i] += 1;
+        let mut d = decision(
+            "drop",
+            stage,
+            "",
+            format!("crafted packet ({}): {}", a.check.class(), a.why),
+        );
+        d.check = a.check.name().into();
+        Some((d, a.check))
+    }
     pub fn decide(&mut self, f: &Flow, now: i64) -> Decision {
         self.decisions += 1;
         let pps = f.pps.max(0) as u64;
-        let owner = f.dst_ip.parse::<IpAddr>().ok().and_then(|a| {
+        let dst = f.dst_ip.parse::<IpAddr>().ok();
+        let owner = dst.and_then(|a| {
             self.prefixes
                 .iter()
                 .find(|(_, p)| p.contains(&a))
                 .map(|(s, _)| s.clone())
         });
         let Some(owner) = owner else {
+            // A packet too broken to say where it is going is no one's traffic to pass.
+            if !f.packet.is_empty() && dst.is_none() {
+                if let Some((d, _)) = self.crafted(f, dst, now) {
+                    self.record(&d, None, f);
+                    self.load.observe(now, pps, true);
+                    return d;
+                }
+            }
             self.unowned += 1;
             self.load.observe(now, pps, false);
             return decision("permit", 0, "", "prefix not assigned to this node");
@@ -957,19 +1063,36 @@ impl Pipeline {
                 .map_or(0.0, |p| p.cut(now)),
             ..Default::default()
         };
-        // An on-demand tunnel's traffic is only watched until it reaches the tunnel's thresholds.
-        if let Some(&i) = self.watched.get(&owner) {
-            if !self.watches[i].mitigating(now, pps, bits(f)) {
-                let d = self.watch_only(f, now, i);
-                self.probed(&owner, now);
-                self.record(&d, None, f);
-                self.load.observe(now, pps, false);
-                self.loads
-                    .entry(owner)
-                    .or_default()
-                    .observe(now, pps, false);
-                return d;
-            }
+        // An on-demand tunnel's traffic is only watched until it reaches the tunnel's thresholds,
+        // and its meter counts everything that reaches it, crafted or not, so mitigation starts on
+        // the whole of an attack.
+        let idle = self
+            .watched
+            .get(&owner)
+            .copied()
+            .filter(|&i| !self.watches[i].mitigating(now, pps, bits(f)));
+        // A crafted packet is judged first, on a watched tunnel too: it needs no volume to do its
+        // harm, so no threshold would ever start mitigation for it.
+        if let Some((d, check)) = self.crafted(f, dst, now) {
+            self.record(&d, None, f);
+            self.load.observe(now, pps, true);
+            let load = self.loads.entry(owner).or_default();
+            load.observe(now, pps, true);
+            let c = &mut load.crafted[class(check)];
+            c[0] += 1;
+            c[1] = c[1].saturating_add(pps);
+            return d;
+        }
+        if let Some(i) = idle {
+            let d = self.watch_only(f, now, i);
+            self.probed(&owner, now);
+            self.record(&d, None, f);
+            self.load.observe(now, pps, false);
+            self.loads
+                .entry(owner)
+                .or_default()
+                .observe(now, pps, false);
+            return d;
         }
         let rules = &self.rules;
         let state = self
@@ -1081,7 +1204,17 @@ impl Pipeline {
                 pulsing = true;
                 peak = peak.max(a["peak_pps"].as_u64().unwrap_or(0));
             }
-            prefixes.push(json!({"prefix":prefix,"flows":l.flows,"flows_dropped":l.flows_dropped,"offered":l.total,"dropped":l.total_dropped,"offered_pps":o,"dropped_pps":d,"pulsing":a["pulsing"],"peak_pps":a["peak_pps"],"mean_pps":a["mean_pps"],"crest":a["crest"],"duty_cycle":a["duty_cycle"],"bursts":a["bursts"],"held_for_seconds":a["held_for"].as_f64().unwrap_or(0.0)/1e9,"ml_cut":cut}));
+            let mut row = json!({"prefix":prefix,"flows":l.flows,"flows_dropped":l.flows_dropped,"offered":l.total,"dropped":l.total_dropped,"offered_pps":o,"dropped_pps":d,"pulsing":a["pulsing"],"peak_pps":a["peak_pps"],"mean_pps":a["mean_pps"],"crest":a["crest"],"duty_cycle":a["duty_cycle"],"bursts":a["bursts"],"held_for_seconds":a["held_for"].as_f64().unwrap_or(0.0)/1e9,"ml_cut":cut});
+            let crafted: Vec<_> = ["stack", "protocol", "buffer"]
+                .iter()
+                .zip(l.crafted)
+                .filter(|(_, [flows, _])| *flows > 0)
+                .map(|(class, [flows, pps])| json!({"class":class,"flows":flows,"dropped":pps}))
+                .collect();
+            if !crafted.is_empty() {
+                row["crafted"] = json!(crafted);
+            }
+            prefixes.push(row);
         }
         prefixes.sort_by(|a, b| a["prefix"].as_str().cmp(&b["prefix"].as_str()));
         let mut egress = self.egress.stats(now);
@@ -1093,7 +1226,13 @@ impl Pipeline {
         if states.as_array().is_some_and(|a| !a.is_empty()) {
             egress["prefix_states"] = states;
         }
+        let checks: Vec<_> = packet::Check::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({"check":c.name(),"class":c.class(),"dropped":self.crafted.dropped[i],"observed":self.crafted.observed[i]}))
+            .collect();
+        let crafted = json!({"mode":self.crafted.mode,"dropped":self.crafted.dropped.iter().sum::<u64>(),"observed":self.crafted.observed.iter().sum::<u64>(),"fragments":self.crafted.fragments.len(),"fragments_max":packet::FRAGMENTS_MAX,"fragments_untracked":self.crafted.fragments.untracked,"checks":checks});
         let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"wave":w.wave,"hold_seconds":w.hold()/1000,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }

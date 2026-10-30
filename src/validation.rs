@@ -181,6 +181,14 @@ pub fn policy(p: &Policy) -> Result<()> {
             return Err(format!("ml.probing {:?}: use tighten or ignore", m.probing));
         }
     }
+    if let Some(c) = &p.crafted {
+        if !["", "enforce", "observe", "off"].contains(&c.mode.as_str()) {
+            return Err(format!(
+                "crafted.mode {:?}: use enforce, observe, or off to stop checking packets",
+                c.mode
+            ));
+        }
+    }
     if let Some(e) = &p.egress {
         if !["", "off", "limit", "drop"].contains(&e.lockdown.as_str())
             || e.lockdown_pps < 0

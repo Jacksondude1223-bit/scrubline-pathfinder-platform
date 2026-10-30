@@ -37,8 +37,8 @@
       "stage": "asic",
       "action": "drop",
       "priority": 20,
-      "match": {"src_cidr": "0.0.0.0/8"},
-      "comment": "Sources no packet can come from"
+      "match": {"src_cidr": "10.0.0.0/8"},
+      "comment": "Private sources, which never arrive from the internet; sources no packet can come from at all are dropped before any rule"
     },
     {
       "id": "dns-reflection",

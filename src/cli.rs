@@ -284,6 +284,10 @@ pub fn render(raw: &[u8], view: View) -> Result<String> {
                     .unwrap_or(&empty)
                     .iter()
                     .map(|v| {
+                        let crafted = text(v, "crafted");
+                        if !crafted.is_empty() {
+                            return format!("crafted-{crafted}");
+                        }
                         let mut name = text(v, "rule_id");
                         if name.is_empty() {
                             name = text(v, "filter_id");

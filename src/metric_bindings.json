@@ -576,5 +576,43 @@
     "path": [
       "unfiltered"
     ]
+  },
+  {
+    "name": "scrubline_crafted_dropped_total",
+    "group": "crafted",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_crafted_observed_total",
+    "group": "crafted",
+    "path": [
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_crafted_fragments",
+    "group": "",
+    "path": [
+      "crafted",
+      "fragments"
+    ]
+  },
+  {
+    "name": "scrubline_crafted_fragments_max",
+    "group": "",
+    "path": [
+      "crafted",
+      "fragments_max"
+    ]
+  },
+  {
+    "name": "scrubline_crafted_fragments_untracked_total",
+    "group": "",
+    "path": [
+      "crafted",
+      "fragments_untracked"
+    ]
   }
 ]

@@ -36,9 +36,14 @@ fn flow(g: &Generator, r: &mut StdRng, kind: u8) -> Flow {
     let mut f = Flow {
         src_ip: source(r),
         dst_ip: host(if kind == 2 { &g.quiet } else { &g.protected }, r),
-        proto: if kind == 1 || kind == 2 { "tcp" } else { "udp" }.into(),
+        proto: if matches!(kind, 1 | 2 | 6) {
+            "tcp"
+        } else {
+            "udp"
+        }
+        .into(),
         sport: 1024 + r.gen_range(0..60000),
-        dport: if kind == 1 || kind == 2 {
+        dport: if matches!(kind, 1 | 2 | 6) {
             443
         } else {
             g.game_port
@@ -69,6 +74,11 @@ fn flow(g: &Generator, r: &mut StdRng, kind: u8) -> Flow {
             f.pps = 60000 + r.gen_range(0..40000);
             f.payload = vec![255; 4];
             f.has_payload = true;
+        }
+        // SYN and FIN together, which no stack sends: the crafted-packet checks drop it.
+        6 => {
+            f.pps = 20000 + r.gen_range(0..20000);
+            f.flags = "syn,fin".into();
         }
         _ => {
             f.pps = 400000 + r.gen_range(0..200000);
@@ -171,7 +181,7 @@ async fn run() -> Result<()> {
             let started = tokio::time::Instant::now();
             while tokio::time::Instant::now() < started + duration {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                send(&flood, &mut r, &[3, 4]).await;
+                send(&flood, &mut r, &[3, 4, 6]).await;
             }
             // Attacks recur on a period, so "every four minutes" means four minutes apart.
             tokio::time::sleep_until(started + every).await;

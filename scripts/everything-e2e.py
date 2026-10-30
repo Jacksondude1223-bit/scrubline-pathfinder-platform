@@ -1,12 +1,14 @@
 """Every feature a policy can turn on, on one node, through the real binaries: the policy in
 configs/policy.everything.json deployed through scrub-api onto a scrub-node, traffic driven through
-the node's own API, what the node renders read back and handed to the provisioner's dry run, and
-the control plane restarted from its state with the node still at work."""
+the node's own API, whole packets built to harm the stack that receives them among it, what the
+node renders read back and handed to the provisioner's dry run, and the control plane restarted
+from its state with the node still at work."""
 import base64
 import json
 import os
 import pathlib
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -66,6 +68,29 @@ def wait_for(check, seconds=20, every=0.1):
 def flow(proto, src, dst, dport, pps=1, payload=b'', **extra):
     return dict(proto=proto, src_ip=src, dst_ip=dst, sport=extra.pop('sport', 50000), dport=dport,
                 pps=pps, payload=base64.b64encode(payload).decode(), **extra)
+
+def ipv4(src, dst, proto, l4, ident=0x1234, frag=0x4000):
+    """An IPv4 packet; frag holds the flags and the offset in 8-byte units."""
+    header = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(l4), ident, frag, 64, proto, 0,
+                         socket.inet_aton(src), socket.inet_aton(dst))
+    total = sum(struct.unpack('!10H', header))
+    while total > 0xffff:
+        total = (total & 0xffff) + (total >> 16)
+    return header[:10] + struct.pack('!H', ~total & 0xffff) + header[12:] + l4
+
+def ipv6(src, dst, next_header, l4):
+    return (struct.pack('!IHBB', 6 << 28, len(l4), next_header, 64) +
+            socket.inet_pton(socket.AF_INET6, src) + socket.inet_pton(socket.AF_INET6, dst) + l4)
+
+def tcp(sport, dport, flags, options=b''):
+    return struct.pack('!HHIIBBHHH', sport, dport, 1, 0, (5 + len(options) // 4) << 4, flags,
+                       65535, 0, 0) + options
+
+def udp(sport, dport, data):
+    return struct.pack('!HHHH', sport, dport, 8 + len(data), 0) + data
+
+def raw(packet, **extra):
+    return dict(packet=base64.b64encode(packet).decode(), **extra)
 
 def get(src, path):
     request = (f'GET {path} HTTP/1.1\r\nHost: 203.0.113.20:30120\r\nUser-Agent: CitizenFX/1\r\n'
@@ -155,6 +180,29 @@ try:
     expect(junk, 'drop', 'source is in the penalty box')
     assert call(local, '/reputation', 'POST', LOCAL, {'release': ['100.64.2.1']})['released'] == 1
     assert call(local, '/reputation?limit=10', token=LOCAL)['stats']['demotions'] == 1
+    # Whole packets off the wire: the node reads them itself, passes a real stack's and drops
+    # those built to harm one, whoever sends them.
+    expect(raw(ipv4('192.0.2.60', '203.0.113.10', 17, udp(53000, 19132, b'\x05'))), 'permit',
+           'PF_RING ZC ml pass')
+    datagram = udp(53000, 19132, bytes(1016))
+    first = ipv4('192.0.2.63', '203.0.113.10', 17, datagram[:512], ident=0x777, frag=0x2000)
+    # The game filter takes the first fragment's zeros for junk; the checks just remember it.
+    assert 'check' not in decide(raw(first))
+    for packet, check in [
+        (ipv4('203.0.113.10', '203.0.113.10', 6, tcp(80, 80, 0x02)), 'land'),
+        (ipv4('192.0.2.61', '203.0.113.10', 6, tcp(40000, 443, 0x03)), 'tcp_flags'),
+        (ipv4('192.0.2.250', '203.0.113.10', 6, tcp(40000, 443, 0x29)), 'tcp_flags'),
+        (ipv4('192.0.2.62', '203.0.113.10', 1, bytes(100), frag=8191), 'oversize'),
+        (ipv4('192.0.2.64', '203.0.113.10', 6, tcp(40000, 443, 0x02, bytes([2, 4, 0, 48]))), 'low_mss'),
+        (ipv4('192.0.2.63', '203.0.113.10', 17, datagram[256:320], ident=0x777, frag=256 // 8),
+         'fragment_overlap'),
+        (ipv6('2001:db8:ffff::1', '2001:db8:100::10', 58, bytes([134, 0, 0, 0]) + bytes(12)), 'icmp'),
+        (ipv4('192.0.2.65', '198.51.100.10', 6, tcp(40000, 443, 0x00)), 'tcp_flags'),
+    ]:
+        d = decide(raw(packet))
+        assert (d['action'], d.get('check')) == ('drop', check), (check, d)
+    crafted_flood = flow('tcp', '100.64.9.1', '203.0.113.10', 443, 100000, flags='syn,fin')
+    assert decide(crafted_flood)['check'] == 'tcp_flags'
 
     # What the node renders for its speaker, its provisioner and BIRD.
     exabgp = call(local, '/bgp?format=exabgp', token=LOCAL, text=True).splitlines()
@@ -172,6 +220,10 @@ try:
     for series in ['scrubline_tunnel_mitigating{', 'scrubline_game_http_requests_total{',
                    'scrubline_bgp_announced{', 'scrubline_reputation_freed_total{']:
         assert series in metrics, series
+    counted = {line.split('check="')[1].split('"')[0]: float(line.rsplit(' ', 1)[1])
+               for line in metrics.splitlines() if line.startswith('scrubline_crafted_dropped_total{')}
+    assert counted['land'] == 1 and counted['tcp_flags'] == 4 and counted['fragment_overlap'] == 1, counted
+    assert 'mode="enforce"} 1' in metrics, metrics
     dry = subprocess.run([str(BIN / 'scrub-provision'), '-agent', local, '-once', '-dry-run'],
                          env=ENV, capture_output=True, text=True, timeout=30)
     assert dry.returncode == 0, (dry.stdout, dry.stderr)
@@ -184,13 +236,20 @@ try:
         return rows['nodes'][0].get('mitigating') and rows['nodes'][0]
     assert wait_for(mitigating)['mitigation_wave'] == 1
     assert 'scrubline_control_ml_false_positive_rate' in call(base, '/metrics', token=OP, text=True)
+    tokens = {}
     for name, prefix in [('northwind', '203.0.113.0/24'), ('contoso', '198.51.100.0/24'),
                          ('fabrikam', '2001:db8:100::/48')]:
-        token = call(base, f'/v1/tenants/{tenants[name]}/token', 'POST', OP, {})['token']
+        token = tokens[name] = call(base, f'/v1/tenants/{tenants[name]}/token', 'POST', OP, {})['token']
         def sees_only_its_own():
             rows = call(base, '/v1/analytics/overview', token=token)['prefixes']
             return [r['prefix'] for r in rows] == [prefix]
         wait_for(sees_only_its_own)
+    # Northwind's attack says the checks stopped part of it.
+    def stopped_by_the_checks():
+        events = call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
+        return any(v.get('crafted') == 'stack' for e in events for v in e.get('vectors', []))
+    wait_for(stopped_by_the_checks)
+    assert wait_for(lambda: call(base, f'/v1/nodes/{node_id}/stats', token=OP)['stats']['crafted']['dropped'] >= 9)
 
     # Restarted from its state, the control plane compiles the node the same program once the
     # node, which kept filtering on the one it had, reports in again.
@@ -203,8 +262,9 @@ try:
     assert (after['policy_id'], after['version']) == (before['policy_id'], before['version'])
     assert [t['id'] for t in after['tunnels']] == [t['id'] for t in before['tunnels']]
     assert wait_for(lambda: call(base, '/v1/nodes', token=OP)[0]['status'] == 'ready')
-    print('Everything on one node passed: stages, game filters, HTTP rules, classifiers, '
-          'reputation, on-demand mitigation, tunnels, BGP, sessions, provisioner, analytics and restart')
+    print('Everything on one node passed: stages, game filters, HTTP rules, classifiers, crafted '
+          'packets, reputation, on-demand mitigation, tunnels, BGP, sessions, provisioner, analytics '
+          'and restart')
 except BaseException:
     for index, log in enumerate(logs):
         log.seek(0); output = log.read().decode(errors='replace')

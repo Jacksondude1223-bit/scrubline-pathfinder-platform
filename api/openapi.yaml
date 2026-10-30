@@ -1796,6 +1796,8 @@ components:
           $ref: '#/components/schemas/EgressPolicy'
         ml:
           $ref: '#/components/schemas/MlPolicy'
+        crafted:
+          $ref: '#/components/schemas/CraftedPolicy'
         tunnels:
           type: array
           items:
@@ -1998,6 +2000,8 @@ components:
           $ref: '#/components/schemas/EgressPolicy'
         ml:
           $ref: '#/components/schemas/MlPolicy'
+        crafted:
+          $ref: '#/components/schemas/CraftedPolicy'
         tunnels:
           type: array
           items:
@@ -2044,10 +2048,9 @@ components:
           type: string
         proto:
           type: string
-          enum:
-          - tcp
-          - udp
-          - icmp
+          example: udp
+          description: tcp, udp or icmp. Read from a packet, also gre, esp, ah, sctp, or the protocol's
+            number.
         sport:
           type: integer
           minimum: 0
@@ -2058,11 +2061,14 @@ components:
           maximum: 65535
         flags:
           type: string
-          example: syn
+          example: syn,ack
+          description: TCP flag names (fin, syn, rst, psh, ack, urg, ece, cwr, ns) separated by ',', '|'
+            or '+', or none for a segment with none set. Empty means the record does not say. Rules
+            compare them as sets, so syn meets a SYN with ECN or PSH set too, and never a SYN-ACK.
         pps:
           type: integer
           minimum: 0
-          description: The flow's observed packet rate.
+          description: The flow's observed packet rate; 1 by default for a record that carries a packet.
         bps:
           type: integer
           minimum: 0
@@ -2074,6 +2080,16 @@ components:
           description: 'Packet bytes, base64. Only the ZC stage sees it. Without one the game filter reports
             the packet uninspectable and never drops it: it refuses to judge what it was not given. In a
             training sample, an HTTP request here makes it a sample for the request model.'
+        packet:
+          type: string
+          format: byte
+          description: 'The whole packet, base64, from its IP header (IPv4 or IPv6) on, as it arrived:
+            for a datapath that hands the node packets rather than flow records. The node reads the
+            addresses, protocol, ports, flags and payload from its headers, which take the place of the
+            fields above, and holds it to the rules those headers state before anything else judges it
+            (see crafted packets in the README). Only what the headers declare may be in it, and at most
+            64 bytes of a link''s padding past them, so a capture cut short reads as a packet that lies
+            about its length.'
     Decision:
       type: object
       properties:
@@ -2105,6 +2121,28 @@ components:
         filter:
           type: string
           description: The game filter that decided, when one did.
+        check:
+          type: string
+          description: The crafted-packet check a packet broke, when one dropped it, as the reason says in
+            words. Its class is the reason's first word in brackets.
+          enum:
+          - land
+          - tcp_flags
+          - martian_source
+          - source_route
+          - low_mss
+          - fragment_overlap
+          - ip_header
+          - ip_options
+          - extension_headers
+          - tcp_header
+          - udp_header
+          - icmp
+          - port_zero
+          - fragment
+          - length
+          - oversize
+          - tiny_fragment
         reply:
           type: string
           format: byte
@@ -2296,6 +2334,74 @@ components:
           description: How far under their published thresholds the classifiers drop for this prefix,
             because what they scored for it gathered just under them. 0, 0.1 or 0.2; each step lapses
             five minutes after the probing that set it was last seen.
+        crafted:
+          type: array
+          description: What the crafted-packet checks dropped for this prefix, per class, once they have
+            dropped any. Absent until then.
+          items:
+            $ref: '#/components/schemas/PrefixCrafted'
+    PrefixCrafted:
+      type: object
+      properties:
+        class:
+          type: string
+          enum:
+          - stack
+          - protocol
+          - buffer
+        flows:
+          type: integer
+        dropped:
+          type: integer
+          description: The packets of those flows, as their rates add up.
+    CraftedStats:
+      type: object
+      description: What the crafted-packet checks did on this node, in all and per check, and how full
+        its table of fragments in reassembly is.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+        dropped:
+          type: integer
+        observed:
+          type: integer
+          description: What the checks caught and let through because the policy only observes.
+        fragments:
+          type: integer
+          description: Fragmented datagrams being tracked for overlapping fragments.
+        fragments_max:
+          type: integer
+          description: The most tracked at once. At the bound the oldest is forgotten.
+        fragments_untracked:
+          type: integer
+          description: Datagrams forgotten before their 30 seconds to make room, and fragments past the 64
+            one datagram keeps.
+        checks:
+          type: array
+          description: Every check, always, in a fixed order.
+          items:
+            $ref: '#/components/schemas/CheckStats'
+    CheckStats:
+      type: object
+      properties:
+        check:
+          type: string
+        class:
+          type: string
+          enum:
+          - stack
+          - protocol
+          - buffer
+          description: stack, built to crash or wedge the receiving stack; protocol, breaking the rules of
+            the protocol it claims to be; buffer, sized to overrun a buffer or a reassembly table.
+        dropped:
+          type: integer
+        observed:
+          type: integer
     MitigationStats:
       type: object
       description: An on-demand tunnel as the node holding it sees it.
@@ -2454,6 +2560,8 @@ components:
             this and offered_pps, so it moves within a second of a flood arriving.
         load_window_seconds:
           type: integer
+        crafted:
+          $ref: '#/components/schemas/CraftedStats'
         mitigation:
           type: array
           nullable: true
@@ -2561,6 +2669,21 @@ components:
             them walk every stage to the same verdict. Off by default: it is an escalation of consequence
             beyond what one packet earned. With it off, strikes and would-be demotions are still counted
             and exposed, which is how it is sized before being switched on.'
+    CraftedPolicy:
+      type: object
+      description: What a node does with a packet built to harm the stack that receives it rather than
+        to swamp it, one that breaks a rule its own headers state. The checks run on every node for every
+        protected prefix, an idle on-demand tunnel's included, before anything else judges the packet,
+        and no permit or verified source exempts one.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: enforce, the default, drops it. observe counts what would be dropped and drops
+            nothing. off does not look.
     MlPolicy:
       type: object
       description: Where the published classifiers judge traffic, and whether they drop what they score
@@ -3368,6 +3491,14 @@ components:
           type: string
         filter_id:
           type: string
+        crafted:
+          type: string
+          enum:
+          - stack
+          - protocol
+          - buffer
+          description: The class of crafted packets the checks dropped, for a vector that is neither a rule
+            nor a filter. It has no stage.
         stage:
           type: string
           enum:

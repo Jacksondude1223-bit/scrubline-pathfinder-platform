@@ -177,6 +177,11 @@ impl Collector {
     pub fn forget(&mut self, live: &HashSet<String>) {
         self.series.retain(|p, _| live.contains(p));
         self.prefix_counters.retain(|(_, p), _| live.contains(p));
+        self.rule_counters.retain(|(_, id, _), _| {
+            id.strip_prefix("|crafted|")
+                .and_then(|rest| rest.split_once('|'))
+                .is_none_or(|(_, p)| live.contains(p))
+        });
     }
     pub fn prefixes(&self) -> Vec<String> {
         self.series.keys().cloned().collect()
@@ -197,6 +202,7 @@ impl Collector {
             s.ring.retain(|minute, _| *minute >= now / 60000 - 1439);
         }
         let mut touched = HashSet::new();
+        let mut crafted = Vec::new();
         for row in rows(stats, "prefixes") {
             let p = row["prefix"].as_str().unwrap_or("");
             // Only what the node is programmed to protect: a row for a prefix just removed would
@@ -219,7 +225,27 @@ impl Collector {
             // A node's first report is only a baseline. Its counters run from agent start, so
             // counting them from zero after a control-plane restart, a failover or a node's return
             // would book its lifetime traffic into this minute.
-            if let Some(prev) = self.prefix_counters.insert((node.into(), p.into()), cur) {
+            let seen = self.prefix_counters.insert((node.into(), p.into()), cur);
+            // What the crafted-packet checks dropped for the prefix, by class. A node reports a
+            // class only once it has dropped one, so one that first appears after the baseline
+            // counts from zero. The prefix is the packets' destination: the drops are never
+            // shared.
+            for c in rows(row, "crafted") {
+                let class = c["class"].as_str().unwrap_or("");
+                if !["stack", "protocol", "buffer"].contains(&class) {
+                    continue;
+                }
+                let counts = [0, n(c, "flows"), 0, n(c, "dropped"), 0];
+                let key = (node.into(), format!("|crafted|{class}|{p}"), false);
+                let prev = self.rule_counters.insert(key, counts);
+                if let Some(prev) = prev.or(seen.map(|_| [0; 5])) {
+                    let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], counts[i]));
+                    if diff[1] > 0 || diff[3] > 0 {
+                        crafted.push((p.to_string(), class.to_string(), diff));
+                    }
+                }
+            }
+            if let Some(prev) = seen {
                 let b = s.ring.entry(now / 60000).or_default();
                 for i in 0..5 {
                     b.counts[i] = b.counts[i].saturating_add(delta(prev[i], cur[i]));
@@ -313,6 +339,22 @@ impl Collector {
         for (p, s) in self.series.iter_mut() {
             if touched.contains(p) || s.open.is_some() {
                 s.judge(now);
+            }
+        }
+        for (p, class, diff) in crafted {
+            if let Some(e) = self.series.get_mut(&p).and_then(|s| s.open.as_mut()) {
+                let key = (format!("|crafted|{class}"), String::new());
+                if !e.vectors.contains_key(&key) && e.vectors.len() >= 32 {
+                    continue;
+                }
+                let v = e
+                    .vectors
+                    .entry(key)
+                    .or_insert_with(|| json!({"crafted":class,"flows":0,"dropped":0}));
+                v["flows"] = json!(n(v, "flows").saturating_add(diff[1]));
+                v["dropped"] = json!(n(v, "dropped").saturating_add(diff[3]));
+                e.flows = e.flows.saturating_add(diff[1]);
+                e.dropped = e.dropped.saturating_add(diff[3]);
             }
         }
         for (id, filter, scope, diff) in moved {

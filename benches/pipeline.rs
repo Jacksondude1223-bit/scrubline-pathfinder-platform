@@ -120,6 +120,62 @@ fn http(path: &str, scored: bool) {
         start.elapsed().as_nanos() as f64 / count as f64
     );
 }
+/// An IPv4 packet from 192.0.2.1 to 203.0.113.1 carrying `l4`.
+fn ipv4(proto: u8, l4: &[u8]) -> Vec<u8> {
+    let mut p = vec![0x45, 0, 0, 0, 0x12, 0x34, 0x40, 0, 64, proto, 0, 0];
+    p[2..4].copy_from_slice(&((20 + l4.len()) as u16).to_be_bytes());
+    p.extend([192, 0, 2, 1, 203, 0, 113, 1]);
+    let mut sum: u32 = p
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    p.extend(l4);
+    p
+}
+/// Whole packets as a datapath hands them over, read and checked by the node: a datagram the game
+/// filter judges, and a SYN-FIN the crafted-packet checks drop.
+fn packets() {
+    let mut p = Pipeline::new(Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        games: vec![GameFilter {
+            id: "game".into(),
+            profile: "raknet".into(),
+            dport: 19132,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let now = 1767225600000;
+    let udp = [0xc3, 0x50, 0x4a, 0xbc, 0, 9, 0, 0, 0x05];
+    let mut tcp = [0u8; 20];
+    tcp[..4].copy_from_slice(&[0x9c, 0x40, 0x01, 0xbb]);
+    tcp[12] = 5 << 4;
+    tcp[13] = 0x03;
+    for (what, packet) in [
+        ("a game datagram", ipv4(17, &udp)),
+        ("a crafted SYN-FIN", ipv4(6, &tcp)),
+    ] {
+        let start = Instant::now();
+        let count = 100000;
+        for _ in 0..count {
+            let mut f = Flow {
+                packet: packet.clone(),
+                pps: 1,
+                ..Default::default()
+            };
+            pathfinder::packet::fill(&mut f);
+            black_box(p.decide(black_box(&f), now));
+        }
+        println!(
+            "packet, {what}: {:.1} ns/packet",
+            start.elapsed().as_nanos() as f64 / count as f64
+        );
+    }
+}
 fn main() {
     for scored in [false, true] {
         run(false, scored);
@@ -127,4 +183,5 @@ fn main() {
         http("/files/map/stream.rpf", scored);
         http("/players.json", scored);
     }
+    packets();
 }

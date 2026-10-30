@@ -127,7 +127,10 @@ pub fn features(f: &Flow) -> [f64; FEATURE_COUNT] {
         proto("tcp"),
         proto("udp"),
         proto("icmp"),
-        if f.flags.eq_ignore_ascii_case("syn") {
+        if crate::packet::tcp_flags(&f.flags).map_or_else(
+            || f.flags.eq_ignore_ascii_case("syn"),
+            |b| crate::packet::flags_meet(crate::packet::SYN, b),
+        ) {
             1.0
         } else {
             0.0
