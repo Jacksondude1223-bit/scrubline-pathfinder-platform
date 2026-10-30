@@ -376,6 +376,11 @@ const KNOWN: [&[u8]; 8] = [
 /// A segment shorter than this that holds only part of a request line was split on purpose: a
 /// client writes a line whole, and TCP cuts one only at a full segment.
 const SPLIT: usize = 512;
+/// The longest request or header line, and the most header lines, a request may carry: what
+/// nginx and Apache refuse past by default, so nothing a server would accept is dropped, and the
+/// overlong lines buffer overflows are built from never reach one.
+const LINE_MAX: usize = 8192;
+const HEADERS_MAX: usize = 100;
 /// The length of the method a request line starts with, if `s` starts one: up to sixteen
 /// capitals and a space.
 fn method(s: &[u8]) -> Option<usize> {
@@ -431,11 +436,17 @@ fn trim(s: &[u8]) -> &[u8] {
 /// refuse as malformed, and what no client sends, is an error.
 fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
     let m = method(s).unwrap_or(0);
+    let long = |what: &str| {
+        Err(format!("a {what} line longer than {LINE_MAX} bytes, which servers refuse and buffer overflows are built from"))
+    };
     let Some((request, mut at)) = line(s) else {
         // A line that runs past a full segment is long, and what it shows of the target is
         // judged; one cut short in a short segment is someone hiding a path.
         if whole < SPLIT {
             return Err("a request line split across segments, which no client needs".into());
+        }
+        if s.len() > LINE_MAX {
+            return long("request");
         }
         let rest = &s[m + 1..];
         let target = &rest[..rest.iter().position(|&c| c == b' ').unwrap_or(rest.len())];
@@ -450,6 +461,9 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
             ..Default::default()
         });
     };
+    if request.len() > LINE_MAX {
+        return long("request");
+    }
     let rest = &request[m + 1..];
     let Some(sp) = rest.iter().position(|&c| c == b' ') else {
         return Err("the request line carries no HTTP version".into());
@@ -475,6 +489,14 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
             break;
         }
         h.headers += 1;
+        if field.len() > LINE_MAX {
+            return long("header");
+        }
+        if h.headers > HEADERS_MAX {
+            return Err(format!(
+                "more than {HEADERS_MAX} header lines, which servers refuse"
+            ));
+        }
         if field[0] == b' ' || field[0] == b'\t' {
             return Err("a folded header line".into());
         }
@@ -523,6 +545,10 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
         return Err(
             "both Content-Length and Transfer-Encoding, the shape request smuggling takes".into(),
         );
+    }
+    // A header line the segment ends inside is as long as what it shows of it, at least.
+    if !h.complete && s.len() - at > LINE_MAX {
+        return long("header");
     }
     h.len = at;
     Ok(h)

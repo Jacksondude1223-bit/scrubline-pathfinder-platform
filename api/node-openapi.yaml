@@ -564,10 +564,9 @@ components:
           type: string
         proto:
           type: string
-          enum:
-          - tcp
-          - udp
-          - icmp
+          example: udp
+          description: tcp, udp or icmp. Read from a packet, also gre, esp, ah, sctp, or the protocol's
+            number.
         sport:
           type: integer
           minimum: 0
@@ -578,11 +577,14 @@ components:
           maximum: 65535
         flags:
           type: string
-          example: syn
+          example: syn,ack
+          description: TCP flag names (fin, syn, rst, psh, ack, urg, ece, cwr, ns) separated by ',', '|'
+            or '+', or none for a segment with none set. Empty means the record does not say. Rules
+            compare them as sets, so syn meets a SYN with ECN or PSH set too, and never a SYN-ACK.
         pps:
           type: integer
           minimum: 0
-          description: The flow's observed packet rate.
+          description: The flow's observed packet rate; 1 by default for a record that carries a packet.
         bps:
           type: integer
           minimum: 0
@@ -593,6 +595,16 @@ components:
           format: byte
           description: 'Packet bytes, base64. Only the ZC stage sees it. Without one the game filter reports
             the packet uninspectable and never drops it: it refuses to judge what it was not given.'
+        packet:
+          type: string
+          format: byte
+          description: 'The whole packet, base64, from its IP header (IPv4 or IPv6) on, as it arrived:
+            for a datapath that hands the node packets rather than flow records. The node reads the
+            addresses, protocol, ports, flags and payload from its headers, which take the place of the
+            fields above, and holds it to the rules those headers state before anything else judges it
+            (see crafted packets in the README). Only what the headers declare may be in it, and at most
+            64 bytes of a link''s padding past them, so a capture cut short reads as a packet that lies
+            about its length.'
     Decision:
       type: object
       properties:
@@ -624,6 +636,28 @@ components:
         filter:
           type: string
           description: The game filter that decided, when one did.
+        check:
+          type: string
+          description: The crafted-packet check a packet broke, when one dropped it, as the reason says in
+            words. Its class is the reason's first word in brackets.
+          enum:
+          - land
+          - tcp_flags
+          - martian_source
+          - source_route
+          - low_mss
+          - fragment_overlap
+          - ip_header
+          - ip_options
+          - extension_headers
+          - tcp_header
+          - udp_header
+          - icmp
+          - port_zero
+          - fragment
+          - length
+          - oversize
+          - tiny_fragment
         reply:
           type: string
           format: byte

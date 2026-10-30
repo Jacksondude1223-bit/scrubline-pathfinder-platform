@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -47,6 +47,18 @@ pub struct Agent {
     mitigations: u64,
 }
 type Shared = Arc<Mutex<Agent>>;
+/// The agent, even after a request panicked while holding it. The control plane's state is
+/// durable, so it fails its health check and is restarted; a node's lives in memory (players'
+/// sessions, sources' reputation and rates), and the heartbeat loop would die on a poisoned lock
+/// and take the node out of the fabric with its process still running. One packet that trips a
+/// bug costs that request its answer, not the node.
+fn locked(s: &Mutex<Agent>) -> MutexGuard<'_, Agent> {
+    s.lock().unwrap_or_else(|poisoned| {
+        eprintln!("node: a request panicked; carrying on with the state it left");
+        s.clear_poison();
+        poisoned.into_inner()
+    })
+}
 fn json_response(code: u16, v: Value) -> Response {
     (StatusCode::from_u16(code).unwrap(), Json(v)).into_response()
 }
@@ -354,13 +366,9 @@ async fn handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    tokio::task::spawn_blocking(move || {
-        s.lock()
-            .unwrap()
-            .dispatch(method.as_str(), &uri, &headers, &body)
-    })
-    .await
-    .unwrap_or_else(|_| error(500, "request worker failed"))
+    tokio::task::spawn_blocking(move || locked(&s).dispatch(method.as_str(), &uri, &headers, &body))
+        .await
+        .unwrap_or_else(|_| error(500, "request worker failed"))
 }
 #[derive(Deserialize)]
 struct Enrollment {
@@ -424,7 +432,7 @@ const SURGE_GAP: Duration = Duration::from_secs(1);
 async fn programs(s: Shared, client: reqwest::Client, api: String) {
     loop {
         let (id, token, since) = {
-            let a = s.lock().unwrap();
+            let a = locked(&s);
             let since = if a.installed {
                 let at = a.pipe.program.compiled_at;
                 at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
@@ -439,7 +447,7 @@ async fn programs(s: Shared, client: reqwest::Client, api: String) {
         let query = [("wait", wait.as_str()), ("since", since.as_str())];
         let installed = match fetch_with::<Program>(&client, &url, &token, &query).await {
             Ok(prog) => {
-                let mut a = s.lock().unwrap();
+                let mut a = locked(&s);
                 // A program fetched for the id this node had before it enrolled again is not its own.
                 let new = a.node.id == id
                     && (prog.policy_id != a.pipe.program.policy_id
@@ -563,7 +571,7 @@ pub async fn run() -> Result<()> {
         let mut surged: Option<tokio::time::Instant> = None;
         loop {
             let (id, mut token, stats, health) = {
-                let mut a = s.lock().unwrap();
+                let mut a = locked(&s);
                 let now = chrono::Utc::now().timestamp_millis();
                 // A surge that has passed lets the next one wake this loop again.
                 a.watch_surge(now);
@@ -585,7 +593,7 @@ pub async fn run() -> Result<()> {
                     match enroll(&client, &api, &enroll_token, &desired).await {
                         Ok(reg) => {
                             token = reg.token;
-                            let mut a = s.lock().unwrap();
+                            let mut a = locked(&s);
                             a.token = token.clone();
                             a.node = reg.node;
                         }
@@ -599,7 +607,7 @@ pub async fn run() -> Result<()> {
             if let Ok(model) =
                 fetch::<ml::Model>(&client, &format!("{api}/v1/ml/model"), &token).await
             {
-                let mut a = s.lock().unwrap();
+                let mut a = locked(&s);
                 if model.usable() {
                     a.pipe.model = model;
                 } else if model.withdrawn {
@@ -684,6 +692,20 @@ mod tests {
         a.dispatch(method, &uri.parse().unwrap(), &headers, body)
             .status()
             .as_u16()
+    }
+    #[test]
+    fn a_request_that_panics_does_not_take_the_node_with_it() {
+        let shared = Arc::new(Mutex::new(agent(vec![])));
+        let held = shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _a = held.lock().unwrap();
+            panic!("a packet that trips a bug");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+        let body = br#"{"dst_ip":"203.0.113.10","proto":"udp","dport":19132,"pps":1}"#;
+        assert_eq!(call(&mut locked(&shared), "POST", "/decide", body), 200);
+        assert!(!shared.is_poisoned());
     }
     #[test]
     fn prefixes_leaving_the_plan_are_withdrawn() {

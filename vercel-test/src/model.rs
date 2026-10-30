@@ -92,6 +92,8 @@ pub struct Policy {
     #[serde(skip_serializing_if = "is_zero")]
     pub ml: Option<MlPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
+    pub crafted: Option<CraftedPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub challenge_secret: String,
     #[serde(deserialize_with = "null_time")]
@@ -114,6 +116,7 @@ impl Default for Policy {
             reputation: None,
             egress: None,
             ml: None,
+            crafted: None,
             challenge_secret: Default::default(),
             updated_at: zero_time(),
             version: Default::default(),
@@ -153,6 +156,17 @@ pub struct MlPolicy {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub probing: String,
+}
+/// What a node does with a packet built to harm the stack that receives it rather than to swamp
+/// it: one that breaks a rule its own headers state (see packet.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CraftedPolicy {
+    /// "enforce", the default: drop it. "observe": count what would be dropped, and drop nothing.
+    /// "off": do not look.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
 }
 impl MlPolicy {
     pub fn everywhere(&self) -> bool {
@@ -281,6 +295,11 @@ pub struct Flow {
     pub payload: Vec<u8>,
     #[serde(skip)]
     pub has_payload: bool,
+    /// The packet itself, from its IP header on, when the datapath hands over whole packets. The
+    /// node reads the addresses, protocol, ports, flags and payload from its headers rather than
+    /// from the record's fields, and holds it to the rules those headers state.
+    #[serde(with = "base64_bytes", skip_serializing_if = "is_zero")]
+    pub packet: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -304,6 +323,10 @@ pub struct Decision {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub filter: String,
+    /// The crafted-packet check a packet broke, when one dropped it.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub check: String,
     #[serde(with = "base64_bytes", skip_serializing_if = "is_zero")]
     pub reply: Vec<u8>,
 }
@@ -389,6 +412,8 @@ pub struct Program {
     pub egress: Option<EgressPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
     pub ml: Option<MlPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub crafted: Option<CraftedPolicy>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub tunnels: Vec<NodeTunnel>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
@@ -430,6 +455,7 @@ impl Default for Program {
             reputation: None,
             egress: None,
             ml: None,
+            crafted: None,
             tunnels: Vec::new(),
             sessions: Vec::new(),
             tunnel_src: Default::default(),
@@ -856,35 +882,38 @@ impl<'de> Deserialize<'de> for Flow {
             dport: i64,
             #[serde(deserialize_with = "null_default")]
             flags: String,
-            #[serde(deserialize_with = "null_default")]
-            pps: i64,
+            pps: Option<i64>,
             #[serde(deserialize_with = "null_default")]
             bps: i64,
             payload: Option<String>,
+            #[serde(deserialize_with = "null_default")]
+            packet: String,
         }
         use base64::Engine;
         let w = Wire::deserialize(d)?;
         let has_payload = w.payload.is_some();
-        let payload = w
-            .payload
-            .map(|p| {
-                base64::engine::general_purpose::STANDARD
-                    .decode(p)
-                    .map_err(serde::de::Error::custom)
-            })
-            .transpose()?
-            .unwrap_or_default();
-        Ok(Self {
+        let decode = |s: String| {
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(serde::de::Error::custom)
+        };
+        let payload = w.payload.map(decode).transpose()?.unwrap_or_default();
+        let packet = decode(w.packet)?;
+        let mut f = Self {
             src_ip: w.src_ip,
             dst_ip: w.dst_ip,
             proto: w.proto,
             sport: w.sport,
             dport: w.dport,
             flags: w.flags,
-            pps: w.pps,
+            // A record carrying a packet stands for that packet unless it says otherwise.
+            pps: w.pps.unwrap_or(i64::from(!packet.is_empty())),
             bps: w.bps,
             payload,
             has_payload,
-        })
+            packet,
+        };
+        crate::packet::fill(&mut f);
+        Ok(f)
     }
 }

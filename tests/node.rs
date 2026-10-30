@@ -249,8 +249,17 @@ fn the_stages_the_game_filters_and_the_classifiers_decide_together() {
     // The stages first: an allow list, then drops and meters.
     let monitoring = udp("192.0.2.250", "203.0.113.10", 19132, 1, &[0x84]);
     expect(&mut pipe, &monitoring, t, "permit", "TCAM ACL permit");
-    let bogon = udp("0.0.0.7", "203.0.113.10", 19132, 1, &[0x84]);
+    let bogon = udp("10.0.0.7", "203.0.113.10", 19132, 1, &[0x84]);
     expect(&mut pipe, &bogon, t, "drop", "TCAM ACL drop");
+    // A source no packet can come from is dropped before any rule is asked, as a crafted packet.
+    let nowhere = udp("0.0.0.7", "203.0.113.10", 19132, 1, &[0x84]);
+    expect(
+        &mut pipe,
+        &nowhere,
+        t,
+        "drop",
+        "crafted packet (stack): a source in 0.0.0.0/8, which never crosses a router",
+    );
     let reflected = Flow {
         sport: 53,
         ..udp("100.64.0.53", "203.0.113.10", 40000, 10, b"answer")
@@ -614,7 +623,7 @@ fn the_node_renders_and_reports_everything_it_is_given() {
         keys,
         [
             "v4 src=192.0.2.250/32 dst=* proto=* dport=0 sport=0 pri=10",
-            "v4 src=0.0.0.0/8 dst=* proto=* dport=0 sport=0 pri=20",
+            "v4 src=10.0.0.0/8 dst=* proto=* dport=0 sport=0 pri=20",
             "any src=* dst=* proto=udp dport=0 sport=53 pri=30",
         ]
     );
@@ -711,6 +720,32 @@ fn the_node_renders_and_reports_everything_it_is_given() {
     }
 }
 #[test]
+fn an_attack_of_crafted_packets_tells_the_customer_what_stopped_it() {
+    let f = Fabric::new();
+    let mut pipe = f.pipeline();
+    f.heartbeat(pipe.stats(T0), json!([]));
+    // A SYN-FIN flood at Northwind's game server: no rule stops it, the checks do.
+    let flood = Flow {
+        flags: "syn,fin".into(),
+        ..flow("tcp", "100.64.9.1", "203.0.113.10", 443, 100_000, &[])
+    };
+    let d = pipe.decide(&flood, T0 + 1000);
+    assert_eq!((d.action.as_str(), d.check.as_str()), ("drop", "tcp_flags"));
+    f.heartbeat(pipe.stats(T0 + 1000), json!([]));
+    let (name, id) = &f.tenants[0];
+    let path = format!("/v1/tenants/{id}/token");
+    let (_, issued) = call(&f.base, "POST", &path, OP, Value::Null);
+    let token = issued["token"].as_str().unwrap();
+    let (status, events) = call(&f.base, "GET", "/v1/analytics/events", token, Value::Null);
+    assert_eq!(status, 200, "{name}: {events}");
+    assert_eq!(events["events"][0]["prefix"], "203.0.113.0/24", "{events}");
+    assert_eq!(
+        events["events"][0]["vectors"],
+        json!([{"crafted":"stack","flows":1,"dropped":100_000}]),
+        "{events}"
+    );
+}
+#[test]
 fn changes_through_the_api_reach_the_running_node_without_losing_its_state() {
     let f = Fabric::new();
     let mut pipe = f.pipeline();
@@ -798,8 +833,18 @@ fn the_control_plane_keeps_everything_the_node_reports() {
     for burst in 0..3 {
         pipe.decide(&flood, T0 + 2000 + burst * 2000);
     }
+    // And a crafted packet, so the checks' counters and the prefix's own are in it too.
+    pipe.decide(
+        &udp("0.0.0.9", "203.0.113.10", 19132, 1, &[0x84]),
+        T0 + 7000,
+    );
     let stats = pipe.stats(T0 + 8000);
     assert!(stats["mitigation"].is_array() && stats["games"].is_array());
+    assert!(stats["prefixes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["crafted"][0]["class"] == "stack"));
     let kept = serde_json::to_value(
         serde_json::from_value::<pathfinder::wire::Stats>(stats.clone()).unwrap(),
     )

@@ -46,6 +46,7 @@ fn go_shape(mut stats: Value) -> Value {
     top.remove("game_http_windows_max");
     top.remove("surge_pps");
     top.remove("mitigation");
+    top.remove("crafted");
     let ml = top["ml"].as_object_mut().unwrap();
     for key in [
         "observed",
@@ -74,7 +75,9 @@ fn go_shape(mut stats: Value) -> Value {
         }
     }
     for row in stats["prefixes"].as_array_mut().into_iter().flatten() {
-        row.as_object_mut().unwrap().remove("ml_cut");
+        let row = row.as_object_mut().unwrap();
+        row.remove("ml_cut");
+        row.remove("crafted");
     }
     stats["reputation"].as_object_mut().unwrap().remove("freed");
     stats

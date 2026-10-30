@@ -104,11 +104,56 @@ pub struct Stats {
     pub surge_pps: u64,
     #[serde(deserialize_with = "null_default")]
     pub load_window_seconds: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub crafted: CraftedStats,
     #[serde(
         deserialize_with = "null_default",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub mitigation: Vec<MitigationStats>,
+}
+/// What the crafted-packet checks did: in which mode, in all and per check, and how full the
+/// table of fragments in reassembly is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CraftedStats {
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub fragments: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub fragments_max: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub fragments_untracked: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub checks: Vec<CheckStats>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckStats {
+    #[serde(deserialize_with = "null_default")]
+    pub check: String,
+    #[serde(deserialize_with = "null_default")]
+    pub class: String,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+}
+/// What the crafted-packet checks dropped of one class for a prefix: flows, and their packets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefixCrafted {
+    #[serde(deserialize_with = "null_default")]
+    pub class: String,
+    #[serde(deserialize_with = "null_default")]
+    pub flows: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
 }
 /// An on-demand tunnel as the node holding it sees it: whether it is being mitigated, what
 /// reaches it over the last second, the thresholds that start its mitigation, and which wave of
@@ -223,6 +268,11 @@ pub struct PrefixStats {
     /// probed.
     #[serde(deserialize_with = "null_default")]
     pub ml_cut: f64,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub crafted: Vec<PrefixCrafted>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

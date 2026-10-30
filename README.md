@@ -599,6 +599,139 @@ decides is who is served first.
 `scrubline_prefix_ml_threshold_cut{prefix}` and
 `scrubline_game_http_budget_dropped_total{filter}` show each defence at work.
 
+## Crafted packets
+
+Some attacks need no volume. One packet built wrong can crash the stack that
+receives it, and a trickle of them can wedge one, so no rate, threshold or
+classifier would ever notice them. Every node holds each packet to the rules
+its own headers state, before anything else judges it, and drops what no
+legitimate stack sends. None of the checks needs tuning: what they catch is
+never real traffic.
+
+A datapath that hands the node whole packets puts each one in a flow record as
+`packet`, base64, from its IP header on. The node reads the addresses,
+protocol, ports, flags and payload from the headers, which take the place of
+the record's own fields, so the rules and filters judge what the packet says
+about itself:
+
+```json
+{"packet": "RQAAKBI0QABABiqQwAACAcsAcQqcQAG7AAAAAQAAAABQAv//AAAAAA==", "pps": 1}
+```
+
+A record without one is held to what its fields can show: where it comes from,
+whether that is where it goes, its TCP flags, and the size of its payload.
+
+### What the checks catch
+
+They fall into three classes. **Stack** packets are built to crash or wedge the
+stack that receives them, **protocol** packets break the rules of the protocol
+they claim to be, and **buffer** packets are sized to overrun a buffer or a
+reassembly table.
+
+| Class | Check | Drops | Known as |
+| --- | --- | --- | --- |
+| stack | `land` | a source that is also the destination | LAND |
+| stack | `tcp_flags` | SYN with FIN or RST, FIN with RST, none of SYN, ACK, FIN, RST, PSH and URG, and anything but a SYN or a bare RST without ACK | SYN-FIN, NULL, FIN and Christmas tree scans |
+| stack | `martian_source` | a source no packet from the internet can have: 0.0.0.0/8, loopback, link-local, multicast, 240.0.0.0/4 and broadcast, and IPv6's unspecified, loopback, link-local, multicast and IPv4-mapped | spoofed impossible sources |
+| stack | `source_route` | IPv4 loose and strict source routes, IPv6 type 0 routing headers | source-routed spoofing, RH0 (RFC 5095) |
+| stack | `low_mss` | a SYN offering an MSS of 500 bytes or less | SACK Panic (CVE-2019-11477) |
+| stack | `fragment_overlap` | a fragment over bytes another of its datagram already carried, or past where the last one ended it, and a TCP fragment 8 bytes in | Teardrop, Bonk, Nestea, RFC 1858 |
+| protocol | `ip_header` | a version other than 4 or 6, a header under 20 bytes, a total length under the header's, the reserved flag bit, a bad checksum | |
+| protocol | `ip_options` | an IPv4 option that claims under 2 bytes or runs past the header | |
+| protocol | `extension_headers` | hop-by-hop anywhere but first, two fragment headers, more than eight extension headers | header chains built to hide the transport header |
+| protocol | `tcp_header` | a data offset under 20 bytes, an option that runs past the header, an MSS, window scale, SACK or timestamp option of the wrong length | |
+| protocol | `udp_header` | a UDP length under 8 bytes, or short of the datagram it heads | data hidden from whatever reads the length |
+| protocol | `icmp` | ICMP shorter than its header, and messages that never leave their own link: redirects, router and neighbour discovery, multicast listener messages, and deprecated types | Bad Neighbor (CVE-2020-16898) |
+| protocol | `port_zero` | TCP or UDP from or to port 0 | |
+| protocol | `fragment` | a fragment before the last whose size is not a multiple of 8 | |
+| buffer | `length` | a length that claims more than arrived (the IP total or payload length, a header, the UDP length), or bytes past it beyond a link's padding | buffer over-reads |
+| buffer | `oversize` | a fragment reaching past the 65,535 bytes an IP datagram holds, and a record's payload larger than any packet | Ping of Death, Jolt2 |
+| buffer | `tiny_fragment` | a fragment before the last under 256 bytes, a first fragment too short for its transport header, an IPv6 first fragment without its whole header chain | FragmentSmack (CVE-2018-5391), tiny fragments (RFC 1858, RFC 7112) |
+
+The HTTP rules hold requests to what servers hold them to. A request line or
+header line over 8 KiB, or more than 100 header lines, is dropped: nginx and
+Apache refuse those by default, so no request a server would accept is lost,
+and the overlong lines buffer overflows are built from never reach one. The
+game profiles bound each datagram's size the same way.
+
+### Where they sit
+
+**First, for everyone.** The checks run before the penalty box, lockdown and
+the stages. An operator's permit and a verified source both vouch for an
+address, and a crafted packet forges its address as easily as the rest of
+itself, so neither exempts one.
+
+**On an idle on-demand tunnel too.** A tunnel watched until it is attacked
+lets traffic under its thresholds through unfiltered, and a crafted packet
+never reaches a threshold. The checks drop it anyway, and the tunnel's meter
+still counts it, so an attack that mixes crafted packets with a flood starts
+mitigation on its whole volume.
+
+**Nobody is boxed for one.** A crafted packet's source address is as likely to
+be the forgery as anything else in it, so its drop is not a strike. The packet
+is dropped every time regardless.
+
+A packet too broken to say where it is going belongs to no customer, and is
+dropped rather than passed as someone else's.
+
+### Fragments
+
+Telling one datagram's fragments from another's takes memory, so the node
+keeps the fragments of up to 4,096 datagrams, by source, destination,
+protocol and identification, for the 30 seconds a host holds them for
+reassembly. When the table is full the oldest datagram is forgotten, so a
+flood of fragments costs the node only its oldest entries, and a pair of
+overlapping fragments sent together is still caught. The same fragment twice
+is a network duplicating a packet, and passes.
+
+A fragment after the first carries no transport header, so it has no ports and
+no flags. The checks still hold it to the rules fragments keep, and rules on
+addresses and protocol still apply to it, but rules on ports and the game
+filters cannot see it.
+
+### Flags compare as sets
+
+`tcp_flags` in a rule, and `flags` in a record, name flags separated by `,`,
+`|` or `+`. They compare as sets: the four that say what a segment is (SYN,
+ACK, FIN and RST) must be exactly the rule's, and any other flag the rule
+names must be set. A SYN meter therefore meters a SYN with ECN or PSH set too,
+and never a SYN-ACK, so setting a spare bit slips past no rule. The flow
+model's SYN feature reads flags the same way. A value the vocabulary does not
+name compares as text, as it always did.
+
+### Rolling them out
+
+```json
+"crafted": {"mode": "observe"}
+```
+
+`observe` counts what the checks would drop and drops nothing, and `off` does
+not look. `enforce` is the default.
+
+Each drop says why: the decision carries the check as `check`, and its reason
+names the class and the rule broken, for example `crafted packet (stack): SYN
+and FIN set together, which no stack sends`. The node counts every check in
+`scrubline_crafted_dropped_total{check,class}`, and each customer's attack
+shows the class that stopped part of it, `crafted-stack` say, beside the rules
+and filters.
+
+A packet that trips a bug in the node costs that request its answer. The node
+carries on with the state the request left, rather than taking its players'
+sessions and its sources' reputation down with it.
+
+### What they will not do
+
+They do not verify TCP and UDP checksums: a stack discards a segment whose
+checksum is wrong, so it can do no harm there. They do not reassemble
+datagrams or track TCP connections; out-of-order floods built to make a host
+do that work are volumetric, and the rest of the pipeline meets them. And they
+need the whole packet: a datapath that captures only the start of each one
+would have every long packet read as one that lies about its length.
+
+Checking a flow record costs about 25 ns, and reading and checking a whole
+packet about 400 ns more, most of it filling the record from the headers;
+`make bench` measures both.
+
 ## Keeping false positives down
 
 A false positive is a customer's own traffic dropped, which can hurt them as
@@ -627,6 +760,9 @@ back from doing more harm than it must:
 - **Your own traffic can be taken out of the question.** A `permit` rule on the
   asic stage takes a source past every stage behind it, and past the penalty
   box, lockdown and an idle on-demand tunnel's HTTP rules too.
+- **The crafted-packet checks judge only what no stack sends.** None of them
+  needs a threshold, and `"crafted": {"mode": "observe"}` counts what they would
+  drop first. See [Crafted packets](#crafted-packets).
 
 When one gets through anyway, mark it `known_good` among the samples and
 retrain: no model that would drop it again can be published.
@@ -757,6 +893,8 @@ work":
 - `scrubline_reputation_boxed_total{node}` — packets dropped at the top of the pipeline, which is the load the rest of the stages did not have to carry.
 - `scrubline_reputation_shielded_total{node}` — strikes that landed on an already-verified source and were not acted on. Alert on this: it is a spoofing attempt against a real player, or a verified client misbehaving.
 - `scrubline_reputation_freed_total{node}` — boxed sources released because the origin kept answering them. Every one is a false positive the box made and undid; a steady rate means something is boxing real clients.
+- `scrubline_crafted_dropped_total{node,check,class}` — packets built to harm the stack that receives them, by the rule each broke. Any of them rising is an attack no rate would show. `scrubline_crafted_mode{node,mode}` at `off` means nothing is stopping them; alert on it.
+- `scrubline_crafted_fragments{node}` against `scrubline_crafted_fragments_max{node}`, and `scrubline_crafted_fragments_untracked_total{node}` — the table of fragments in reassembly. A steadily rising untracked count is a flood of fragments cycling it.
 - `scrubline_prefix_ml_threshold_cut{node,prefix}` and `scrubline_ml_tightened_total{node}` — a customer whose traffic is gathering just under the classifiers' thresholds, which is what tuning an attack against them looks like. A cut that never lapses on ordinary traffic means the model scores that traffic too close to its threshold.
 - `scrubline_tunnel_up{node,tunnel,remote}` — 1 when a return path is reported carrying traffic, 0 when reported down. A never-reported tunnel is **absent**, not zero: `scrubline_tunnel_reported` is how you tell "nothing is reporting" from "it is broken".
 - `scrubline_tunnel_mtu_bytes{node,tunnel}` and `scrubline_tunnel_mss_clamp_bytes{...}` — the derived encapsulation numbers, so a hung-TCP complaint can be checked against them rather than guessed at.

@@ -1144,6 +1144,42 @@ unconfirmed source is capped rather than silenced.
 server return there are no replies to see, and treating that as "nobody is
 confirmed" would hold back every real player.
 
+### 12. Crafted packets
+
+A datapath that hands the node whole packets sends each one as `packet`,
+base64, from its IP header on. The node reads the flow from the headers, and
+holds the packet to the rules those headers state before anything else judges
+it:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"packet":"RQAAKBI0QABABiqIwAACCcsAcQqcQAG7AAAAAQAAAABQA///AAAAAA=="}'
+{"action":"drop","stage":"asic","reason":"crafted packet (stack): SYN and FIN set together, which no stack sends","check":"tcp_flags"}
+```
+
+That is a SYN-FIN from 192.0.2.9 to 203.0.113.10:443. A flow record without a
+packet is held to what its fields show, its flags among them:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"192.0.2.9","dst_ip":"203.0.113.10","proto":"tcp","dport":443,"flags":"syn,fin","pps":1}'
+{"action":"drop","stage":"asic","reason":"crafted packet (stack): SYN and FIN set together, which no stack sends","check":"tcp_flags"}
+```
+
+Each check, its class and what it catches are in the README's
+[crafted packets](../README.md#crafted-packets) table. `check` names the one a
+packet broke, and the node's counters keep every check, in a fixed order, under
+`crafted` in its stats:
+
+```json
+"crafted": {"mode": "enforce", "dropped": 2, "observed": 0, "fragments": 0, "fragments_max": 4096,
+            "fragments_untracked": 0,
+            "checks": [{"check": "land", "class": "stack", "dropped": 0, "observed": 0}, …]}
+```
+
+To try them first, `"crafted": {"mode": "observe"}` in the policy counts what
+would be dropped and drops nothing.
+
 ## The node agent
 
 ```console
@@ -1222,6 +1258,20 @@ the source address on a packet is written by whoever sent it.
 signal would let anyone get a real player banned by spoofing their address.
 Those strikes are counted as `shielded` instead; the junk is still dropped,
 the player stays online. Alert on `scrubline_reputation_shielded_total`.
+
+**A crafted packet is dropped whoever sends it.** A permit and a verified
+source vouch for an address, and a crafted packet forges its address as easily
+as the rest of itself, so neither exempts one. Nor is its source boxed: the
+address is as likely to be the forgery.
+
+**A packet's own headers win.** A record that carries `packet` is judged on the
+addresses, ports and flags the packet states, whatever the record's own fields
+say. It must be the whole packet as it arrived: a capture cut short reads as a
+packet that lies about its length, and is dropped.
+
+**`flags` compare as sets.** `syn` in a rule meets a SYN with ECN or PSH set
+too, and never a SYN-ACK; a value the vocabulary does not name compares as
+text.
 
 **A permit is an allow list everywhere a source is judged.** When the first
 `asic` rule that drops or permits a flow, or failing one there the first
