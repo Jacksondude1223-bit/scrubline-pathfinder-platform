@@ -19,13 +19,82 @@ fn capacity(n: &Node) -> f64 {
     }
 }
 fn eligible(p: &Policy, n: &Node, prefix: &str) -> bool {
-    p.steering
-        .iter()
-        .rev()
-        .find(|s| s.prefix == prefix)
-        .is_none_or(|s| {
-            s.regions.is_empty() || s.regions.iter().any(|r| r.eq_ignore_ascii_case(&n.region))
-        })
+    in_regions(p.steering.iter().rev().find(|s| s.prefix == prefix), n)
+}
+fn in_regions(steering: Option<&Steering>, n: &Node) -> bool {
+    steering.is_none_or(|s| {
+        s.regions.is_empty() || s.regions.iter().any(|r| r.eq_ignore_ascii_case(&n.region))
+    })
+}
+/// What planning and compiling look up for every prefix on every node, worked out once for the
+/// fabric: how each prefix is steered, which tunnel carries it, why a node's tunnel_src cannot end
+/// a tunnel when it cannot, and the other tunnels' prefixes inside each tunnel's. Each is a pass
+/// over the policy, and taking one for every prefix on every node made a recompile of a large
+/// policy on a large fabric take minutes.
+struct Index<'a> {
+    p: &'a Policy,
+    steering: HashMap<&'a str, &'a Steering>,
+    carriers: HashMap<&'a str, &'a Tunnel>,
+    /// By tunnel_src, which is all the answer depends on.
+    endpoints: HashMap<&'a str, Option<String>>,
+    foreign: HashMap<&'a str, Vec<String>>,
+}
+impl<'a> Index<'a> {
+    fn new(p: &'a Policy, nodes: &'a [Node]) -> Self {
+        let mut carriers = HashMap::new();
+        for t in &p.tunnels {
+            for prefix in &t.prefixes {
+                carriers.entry(prefix.as_str()).or_insert(t);
+            }
+        }
+        let protected: Vec<(&String, IpNet)> = p
+            .protected
+            .iter()
+            .filter_map(|prefix| Some((prefix, prefix.parse().ok()?)))
+            .collect();
+        let held: Vec<(&str, IpNet, &String)> = p
+            .tunnels
+            .iter()
+            .flat_map(|t| {
+                t.prefixes
+                    .iter()
+                    .filter_map(move |v| Some((t.id.as_str(), v.parse().ok()?, v)))
+            })
+            .collect();
+        Self {
+            p,
+            steering: p.steering.iter().map(|s| (s.prefix.as_str(), s)).collect(),
+            carriers,
+            endpoints: nodes
+                .iter()
+                .map(|n| (n.tunnel_src.as_str(), endpoint_in(&protected, n)))
+                .collect(),
+            foreign: p
+                .tunnels
+                .iter()
+                .map(|t| (t.id.as_str(), foreign_in(&held, t)))
+                .collect(),
+        }
+    }
+    fn eligible(&self, n: &Node, prefix: &str) -> bool {
+        in_regions(self.steering.get(prefix).copied(), n)
+    }
+    /// The tunnel carrying a prefix, if one does.
+    fn tunnel_of(&self, prefix: &str) -> Option<&'a Tunnel> {
+        self.carriers.get(prefix).copied()
+    }
+    fn endpoint_problem(&self, n: &Node) -> Option<String> {
+        match self.endpoints.get(n.tunnel_src.as_str()) {
+            Some(why) => why.clone(),
+            None => endpoint_problem(self.p, n),
+        }
+    }
+    fn foreign_to(&self, t: &Tunnel) -> Vec<String> {
+        match self.foreign.get(t.id.as_str()) {
+            Some(prefixes) => prefixes.clone(),
+            None => foreign_to(self.p, t),
+        }
+    }
 }
 fn next_hop(n: &Node) -> String {
     if let Ok(addr) = n.advertise.parse::<SocketAddr>() {
@@ -62,6 +131,7 @@ pub fn plan_with(
     health: &TunnelHealth,
     overflowing: &HashSet<String>,
 ) -> Vec<Announcement> {
+    let idx = Index::new(p, nodes);
     let mut out = Vec::new();
     for prefix in &p.protected {
         // Padding is relative to the largest node actually announcing this prefix. A node outside
@@ -71,13 +141,13 @@ pub fn plan_with(
             .iter()
             .filter(|n| {
                 n.status != "stale"
-                    && eligible(p, n, prefix)
-                    && deliverable(p, nodes, n, prefix, health, overflowing).0
+                    && idx.eligible(n, prefix)
+                    && deliverable(&idx, nodes, n, prefix, health, overflowing).0
             })
             .map(capacity)
             .fold(0.0, f64::max);
         for n in nodes {
-            if !eligible(p, n, prefix) {
+            if !idx.eligible(n, prefix) {
                 continue;
             }
             let mut a = Announcement {
@@ -85,17 +155,15 @@ pub fn plan_with(
                 node_id: n.id.clone(),
                 node_name: n.name.clone(),
                 region: n.region.clone(),
-                communities: p
+                communities: idx
                     .steering
-                    .iter()
-                    .rev()
-                    .find(|s| &s.prefix == prefix)
+                    .get(prefix.as_str())
                     .map(|s| s.communities.clone())
                     .unwrap_or_default(),
                 next_hop: next_hop(n),
                 ..Default::default()
             };
-            let (can_deliver, why) = deliverable(p, nodes, n, prefix, health, overflowing);
+            let (can_deliver, why) = deliverable(&idx, nodes, n, prefix, health, overflowing);
             if n.status == "stale" {
                 a.state = "withdraw".into();
                 a.reason = "node has not heartbeated within its TTL".into();
@@ -122,7 +190,7 @@ pub fn plan_with(
                         "anycast member padded {t}: {b} for capacity, {e} shedding measured load"
                     ),
                 };
-                if let Some(at) = location_of(p, nodes, prefix).filter(|at| at.id != n.id) {
+                if let Some(at) = location_of(&idx, nodes, prefix).filter(|at| at.id != n.id) {
                     a.reason = format!("overflow for {}: {}", at.name, a.reason);
                 }
             }
@@ -132,30 +200,24 @@ pub fn plan_with(
     out.sort_by(|a, b| (&a.prefix, &a.node_id).cmp(&(&b.prefix, &b.node_id)));
     out
 }
-/// The tunnel carrying a prefix, if one does.
-fn tunnel_of<'a>(p: &'a Policy, prefix: &str) -> Option<&'a Tunnel> {
-    p.tunnels
-        .iter()
-        .find(|t| t.prefixes.iter().any(|v| v == prefix))
-}
 /// The node a prefix's tunnel is pinned to, if it is pinned to a registered one.
-fn location_of<'a>(p: &Policy, nodes: &'a [Node], prefix: &str) -> Option<&'a Node> {
-    let t = tunnel_of(p, prefix).filter(|t| !t.node.is_empty())?;
+fn location_of<'a>(idx: &Index, nodes: &'a [Node], prefix: &str) -> Option<&'a Node> {
+    let t = idx.tunnel_of(prefix).filter(|t| !t.node.is_empty())?;
     nodes.iter().find(|n| n.id == t.node)
 }
 fn deliverable(
-    p: &Policy,
+    idx: &Index,
     nodes: &[Node],
     n: &Node,
     prefix: &str,
     health: &TunnelHealth,
     overflowing: &HashSet<String>,
 ) -> (bool, String) {
-    let Some(t) = tunnel_of(p, prefix) else {
+    let Some(t) = idx.tunnel_of(prefix) else {
         return (true, String::new());
     };
     if t.node.is_empty() || t.node == n.id {
-        return builds(p, n, t, health);
+        return builds(idx, n, t, health);
     }
     // Everyone else delivers a pinned customer's traffic by forwarding it to their location.
     if t.disabled.iter().any(|id| id == &n.id) {
@@ -173,7 +235,7 @@ fn deliverable(
             ),
         );
     };
-    if !eligible(p, at, prefix) {
+    if !idx.eligible(at, prefix) {
         return (
             false,
             format!(
@@ -182,7 +244,7 @@ fn deliverable(
             ),
         );
     }
-    let (ok, why) = builds(p, at, t, health);
+    let (ok, why) = builds(idx, at, t, health);
     if !ok {
         return (
             false,
@@ -201,7 +263,7 @@ fn deliverable(
             ),
         );
     }
-    if let Some(why) = endpoint_problem(p, n) {
+    if let Some(why) = idx.endpoint_problem(n) {
         return (false, why);
     }
     if !overflowing.contains(&at.id) {
@@ -233,7 +295,7 @@ pub fn misplaced(p: &Policy, at: &Node, t: &Tunnel) -> Option<String> {
     ))
 }
 /// Whether a node can build a tunnel's customer end and deliver over it.
-fn builds(p: &Policy, n: &Node, t: &Tunnel, health: &TunnelHealth) -> (bool, String) {
+fn builds(idx: &Index, n: &Node, t: &Tunnel, health: &TunnelHealth) -> (bool, String) {
     if t.disabled.iter().any(|id| id == &n.id) {
         return (
             false,
@@ -246,7 +308,7 @@ fn builds(p: &Policy, n: &Node, t: &Tunnel, health: &TunnelHealth) -> (bool, Str
             "node has no tunnel_src, so it cannot build the return path for this prefix".into(),
         );
     }
-    if let Some(why) = unusable_endpoint(p, n, t) {
+    if let Some(why) = unusable_endpoint(idx, n, t) {
         return (false, why);
     }
     let nt = NodeTunnel {
@@ -266,23 +328,31 @@ fn builds(p: &Policy, n: &Node, t: &Tunnel, health: &TunnelHealth) -> (bool, Str
 /// Why a node's tunnel_src cannot be the local end of this tunnel, when it cannot: a tunnel that
 /// ends where it starts, or an address inside a protected prefix, which the fabric anycasts, so
 /// the customer's packets to it are drawn to whichever scrubber is nearest.
-fn unusable_endpoint(p: &Policy, n: &Node, t: &Tunnel) -> Option<String> {
+fn unusable_endpoint(idx: &Index, n: &Node, t: &Tunnel) -> Option<String> {
     if n.tunnel_src == t.remote {
         return Some(format!(
             "return tunnel {} would end where it starts: the node's tunnel_src is its remote",
             t.id
         ));
     }
-    endpoint_problem(p, n)
+    idx.endpoint_problem(n)
 }
 /// Why a node's tunnel_src cannot end any tunnel: an address inside a protected prefix, which the
 /// fabric anycasts, so packets to it are drawn to whichever scrubber is nearest.
 fn endpoint_problem(p: &Policy, n: &Node) -> Option<String> {
-    let addr: IpAddr = n.tunnel_src.parse().ok()?;
-    p.protected
+    let protected: Vec<(&String, IpNet)> = p
+        .protected
         .iter()
-        .find(|prefix| prefix.parse::<IpNet>().is_ok_and(|net| net.contains(&addr)))
-        .map(|prefix| {
+        .filter_map(|prefix| Some((prefix, prefix.parse().ok()?)))
+        .collect();
+    endpoint_in(&protected, n)
+}
+fn endpoint_in(protected: &[(&String, IpNet)], n: &Node) -> Option<String> {
+    let addr: IpAddr = n.tunnel_src.parse().ok()?;
+    protected
+        .iter()
+        .find(|(_, net)| net.contains(&addr))
+        .map(|(prefix, _)| {
             format!(
                 "the node's tunnel_src {} is inside protected prefix {prefix}, which the fabric anycasts",
                 n.tunnel_src
@@ -291,19 +361,29 @@ fn endpoint_problem(p: &Policy, n: &Node) -> Option<String> {
 }
 /// Other tunnels' prefixes inside this tunnel's, across the whole policy.
 fn foreign_to(p: &Policy, t: &Tunnel) -> Vec<String> {
-    let mine: Vec<IpNet> = t.prefixes.iter().filter_map(|v| v.parse().ok()).collect();
-    let mut out: Vec<String> = p
+    let held: Vec<(&str, IpNet, &String)> = p
         .tunnels
         .iter()
-        .filter(|o| o.id != t.id)
-        .flat_map(|o| &o.prefixes)
-        .filter(|prefix| {
-            prefix.parse::<IpNet>().is_ok_and(|net| {
-                mine.iter()
-                    .any(|m| m.prefix_len() < net.prefix_len() && m.contains(&net))
-            })
+        .flat_map(|o| {
+            o.prefixes
+                .iter()
+                .filter_map(move |v| Some((o.id.as_str(), v.parse().ok()?, v)))
         })
-        .cloned()
+        .collect();
+    foreign_in(&held, t)
+}
+/// foreign_to, given every tunnel's prefixes parsed: (its id, the prefix, as written).
+fn foreign_in(held: &[(&str, IpNet, &String)], t: &Tunnel) -> Vec<String> {
+    let mine: Vec<IpNet> = t.prefixes.iter().filter_map(|v| v.parse().ok()).collect();
+    let mut out: Vec<String> = held
+        .iter()
+        .filter(|(id, net, _)| {
+            *id != t.id
+                && mine
+                    .iter()
+                    .any(|m| m.prefix_len() < net.prefix_len() && m.contains(net))
+        })
+        .map(|(_, _, prefix)| (*prefix).clone())
         .collect();
     out.sort();
     out
@@ -316,24 +396,29 @@ pub fn enforced_prefixes(p: &Policy, n: &Node) -> Vec<String> {
         .collect()
 }
 pub fn tunnels_for(p: &Policy, n: &Node, enforced: &[String]) -> Vec<NodeTunnel> {
-    let mut out: Vec<_> = p
+    tunnels_with(&Index::new(p, std::slice::from_ref(n)), n, enforced)
+}
+fn tunnels_with(idx: &Index, n: &Node, enforced: &[String]) -> Vec<NodeTunnel> {
+    let enforced: HashSet<&str> = enforced.iter().map(String::as_str).collect();
+    let mut out: Vec<_> = idx
+        .p
         .tunnels
         .iter()
         .filter_map(|t| {
             let mine: Vec<_> = t
                 .prefixes
                 .iter()
-                .filter(|prefix| enforced.contains(prefix))
+                .filter(|prefix| enforced.contains(prefix.as_str()))
                 .cloned()
                 .collect();
             if mine.is_empty()
                 || (!t.node.is_empty() && t.node != n.id)
                 || t.disabled.iter().any(|id| id == &n.id)
-                || unusable_endpoint(p, n, t).is_some()
+                || unusable_endpoint(idx, n, t).is_some()
             {
                 None
             } else {
-                build(p, t, n, &mine).ok()
+                built(idx, t, n, &mine).ok()
             }
         })
         .collect();
@@ -351,22 +436,31 @@ pub fn build(p: &Policy, t: &Tunnel, n: &Node, prefixes: &[String]) -> crate::Re
     built.foreign = foreign_to(p, t);
     Ok(built)
 }
+/// build, with what it looks up worked out once for the fabric.
+fn built(idx: &Index, t: &Tunnel, n: &Node, prefixes: &[String]) -> crate::Result<NodeTunnel> {
+    let mut built = tunnel::for_node(t, n, prefixes)?;
+    if !t.node.is_empty() {
+        built.mss_clamp = built.mss_clamp.min(tunnel::backhaul_clamp(&t.prefixes));
+    }
+    built.foreign = idx.foreign_to(t);
+    Ok(built)
+}
 /// Whether a pinned tunnel's location builds the customer's end, so it can take what other nodes
 /// forward to it.
-fn location_builds(p: &Policy, at: &Node, t: &Tunnel) -> bool {
+fn location_builds(idx: &Index, at: &Node, t: &Tunnel) -> bool {
     !at.tunnel_src.is_empty()
         && !t.disabled.iter().any(|id| id == &at.id)
-        && unusable_endpoint(p, at, t).is_none()
-        && t.prefixes.iter().any(|prefix| eligible(p, at, prefix))
+        && unusable_endpoint(idx, at, t).is_none()
+        && t.prefixes.iter().any(|prefix| idx.eligible(at, prefix))
 }
 /// Whether a node may help a pinned tunnel's location: it carries some of the prefixes and can
 /// end a tunnel to it.
-fn helps(p: &Policy, n: &Node, t: &Tunnel, at: &Node) -> bool {
+fn helps(idx: &Index, n: &Node, t: &Tunnel, at: &Node) -> bool {
     n.id != at.id
         && !n.tunnel_src.is_empty()
-        && endpoint_problem(p, n).is_none()
+        && idx.endpoint_problem(n).is_none()
         && !t.disabled.iter().any(|id| id == &n.id)
-        && t.prefixes.iter().any(|prefix| eligible(p, n, prefix))
+        && t.prefixes.iter().any(|prefix| idx.eligible(n, prefix))
 }
 /// The node-to-node tunnels a node holds for pinned customers: one to each location whose
 /// customers' prefixes it carries, which it routes those prefixes into, and one from each node
@@ -374,28 +468,32 @@ fn helps(p: &Policy, n: &Node, t: &Tunnel, at: &Node) -> bool {
 /// overflowing, so help starts the moment BGP moves traffic, and traffic still arriving after
 /// it moves back is delivered rather than dropped.
 pub fn backhaul_for(p: &Policy, nodes: &[Node], n: &Node, enforced: &[String]) -> Vec<Backhaul> {
-    if n.tunnel_src.is_empty() || endpoint_problem(p, n).is_some() {
+    backhaul_with(&Index::new(p, nodes), nodes, n, enforced)
+}
+fn backhaul_with(idx: &Index, nodes: &[Node], n: &Node, enforced: &[String]) -> Vec<Backhaul> {
+    if n.tunnel_src.is_empty() || idx.endpoint_problem(n).is_some() {
         return vec![];
     }
+    let enforced: HashSet<&str> = enforced.iter().map(String::as_str).collect();
     let mut peers: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
-    for t in p.tunnels.iter().filter(|t| !t.node.is_empty()) {
+    for t in idx.p.tunnels.iter().filter(|t| !t.node.is_empty()) {
         let Some(at) = nodes.iter().find(|v| v.id == t.node) else {
             continue;
         };
-        if !location_builds(p, at, t) {
+        if !location_builds(idx, at, t) {
             continue;
         }
         if at.id == n.id {
-            for h in nodes.iter().filter(|h| helps(p, h, t, at)) {
+            for h in nodes.iter().filter(|h| helps(idx, h, t, at)) {
                 peers.entry(h.id.as_str()).or_default();
             }
-        } else if helps(p, n, t, at) {
+        } else if helps(idx, n, t, at) {
             // Only what the location routes down the customer's tunnel: a prefix steered away
             // from it would have nowhere to go there.
             peers.entry(at.id.as_str()).or_default().extend(
                 t.prefixes
                     .iter()
-                    .filter(|prefix| enforced.contains(prefix) && eligible(p, at, prefix))
+                    .filter(|prefix| enforced.contains(prefix.as_str()) && idx.eligible(at, prefix))
                     .cloned(),
             );
         }
@@ -422,12 +520,13 @@ pub fn backhaul_for(p: &Policy, nodes: &[Node], n: &Node, enforced: &[String]) -
         .collect()
 }
 /// Prefixes of the customers pinned to a node that it builds the tunnel for and routes down it.
-fn pinned_at(p: &Policy, n: &Node) -> Vec<String> {
-    let mut out: Vec<String> = p
+fn pinned_at(idx: &Index, n: &Node) -> Vec<String> {
+    let mut out: Vec<String> = idx
+        .p
         .tunnels
         .iter()
-        .filter(|t| t.node == n.id && location_builds(p, n, t))
-        .flat_map(|t| t.prefixes.iter().filter(|prefix| eligible(p, n, prefix)))
+        .filter(|t| t.node == n.id && location_builds(idx, n, t))
+        .flat_map(|t| t.prefixes.iter().filter(|prefix| idx.eligible(n, prefix)))
         .cloned()
         .collect();
     out.sort();
@@ -489,11 +588,14 @@ fn share_rates(programs: &mut HashMap<String, Program>, nodes: &[Node]) {
     let mut senders: HashMap<String, i64> = HashMap::new();
     let mut builders: HashMap<String, i64> = HashMap::new();
     for prog in programs.values() {
+        let announcing: HashSet<&str> = prog
+            .announcements
+            .iter()
+            .filter(|a| a.state == "announce")
+            .map(|a| a.prefix.as_str())
+            .collect();
         for t in &prog.tunnels {
-            let announced = prog
-                .announcements
-                .iter()
-                .any(|a| a.state == "announce" && t.prefixes.contains(&a.prefix));
+            let announced = t.prefixes.iter().any(|v| announcing.contains(v.as_str()));
             if announced {
                 *senders.entry(t.id.clone()).or_default() += 1;
             }
@@ -522,17 +624,30 @@ fn share_rates(programs: &mut HashMap<String, Program>, nodes: &[Node]) {
 }
 pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<String, Program> {
     let now = Utc::now();
+    let idx = Index::new(p, nodes);
+    let mut planned: HashMap<&str, Vec<Announcement>> = HashMap::new();
+    for a in plan {
+        planned
+            .entry(a.node_id.as_str())
+            .or_default()
+            .push(a.clone());
+    }
     let mut programs: HashMap<String, Program> = nodes
         .iter()
         .map(|n| {
-            let prefixes = enforced_prefixes(p, n);
+            let prefixes: Vec<String> = p
+                .protected
+                .iter()
+                .filter(|prefix| idx.eligible(n, prefix))
+                .cloned()
+                .collect();
             let has = |stage: &str| n.backends.is_empty() || n.backends.iter().any(|s| s == stage);
             let mut prog = Program {
                 node_id: n.id.clone(),
                 policy_id: p.id.clone(),
                 version: p.version,
                 prefixes: prefixes.clone(),
-                announcements: plan.iter().filter(|a| a.node_id == n.id).cloned().collect(),
+                announcements: planned.get(n.id.as_str()).cloned().unwrap_or_default(),
                 games: games_for(p, &prefixes, has("zc")),
                 challenge_secret: p.challenge_secret.clone(),
                 pulse_floor_pps: p.pulse_floor_pps,
@@ -540,9 +655,9 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                 egress: p.egress.clone(),
                 ml: p.ml.clone(),
                 crafted: p.crafted.clone(),
-                tunnels: tunnels_for(p, n, &prefixes),
-                backhaul: backhaul_for(p, nodes, n, &prefixes),
-                pinned: pinned_at(p, n),
+                tunnels: tunnels_with(&idx, n, &prefixes),
+                backhaul: backhaul_with(&idx, nodes, n, &prefixes),
+                pinned: pinned_at(&idx, n),
                 sessions: sessions_for(p, n),
                 tunnel_src: n.tunnel_src.clone(),
                 compiled_at: now,

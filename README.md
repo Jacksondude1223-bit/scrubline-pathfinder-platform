@@ -860,6 +860,49 @@ puts credentials on the wire in the clear.
 **[`deploy/README.md`](deploy/README.md)** covers reaching it on a real URL
 without doing that.
 
+## Sizing for a 16 GB server
+
+Every server Scrubline runs on needs 16 GB of memory: the control plane's,
+each scrubbing node's, or one running both. Everything either keeps has a
+ceiling, and at the most it is built to hold both fit with room to spare.
+[`tests/memory.rs`](tests/memory.rs) builds each part at those bounds and
+holds it to its share; CI runs it on every change
+(`cargo test --release --test memory -- --nocapture` prints the breakdown).
+
+What it is built to hold:
+
+- a fabric of **128 nodes**;
+- **32 policies**, each of up to **1024 protected prefixes, 1024 rules, 1024
+  tunnels, 256 game filters and 256 BGP sessions**;
+- **4096 tenants** with 16384 prefixes between them;
+- a training set of **200000 samples** with 64 MiB of payloads and packets.
+
+A write past one is refused with what it hit (`413`, or `400` for a policy).
+A node that is gone for good gives its place back with `DELETE /v1/nodes/{id}`,
+and an old policy with `DELETE /v1/policies/{id}`.
+
+At those bounds, as the allocator counts it:
+
+| Part | Holds at the most | Of which |
+| --- | --- | --- |
+| Node agent | 270 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, game session and HTTP tables): 72 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
+| Control plane, 128 nodes | 3.6 GiB | programs and the plan 205 MiB, node reports 52 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; a metrics scrape building 661 MiB while the last one is still being sent, 389 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
+
+Each part grows with what the policy holds multiplied by the nodes: every node
+is compiled the whole policy and reports counters for every prefix, rule,
+tunnel and filter in it, and the control plane keeps both for each of them.
+The limits are set by time as much as by memory. The control plane handles
+every heartbeat, recompile and scrape under one lock, so the largest policy
+is the most a heartbeat can carry for 128 nodes, every two seconds, to take
+under half of it.
+
+[`scripts/install.sh`](docs/install.md) gives each service a share to match:
+the control plane is reclaimed from past 8G and restarted at 10G, the agent
+past 1536M and at 2G, and the kernel kills the agent last when the server runs
+out, since the scrubbing goes with it. The installer warns on a server with
+less than 16 GB. Both report what they hold: `scrubline_resident_bytes{node}`
+for each node and `scrubline_control_resident_bytes` for the control plane.
+
 ## Observability
 
 Both binaries expose Prometheus metrics at `/metrics`. The exposition carries
@@ -885,6 +928,7 @@ work":
 - `scrubline_surge_pps{node}` — the offered rate over the last second. Load-driven shedding reacts to it or to `scrubline_offered_pps`, whichever is higher, so it moves within a second of a flood arriving.
 - `scrubline_steering_escalation{node}`, `scrubline_steering_load_ratio{node}` and `scrubline_node_capacity_pps{node}` — the shedding loop. A node at a non-zero escalation is deliberately leaning away from traffic.
 - `scrubline_rate_buckets{node}` against `scrubline_rate_buckets_max{node}` — at the bound, the ZC behavioral cap has stopped tracking every source.
+- `scrubline_resident_bytes{node}` — what the agent's process holds in memory. Its tables are bounded, so it levels off under load; one that keeps climbing is a fault. The control plane reports its own as `scrubline_control_resident_bytes`.
 - `scrubline_prefix_offered_pps{node,prefix}` and `scrubline_prefix_dropped_pps{node,prefix}` — the same rates broken down by the protected prefix the traffic was aimed at. The node-wide pair cannot answer "which customer is being attacked": a scrubber carries many prefixes at once.
 - `scrubline_prefix_flows_total{node,prefix}`, `scrubline_prefix_flows_dropped_total{...}`, `scrubline_prefix_offered_total{...}` and `scrubline_prefix_dropped_total{...}` — the cumulative per-prefix counters the customer-facing analytics are deltaed from.
 - `scrubline_egress_visibility{node,prefix,state}` — whether this node sees a prefix's return path. `asymmetric` means the return-traffic layer is standing down for it.

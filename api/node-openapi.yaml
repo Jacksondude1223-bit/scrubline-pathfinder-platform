@@ -12,7 +12,12 @@ info:
     the control plane.
 
 
-    The agent serves TLS with `-tls-cert`/`-tls-key` and refuses a routable address without it.'
+    The agent serves TLS with `-tls-cert`/`-tls-key` and refuses a routable address without it.
+
+
+    A request body may carry 1 MiB (`413`), and the bodies being read and answered share 64 MiB
+    between them: a request that finds it spent answers `503` with `Retry-After: 1`. At most 1024
+    connections are held open at once.'
 servers:
 - url: https://127.0.0.1:9091
   description: A node agent serving TLS

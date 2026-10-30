@@ -137,6 +137,13 @@
     ]
   },
   {
+    "name": "scrubline_resident_bytes",
+    "group": "",
+    "path": [
+      "resident_bytes"
+    ]
+  },
+  {
     "name": "scrubline_stage_dropped_total",
     "group": "stages",
     "path": [

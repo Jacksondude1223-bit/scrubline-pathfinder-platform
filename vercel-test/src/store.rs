@@ -3,7 +3,6 @@ use crate::{ml, model::*, Result};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -12,6 +11,18 @@ use std::{
 };
 /// How long a node may go without heartbeating before it is stale.
 pub const STALE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
+/// The most of each the control plane keeps, so its memory has a ceiling a 16 GB server can give
+/// it. Every node is compiled a program and keeps a report, so the fabric's size multiplies the
+/// policy's (see validation::PREFIXES_MAX); policies and tenants are kept whole, every one of
+/// them, and written out with the rest of the state on every change.
+pub const NODES_MAX: usize = 128;
+pub const POLICIES_MAX: usize = 32;
+pub const TENANTS_MAX: usize = 4096;
+/// The most prefixes all tenants are entitled to between them: each may hold as many as a policy
+/// protects, but not every one of them at once.
+pub const TENANT_PREFIXES_MAX: usize = 16_384;
+/// What a registration beyond NODES_MAX is refused with.
+pub const FABRIC_FULL: &str = "the fabric holds at most 128 nodes";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
@@ -65,7 +76,7 @@ pub struct Store {
     pub data: Snapshot,
     pub programs: BTreeMap<String, Program>,
     pub plan: Vec<Announcement>,
-    pub reports: BTreeMap<String, Value>,
+    pub reports: BTreeMap<String, crate::wire::Report>,
     pub tunnels: BTreeMap<String, Vec<TunnelStatus>>,
     path: Option<PathBuf>,
 }
@@ -273,6 +284,11 @@ impl Store {
                 );
             }
         }
+        if !self.data.nodes.iter().any(|o| o.id == n.id) && self.data.nodes.len() >= NODES_MAX {
+            return Err(format!(
+                "{FABRIC_FULL}; retire one that is gone for good with DELETE /v1/nodes/{{id}}"
+            ));
+        }
         n.last_seen = now;
         n.status = "ready".into();
         let token = secret()?;
@@ -308,6 +324,34 @@ impl Store {
             d.policies.push(p.clone());
             Ok(p)
         })
+    }
+    /// Forgets a node: its record, its credential and its assigned tunnel endpoint, and what it
+    /// last reported. False when there is no such node.
+    pub fn retire(&mut self, id: &str) -> Result<bool> {
+        if !self.data.nodes.iter().any(|n| n.id == id) {
+            return Ok(false);
+        }
+        self.transaction(|d| {
+            d.nodes.retain(|n| n.id != id);
+            d.node_tokens.remove(id);
+            d.tunnel_endpoints.remove(id);
+            Ok(())
+        })?;
+        self.reports.remove(id);
+        self.programs.remove(id);
+        self.tunnels.remove(id);
+        Ok(true)
+    }
+    /// Forgets a policy. False when there is no such policy.
+    pub fn forget_policy(&mut self, id: &str) -> Result<bool> {
+        if !self.data.policies.iter().any(|p| p.id == id) {
+            return Ok(false);
+        }
+        self.transaction(|d| {
+            d.policies.retain(|p| p.id != id);
+            Ok(())
+        })?;
+        Ok(true)
     }
     pub fn save_tenant(&mut self, mut t: Tenant, now: DateTime<Utc>) -> Result<Tenant> {
         self.transaction(|d| {

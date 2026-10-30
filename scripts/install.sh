@@ -248,6 +248,15 @@ if [[ $ROLE == uninstall ]]; then
 	exit 0
 fi
 
+# ---------------------------------------------------------------- memory
+# Scrubline is sized for servers with 16 GB: the control plane at the most it keeps and a node at
+# its bounds fit in that with room to spare (README, "Sizing for a 16 GB server"). On less it still
+# installs, and says so. A 16 GB server shows the kernel a little less than 16 GiB.
+mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+if [[ $mem_kb =~ ^[0-9]+$ ]] && ((mem_kb < 15 * 1024 * 1024)); then
+	warn "this server has $(awk -v kb="$mem_kb" 'BEGIN {printf "%.1f", kb / 1048576}') GiB of memory; Scrubline is sized for at least 16 GB (see docs/install.md)"
+fi
+
 # ---------------------------------------------------------------- packages
 # The commands this role uses, then the packages they come in, which differ between families.
 needs=(curl ip)
@@ -665,6 +674,10 @@ RestartSec=2
 StateDirectory=scrubline
 StateDirectoryMode=0750
 LimitNOFILE=65536
+# At the most it keeps, a full fabric, it holds about 4G (tests/memory.rs); past 8G the kernel
+# reclaims from it, and at 10G it is restarted rather than left to starve the server.
+MemoryHigh=8G
+MemoryMax=10G
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
@@ -693,6 +706,11 @@ ExecStart=$PREFIX/scrub-node \$SCRUBLINE_NODE_OPTS \$SCRUBLINE_NODE_EXTRA_OPTS
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+# At its bounds the agent holds under 300M (tests/memory.rs), so 2G is a fault, not load. It is the
+# last thing here the kernel should kill for memory: the scrubbing goes with it.
+MemoryHigh=1536M
+MemoryMax=2G
+OOMScoreAdjust=-500
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 MemoryDenyWriteExecute=yes
@@ -716,6 +734,7 @@ Restart=always
 RestartSec=5
 # How its last pass went, in $STATUS; gone when it stops.
 RuntimeDirectory=scrubline-provision
+MemoryMax=512M
 # It changes interfaces, routes, nftables and qdiscs through netlink, and nothing else.
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN

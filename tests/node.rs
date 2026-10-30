@@ -718,6 +718,11 @@ fn the_node_renders_and_reports_everything_it_is_given() {
     ] {
         assert!(fleet.contains(series), "{series} missing from:\n{fleet}");
     }
+    let held = fleet
+        .lines()
+        .find_map(|l| l.strip_prefix("scrubline_control_resident_bytes "))
+        .and_then(|v| v.parse::<f64>().ok());
+    assert!(held > Some(0.0), "{fleet}");
 }
 #[test]
 fn an_attack_of_crafted_packets_tells_the_customer_what_stopped_it() {

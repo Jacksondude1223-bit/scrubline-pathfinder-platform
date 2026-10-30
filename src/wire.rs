@@ -1,6 +1,17 @@
 //! Typed heartbeat wire contract.
 use crate::model::null_default;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+/// A node's last heartbeat as the control plane keeps it. The counters stay typed: as JSON values
+/// a fabric's worth of them would cost several times what the counters themselves do.
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub node_id: String,
+    pub name: String,
+    pub region: String,
+    pub stats: Stats,
+    pub reported_at: DateTime<Utc>,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReputationStats {
@@ -106,6 +117,9 @@ pub struct Stats {
     pub load_window_seconds: i64,
     #[serde(deserialize_with = "null_default")]
     pub crafted: CraftedStats,
+    /// What the agent's process holds in memory, as the kernel counts it.
+    #[serde(deserialize_with = "null_default")]
+    pub resident_bytes: u64,
     #[serde(
         deserialize_with = "null_default",
         skip_serializing_if = "Vec::is_empty"

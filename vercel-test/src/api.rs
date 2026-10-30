@@ -4,7 +4,7 @@ use crate::{
     compiler, ml,
     model::*,
     pipeline::Pipeline,
-    steering,
+    runtime, steering,
     store::{self, Store},
     validation, wire,
 };
@@ -147,7 +147,11 @@ pub struct Api {
     pub enroll: String,
     collector: Collector,
     steering: steering::Controller,
-    pipes: HashMap<String, Pipeline>,
+    /// The pipelines /v1/decide judges with, by node, each with when it was last asked.
+    pipes: HashMap<String, (Pipeline, u64)>,
+    decides: u64,
+    /// Whether a model is being fitted: one at a time, since each fit holds a copy of the samples.
+    fitting: bool,
     last_key: String,
     recompiles: u64,
     requests: BTreeMap<(String, u16), u64>,
@@ -181,6 +185,8 @@ impl Api {
             collector: Default::default(),
             steering: Default::default(),
             pipes: HashMap::new(),
+            decides: 0,
+            fitting: false,
             last_key: String::new(),
             recompiles: 0,
             requests: BTreeMap::new(),
@@ -498,18 +504,16 @@ impl Api {
                         }
                         // What the node holding an on-demand tunnel last said about its traffic.
                         if let Some(m) = self.store.reports.get(&n.id).and_then(|r| {
-                            analytics::rows(&r["stats"], "mitigation")
-                                .iter()
-                                .find(|m| m["tunnel_id"] == t.id.as_str())
+                            r.stats.mitigation.iter().find(|m| m.tunnel_id == t.id)
                         }) {
-                            row["mitigating"] = m["active"].clone();
-                            if m["active"] == true {
-                                row["mitigating_since"] = m["since"].clone();
-                                row["mitigation_wave"] = m["wave"].clone();
-                                row["mitigation_hold_seconds"] = m["hold_seconds"].clone();
+                            row["mitigating"] = json!(m.active);
+                            if m.active {
+                                row["mitigating_since"] = json!(m.since);
+                                row["mitigation_wave"] = json!(m.wave);
+                                row["mitigation_hold_seconds"] = json!(m.hold_seconds);
                             }
-                            row["ingress_pps"] = m["pps"].clone();
-                            row["ingress_bps"] = m["bps"].clone();
+                            row["ingress_pps"] = json!(m.pps);
+                            row["ingress_bps"] = json!(m.bps);
                         }
                         if let Some(built) = self
                             .store
@@ -635,20 +639,17 @@ impl Api {
             .iter()
             .map(|n| {
                 let report = self.store.reports.get(&n.id);
-                let stats = report.map(|r| &r["stats"]);
-                let fresh = report
-                    .and_then(|r| r["reported_at"].as_str())
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .is_some_and(|at| now.signed_duration_since(at).num_milliseconds() <= 15000);
+                let stats = report.map(|r| &r.stats);
+                let fresh = report.is_some_and(|r| {
+                    now.signed_duration_since(r.reported_at).num_milliseconds() <= 15000
+                });
                 steering::Sample {
                     node_id: n.id.clone(),
                     capacity_pps: n.capacity_pps,
-                    offered_pps: stats.map(|s| analytics::n(s, "offered_pps")).unwrap_or(0),
-                    surge_pps: stats.map(|s| analytics::n(s, "surge_pps")).unwrap_or(0),
-                    pulsing: stats.is_some_and(|s| s["pulsing"] == true),
-                    peak_pps: stats
-                        .map(|s| analytics::n(s, "pulse_peak_pps"))
-                        .unwrap_or(0),
+                    offered_pps: stats.map_or(0, |s| s.offered_pps),
+                    surge_pps: stats.map_or(0, |s| s.surge_pps),
+                    pulsing: stats.is_some_and(|s| s.pulsing),
+                    peak_pps: stats.map_or(0, |s| s.pulse_peak_pps),
                     fresh,
                 }
             })
@@ -760,10 +761,6 @@ impl Api {
             .collect();
         let id = parts.get(1).copied().unwrap_or("");
         match (method, parts.as_slice()) {
-            ("GET", ["state"]) => {
-                who.operator()?;
-                Ok(value(self.store.snapshot()))
-            }
             ("POST", ["promote"]) => {
                 who.operator()?;
                 if self.mode != "replica" {
@@ -802,6 +799,8 @@ impl Api {
                 let (n, token) = self.store.register(n, now).map_err(|e| {
                     if e.contains("different live node") {
                         (409, e.into())
+                    } else if e.starts_with(store::FABRIC_FULL) {
+                        (413, e.into())
                     } else {
                         eprintln!("registration failed: {e}");
                         (500, "could not issue a node credential".into())
@@ -813,6 +812,29 @@ impl Api {
             ("GET", ["nodes"]) => {
                 who.operator()?;
                 Ok(value(self.store.nodes(now)))
+            }
+            ("DELETE", ["nodes", _]) if !id.is_empty() => {
+                who.operator()?;
+                self.writable()?;
+                // A node still running enrols again with its next heartbeat, so retiring it would
+                // only lose what it last reported.
+                if self.store.data.nodes.iter().any(|n| {
+                    n.id == id && now.signed_duration_since(n.last_seen) <= store::STALE_AFTER
+                }) {
+                    return Err((
+                        409,
+                        "this node is live; stop it before retiring it, or it enrols again".into(),
+                    ));
+                }
+                if !self.store.retire(id).map_err(failed)? {
+                    return Err((404, "unknown node".into()));
+                }
+                self.fences.remove(id);
+                self.overflow_until.remove(id);
+                self.pipes.remove(id);
+                self.collector.forget_node(id);
+                self.reconcile(now, true).map_err(failed)?;
+                Ok(json!({"retired":id}))
             }
             ("POST", ["nodes", _, "heartbeat"]) if !id.is_empty() => {
                 if !who.acts(id) {
@@ -869,11 +891,17 @@ impl Api {
                     }
                 }
                 if !body.is_empty() {
-                    let stats = value(hb.stats);
-                    let report = json!({"node_id":id,"name":name,"region":region,"stats":stats,"reported_at":now});
+                    let none = Program::default();
+                    let prog = self.store.programs.get(id).unwrap_or(&none);
+                    self.collector.observe(id, &value(&hb.stats), prog, ms);
+                    let report = wire::Report {
+                        node_id: id.into(),
+                        name,
+                        region,
+                        stats: hb.stats,
+                        reported_at: now,
+                    };
                     self.store.reports.insert(id.into(), report);
-                    let prog = self.store.programs.get(id).cloned().unwrap_or_default();
-                    self.collector.observe(id, &stats, &prog, ms);
                 }
                 self.reconcile(now, false).map_err(failed)?;
                 Ok(json!({"status":"ok"}))
@@ -898,7 +926,7 @@ impl Api {
                 self.store
                     .reports
                     .get(id)
-                    .cloned()
+                    .map(value)
                     .ok_or((404, "no counters reported for this node".into()))
             }
             ("POST", ["policies"]) => {
@@ -913,13 +941,34 @@ impl Api {
                 if p.challenge_secret.is_empty() && !p.games.is_empty() {
                     p.challenge_secret = store::secret().map_err(failed)?;
                 }
+                let kept = &self.store.data.policies;
+                if !kept.iter().any(|v| !p.id.is_empty() && v.id == p.id)
+                    && kept.len() >= store::POLICIES_MAX
+                {
+                    return Err((
+                        413,
+                        format!(
+                            "the control plane keeps at most {} policies; save over one by its id, or delete one with DELETE /v1/policies/{{id}}",
+                            store::POLICIES_MAX
+                        )
+                        .into(),
+                    ));
+                }
                 Ok(value(self.store.save_policy(p, now).map_err(failed)?))
             }
-            ("GET", ["policies"]) => {
+            ("DELETE", ["policies", _]) if !id.is_empty() => {
                 who.operator()?;
-                let mut p = self.store.data.policies.clone();
-                p.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
-                Ok(value(p))
+                self.writable()?;
+                if self.store.data.last_policy_id == id {
+                    return Err((
+                        409,
+                        "this policy is deployed; deploy another before deleting it".into(),
+                    ));
+                }
+                if !self.store.forget_policy(id).map_err(failed)? {
+                    return Err((404, "unknown policy".into()));
+                }
+                Ok(json!({"deleted":id}))
             }
             ("POST", ["policies", _, "deploy"]) if !id.is_empty() => {
                 who.operator()?;
@@ -1250,16 +1299,6 @@ impl Api {
                 self.writable()?;
                 self.toggle_tunnel(id, body, false, now)
             }
-            ("GET", ["fabric"]) => {
-                who.operator()?;
-                Ok(
-                    json!({"announcements":self.store.plan,"programs":self.store.programs.values().collect::<Vec<_>>(),"ml":self.store.data.model}),
-                )
-            }
-            ("GET", ["ml", "samples"]) => {
-                who.operator()?;
-                Ok(value(&self.store.data.samples))
-            }
             ("POST", ["ml", "samples"]) => {
                 who.operator()?;
                 self.writable()?;
@@ -1274,10 +1313,18 @@ impl Api {
                 for (i, s) in batch.samples.iter().enumerate() {
                     ml::validate_sample(s).map_err(|e| bad(format!("samples[{i}]: {e}")))?;
                 }
-                if self.store.data.samples.len() + batch.samples.len() > 200000 {
+                let stored = &self.store.data.samples;
+                if stored.len() + batch.samples.len() > ml::SAMPLES_MAX {
                     return Err((
                         413,
-                        json!({"error":"training set is limited to 200000 samples","stored":self.store.data.samples.len()}),
+                        json!({"error":format!("training set is limited to {} samples", ml::SAMPLES_MAX),"stored":stored.len()}),
+                    ));
+                }
+                let bytes = ml::sample_bytes(stored) + ml::sample_bytes(&batch.samples);
+                if bytes > ml::SAMPLE_BYTES_MAX {
+                    return Err((
+                        413,
+                        json!({"error":format!("training set is limited to {} MiB of payloads and packets", ml::SAMPLE_BYTES_MAX >> 20),"stored":stored.len(),"stored_bytes":ml::sample_bytes(stored)}),
                     ));
                 }
                 let stored = self
@@ -1356,10 +1403,24 @@ impl Api {
                     .get(&b.node_id)
                     .cloned()
                     .ok_or((404, "node has no program".into()))?;
-                let p = self
+                // Each holds as much as a node's datapath can, so only the few last asked of are kept.
+                if !self.pipes.contains_key(&b.node_id) && self.pipes.len() >= DECIDE_PIPELINES {
+                    if let Some(oldest) = self
+                        .pipes
+                        .iter()
+                        .min_by_key(|(_, (_, used))| *used)
+                        .map(|(id, _)| id.clone())
+                    {
+                        self.pipes.remove(&oldest);
+                    }
+                }
+                self.decides += 1;
+                let tick = self.decides;
+                let (p, used) = self
                     .pipes
                     .entry(b.node_id.clone())
-                    .or_insert_with(|| Pipeline::new(prog.clone()));
+                    .or_insert_with(|| (Pipeline::new(prog.clone()), 0));
+                *used = tick;
                 if p.program.policy_id != prog.policy_id
                     || p.program.version != prog.version
                     || p.program.compiled_at != prog.compiled_at
@@ -1384,6 +1445,33 @@ impl Api {
                 validation::tenant(&t).map_err(bad)?;
                 if t.id.is_empty() {
                     t.id = store::id("ten", &[&t.name]);
+                }
+                let kept = &self.store.data.tenants;
+                if !kept.iter().any(|v| v.id == t.id) && kept.len() >= store::TENANTS_MAX {
+                    return Err((
+                        413,
+                        format!(
+                            "the control plane keeps at most {} tenants; delete one first",
+                            store::TENANTS_MAX
+                        )
+                        .into(),
+                    ));
+                }
+                let entitled = t.prefixes.len()
+                    + kept
+                        .iter()
+                        .filter(|v| v.id != t.id)
+                        .map(|v| v.prefixes.len())
+                        .sum::<usize>();
+                if entitled > store::TENANT_PREFIXES_MAX {
+                    return Err((
+                        413,
+                        format!(
+                            "the control plane keeps at most {} prefixes between all its tenants, and this would make {entitled}",
+                            store::TENANT_PREFIXES_MAX
+                        )
+                        .into(),
+                    ));
                 }
                 // A change to a customer's prefixes must leave every tunnel allocated to them
                 // carrying only their own address space.
@@ -1526,12 +1614,73 @@ impl Api {
             _ => Err((404, "not found".into())),
         }
     }
+    /// Answers a request. The reads that carry every policy, the whole fabric, the training set or
+    /// the whole state are written straight to JSON: held as a Value first, each would take
+    /// several times the memory its JSON does, all of it under the lock.
+    fn answer(
+        &mut self,
+        method: &str,
+        path: &str,
+        query: &HashMap<String, String>,
+        headers: &HeaderMap,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Answer<Reply> {
+        let parts: Vec<_> = path
+            .strip_prefix("/v1/")
+            .unwrap_or(path)
+            .split('/')
+            .collect();
+        let written = match (method, parts.as_slice()) {
+            ("GET", ["state"]) => {
+                self.auth(headers)?.operator()?;
+                serde_json::to_vec(&self.store.snapshot())
+            }
+            ("GET", ["policies"]) => {
+                self.auth(headers)?.operator()?;
+                let mut p: Vec<_> = self.store.data.policies.iter().collect();
+                p.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+                serde_json::to_vec(&p)
+            }
+            ("GET", ["fabric"]) => {
+                self.auth(headers)?.operator()?;
+                #[derive(Serialize)]
+                struct Fabric<'a> {
+                    announcements: &'a [Announcement],
+                    ml: &'a ml::Model,
+                    programs: Vec<&'a Program>,
+                }
+                serde_json::to_vec(&Fabric {
+                    announcements: &self.store.plan,
+                    ml: &self.store.data.model,
+                    programs: self.store.programs.values().collect(),
+                })
+            }
+            ("GET", ["ml", "samples"]) => {
+                self.auth(headers)?.operator()?;
+                serde_json::to_vec(&self.store.data.samples)
+            }
+            _ => {
+                return self
+                    .dispatch(method, path, query, headers, body, now)
+                    .map(Reply::Value)
+            }
+        };
+        written.map(Reply::Json).map_err(|e| {
+            eprintln!("writing an answer: {e}");
+            (500, "could not write the answer".into())
+        })
+    }
     pub fn router(state: Shared) -> Router {
         Router::new()
             .route("/health", any(health))
             .route("/metrics", any(metrics_handler))
             .fallback(handler)
-            .layer(DefaultBodyLimit::max(4 << 20))
+            .layer(DefaultBodyLimit::max(BODY_LIMIT))
+            .layer(axum::middleware::from_fn_with_state(
+                runtime::Bodies::new(BODY_BUDGET, BODY_LIMIT),
+                runtime::bounded,
+            ))
             .with_state(state)
     }
     pub fn metrics(&self) -> crate::Result<String> {
@@ -1618,9 +1767,19 @@ async fn health(State(s): State<Shared>) -> Response {
         ))),
     }
 }
-fn response(result: Answer) -> Response {
+/// What a request is answered with: a value, or JSON already written out (see Api::answer).
+enum Reply {
+    Value(Value),
+    Json(Vec<u8>),
+}
+fn response(result: Answer<Reply>) -> Response {
     match result {
-        Ok(v) => Json(v).into_response(),
+        Ok(Reply::Value(v)) => Json(v).into_response(),
+        Ok(Reply::Json(written)) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            written,
+        )
+            .into_response(),
         Err((status, body)) => (
             StatusCode::from_u16(status).unwrap(),
             Json(if body.is_object() {
@@ -1682,11 +1841,11 @@ async fn handler(
     }
     let result = tokio::task::spawn_blocking(move || {
         let (mut a, result) = if method == Method::POST && path == "/v1/ml/train" {
-            let result = train(&s, &headers, &body);
+            let result = train(&s, &headers, &body).map(Reply::Value);
             (s.lock().unwrap(), result)
         } else {
             let mut a = s.lock().unwrap();
-            let result = a.dispatch(method.as_str(), &path, &query, &headers, &body, Utc::now());
+            let result = a.answer(method.as_str(), &path, &query, &headers, &body, Utc::now());
             (a, result)
         };
         let code = result.as_ref().map(|_| 200).unwrap_or_else(|e| e.0);
@@ -1699,6 +1858,16 @@ async fn handler(
 }
 /// The longest a node's request for its program is held.
 const LONGEST_WAIT: i64 = 30_000;
+/// How many nodes' pipelines /v1/decide keeps: each can grow to what a node's datapath holds.
+const DECIDE_PIPELINES: usize = 8;
+/// The most a request may carry: a policy as large as validation allows, or a batch of samples.
+pub const BODY_LIMIT: usize = 4 << 20;
+/// What the bodies of requests to the control plane may hold between them: a full fabric's
+/// heartbeats arriving at once, under 1 MiB each at the most a node reports, with room to spare.
+pub const BODY_BUDGET: usize = 256 << 20;
+/// How many connections the control plane holds open: a few for every node the fabric can hold,
+/// and one for each tenant, operator and scraper.
+pub const CONNECTIONS: usize = 8192;
 /// Whether a node holding `held` has something to fetch: a program that differs from it in more
 /// than when it was compiled, one where it had none or none where it had one, or tunnel reports
 /// ignored until it fetches again.
@@ -1794,12 +1963,35 @@ async fn hold(
 /// heartbeat and program fetch behind it, so only reading the set and storing the model take it.
 fn train(s: &Shared, headers: &HeaderMap, body: &[u8]) -> Answer {
     let job = {
-        let a = s.lock().unwrap();
+        let mut a = s.lock().unwrap();
         let who = a.auth(headers)?;
-        a.training(&who, body)?
+        who.operator()?;
+        // Each fit holds its own copy of the samples, so fits running side by side would hold one
+        // each.
+        if a.fitting {
+            return Err((
+                409,
+                "a model is already being trained; try again when it is done".into(),
+            ));
+        }
+        let job = a.training(&who, body)?;
+        a.fitting = true;
+        job
     };
-    let m = job.fit()?;
-    s.lock().unwrap().install(m)
+    /// Lets the next fit start however this one ends, a panic included.
+    struct Fitting<'a>(&'a Shared);
+    impl Drop for Fitting<'_> {
+        fn drop(&mut self) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .fitting = false;
+        }
+    }
+    let fitting = Fitting(s);
+    let m = job.fit();
+    drop(fitting);
+    s.lock().unwrap().install(m?)
 }
 fn route_label(path: &str) -> String {
     let parts: Vec<_> = path
@@ -2802,5 +2994,249 @@ mod tests {
         let mut keyed = policy;
         keyed["tunnels"][1]["key"] = json!(7);
         assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, keyed).0, 200);
+    }
+    #[test]
+    fn a_full_fabric_takes_no_more_nodes_until_one_that_is_gone_is_retired() {
+        let mut a = api();
+        let (first, token) = register(&mut a, 0, "edge-0", "10.0.0.1");
+        for i in 1..store::NODES_MAX {
+            register(
+                &mut a,
+                0,
+                &format!("edge-{i}"),
+                &format!("10.{}.{}.1", i / 256, i % 256),
+            );
+        }
+        let late = json!({"name":"edge-late","region":"iad"});
+        let (status, body) = call(
+            &mut a,
+            0,
+            "POST",
+            "/v1/nodes/register",
+            ENROLL,
+            late.clone(),
+        );
+        assert_eq!(status, 413, "{body}");
+        let refusal = body.as_str().unwrap();
+        assert!(refusal.contains("DELETE /v1/nodes/"), "{body}");
+        assert!(refusal.contains(&store::NODES_MAX.to_string()), "{body}");
+        // A node already in the fabric still enrols again.
+        register(&mut a, 0, "edge-0", "10.0.0.1");
+        let gone = format!("/v1/nodes/{first}");
+        let (status, body) = call(&mut a, 10, "DELETE", &gone, OP, Value::Null);
+        assert_eq!(
+            status, 409,
+            "a node that is still running is not retired: {body}"
+        );
+        assert_eq!(
+            call(&mut a, 60, "DELETE", &gone, &token, Value::Null).0,
+            401
+        );
+        assert_eq!(
+            call(&mut a, 60, "DELETE", "/v1/nodes/node-none", OP, Value::Null).0,
+            404
+        );
+        let (_, second_token) = register(&mut a, 0, "edge-1", "10.0.1.1");
+        assert_eq!(
+            call(&mut a, 60, "DELETE", &gone, &second_token, Value::Null).0,
+            403
+        );
+        assert_eq!(
+            call(&mut a, 60, "DELETE", &gone, OP, Value::Null),
+            (200, json!({"retired":first}))
+        );
+        assert!(!a.store.data.node_tokens.contains_key(&first));
+        assert!(!a.store.reports.contains_key(&first));
+        assert_eq!(call(&mut a, 60, "DELETE", &gone, OP, Value::Null).0, 404);
+        assert_eq!(
+            call(&mut a, 60, "POST", "/v1/nodes/register", ENROLL, late).0,
+            200
+        );
+    }
+    #[test]
+    fn the_control_plane_keeps_a_bounded_number_of_policies_and_tenants() {
+        let mut a = api();
+        register(&mut a, 0, "edge-a", "192.0.2.1");
+        let policy = |id: &str| json!({"id":id,"name":id,"protected":["203.0.113.0/24"]});
+        for i in 0..store::POLICIES_MAX {
+            assert_eq!(
+                call(
+                    &mut a,
+                    0,
+                    "POST",
+                    "/v1/policies",
+                    OP,
+                    policy(&format!("p{i}"))
+                )
+                .0,
+                200
+            );
+        }
+        let (status, body) = call(&mut a, 0, "POST", "/v1/policies", OP, policy("extra"));
+        assert_eq!(status, 413, "{body}");
+        let unnamed = json!({"name":"unnamed","protected":["203.0.113.0/24"]});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/policies", OP, unnamed).0, 413);
+        // Saving over one keeps no more of them.
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies", OP, policy("p0")).0,
+            200
+        );
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies/p0/deploy", OP, Value::Null).0,
+            200
+        );
+        let (status, body) = call(&mut a, 0, "DELETE", "/v1/policies/p0", OP, Value::Null);
+        assert_eq!(status, 409, "the deployed policy stays: {body}");
+        assert_eq!(
+            call(&mut a, 0, "DELETE", "/v1/policies/none", OP, Value::Null).0,
+            404
+        );
+        assert_eq!(
+            call(&mut a, 0, "DELETE", "/v1/policies/p1", OP, Value::Null),
+            (200, json!({"deleted":"p1"}))
+        );
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/policies", OP, policy("extra")).0,
+            200
+        );
+        assert_eq!(a.store.data.policies.len(), store::POLICIES_MAX);
+        // Tenants: as many as the control plane keeps, with as many prefixes between them, then no
+        // more of either until some go.
+        let share = store::TENANT_PREFIXES_MAX / store::TENANTS_MAX;
+        let entitled = |i: usize, n: usize| -> Vec<String> {
+            (0..n)
+                .map(|j| format!("10.{}.{}.{j}/32", i / 256, i % 256))
+                .collect()
+        };
+        a.store.data.tenants = (0..store::TENANTS_MAX)
+            .map(|i| Tenant {
+                id: format!("ten-{i}"),
+                name: format!("t{i}"),
+                prefixes: entitled(i, share),
+                ..Default::default()
+            })
+            .collect();
+        let tenant = json!({"name":"late","prefixes":["198.51.100.0/24"]});
+        let (status, body) = call(&mut a, 0, "POST", "/v1/tenants", OP, tenant);
+        assert_eq!(status, 413, "{body}");
+        let kept = json!({"id":"ten-7","name":"t7","prefixes":entitled(7, share)});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/tenants", OP, kept).0, 200);
+        let grown = json!({"id":"ten-7","name":"t7","prefixes":entitled(7, share + 1)});
+        let (status, body) = call(&mut a, 0, "POST", "/v1/tenants", OP, grown);
+        assert_eq!(status, 413, "{body}");
+        assert!(
+            body.as_str().unwrap().contains("between all its tenants"),
+            "{body}"
+        );
+    }
+    #[test]
+    fn a_policy_is_refused_past_what_every_node_could_be_compiled() {
+        let mut a = api();
+        let prefixes: Vec<String> = (0..=validation::PREFIXES_MAX)
+            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+            .collect();
+        let wide = json!({"name":"wide","protected":prefixes});
+        let (status, body) = call(&mut a, 0, "POST", "/v1/policies", OP, wide);
+        assert_eq!(status, 400);
+        let most = format!("at most {} protected prefixes", validation::PREFIXES_MAX);
+        assert!(body.as_str().unwrap().contains(&most), "{body}");
+        let rules: Vec<Value> = (0..=validation::RULES_MAX)
+            .map(|i| json!({"id":format!("r{i}"),"stage":"asic","action":"drop","match":{"proto":"udp","dport":i % 60000 + 1}}))
+            .collect();
+        let long = json!({"name":"long","protected":["203.0.113.0/24"],"rules":rules});
+        let (status, body) = call(&mut a, 0, "POST", "/v1/policies", OP, long);
+        assert_eq!(status, 400);
+        let most = format!("at most {} rules", validation::RULES_MAX);
+        assert!(body.as_str().unwrap().contains(&most), "{body}");
+        let tenant = json!({"name":"wide","prefixes":prefixes});
+        assert_eq!(call(&mut a, 0, "POST", "/v1/tenants", OP, tenant).0, 400);
+    }
+    #[test]
+    fn the_training_set_is_bounded_in_bytes_as_well_as_samples() {
+        use base64::Engine;
+        let mut a = api();
+        let carrying = |n: usize| {
+            json!({"samples":[{"flow":{"src_ip":"192.0.2.1","dst_ip":"203.0.113.1","proto":"udp","dport":53,"pps":1,
+                "payload":base64::engine::general_purpose::STANDARD.encode(vec![7u8; n])},"label":1}]})
+        };
+        let (status, body) = call(
+            &mut a,
+            0,
+            "POST",
+            "/v1/ml/samples",
+            OP,
+            carrying(ml::SAMPLE_MAX + 1),
+        );
+        assert_eq!(status, 400);
+        assert!(body.as_str().unwrap().starts_with("samples[0]:"), "{body}");
+        let full = ml::Sample {
+            flow: Flow {
+                payload: vec![7; ml::SAMPLE_MAX],
+                ..Default::default()
+            },
+            label: 1,
+            known_good: false,
+        };
+        a.store.data.samples = vec![full; ml::SAMPLE_BYTES_MAX / ml::SAMPLE_MAX];
+        let stored = ml::sample_bytes(&a.store.data.samples);
+        let room = ml::SAMPLE_BYTES_MAX - stored;
+        let (status, body) = call(&mut a, 0, "POST", "/v1/ml/samples", OP, carrying(room + 1));
+        assert_eq!(status, 413, "{body}");
+        assert_eq!(body["stored_bytes"], json!(stored));
+        assert_eq!(
+            call(&mut a, 0, "POST", "/v1/ml/samples", OP, carrying(room)).0,
+            200
+        );
+    }
+    #[test]
+    fn one_model_is_trained_at_a_time() {
+        let shared: Shared = Arc::new(Mutex::new(api()));
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {OP}").parse().unwrap());
+        shared.lock().unwrap().fitting = true;
+        let (status, _) = train(&shared, &headers, b"{}").unwrap_err();
+        assert_eq!(status, 409);
+        shared.lock().unwrap().fitting = false;
+        // A fit that fails lets the next one start.
+        let refused = train(&shared, &headers, b"{}").unwrap_err();
+        assert_ne!(refused.0, 409, "{refused:?}");
+        assert!(!shared.lock().unwrap().fitting);
+    }
+    #[test]
+    fn decide_keeps_the_pipelines_of_the_nodes_last_asked_about() {
+        let mut a = api();
+        let nodes: Vec<String> = (0..=DECIDE_PIPELINES)
+            .map(|i| {
+                register(
+                    &mut a,
+                    0,
+                    &format!("edge-{i}"),
+                    &format!("192.0.2.{}", i + 1),
+                )
+                .0
+            })
+            .collect();
+        deploy(
+            &mut a,
+            0,
+            json!({"id":"nw","remote":"198.51.100.1","prefixes":["203.0.113.0/24"]}),
+        );
+        let ask = |a: &mut Api, node: &str| {
+            let body = json!({"node_id":node,"flow":{"src_ip":"192.0.2.200","dst_ip":"203.0.113.1","proto":"udp","dport":53,"pps":1}});
+            assert_eq!(call(a, 1, "POST", "/v1/decide", OP, body).0, 200);
+        };
+        for n in &nodes {
+            ask(&mut a, n);
+        }
+        assert_eq!(a.pipes.len(), DECIDE_PIPELINES);
+        assert!(
+            !a.pipes.contains_key(&nodes[0]),
+            "the one asked about longest ago goes"
+        );
+        ask(&mut a, &nodes[1]);
+        ask(&mut a, &nodes[0]);
+        assert_eq!(a.pipes.len(), DECIDE_PIPELINES);
+        assert!(a.pipes.contains_key(&nodes[1]) && a.pipes.contains_key(&nodes[0]));
+        assert!(!a.pipes.contains_key(&nodes[2]));
     }
 }

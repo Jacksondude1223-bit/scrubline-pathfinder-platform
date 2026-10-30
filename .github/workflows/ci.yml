@@ -25,6 +25,10 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Build release binaries
         run: cargo build --locked --release --bins
+      # The fabric at its bounds against what a 16 GB server gives each part. It is skipped in a
+      # debug build, which would take too long to fill every table.
+      - name: Memory at the bounds
+        run: cargo test --locked --release --test memory -- --nocapture
       - name: Native process integration
         env:
           PATHFINDER_BIN_DIR: target/release

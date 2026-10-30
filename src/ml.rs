@@ -101,6 +101,18 @@ pub fn validate_flow(f: &Flow) -> Result<()> {
     }
     Ok(())
 }
+/// The most samples a training set holds, and the most bytes of payload and packet among them:
+/// the set is kept in memory, copied for each fit, and written out with the rest of the state.
+pub const SAMPLES_MAX: usize = 200_000;
+pub const SAMPLE_BYTES_MAX: usize = 64 << 20;
+/// The most payload and packet one sample may carry: an IP packet's worth of each.
+pub const SAMPLE_MAX: usize = 2 * 65_575;
+pub fn sample_bytes(samples: &[Sample]) -> usize {
+    samples
+        .iter()
+        .map(|s| s.flow.payload.len() + s.flow.packet.len())
+        .sum()
+}
 pub fn validate_sample(s: &Sample) -> Result<()> {
     if s.label != 0 && s.label != 1 {
         return Err(format!(
@@ -110,6 +122,12 @@ pub fn validate_sample(s: &Sample) -> Result<()> {
     }
     if s.known_good && s.label != 0 {
         return Err("a known_good sample must be labelled 0 (clean)".into());
+    }
+    let carried = s.flow.payload.len() + s.flow.packet.len();
+    if carried > SAMPLE_MAX {
+        return Err(format!(
+            "{carried} bytes of payload and packet, more than a packet of each"
+        ));
     }
     validate_flow(&s.flow)
 }
