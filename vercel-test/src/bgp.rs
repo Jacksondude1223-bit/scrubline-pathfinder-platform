@@ -42,7 +42,8 @@ pub fn commands(plan: &[Announcement], local_as: i64) -> Result<Vec<String>> {
     rows.sort_by_key(|a| (&a.prefix, &a.node_id));
     rows.into_iter()
         .map(|a| {
-            a.prefix
+            let prefix = a
+                .prefix
                 .parse::<IpNet>()
                 .map_err(|e| format!("announcement for {:?}: {e}", a.prefix))?;
             let verb = match a.state.as_str() {
@@ -52,8 +53,13 @@ pub fn commands(plan: &[Announcement], local_as: i64) -> Result<Vec<String>> {
             };
             let mut line = format!("{verb} route {}", a.prefix);
             if !a.next_hop.is_empty() {
-                a.next_hop.parse::<IpAddr>().map_err(|e| e.to_string())?;
-                line += &format!(" next-hop {}", a.next_hop);
+                let hop = a.next_hop.parse::<IpAddr>().map_err(|e| e.to_string())?;
+                // A route needs a next hop of its own family: an IPv6 prefix sent towards an IPv4
+                // address is refused by any peer without extended next hops. A node with one
+                // address leaves it off the other family's routes, as it does a hostname.
+                if hop.is_ipv4() == prefix.addr().is_ipv4() {
+                    line += &format!(" next-hop {}", a.next_hop);
+                }
             }
             if a.state == "withdraw" {
                 return Ok(line);

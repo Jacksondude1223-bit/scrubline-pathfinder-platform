@@ -604,11 +604,29 @@ paths:
               schema:
                 $ref: '#/components/schemas/MLModel'
         '400':
-          description: Fewer than two samples, a malformed body, or a fit that diverged.
+          description: Fewer than two samples, a malformed body, a limit outside 0 to 1, or a fit that
+            diverged.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '422':
+          description: The fit drops more of the clean samples than the limit allows, or a known-good
+            sample, and was not published. The published model stays.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                - error
+                - model
+                properties:
+                  error:
+                    type: string
+                    example: 'not published: the flow model drops 4.2% of the clean samples it was measured
+                      on, over the 1.0% limit'
+                  model:
+                    $ref: '#/components/schemas/MLModel'
         '409': *id006
         '503': *id007
         '401': *id002
@@ -618,7 +636,11 @@ paths:
 
 
         One sample in five is held out of the fit and the reported metrics are measured on that holdout.
-        Sets below ten samples are too small to split and report training metrics with validation 0.'
+        Sets below ten samples are too small to split and report training metrics with validation 0.
+
+
+        A fit that would drop more than max_false_positive_rate of the clean samples it is measured on,
+        or any known-good sample, is not published unless force is set.'
       requestBody:
         required: false
         content:
@@ -1880,6 +1902,8 @@ components:
             type: string
         next_hop:
           type: string
+          description: The address the node announces its routes towards. The text form leaves it off
+            a route of the other address family, which a peer without extended next hops would refuse.
         reason:
           type: string
     ACLEntry:
@@ -1895,6 +1919,9 @@ components:
           type: string
         tcam_key:
           type: string
+          description: The rule as a TCAM entry. The first word is the table it belongs in, v4 or v6 by
+            the addresses it matches, or any for a rule matching no address, which a switch installs
+            in both.
     FPGAEntry:
       type: object
       properties:
@@ -2106,6 +2133,16 @@ components:
         recall:
           type: number
           description: On the holdout.
+        false_positive_rate:
+          type: number
+          description: Of the clean samples it was measured on, the holdout's, the share it drops.
+            Training refuses a model over its limit, 0.01 unless the request sets another.
+        max_cut:
+          type: number
+          description: How far under its threshold a node may hold it for a target being probed. 0.2 or 0.1
+            when it still drops no more of the clean samples than the limit there, and no known-good
+            sample; otherwise 0, and the model never tightens. A model published before this was measured
+            has 0.
         validation:
           type: integer
           description: Samples held out of the fit. Zero means the set was too small to split.
@@ -2139,6 +2176,11 @@ components:
           - 1
           description: 0 clean, 1 attack. A TCP flow whose payload is an HTTP request trains the request
             model; any other trains the flow model.
+        known_good:
+          type: boolean
+          description: A clean sample the models must never drop, such as a false positive that was
+            reported. Training refuses a model that drops one, at its threshold, and holds max_cut where
+            none would be dropped. Only with label 0.
     StageStats:
       type: object
       properties:
@@ -2551,8 +2593,8 @@ components:
             threshold, so when near misses (within 0.1 under the threshold in force) are 20 or more,
             and a quarter or more of what the models scored for a protected prefix over the last ten
             seconds, both models drop 0.1 lower for that prefix, and 0.2 lower if it happens again
-            there. Each step lapses five minutes after the probing that set it was last seen. ignore
-            keeps the thresholds where they are.'
+            there, each no further than its max_cut. Each step lapses five minutes after the probing
+            that set it was last seen. ignore keeps the thresholds where they are.'
     EgressPolicy:
       type: object
       description: What the fabric does with the return path it can see. Watching what the origin sends
@@ -2673,6 +2715,11 @@ components:
             A rising value is a spoofing attempt or a misbehaving verified client, and both want a human.
         full:
           type: integer
+        freed:
+          type: integer
+          description: Boxed sources released because their address answered for itself, the origin
+            replying to them at length or a challenge answered. Each was a penalty cutting off a real
+            client.
     Tunnel:
       type: object
       required:
@@ -3557,6 +3604,16 @@ components:
         threshold:
           type: number
           description: Score at or above which a flow is an attack. Default 0.7.
+        max_false_positive_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: The share of the clean samples it is measured on that either model may drop, at its
+            threshold to be published and at a tightened one for max_cut. Default 0.01.
+        force:
+          type: boolean
+          description: Publish the fit even when it drops more than that, or a known-good sample. Its
+            max_cut still holds it to the limit.
     DecideRequest:
       type: object
       required:

@@ -203,12 +203,9 @@ impl Watch {
         (MITIGATION_HOLD << self.wave.saturating_sub(1).min(4)).min(MITIGATION_HOLD_MAX)
     }
 }
-/// How far under its threshold a score is a near miss, and how far each step of tightening lowers
-/// the thresholds a target being probed is held to.
-const PROBE_MARGIN: f64 = 0.1;
-/// How many steps a target's thresholds can be lowered.
-const PROBE_STEPS: u8 = 2;
-/// How long a step holds after the probing that set it was last seen.
+/// How long a step of tightening holds after the probing that set it was last seen. A score
+/// within ml::PROBE_MARGIN under the threshold in force is a near miss, and each step lowers the
+/// thresholds by as much, ml::PROBE_STEPS at most.
 pub const PROBE_HOLD: i64 = 300_000;
 /// Near misses over the last ten seconds that say a target is being probed, when they are also a
 /// quarter or more of what the classifiers scored for it.
@@ -235,7 +232,7 @@ impl Probe {
             self.step -= 1;
             self.until += PROBE_HOLD;
         }
-        f64::from(self.step) * PROBE_MARGIN
+        f64::from(self.step) * ml::PROBE_MARGIN
     }
     /// Counts a flow the classifiers scored, and whether it was a near miss. Near misses at
     /// PROBE_MIN or more, and at a quarter or more of what was scored, are probing: with `tighten`
@@ -264,7 +261,7 @@ impl Probe {
             return false;
         }
         self.until = now + PROBE_HOLD;
-        if self.step >= PROBE_STEPS {
+        if self.step >= ml::PROBE_STEPS {
             return false;
         }
         self.step += 1;
@@ -287,6 +284,11 @@ struct Scoring {
 fn consulted<'a>(model: &'a ml::Model, ml: &MlPolicy) -> Option<&'a ml::Model> {
     model.http.as_deref().filter(|m| m.ready && ml.everywhere())
 }
+/// The score a model drops at for a target `cut` under the thresholds while it is being probed:
+/// no further under its own than training showed it could go without dropping clean traffic.
+fn held_to(m: &ml::Model, cut: f64) -> f64 {
+    m.threshold - cut.min(m.max_cut)
+}
 /// What a game filter's HTTP rules judge a flow with besides themselves: whether its source is
 /// verified, and the request model, if they consult one, with the score it drops at for the
 /// flow's target, `cut` under its own threshold.
@@ -300,7 +302,7 @@ fn http_context<'a>(
     httpfilter::Context {
         verified,
         model,
-        threshold: model.map_or(0.0, |m| m.threshold - cut),
+        threshold: model.map_or(0.0, |m| held_to(m, cut)),
     }
 }
 /// A flow's bit rate: the one its record carries, or its packets' headers and payload.
@@ -359,6 +361,20 @@ pub struct Pipeline {
     lockdown: String,
     lockdown_pps: i64,
     grace: i64,
+}
+/// Whether an operator's permit lets a flow through the stages before anything else judges it:
+/// the first rule on the asic stage, or failing one there the fpga stage, that matches it and drops
+/// or permits, permits. The checks made before the stages, lockdown and the penalty box, and an
+/// idle tunnel's HTTP rules honour it as the stages behind the rule do.
+fn allowed(rules: &[Vec<Entry>; 3], f: &Flow) -> bool {
+    rules[..2]
+        .iter()
+        .find_map(|stage| {
+            stage
+                .iter()
+                .find(|r| (r.action == "drop" || r.action == "permit") && r.matcher.matches(f))
+        })
+        .is_some_and(|r| r.action == "permit")
 }
 fn decision(action: &str, stage: usize, id: &str, reason: impl Into<String>) -> Decision {
     Decision {
@@ -458,8 +474,18 @@ impl Pipeline {
                 })
                 .collect(),
         ];
-        let bucket_live: HashSet<_> = program.zc.iter().map(|r| r.rule_id.clone()).collect();
-        self.buckets.retain(|(r, _), _| bucket_live.contains(r));
+        // A behavioural cap, an FPGA meter on the trusted path and lockdown's trickle all count per
+        // source, and the fabric recompiles all the time: a reload must not hand every source a
+        // fresh allowance for the rules it keeps.
+        let bucket_live: HashSet<&str> = program
+            .zc
+            .iter()
+            .map(|r| r.rule_id.as_str())
+            .chain(program.fpga.iter().map(|r| r.rule_id.as_str()))
+            .chain(["|lockdown"])
+            .collect();
+        self.buckets
+            .retain(|(r, _), _| bucket_live.contains(r.as_str()));
         let mut stats = HashMap::new();
         for (i, rules) in self.rules.iter().enumerate() {
             for r in rules {
@@ -562,6 +588,23 @@ impl Pipeline {
     /// unfiltered, though the other game filters still see it, so a player who connects now is
     /// known when mitigation starts.
     fn watch_only(&mut self, f: &Flow, now: i64, i: usize) -> Decision {
+        let watching = |w: &Watch| {
+            decision(
+                "permit",
+                0,
+                "",
+                format!(
+                    "watching only: tunnel {} is under its attack thresholds",
+                    w.tunnel
+                ),
+            )
+        };
+        // What an operator permits passes a mitigating tunnel's stages unjudged, so it passes an
+        // idle one's HTTP rules too.
+        if allowed(&self.rules, f) {
+            self.watches[i].unfiltered += 1;
+            return watching(&self.watches[i]);
+        }
         let verified = self.verified(f, now);
         let r = self.games.inspect(
             f,
@@ -580,15 +623,7 @@ impl Pipeline {
             }
             self.watches[i].unfiltered += 1;
         }
-        decision(
-            "permit",
-            0,
-            "",
-            format!(
-                "watching only: tunnel {} is under its attack thresholds",
-                self.watches[i].tunnel
-            ),
-        )
+        watching(&self.watches[i])
     }
     fn over_rate(&mut self, id: &str, limit: i64, f: &Flow, now: i64) -> bool {
         if limit <= 0 {
@@ -682,11 +717,10 @@ impl Pipeline {
             let threshold = self
                 .model
                 .http
-                .as_ref()
-                .map_or(f64::INFINITY, |m| m.threshold)
-                - self.scoring.cut;
+                .as_deref()
+                .map_or(f64::INFINITY, |m| held_to(m, self.scoring.cut));
             self.scoring.scored = true;
-            self.scoring.near |= r.score < threshold && r.score >= threshold - PROBE_MARGIN;
+            self.scoring.near |= r.score < threshold && r.score >= threshold - ml::PROBE_MARGIN;
         }
         if r.filter.is_empty() {
             return None;
@@ -715,8 +749,9 @@ impl Pipeline {
             self.reputation.promote(&f.src_ip, r.cleared, now);
         }
         // Turned away because everyone together spent a budget is nothing the source did, and a
-        // player loading the server list mid-flood must not be boxed for it.
-        if r.verdict == "drop" && !r.budget {
+        // player loading the server list mid-flood must not be boxed for it. Nor is a model's
+        // score proof of anything: the box would turn one wrong score into every packet dropped.
+        if r.verdict == "drop" && !r.budget && !r.classified {
             self.reputation.strike(&f.src_ip, now);
         }
         if r.verdict == "drop" || r.verdict == "challenge" {
@@ -736,16 +771,17 @@ impl Pipeline {
         None
     }
     /// The flow model's verdict, if it is published: a drop at its threshold, unless the policy
-    /// only observes, or a pass.
-    fn classify(&mut self, f: &Flow, now: i64, rule: &str) -> Option<Decision> {
+    /// only observes, or a pass. A drop is no strike against the source, which the penalty box
+    /// takes only on what a rule, a gate or a rate proved.
+    fn classify(&mut self, f: &Flow, rule: &str) -> Option<Decision> {
         if !self.model.ready {
             return None;
         }
         let score = ml::score(&self.model, f);
-        let threshold = self.model.threshold - self.scoring.cut;
+        let threshold = held_to(&self.model, self.scoring.cut);
         let over = score >= threshold;
         self.scoring.scored = true;
-        self.scoring.near |= !over && score >= threshold - PROBE_MARGIN;
+        self.scoring.near |= !over && score >= threshold - ml::PROBE_MARGIN;
         let drop = over && self.ml.enforcing();
         self.ml_counts[0] += 1;
         self.ml_counts[if drop {
@@ -755,10 +791,7 @@ impl Pipeline {
         } else {
             2
         }] += 1;
-        if drop {
-            self.reputation.strike(&f.src_ip, now);
-        }
-        let probed = if self.scoring.cut > 0.0 {
+        let probed = if threshold < self.model.threshold {
             format!(", over the {threshold:.2} this target is held to while it is being probed")
         } else {
             String::new()
@@ -793,21 +826,24 @@ impl Pipeline {
                 if trusted {
                     // Trust skips the challenge and the classifier, nothing else. A count is still
                     // observe-only and the behavioural cap still applies, so a match that decides
-                    // nothing must not end the stage and hide the rules behind it.
+                    // nothing must not end the stage and hide the rules behind it. A drop or a
+                    // permit ends evaluation, as it does for everyone: a permit is an operator's
+                    // allow list, and trust is no reason to hold a source to the stages behind it.
                     self.seen(&r.id, f);
-                    if r.action == "drop" {
+                    if r.action == "drop" || r.action == "permit" {
                         return (
                             decision(
-                                "drop",
+                                &r.action,
                                 stage,
                                 &r.id,
-                                ["TCAM ACL drop", "FPGA drop", "PF_RING ZC drop"][stage],
+                                format!(
+                                    "{} {}",
+                                    ["TCAM ACL", "FPGA", "PF_RING ZC"][stage],
+                                    r.action
+                                ),
                             ),
                             None,
                         );
-                    }
-                    if r.action == "permit" {
-                        break;
                     }
                     if r.limit > 0 && self.over_rate(&r.id, r.limit, f, now) {
                         return (
@@ -870,7 +906,7 @@ impl Pipeline {
                         id,
                     );
                 }
-                if let Some(d) = self.classify(f, now, &r.id) {
+                if let Some(d) = self.classify(f, &r.id) {
                     return (d, id);
                 }
                 return (decision("permit", 2, &r.id, "PF_RING ZC inspect pass"), id);
@@ -880,7 +916,7 @@ impl Pipeline {
         // what a game filter or the HTTP rules passed, and what no rule decided. A permit rule,
         // which ends evaluation, and a verified source skip it.
         if !trusted && self.ml.everywhere() {
-            if let Some(d) = self.classify(f, now, "") {
+            if let Some(d) = self.classify(f, "") {
                 return (d, None);
             }
         }
@@ -935,7 +971,10 @@ impl Pipeline {
                 return d;
             }
         }
-        let state = self.reputation.check(&f.src_ip, now);
+        let rules = &self.rules;
+        let state = self
+            .reputation
+            .check_sparing(&f.src_ip, now, || allowed(rules, f));
         let (d, by) = if state == 2 {
             (
                 decision("drop", 0, "", "source is in the penalty box"),
@@ -950,7 +989,8 @@ impl Pipeline {
                     .unwrap_or(false)
                 && self.egress.visibility(&owner, now) == "visible"
                 && !self.egress.confirmed(&owner, &f.src_ip, now)
-                && !self.egress.grace(&owner, &f.src_ip, self.grace, now);
+                && !self.egress.grace(&owner, &f.src_ip, self.grace, now)
+                && !allowed(&self.rules, f);
             if held {
                 self.returns[2] += 1;
             }

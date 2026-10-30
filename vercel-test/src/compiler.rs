@@ -558,7 +558,8 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                         r#match: r.r#match.clone(),
                         rule_id: r.id.clone(),
                         tcam_key: format!(
-                            "v4 src={} dst={} proto={} dport={} sport={} pri={}",
+                            "{} src={} dst={} proto={} dport={} sport={} pri={}",
+                            family(&r.r#match),
                             or_any(&r.r#match.src_cidr),
                             or_any(&r.r#match.dst_cidr),
                             or_any(&r.r#match.proto),
@@ -595,6 +596,17 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
         .collect();
     share_rates(&mut programs, nodes);
     programs
+}
+/// The TCAM table a rule belongs in: v4 or v6 by the addresses it matches, and any for a rule
+/// matching none, which a switch has to install in both.
+fn family(m: &Match) -> &'static str {
+    [&m.src_cidr, &m.dst_cidr]
+        .into_iter()
+        .find_map(|c| c.parse::<IpNet>().ok())
+        .map_or("any", |net| match net {
+            IpNet::V4(_) => "v4",
+            IpNet::V6(_) => "v6",
+        })
 }
 fn or_any(s: &str) -> &str {
     if s.is_empty() {

@@ -209,6 +209,11 @@ pub fn control(api: &Api) -> crate::Result<String> {
         ("scrubline_control_ml_precision", model.precision),
         ("scrubline_control_ml_recall", model.recall),
         (
+            "scrubline_control_ml_false_positive_rate",
+            model.false_positive_rate,
+        ),
+        ("scrubline_control_ml_max_cut", model.max_cut),
+        (
             "scrubline_control_ml_http_model_ready",
             f64::from(http.ready),
         ),
@@ -220,6 +225,11 @@ pub fn control(api: &Api) -> crate::Result<String> {
         ("scrubline_control_ml_http_accuracy", http.accuracy),
         ("scrubline_control_ml_http_precision", http.precision),
         ("scrubline_control_ml_http_recall", http.recall),
+        (
+            "scrubline_control_ml_http_false_positive_rate",
+            http.false_positive_rate,
+        ),
+        ("scrubline_control_ml_http_max_cut", http.max_cut),
     ] {
         m.add(name, vec![], v);
     }

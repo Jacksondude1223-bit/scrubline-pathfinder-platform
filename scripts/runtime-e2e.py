@@ -253,8 +253,11 @@ with tempfile.TemporaryDirectory() as temporary:
         call(base,'/v1/ml/samples','POST',OP,samples)
         model=call(base,'/v1/ml/train','POST',OP,{'epochs':30,'lr':0.2,'threshold':0.65})
         assert model['ready'] and model['http']['ready'], model
+        # Published only because neither drops more than 1% of the clean samples, and a node is
+        # told how far each may be tightened.
+        assert model['false_positive_rate'] <= 0.01 and model['http']['false_positive_rate'] <= 0.01, model
         call(base,'/v1/ml/score','POST',OP,dict(flow,payload=''))
-        call(base,'/v1/ml/model',token=node_token)
+        assert 'max_cut' in call(base,'/v1/ml/model',token=node_token)
         wait_for(lambda:call(base,f'/v1/nodes/{runtime_id}/stats',token=OP)['stats']['ml']['ready'])
         # The node installs the request model with the flow model, and the HTTP rules hand it what
         # they allow: a game client's request passes, and one shaped like the flood samples, which

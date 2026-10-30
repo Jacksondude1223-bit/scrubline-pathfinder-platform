@@ -1021,3 +1021,122 @@ fn the_provisioner_accepts_everything_the_agent_renders() {
         assert!(pass.is_ok(), "{id}: {:?}\n{lines:#?}", pass.err());
     }
 }
+#[test]
+fn routes_carry_a_next_hop_only_of_their_own_family() {
+    let row = |prefix: &str, hop: &str| Announcement {
+        prefix: prefix.into(),
+        node_id: "a".into(),
+        state: "announce".into(),
+        next_hop: hop.into(),
+        ..Default::default()
+    };
+    let plan = [
+        row("203.0.113.0/24", "192.0.2.1"),
+        row("2001:db8:100::/48", "192.0.2.1"),
+        row("2001:db8:200::/48", "2001:db8::1"),
+        row("198.51.100.0/24", "2001:db8::1"),
+    ];
+    assert_eq!(
+        bgp::commands(&plan, 64512).unwrap(),
+        [
+            "announce route 198.51.100.0/24",
+            "announce route 2001:db8:100::/48",
+            "announce route 2001:db8:200::/48 next-hop 2001:db8::1",
+            "announce route 203.0.113.0/24 next-hop 192.0.2.1",
+        ]
+    );
+}
+#[test]
+fn hardware_rules_are_keyed_for_the_address_family_they_match() {
+    let rule = |id: &str, src: &str, dst: &str| Rule {
+        id: id.into(),
+        stage: "asic".into(),
+        action: "drop".into(),
+        r#match: Match {
+            src_cidr: src.into(),
+            dst_cidr: dst.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut p = Policy {
+        name: "p".into(),
+        protected: vec!["203.0.113.0/24".into(), "2001:db8:100::/48".into()],
+        rules: vec![
+            rule("v4", "", "203.0.113.0/24"),
+            rule("v6", "2001:db8:ffff::/48", ""),
+            rule("both", "", ""),
+        ],
+        ..Default::default()
+    };
+    validation::policy(&p).unwrap();
+    let nodes = [node("a", "iad", 10.0, "")];
+    let plan = compiler::plan(&p, &nodes, &HashMap::new(), &HashMap::new());
+    let keys: Vec<_> = compiler::compile(&p, &nodes, &plan)["a"]
+        .asic
+        .iter()
+        .map(|r| r.tcam_key.split(' ').next().unwrap().to_string())
+        .collect();
+    assert_eq!(keys, ["v4", "v6", "any"]);
+    // A rule matching a source of one family and a destination of the other matches nothing.
+    p.rules = vec![rule("mixed", "2001:db8:ffff::/48", "203.0.113.0/24")];
+    let e = validation::policy(&p).unwrap_err();
+    assert!(e.contains("different address families"), "{e}");
+}
+#[test]
+fn filters_and_rules_aimed_outside_the_protected_prefixes_are_refused() {
+    let game = |dst: &str| GameFilter {
+        id: "game".into(),
+        dst_cidr: dst.into(),
+        proto: "udp".into(),
+        dport: 19132,
+        profile: "raknet".into(),
+        ..Default::default()
+    };
+    let rule = |src: &str, dst: &str| Rule {
+        id: "rule".into(),
+        stage: "asic".into(),
+        action: "drop".into(),
+        r#match: Match {
+            src_cidr: src.into(),
+            dst_cidr: dst.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let policy = |games: Vec<GameFilter>, rules: Vec<Rule>| Policy {
+        name: "p".into(),
+        protected: vec!["203.0.113.0/24".into(), "2001:db8:100::/48".into()],
+        games,
+        rules,
+        ..Default::default()
+    };
+    // A node carries only the protected prefixes, so nothing aimed elsewhere ever reaches it.
+    let e = validation::policy(&policy(vec![game("198.51.100.10/32")], vec![])).unwrap_err();
+    assert!(
+        e.contains(
+            "game filter \"game\": dst_cidr 198.51.100.10/32 is outside every protected prefix"
+        ),
+        "{e}"
+    );
+    let e = validation::policy(&policy(vec![], vec![rule("", "198.51.100.0/24")])).unwrap_err();
+    assert!(
+        e.contains("rule \"rule\": dst_cidr 198.51.100.0/24 is outside every protected prefix"),
+        "{e}"
+    );
+    let e = validation::policy(&policy(vec![], vec![rule("", "2001:db8:200::/48")])).unwrap_err();
+    assert!(e.contains("outside every protected prefix"), "{e}");
+    // Part of a protected prefix, or more than one, is judged wherever the prefix is carried, and
+    // a source alone says nothing about where the packet is going.
+    for dst in ["203.0.113.10/32", "203.0.0.0/16", "2001:db8:100:5::/64"] {
+        validation::policy(&policy(vec![game(dst)], vec![])).unwrap();
+    }
+    for (src, dst) in [
+        ("", "0.0.0.0/0"),
+        ("", "203.0.113.128/25"),
+        ("198.51.100.0/24", ""),
+        ("", "::/0"),
+    ] {
+        validation::policy(&policy(vec![], vec![rule(src, dst)])).unwrap();
+    }
+}

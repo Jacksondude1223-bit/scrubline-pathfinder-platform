@@ -654,6 +654,8 @@ components:
             type: string
         next_hop:
           type: string
+          description: The address the node announces its routes towards. The text form leaves it off
+            a route of the other address family, which a peer without extended next hops would refuse.
         reason:
           type: string
     NodeHealth:
@@ -910,6 +912,11 @@ components:
             A rising value is a spoofing attempt or a misbehaving verified client, and both want a human.
         full:
           type: integer
+        freed:
+          type: integer
+          description: Boxed sources released because their address answered for itself, the origin
+            replying to them at length or a challenge answered. Each was a penalty cutting off a real
+            client.
     SourceReputation:
       type: object
       description: What the datapath remembers about one source address.

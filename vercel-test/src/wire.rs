@@ -26,6 +26,8 @@ pub struct ReputationStats {
     pub shielded: u64,
     #[serde(deserialize_with = "null_default")]
     pub full: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub freed: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

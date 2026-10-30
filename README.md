@@ -238,7 +238,10 @@ withdraw route 203.0.113.0/24 next-hop 198.51.100.1
 Give the agent `-local-as` so it can pad the path, and `-bgp-next-hop` when the
 address upstreams should route to differs from the one peers reach the node on,
 or when `-advertise` is a hostname: only an address can be a next hop, so a
-hostname leaves it off the commands and the agent warns at startup.
+hostname leaves it off the commands and the agent warns at startup. An address
+is a next hop only for routes of its own family: a node with an IPv4 next hop
+announces its IPv6 prefixes without one, as it does for a hostname, rather
+than with one a peer without extended next hops would refuse.
 Communities are validated when the policy is saved, not at the speaker: these
 lines are written into a routing daemon's control pipe, so an unchecked value
 would be a command injection into the thing that decides where the internet
@@ -283,6 +286,14 @@ built-in or a signature written in the policy:
 A filter only reaches nodes that carry the address it protects, and only
 nodes that advertised a `zc` backend. `observe` records what a filter would
 have done without acting on it, which is how a binding is rolled out.
+
+A packet goes to the first filter bound to it, in policy order, so a policy is
+refused when an earlier filter takes every packet a later one is bound to (a
+whole prefix on every port ahead of one address on one port), or when an
+earlier filter's HTTP rules cover every request a later one's would judge: put
+the narrower one first. A `dst_cidr` outside every protected prefix is refused
+too, since no node carries it. A node handed a program compiled before these
+checks still loads it, and the filter that takes the packets judges them.
 
 ### Gates
 
@@ -377,8 +388,8 @@ is what stops a flood aimed at handlers nobody thought to list.
   its binary frames would carry requests no rule could read; a WebSocket
   upgrade passes.
 - **A drop counts against the source** like any other the filter makes, a
-  budget's apart, so with `penalty_box` on, a source that keeps abusing an
-  endpoint loses its game traffic for a while too. `observe` works here as
+  budget's and the request model's apart, so with `penalty_box` on, a source
+  that keeps abusing an endpoint loses its game traffic for a while too. `observe` works here as
   everywhere: the rules record what they would have dropped and drop nothing.
 - **What the rules allow, the request model then judges**, once one is
   published: a request it scores at its threshold drops the segment, with a
@@ -428,6 +439,10 @@ bound it admits without tracking rather than evicting connected players.
 
 Within a stage the first matching rule decides: `drop` and `permit` are both terminal, so a `permit` rule acts as an allow-list that exempts a source from the stages behind it. A TCAM entry carries no meter, so `rate_limit` is rejected on the `asic` stage.
 
+The allow list holds wherever a source is judged, not only in the stages. When the first `asic` rule that drops or permits a flow, or failing one there the first `fpga` rule, is a `permit`, the flow passes the penalty box, lockdown and an idle on-demand tunnel's HTTP rules as well, and a verified source's permit ends evaluation as anyone's does. A permit written for a source already in the box takes effect on its next packet.
+
+Each TCAM key names the table it belongs in: `v4` or `v6` by the addresses the rule matches, or `any` for a rule matching no address, which a switch installs in both. A rule whose source and destination are different families would match nothing and is refused, as is one whose `dst_cidr` is outside every protected prefix.
+
 Rules are ordered by `priority` on every stage, not just the ASIC, and the ordering is stable, so rules sharing a priority keep policy order and compile identically on every node. A node is only given entries for the backends it advertised at registration.
 
 Payload inspection belongs to the ZC stage alone; see
@@ -438,6 +453,8 @@ Payload inspection belongs to the ZC stage alone; see
 3. PF_RING ZC. Zero-copy userspace inspect for residual traffic. No XDP redirect, no eBPF drop path. The game filters and their HTTP rules run here, and the classifiers trained from the control API have the last word (see [The classifiers](#the-classifiers)).
 
 Hardware programming is represented as compiled programs the node agent pulls. A node without a switch ASIC, FPGA, or PF_RING license still enforces the same decision order in the software pipeline so the control plane can be tested. On an appliance, the agent writes the TCAM key, FPGA table, and `zc:<node>` cluster from that program.
+
+The fabric recompiles all the time, so a reload keeps what each source has spent: of an FPGA meter, of a ZC behavioral cap and of lockdown's trickle, for every rule the new program keeps. A recompile hands nobody a fresh allowance, and a game filter's sessions and an HTTP rule's rate windows carry over the same way.
 
 ### The classifiers
 
@@ -470,9 +487,10 @@ A `permit` rule on the asic or fpga stage ends evaluation before either has a
 say. One on the zc stage comes after the game filters, so it spares a flow the
 flow model but not the HTTP rules or the request model. A verified source skips
 the flow model; the request model judges verified sources too, as the HTTP
-rules do. A drop by either counts against the source like any other, so
-with `penalty_box` on, a source the models keep flagging is boxed. Scoring
-costs about 40 ns a flow and 60 ns a request.
+rules do. A drop by either is no strike against the source: a score proves
+nothing, and the penalty box would turn one wrong score into every packet from
+that source dropped for up to an hour. Scoring costs about 40 ns a flow and
+60 ns a request.
 
 The policy says where they run and whether they drop:
 
@@ -497,10 +515,12 @@ of what both models scored there. When 20 or more of those flows landed within
 models drop 0.1 lower for that prefix, and 0.2 lower if it happens again; each
 step lapses five minutes after the probing that set it was last seen. A
 decision reads `PF_RING ZC ml score 0.47, over the 0.40 this target is held to
-while it is being probed`, and other prefixes keep the published thresholds. A
-model whose clean traffic already scores close to its threshold will tighten on
-that traffic too, which `observe` shows before it costs anything;
-`"probing": "ignore"` keeps the thresholds where they are.
+while it is being probed`, and other prefixes keep the published thresholds.
+Each model goes no further under its threshold than its `max_cut`: as far as
+training showed it can go and still drop no more clean traffic than its limit,
+and no known-good sample. A model published before that was measured has a
+`max_cut` of 0 and never tightens. `"probing": "ignore"` keeps the thresholds
+where they are.
 
 Train with labelled samples, then nodes pull both models on their next poll.
 An HTTP sample is a TCP flow whose `payload` is the request, base64-encoded as
@@ -513,6 +533,16 @@ training metrics with `validation: 0`. `DELETE /v1/ml/model` retires both
 models; agents clear their copy on the next poll, which is the only way to pull
 a bad model without restarting the fleet.
 
+**A model that would drop clean traffic is not published.** Each model reports
+its `false_positive_rate`, the share of the clean samples it was measured on
+that it drops. Training refuses one over 1%, or one that drops any sample marked
+`"known_good": true`. Mark a false positive you have seen that way, or traffic
+the models must never touch. The answer is `422`, with the model that would
+have been published, and the one already published stays. Set
+`"max_false_positive_rate"` in the training request for another limit, or
+`"force": true` to publish it all the same, in which case it is never tightened
+past what the limit allows.
+
 `scrubline_ml_scored_total`, `_drops_total`, `_passes_total` and
 `_observed_total` count the flow model's verdicts on each node, and
 `scrubline_ml_http_scored_total`, `_http_drops_total` and
@@ -522,7 +552,8 @@ and `_tightened_total` count the probing, and
 prefix is held. `scrubline_ml_model_ready` and
 `scrubline_ml_http_model_ready` say which a node has installed. The control
 plane reports each published model's holdout metrics as
-`scrubline_control_ml_*` and `scrubline_control_ml_http_*`.
+`scrubline_control_ml_*` and `scrubline_control_ml_http_*`, its
+`_false_positive_rate` and `_max_cut` among them.
 
 ## Attacks that adapt
 
@@ -546,7 +577,8 @@ from then on. After an hour without one, the next is a first wave again. See
 changing at the first variant that gets through, so it scores just under the
 threshold, where ordinary traffic has no reason to gather. When that is where
 much of a customer's traffic lands, both models drop lower for that customer's
-prefix, a step at a time, until the probing stops. See
+prefix, a step at a time, until the probing stops, and each only as far as its
+training showed it can without dropping clean traffic. See
 [The classifiers](#the-classifiers).
 
 **A flood spread thin runs into a budget for everyone.** A botnet with enough
@@ -566,6 +598,38 @@ decides is who is served first.
 `scrubline_tunnel_mitigation_wave{tunnel}`, `scrubline_ml_tightened_total`,
 `scrubline_prefix_ml_threshold_cut{prefix}` and
 `scrubline_game_http_budget_dropped_total{filter}` show each defence at work.
+
+## Keeping false positives down
+
+A false positive is a customer's own traffic dropped, which can hurt them as
+much as the attack would have. So every judgement that can be wrong is held
+back from doing more harm than it must:
+
+- **A model that would drop clean traffic is not published.** Training refuses
+  a model that drops more than 1% of the clean samples it is measured on, or
+  any sample marked `"known_good": true`, and the published one stays. See
+  [The classifiers](#the-classifiers).
+- **The classifiers tighten only as far as training showed is safe.** A target
+  being probed holds each model at most its `max_cut` under its threshold: as
+  far as it stays within that 1% and clear of every known-good sample.
+- **A score never puts a source in the penalty box.** Only what a rule, a gate
+  or a source's own rate proved does, so a model's mistake costs the flow it
+  scored and not everything the source sends. A budget for everyone does not
+  box anyone either.
+- **The box releases real clients.** A trusted source cannot be boxed, and a
+  boxed one the origin keeps answering is released at once. An operator can
+  release any other. See [Clearing a false positive](#clearing-a-false-positive).
+- **New judgements can be watched before they act.** `"mode": "observe"` for
+  the classifiers, and `observe` on a game filter, count what they would drop
+  and drop nothing.
+- **Nothing is dropped for want of a look.** A game filter given no payload
+  passes the packet and counts it as uninspectable.
+- **Your own traffic can be taken out of the question.** A `permit` rule on the
+  asic stage takes a source past every stage behind it, and past the penalty
+  box, lockdown and an idle on-demand tunnel's HTTP rules too.
+
+When one gets through anyway, mark it `known_good` among the samples and
+retrain: no model that would drop it again can be published.
 
 ## Run
 
@@ -599,6 +663,25 @@ cargo run --release --bin scrub-node -- -name scrub-b -region fra -capacity 80 -
 cargo run --release --bin scrub-node -- -name scrub-c -region sin -capacity 40 -listen 127.0.0.1:9093
 sh scripts/demo.sh
 cargo run --release --bin scrubctl -- fabric
+```
+
+### Every feature on one node
+
+[`configs/policy.everything.json`](configs/policy.everything.json) turns on
+everything a policy can at once: TCAM, FPGA and ZC rules with a permit for
+monitoring, RakNet, A2S and custom game filters, HTTP rules with budgets, IPv4
+and IPv6 prefixes with communities, three tunnels (one on-demand, one IPv6
+whose replies leave by the customer's own transit), a customer BGP session,
+the penalty box, return-traffic confirmation with lockdown, and both
+classifiers enforcing and tightening under probing.
+[`tests/node.rs`](tests/node.rs) deploys it to one node through the API and
+checks that the features decide together, report together, render together
+and survive a policy change; the real binaries do the same, through the API
+restarting from its state:
+
+```sh
+cargo build --release --bins
+PATHFINDER_BIN_DIR=target/release python3 scripts/everything-e2e.py
 ```
 
 ### A demo fabric in containers
@@ -673,6 +756,7 @@ work":
 - `scrubline_reputation_trusted{node}` and `scrubline_reputation_penalised{node}` — how many sources are on the short path and how many are in the box.
 - `scrubline_reputation_boxed_total{node}` — packets dropped at the top of the pipeline, which is the load the rest of the stages did not have to carry.
 - `scrubline_reputation_shielded_total{node}` — strikes that landed on an already-verified source and were not acted on. Alert on this: it is a spoofing attempt against a real player, or a verified client misbehaving.
+- `scrubline_reputation_freed_total{node}` — boxed sources released because the origin kept answering them. Every one is a false positive the box made and undid; a steady rate means something is boxing real clients.
 - `scrubline_prefix_ml_threshold_cut{node,prefix}` and `scrubline_ml_tightened_total{node}` — a customer whose traffic is gathering just under the classifiers' thresholds, which is what tuning an attack against them looks like. A cut that never lapses on ordinary traffic means the model scores that traffic too close to its threshold.
 - `scrubline_tunnel_up{node,tunnel,remote}` — 1 when a return path is reported carrying traffic, 0 when reported down. A never-reported tunnel is **absent**, not zero: `scrubline_tunnel_reported` is how you tell "nothing is reporting" from "it is broken".
 - `scrubline_tunnel_mtu_bytes{node,tunnel}` and `scrubline_tunnel_mss_clamp_bytes{...}` — the derived encapsulation numbers, so a hung-TCP complaint can be checked against them rather than guessed at.
@@ -791,6 +875,15 @@ curl -X POST -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" node:9091/repu
 
 Releasing leaves the escalation level alone: the next offence should not start
 from scratch because this one was forgiven.
+
+**Return traffic releases one on its own.** A boxed client that the origin keeps
+answering, as a game server keeps sending to a connected player, is confirmed
+like any other client and released at once: an address the origin talks to at
+length belongs to a real client, and once trusted it could never have been
+boxed. So is one that answers a challenge. A completed handshake releases
+nobody, since a spoofer can complete one blind. `scrubline_reputation_freed_total`
+counts these releases, and each one is a penalty that was cutting off a real
+client.
 
 ## Return-traffic confirmation
 

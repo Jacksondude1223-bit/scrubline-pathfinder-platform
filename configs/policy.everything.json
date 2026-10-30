@@ -1,0 +1,202 @@
+{
+  "id": "everything",
+  "name": "everything on one node",
+  "protected": [
+    "203.0.113.0/24",
+    "198.51.100.0/24",
+    "2001:db8:100::/48"
+  ],
+  "pulse_floor_pps": 20000,
+  "steering": [
+    {
+      "prefix": "203.0.113.0/24",
+      "regions": ["lhr"],
+      "communities": ["64512:100"]
+    },
+    {
+      "prefix": "198.51.100.0/24",
+      "regions": ["lhr"],
+      "communities": ["64512:200", "no-export"]
+    },
+    {
+      "prefix": "2001:db8:100::/48",
+      "regions": ["lhr"]
+    }
+  ],
+  "rules": [
+    {
+      "id": "monitoring",
+      "stage": "asic",
+      "action": "permit",
+      "priority": 10,
+      "match": {"src_cidr": "192.0.2.250/32"},
+      "comment": "The customers' own monitoring, past every stage"
+    },
+    {
+      "id": "bogons",
+      "stage": "asic",
+      "action": "drop",
+      "priority": 20,
+      "match": {"src_cidr": "0.0.0.0/8"},
+      "comment": "Sources no packet can come from"
+    },
+    {
+      "id": "dns-reflection",
+      "stage": "asic",
+      "action": "drop",
+      "priority": 30,
+      "match": {"proto": "udp", "sport": 53},
+      "comment": "DNS answers nobody here asked for"
+    },
+    {
+      "id": "udp-meter",
+      "stage": "fpga",
+      "action": "rate_limit",
+      "priority": 100,
+      "pps": 200000,
+      "match": {"dst_cidr": "203.0.113.0/24", "proto": "udp"},
+      "comment": "A line-rate cap on UDP to the game servers"
+    },
+    {
+      "id": "syn-meter",
+      "stage": "fpga",
+      "action": "rate_limit",
+      "priority": 110,
+      "pps": 20000,
+      "match": {"proto": "tcp", "tcp_flags": "syn"},
+      "comment": "SYN floods"
+    },
+    {
+      "id": "count-all",
+      "stage": "zc",
+      "action": "count",
+      "priority": 200,
+      "match": {},
+      "comment": "Observe everything that reaches the zero-copy stage"
+    },
+    {
+      "id": "web-inspect",
+      "stage": "zc",
+      "action": "inspect",
+      "priority": 210,
+      "pps": 100000,
+      "match": {"dst_cidr": "198.51.100.0/24", "proto": "tcp"},
+      "comment": "The storefront's TCP, capped per source and handed to the flow model"
+    },
+    {
+      "id": "icmp-cap",
+      "stage": "zc",
+      "action": "rate_limit",
+      "priority": 220,
+      "pps": 1000,
+      "match": {"proto": "icmp"},
+      "comment": "Pings, per source"
+    }
+  ],
+  "games": [
+    {
+      "id": "bedrock",
+      "dst_cidr": "203.0.113.10/32",
+      "proto": "udp",
+      "dport": 19132,
+      "profile": "raknet",
+      "comment": "A source finishes the RakNet handshake before it can play"
+    },
+    {
+      "id": "queries",
+      "dst_cidr": "203.0.113.10/32",
+      "proto": "udp",
+      "dport": 27015,
+      "profile": "a2s",
+      "comment": "Server-browser queries answer A2S's own challenge"
+    },
+    {
+      "id": "fivem",
+      "dst_cidr": "203.0.113.20/32",
+      "proto": "udp",
+      "dport": 30120,
+      "custom": {"min_len": 4},
+      "http": {
+        "rate_per_source": 30,
+        "rate_total": 2000,
+        "default": "drop",
+        "paths": [
+          {"path": "/players.json", "rate_per_source": 1, "rate_total": 400},
+          {"path": "/info.json", "rate_per_source": 2},
+          {"path": "/dynamic.json", "rate_per_source": 2},
+          {"path": "/client", "methods": ["POST"], "user_agents": ["CitizenFX/"],
+           "max_body_bytes": 8192, "rate_per_source": 5},
+          {"prefix": "/files/", "methods": ["GET", "HEAD"], "rate_per_source": 50},
+          {"prefix": "/admin/", "action": "drop"}
+        ]
+      },
+      "comment": "FiveM: game traffic on UDP, its player list, resources and handlers over HTTP on the same port"
+    },
+    {
+      "id": "storefront",
+      "dst_cidr": "198.51.100.80/32",
+      "dport": 80,
+      "http": {
+        "rate_per_source": 20,
+        "rate_total": 5000,
+        "paths": [
+          {"prefix": "/api/", "methods": ["GET", "POST"], "rate_per_source": 10, "rate_total": 1000},
+          {"prefix": "/wp-admin/", "action": "drop"}
+        ]
+      },
+      "comment": "A website with HTTP rules alone"
+    },
+    {
+      "id": "bedrock-v6",
+      "dst_cidr": "2001:db8:100::10/128",
+      "proto": "udp",
+      "dport": 19132,
+      "profile": "raknet",
+      "comment": "The same game over IPv6"
+    }
+  ],
+  "tunnels": [
+    {
+      "id": "northwind",
+      "remote": "198.18.0.10",
+      "prefixes": ["203.0.113.0/24"],
+      "rate_mbps": 1000,
+      "comment": "Filtered all the time"
+    },
+    {
+      "id": "contoso",
+      "remote": "198.18.0.20",
+      "key": 20,
+      "prefixes": ["198.51.100.0/24"],
+      "rate_mbps": 500,
+      "mitigation": "on_demand",
+      "attack_pps": 150000,
+      "attack_mbps": 200,
+      "comment": "Watched until it is attacked, its HTTP rules apart"
+    },
+    {
+      "id": "fabrikam",
+      "remote": "198.18.0.30",
+      "prefixes": ["2001:db8:100::/48"],
+      "direction": "return",
+      "rate_mbps": 200,
+      "comment": "IPv6 over GRE; replies leave the customer directly"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "contoso-edge",
+      "peer_ip": "198.18.0.20",
+      "peer_as": 64600,
+      "prefixes": ["198.51.100.0/24"],
+      "max_prefixes": 4,
+      "password": "s3cret-shared",
+      "multihop": 2,
+      "regions": ["lhr"],
+      "comment": "Contoso announces its own prefix to the fabric"
+    }
+  ],
+  "reputation": {"fast_pass": "egress", "penalty_box": true},
+  "egress": {"lockdown": "limit", "lockdown_pps": 500, "grace_millis": 500},
+  "ml": {"scope": "all", "mode": "enforce", "probing": "tighten"}
+}
