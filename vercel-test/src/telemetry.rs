@@ -4,6 +4,7 @@ use crate::{
     api::Api,
     metrics::{write_label, Label, Written, UNSHARED},
     model::*,
+    wire::Report,
 };
 use serde_json::Value;
 use std::{
@@ -187,18 +188,19 @@ impl Metrics {
         }
     }
     pub fn tunnels(&mut self, node: &Node, tunnels: &[NodeTunnel], reports: &[TunnelStatus]) {
+        let reported: HashMap<&str, &TunnelStatus> =
+            reports.iter().map(|r| (r.tunnel_id.as_str(), r)).collect();
+        let shared = self.share(&identity(&node.id, &node.name, &node.region));
+        let mut labels = String::new();
         for t in tunnels {
-            let mut labels = identity(&node.id, &node.name, &node.region);
-            labels.push(label("tunnel", &t.id));
-            labels.push(label("remote", &t.remote));
-            let report = reports.iter().find(|r| r.tunnel_id == t.id);
+            labels.clear();
+            self.write(&mut labels, "tunnel", &t.id);
+            self.write(&mut labels, "remote", &t.remote);
+            let report = reported.get(t.id.as_str());
             let state = report.map(|r| r.state.as_str()).unwrap_or("unknown");
             if state == "up" || state == "down" {
-                self.add(
-                    "scrubline_tunnel_up",
-                    labels.clone(),
-                    f64::from(state == "up"),
-                );
+                let up = f64::from(state == "up");
+                self.add_written("scrubline_tunnel_up", shared, &labels, up);
             }
             for (name, v) in [
                 // Reporting "unknown" is still a provisioner speaking, which is what this tells
@@ -209,14 +211,12 @@ impl Metrics {
                 ("scrubline_tunnel_mss_clamp_bytes", t.mss_clamp as f64),
                 ("scrubline_tunnel_prefixes", t.prefixes.len() as f64),
             ] {
-                self.add(name, labels.clone(), v);
+                self.add_written(name, shared, &labels, v);
             }
             if t.rate_kbps > 0 {
-                self.add(
-                    "scrubline_tunnel_rate_limit_bits_per_second",
-                    labels.clone(),
-                    t.rate_kbps as f64 * 1000.0,
-                );
+                let bits = t.rate_kbps as f64 * 1000.0;
+                let name = "scrubline_tunnel_rate_limit_bits_per_second";
+                self.add_written(name, shared, &labels, bits);
             }
         }
     }
@@ -232,109 +232,200 @@ impl Default for Metrics {
         Self::new()
     }
 }
-pub fn control(api: &Api) -> crate::Result<String> {
-    let mut m = Metrics::new();
-    let now = chrono::Utc::now();
-    let nodes = api.store.nodes(now);
-    let ready = nodes.iter().filter(|n| n.status == "ready").count();
-    m.add(
-        "scrubline_nodes",
-        vec![label("status", "ready")],
-        ready as f64,
-    );
-    m.add(
-        "scrubline_nodes",
-        vec![label("status", "stale")],
-        (nodes.len() - ready) as f64,
-    );
-    let model = &api.store.data.model;
-    let unfitted = crate::ml::Model::default();
-    let http = model.http.as_deref().unwrap_or(&unfitted);
-    let (recompiles, requests, levels) = api.metric_state();
-    for (name, v) in [
-        ("scrubline_policies", api.store.data.policies.len() as f64),
-        ("scrubline_announcements", api.store.plan.len() as f64),
-        ("scrubline_programs", api.store.programs.len() as f64),
-        ("scrubline_fabric_recompiles_total", recompiles as f64),
-        (
-            "scrubline_control_resident_bytes",
-            crate::runtime::resident_bytes() as f64,
-        ),
-        ("scrubline_control_ml_model_ready", f64::from(model.ready)),
-        ("scrubline_control_ml_samples", model.samples as f64),
-        (
-            "scrubline_control_ml_validation_samples",
-            model.validation as f64,
-        ),
-        ("scrubline_control_ml_accuracy", model.accuracy),
-        ("scrubline_control_ml_precision", model.precision),
-        ("scrubline_control_ml_recall", model.recall),
-        (
-            "scrubline_control_ml_false_positive_rate",
-            model.false_positive_rate,
-        ),
-        ("scrubline_control_ml_max_cut", model.max_cut),
-        (
-            "scrubline_control_ml_http_model_ready",
-            f64::from(http.ready),
-        ),
-        ("scrubline_control_ml_http_samples", http.samples as f64),
-        (
-            "scrubline_control_ml_http_validation_samples",
-            http.validation as f64,
-        ),
-        ("scrubline_control_ml_http_accuracy", http.accuracy),
-        ("scrubline_control_ml_http_precision", http.precision),
-        ("scrubline_control_ml_http_recall", http.recall),
-        (
-            "scrubline_control_ml_http_false_positive_rate",
-            http.false_positive_rate,
-        ),
-        ("scrubline_control_ml_http_max_cut", http.max_cut),
-    ] {
-        m.add(name, vec![], v);
-    }
-    for n in &nodes {
-        let id = identity(&n.id, &n.name, &n.region);
-        if let Some(prog) = api.store.programs.get(&n.id) {
-            m.add(
-                "scrubline_node_prefixes",
-                id.clone(),
-                prog.prefixes.len() as f64,
-            );
-            m.tunnels(
-                n,
-                &prog.tunnels,
-                api.store
-                    .tunnels
-                    .get(&n.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            );
-        }
-        if let Some(level) = levels.get(&n.id) {
-            m.add(
-                "scrubline_steering_escalation",
-                id.clone(),
-                level.prepends as f64,
-            );
-            m.add("scrubline_steering_load_ratio", id.clone(), level.ratio);
-            m.add("scrubline_node_capacity_pps", id, n.capacity_pps as f64);
-        }
-    }
-    for ((route, status), count) in requests {
+/// A scrape of the control plane: what it renders, copied out from under the control plane's
+/// lock, which is let go before the series are built and written out.
+pub struct Scrape {
+    metrics: Metrics,
+    reports: Vec<Report>,
+    detail: Option<Detail>,
+    now: i64,
+}
+/// One node's every series, as it renders them itself: its counters, its announcements and its
+/// tunnels.
+struct Detail {
+    node: Node,
+    announcements: Vec<Announcement>,
+    tunnels: Vec<NodeTunnel>,
+    statuses: Vec<TunnelStatus>,
+}
+impl Scrape {
+    /// The fabric's view: the control plane's own series and each node's counters for the node
+    /// as a whole. Its counters for each prefix, rule, filter and tunnel are left to the node's
+    /// own view (Scrape::node): a fabric's worth of them is millions of series, more than one
+    /// scrape can carry or the control plane can render without holding up its nodes.
+    pub fn fleet(api: &Api) -> Self {
+        let mut m = Metrics::new();
+        let now = chrono::Utc::now();
+        let nodes = api.store.nodes(now);
+        let ready = nodes.iter().filter(|n| n.status == "ready").count();
         m.add(
-            "scrubline_api_requests_total",
-            vec![label("route", route), label("status", &status.to_string())],
-            *count as f64,
+            "scrubline_nodes",
+            vec![label("status", "ready")],
+            ready as f64,
         );
-    }
-    m.announcements(&api.store.plan);
-    for report in api.store.reports.values() {
-        m.report(
-            &serde_json::to_value(report).unwrap_or_default(),
-            now.timestamp_millis(),
+        m.add(
+            "scrubline_nodes",
+            vec![label("status", "stale")],
+            (nodes.len() - ready) as f64,
         );
+        let model = &api.store.data.model;
+        let unfitted = crate::ml::Model::default();
+        let http = model.http.as_deref().unwrap_or(&unfitted);
+        let (recompiles, requests, levels) = api.metric_state();
+        for (name, v) in [
+            ("scrubline_policies", api.store.data.policies.len() as f64),
+            ("scrubline_announcements", api.store.plan.len() as f64),
+            ("scrubline_programs", api.store.programs.len() as f64),
+            ("scrubline_fabric_recompiles_total", recompiles as f64),
+            (
+                "scrubline_control_resident_bytes",
+                crate::runtime::resident_bytes() as f64,
+            ),
+            ("scrubline_control_ml_model_ready", f64::from(model.ready)),
+            ("scrubline_control_ml_samples", model.samples as f64),
+            (
+                "scrubline_control_ml_validation_samples",
+                model.validation as f64,
+            ),
+            ("scrubline_control_ml_accuracy", model.accuracy),
+            ("scrubline_control_ml_precision", model.precision),
+            ("scrubline_control_ml_recall", model.recall),
+            (
+                "scrubline_control_ml_false_positive_rate",
+                model.false_positive_rate,
+            ),
+            ("scrubline_control_ml_max_cut", model.max_cut),
+            (
+                "scrubline_control_ml_http_model_ready",
+                f64::from(http.ready),
+            ),
+            ("scrubline_control_ml_http_samples", http.samples as f64),
+            (
+                "scrubline_control_ml_http_validation_samples",
+                http.validation as f64,
+            ),
+            ("scrubline_control_ml_http_accuracy", http.accuracy),
+            ("scrubline_control_ml_http_precision", http.precision),
+            ("scrubline_control_ml_http_recall", http.recall),
+            (
+                "scrubline_control_ml_http_false_positive_rate",
+                http.false_positive_rate,
+            ),
+            ("scrubline_control_ml_http_max_cut", http.max_cut),
+        ] {
+            m.add(name, vec![], v);
+        }
+        for n in &nodes {
+            let id = identity(&n.id, &n.name, &n.region);
+            if let Some(prog) = api.store.programs.get(&n.id) {
+                m.add(
+                    "scrubline_node_prefixes",
+                    id.clone(),
+                    prog.prefixes.len() as f64,
+                );
+            }
+            let statuses = api
+                .store
+                .tunnels()
+                .get(&n.id)
+                .map_or(&[][..], Vec::as_slice);
+            for state in ["up", "down", "unknown"] {
+                let mut labels = id.clone();
+                labels.push(label("state", state));
+                let count = statuses.iter().filter(|s| s.state == state).count();
+                m.add("scrubline_node_tunnels", labels, count as f64);
+            }
+            if let Some(level) = levels.get(&n.id) {
+                m.add(
+                    "scrubline_steering_escalation",
+                    id.clone(),
+                    level.prepends as f64,
+                );
+                m.add("scrubline_steering_load_ratio", id.clone(), level.ratio);
+                m.add("scrubline_node_capacity_pps", id, n.capacity_pps as f64);
+            }
+        }
+        for ((route, status), count) in requests {
+            m.add(
+                "scrubline_api_requests_total",
+                vec![label("route", route), label("status", &status.to_string())],
+                *count as f64,
+            );
+        }
+        // How many nodes announce each protected prefix: none means nothing is drawing its traffic
+        // to the fabric.
+        let mut announcers: BTreeMap<&str, usize> = api
+            .store
+            .data
+            .policies
+            .iter()
+            .filter(|p| p.id == api.store.data.last_policy_id)
+            .flat_map(|p| p.protected.iter().map(|v| (v.as_str(), 0)))
+            .collect();
+        for a in api.store.plan.iter().filter(|a| a.state == "announce") {
+            *announcers.entry(a.prefix.as_str()).or_default() += 1;
+        }
+        for (prefix, count) in announcers {
+            let labels = vec![label("prefix", prefix)];
+            m.add("scrubline_prefix_announcers", labels, count as f64);
+        }
+        let reports = api
+            .store
+            .reports
+            .values()
+            .map(|r| Report {
+                node_id: r.node_id.clone(),
+                name: r.name.clone(),
+                region: r.region.clone(),
+                stats: r.stats.summary(),
+                reported_at: r.reported_at,
+            })
+            .collect();
+        Self {
+            metrics: m,
+            reports,
+            detail: None,
+            now: now.timestamp_millis(),
+        }
     }
-    m.render()
+    /// One node's every series, as the control plane last heard of them: what the node renders
+    /// itself. None for a node the control plane does not know.
+    pub fn node(api: &Api, id: &str) -> Option<Self> {
+        let now = chrono::Utc::now();
+        let node = api.store.nodes(now).into_iter().find(|n| n.id == id)?;
+        let tunnels = api
+            .store
+            .programs
+            .get(id)
+            .map(|p| p.tunnels.clone())
+            .unwrap_or_default();
+        Some(Self {
+            metrics: Metrics::new(),
+            reports: api.store.reports.get(id).cloned().into_iter().collect(),
+            detail: Some(Detail {
+                announcements: api
+                    .store
+                    .plan
+                    .iter()
+                    .filter(|a| a.node_id == id)
+                    .cloned()
+                    .collect(),
+                tunnels,
+                statuses: api.store.tunnels().get(id).cloned().unwrap_or_default(),
+                node,
+            }),
+            now: now.timestamp_millis(),
+        })
+    }
+    pub fn render(self) -> crate::Result<String> {
+        let mut m = self.metrics;
+        for report in &self.reports {
+            m.report(&serde_json::to_value(report).unwrap_or_default(), self.now);
+        }
+        if let Some(d) = self.detail {
+            m.announcements(&d.announcements);
+            m.tunnels(&d.node, &d.tunnels, &d.statuses);
+        }
+        m.render()
+    }
 }

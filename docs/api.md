@@ -541,8 +541,10 @@ PREFIX           OFFERED   SCRUBBED  MITIGATED  PEAK PPS  NOW PPS  NODES  ATTACK
 over the last 1h0m0s
 ```
 
-Per-node detail stays on `/metrics`, where the new `scrubline_prefix_*` series
-break each node's traffic down by the prefix it was aimed at:
+Per-node detail stays on each node's view of the metrics, `/metrics?node=<id>`
+on the control plane or the agent's own `/metrics`, where the
+`scrubline_prefix_*` series break each node's traffic down by the prefix it was
+aimed at:
 
 ```
 scrubline_prefix_offered_pps{node="…",name="edge-lhr",region="us-east",prefix="203.0.113.0/24"} 940000

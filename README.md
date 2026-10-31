@@ -866,8 +866,10 @@ Every server Scrubline runs on needs 16 GB of memory: the control plane's,
 each scrubbing node's, or one running both. Everything either keeps has a
 ceiling, and at the most it is built to hold both fit with room to spare.
 [`tests/memory.rs`](tests/memory.rs) builds each part at those bounds and
-holds it to its share; CI runs it on every change
-(`cargo test --release --test memory -- --nocapture` prints the breakdown).
+holds it to its share, and [`tests/load.rs`](tests/load.rs) runs the largest
+fabric against one control plane; CI runs both on every change
+(`cargo test --release --test memory --test load -- --nocapture` prints how
+they went).
 
 What it is built to hold:
 
@@ -886,15 +888,38 @@ At those bounds, as the allocator counts it:
 | Part | Holds at the most | Of which |
 | --- | --- | --- |
 | Node agent | 270 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, game session and HTTP tables): 72 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
-| Control plane, 128 nodes | 3.6 GiB | programs and the plan 205 MiB, node reports 52 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; a metrics scrape building 661 MiB while the last one is still being sent, 389 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
+| Control plane, 128 nodes | 3.0 GiB | programs and the plan 205 MiB, node and tunnel reports 64 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; writing the state out 332 MiB; metrics scrapes, four at a time, 26 MiB; the largest answer still being sent, the whole fabric, 109 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
 
 Each part grows with what the policy holds multiplied by the nodes: every node
 is compiled the whole policy and reports counters for every prefix, rule,
 tunnel and filter in it, and the control plane keeps both for each of them.
-The limits are set by time as much as by memory. The control plane handles
-every heartbeat, recompile and scrape under one lock, so the largest policy
-is the most a heartbeat can carry for 128 nodes, every two seconds, to take
-under half of it.
+
+### Talking to the control plane
+
+The limits are set by time as much as by memory: every node heartbeats every
+couple of seconds, and the control plane takes each one under the lock that
+also guards its recompiles. So it does as little as it can there:
+
+- A heartbeat's body is read before the lock is taken, once its credential
+  checks out, and analytics reads the counters as they arrive rather than
+  through a copy several times their size.
+- Whether anything a recompile depends on has changed is told from a digest of
+  each node's tunnel reports, not from every report written out again.
+- A recompile that takes long is paced: changes arriving within a few of its
+  own lengths of the last are folded into the next, so a fabric checking in at
+  once after a restart costs a few recompiles, not one for each node.
+- Programs are shared with the requests that answer with them, and written out
+  after the lock is let go; so are the reads that carry the whole state,
+  fabric, training set or every policy, and every metrics scrape.
+
+[`tests/load.rs`](tests/load.rs) holds it to that at the bounds: 128 agents
+heartbeating every two seconds with everything they can report, every tunnel's
+state among it, each holding a request open for its program, an operator
+deploying a new version of the policy every ten seconds, and a scraper. No
+heartbeat fails and no node goes stale; half are answered within about 10 ms
+and the slowest, waiting on a recompile, in about a second, well within the
+five seconds an agent waits; every node has each new program within a second;
+a scrape takes about 30 ms.
 
 [`scripts/install.sh`](docs/install.md) gives each service a share to match:
 the control plane is reclaimed from past 8G and restarted at 10G, the agent
@@ -912,13 +937,20 @@ liveness probes.
 
 A node counts what its datapath did and attaches those counters to the
 heartbeat it already sends every couple of seconds, so the control plane has a
-fleet view without a second round trip. Both ends render the same metric names,
-one series per node, so a dashboard written against a node works against the
-control plane.
+fleet view without a second round trip. Both ends render the same metric names.
+The control plane's `/metrics` carries each node as a whole: its totals, stages,
+crafted-packet checks, reputation and return-traffic tables, and how many of its
+tunnels are up. A node's series for each prefix, rule, filter and tunnel are on
+that node's own view, `/metrics?node=<id>` on the control plane or the agent's
+`/metrics`: a large fabric has millions of them, more than one scrape can carry.
+A scraper that cannot reach the agents, which listen on loopback once installed,
+takes one target for each node from the control plane.
 
 The counters that answer "is mitigation working, and which rule is doing the
 work":
 
+- `scrubline_prefix_announcers{prefix}` — on the control plane, how many nodes announce each protected prefix. Zero means nothing is drawing that customer's traffic to the fabric.
+- `scrubline_node_tunnels{node,state}` — on the control plane, how many of a node's tunnels its provisioner last reported up, down or unknown. Each tunnel's own series are on the node's view.
 - `scrubline_rule_matches_total{node,stage,rule}` and `scrubline_rule_drops_total{...}` — per rule. A rule with matches and no drops is seeing traffic it is not acting on; a rule with neither is dead weight in the policy.
 - `scrubline_stage_dropped_total{node,stage}` and `scrubline_stage_permitted_total{...}` — where in the pipeline traffic is being decided. Work moving from `asic` toward `zc` means the cheap stages are missing it.
 - `scrubline_*_pps_total` — the same counts weighted by the per-flow rate reported on each decision. A volume indicator, not a packet counter.
@@ -957,6 +989,7 @@ the published model's holdout metrics, and
 
 ```sh
 curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      http://127.0.0.1:8080/metrics
+curl -H "Authorization: Bearer $SCRUBLINE_API_TOKEN"      "http://127.0.0.1:8080/metrics?node=$NODE_ID"
 curl -H "Authorization: Bearer $SCRUBLINE_NODE_API_TOKEN" http://127.0.0.1:9091/metrics
 ```
 

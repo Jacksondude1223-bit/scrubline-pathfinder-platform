@@ -126,6 +126,80 @@ pub struct Stats {
     )]
     pub mitigation: Vec<MitigationStats>,
 }
+impl Stats {
+    /// The node as a whole: everything but its rows for each prefix, rule, filter and on-demand
+    /// tunnel, and which prefixes' return paths it sees. Every field is named, so one added to
+    /// Stats is not left out of the summary without a decision.
+    pub fn summary(&self) -> Self {
+        let Self {
+            decisions,
+            unowned,
+            stages,
+            rules: _,
+            games: _,
+            prefixes: _,
+            ml,
+            pulsing,
+            pulse_peak_pps,
+            game_sessions,
+            game_sessions_max,
+            game_http_windows,
+            game_http_windows_max,
+            reputation,
+            egress,
+            rate_buckets,
+            rate_buckets_max,
+            offered_pps,
+            dropped_pps,
+            surge_pps,
+            load_window_seconds,
+            crafted,
+            resident_bytes,
+            mitigation: _,
+        } = self;
+        let EgressStats {
+            tracker,
+            seen,
+            promoted,
+            locked_down,
+            lockdown,
+            prefix_states: _,
+        } = egress;
+        Self {
+            decisions: *decisions,
+            unowned: *unowned,
+            stages: stages.clone(),
+            rules: Vec::new(),
+            games: Vec::new(),
+            prefixes: Vec::new(),
+            ml: ml.clone(),
+            pulsing: *pulsing,
+            pulse_peak_pps: *pulse_peak_pps,
+            game_sessions: *game_sessions,
+            game_sessions_max: *game_sessions_max,
+            game_http_windows: *game_http_windows,
+            game_http_windows_max: *game_http_windows_max,
+            reputation: reputation.clone(),
+            egress: EgressStats {
+                tracker: tracker.clone(),
+                seen: *seen,
+                promoted: *promoted,
+                locked_down: *locked_down,
+                lockdown: lockdown.clone(),
+                prefix_states: Vec::new(),
+            },
+            rate_buckets: *rate_buckets,
+            rate_buckets_max: *rate_buckets_max,
+            offered_pps: *offered_pps,
+            dropped_pps: *dropped_pps,
+            surge_pps: *surge_pps,
+            load_window_seconds: *load_window_seconds,
+            crafted: crafted.clone(),
+            resident_bytes: *resident_bytes,
+            mitigation: Vec::new(),
+        }
+    }
+}
 /// What the crafted-packet checks did: in which mode, in all and per check, and how full the
 /// table of fragments in reassembly is.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -8,6 +8,8 @@
 //! Every byte the allocator is asked for counts while it is held, and a reallocation as both what
 //! it moves from and to. It takes optimisations to run in reasonable time:
 //! `cargo test --release --test memory -- --nocapture` prints what each part holds.
+mod common;
+use common::{flow, largest_policy, source, touch, T0, V6};
 use pathfinder::{
     analytics::Collector, api, compiler, ml, model::*, node, packet, pipeline::Pipeline, store,
     telemetry::Metrics, validation, wire,
@@ -58,15 +60,12 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static HEAP: Counting = Counting;
 
-const T0: i64 = 1767225600000;
 const MIB: usize = 1 << 20;
 const GIB: usize = 1 << 30;
 /// How many nodes the control plane is measured with: the largest fabric is this many times over.
 const MEASURED: usize = 16;
 /// The most one open connection holds: hyper's read and write buffers, and a TLS session.
 const CONNECTION: usize = 128 << 10;
-/// The prefix the game servers and the capped service sit in.
-const V6: &str = "2001:db8:100::/48";
 
 /// What building `T` leaves held.
 fn held<T>(build: impl FnOnce() -> T) -> (T, usize) {
@@ -80,126 +79,6 @@ fn peak<T>(run: impl FnOnce() -> T) -> (T, usize) {
     PEAK.store(before, Relaxed);
     let v = run();
     (v, PEAK.load(Relaxed) - before)
-}
-/// A source address written as long as one is: every table keyed by one holds its longest key.
-fn source(i: usize) -> String {
-    format!(
-        "2001:db8:aaaa:bbbb:cccc:dddd:{:04x}:{:04x}",
-        i >> 16,
-        i & 0xffff
-    )
-}
-fn flow(src: &str, proto: &str, dport: i64, payload: &[u8]) -> Flow {
-    Flow {
-        src_ip: src.into(),
-        dst_ip: "2001:db8:100::10".into(),
-        proto: proto.into(),
-        sport: 50000,
-        dport,
-        pps: 1,
-        payload: payload.to_vec(),
-        has_payload: !payload.is_empty(),
-        ..Default::default()
-    }
-}
-/// A policy holding as much of everything as validation lets one.
-fn largest_policy() -> Policy {
-    let mut protected: Vec<String> = (0..validation::PREFIXES_MAX - 1)
-        .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
-        .collect();
-    protected.push(V6.into());
-    let mut rules: Vec<Rule> = (0..validation::RULES_MAX)
-        .map(|i| Rule {
-            id: format!("rule-{i}"),
-            stage: ["asic", "fpga", "zc"][i % 3].into(),
-            action: if i % 3 == 0 { "drop" } else { "rate_limit" }.into(),
-            pps: if i % 3 == 0 { 0 } else { 1000 },
-            priority: i as i64,
-            r#match: Match {
-                dst_cidr: protected[i].clone(),
-                proto: "udp".into(),
-                dport: (i % 60000) as i64 + 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .collect();
-    rules[validation::RULES_MAX - 1] = Rule {
-        id: "cap".into(),
-        stage: "zc".into(),
-        action: "rate_limit".into(),
-        pps: 1_000_000,
-        r#match: Match {
-            dst_cidr: V6.into(),
-            proto: "tcp".into(),
-            dport: 443,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut games: Vec<GameFilter> = (0..validation::GAMES_MAX)
-        .map(|i| GameFilter {
-            id: format!("game-{i}"),
-            dst_cidr: protected[i].clone(),
-            proto: "udp".into(),
-            dport: 19132,
-            profile: "raknet".into(),
-            ..Default::default()
-        })
-        .collect();
-    games[0].dst_cidr = V6.into();
-    games[1] = GameFilter {
-        id: "site".into(),
-        dst_cidr: V6.into(),
-        proto: "tcp".into(),
-        dport: 80,
-        http: Some(GameHttp {
-            rate_per_source: 1000,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    Policy {
-        id: "largest".into(),
-        name: "largest".into(),
-        rules,
-        games,
-        tunnels: (0..validation::TUNNELS_MAX)
-            .map(|i| Tunnel {
-                id: format!("tunnel-{i}"),
-                prefixes: vec![protected[i].clone()],
-                r#type: "gre".into(),
-                remote: format!("198.18.{}.{}", i / 256, i % 256),
-                rate_mbps: 1000,
-                mitigation: "on_demand".into(),
-                ..Default::default()
-            })
-            .collect(),
-        sessions: (0..validation::SESSIONS_MAX)
-            .map(|i| Session {
-                id: format!("session-{i}"),
-                peer_ip: format!("198.19.{}.{}", i / 256, i % 256),
-                peer_as: 64512 + i as i64,
-                prefixes: vec![protected[i].clone()],
-                ..Default::default()
-            })
-            .collect(),
-        protected,
-        reputation: Some(ReputationPolicy {
-            fast_pass: "egress".into(),
-            penalty_box: true,
-        }),
-        challenge_secret: "secret".into(),
-        ..Default::default()
-    }
-}
-/// Sends a flow to every prefix, so each has its counters.
-fn touch(pipe: &mut Pipeline, policy: &Policy) {
-    for p in policy.protected.iter().filter(|p| p.ends_with(".0/24")) {
-        let mut f = flow("192.0.2.1", "udp", 9, &[]);
-        f.dst_ip = p.replace(".0/24", ".1");
-        pipe.decide(&f, T0);
-    }
 }
 /// Fills every table a node's pipeline keeps by source past its bound, through every kind of
 /// traffic: a game server, a capped service, a site behind an HTTP filter, the penalty box and
@@ -437,15 +316,36 @@ fn the_fabric_at_its_bounds_fits_a_16_gb_server() {
             stats: wire::Stats,
         }
         let typed: Heartbeat = serde_json::from_slice(&heartbeat).unwrap();
-        let stats = serde_json::to_value(&typed.stats).unwrap();
-        collector.observe("node-0", &stats, &program, T0 + 2000);
+        collector.observe_stats("node-0", &typed.stats, &program, T0 + 2000);
     });
-    let (text, scrape) = peak(|| {
+    // What every node's provisioner last said about its tunnels.
+    let statuses: Vec<TunnelStatus> = program
+        .tunnels
+        .iter()
+        .map(|t| TunnelStatus {
+            tunnel_id: t.id.clone(),
+            state: "up".into(),
+            ..Default::default()
+        })
+        .collect();
+    let (_statuses, kept_statuses) = held(|| vec![statuses.clone(); MEASURED]);
+    // The fabric's view of every node as a whole, and one node's every series.
+    let (fleet_text, fleet_scrape) = peak(|| {
         let mut m = Metrics::new();
         for r in &reports {
-            m.report(&serde_json::to_value(r).unwrap(), T0);
+            let summary = wire::Report {
+                stats: r.stats.summary(),
+                ..r.clone()
+            };
+            m.report(&serde_json::to_value(&summary).unwrap(), T0);
         }
-        m.announcements(&plan);
+        m.render().unwrap()
+    });
+    let (node_text, node_scrape) = peak(|| {
+        let mut m = Metrics::new();
+        m.report(&serde_json::to_value(&reports[0]).unwrap(), T0);
+        m.announcements(&program.announcements);
+        m.tunnels(&fleet[0], &program.tunnels, &statuses);
         m.render().unwrap()
     });
     let (fabric, fabric_read) =
@@ -498,6 +398,7 @@ fn the_fabric_at_its_bounds_fits_a_16_gb_server() {
     let kept = [
         ("programs and the plan", compiled * scale),
         ("node reports", kept_reports * scale),
+        ("tunnel reports", kept_statuses * scale),
         ("analytics counters", counters * scale),
         ("analytics history", days),
         ("policies", one_policy * store::POLICIES_MAX),
@@ -506,7 +407,6 @@ fn the_fabric_at_its_bounds_fits_a_16_gb_server() {
     ];
     // Each of these runs under the control plane's lock, so one at a time.
     let one_at_a_time = [
-        ("a metrics scrape", scrape * scale),
         ("GET /v1/fabric", fabric_read * scale),
         ("a recompile", compiled * scale),
         ("writing the state, or GET /v1/state", write),
@@ -516,8 +416,14 @@ fn the_fabric_at_its_bounds_fits_a_16_gb_server() {
     let (worst, worst_bytes) = one_at_a_time.iter().max_by_key(|(_, b)| *b).unwrap();
     let beside = [
         (
+            "metrics scrapes, rendered a few at a time",
+            api::SCRAPES * (fleet_scrape * scale).max(node_scrape),
+        ),
+        (
             "the last answer still being sent",
-            text.len().max(fabric.len()) * scale,
+            (fleet_text.len() * scale)
+                .max(node_text.len())
+                .max(fabric.len() * scale),
         ),
         ("request bodies", api::BODY_BUDGET),
         ("connections", api::CONNECTIONS * CONNECTION),

@@ -707,17 +707,43 @@ fn the_node_renders_and_reports_everything_it_is_given() {
             "{name}: {overview}"
         );
     }
+    // The fabric's view carries each node as a whole; a node's own view, every series it renders.
     let (status, fleet) = call(&f.base, "GET", "/metrics", OP, Value::Null);
     let fleet = fleet.as_str().unwrap_or_default().to_string();
     assert_eq!(status, 200, "{fleet}");
     for series in [
-        "scrubline_game_http_requests_total{",
-        "scrubline_tunnel_mitigating{",
-        "scrubline_tunnel_up{",
+        "scrubline_decisions_total{",
+        "scrubline_stage_dropped_total{",
+        "scrubline_crafted_mode{",
+        "scrubline_node_tunnels{",
+        "scrubline_prefix_announcers{",
         "scrubline_control_ml_false_positive_rate",
     ] {
         assert!(fleet.contains(series), "{series} missing from:\n{fleet}");
     }
+    for series in [
+        "scrubline_prefix_offered_pps{",
+        "scrubline_game_http_requests_total{",
+        "scrubline_tunnel_up{",
+    ] {
+        assert!(!fleet.contains(series), "{series} in the fabric's view");
+    }
+    let path = format!("/metrics?node={}", f.node.id);
+    let (status, own) = call(&f.base, "GET", &path, OP, Value::Null);
+    let own = own.as_str().unwrap_or_default().to_string();
+    assert_eq!(status, 200, "{own}");
+    for series in [
+        "scrubline_prefix_offered_pps{",
+        "scrubline_game_http_requests_total{",
+        "scrubline_tunnel_mitigating{",
+        "scrubline_tunnel_up{",
+        "scrubline_bgp_announced{",
+    ] {
+        assert!(own.contains(series), "{series} missing from:\n{own}");
+    }
+    assert!(!own.contains("scrubline_control_"), "{own}");
+    let (status, _) = call(&f.base, "GET", "/metrics?node=node-none", OP, Value::Null);
+    assert_eq!(status, 404);
     let held = fleet
         .lines()
         .find_map(|l| l.strip_prefix("scrubline_control_resident_bytes "))

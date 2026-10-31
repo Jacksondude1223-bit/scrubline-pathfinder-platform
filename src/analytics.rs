@@ -264,7 +264,18 @@ impl Collector {
     pub fn prefixes(&self) -> Vec<String> {
         self.series.keys().cloned().collect()
     }
+    /// A report given as JSON, read as a heartbeat's would be.
     pub fn observe(&mut self, node: &str, stats: &Value, program: &Program, now: i64) {
+        let stats: crate::wire::Stats = serde_json::from_value(stats.clone()).unwrap_or_default();
+        self.observe_stats(node, &stats, program, now);
+    }
+    pub fn observe_stats(
+        &mut self,
+        node: &str,
+        stats: &crate::wire::Stats,
+        program: &Program,
+        now: i64,
+    ) {
         let key = Attribution::fingerprint(program);
         let attr = match self.attributions.get(&key) {
             Some(a) => a.clone(),
@@ -304,8 +315,8 @@ impl Collector {
         }
         let mut touched = HashSet::new();
         let mut crafted = Vec::new();
-        for row in rows(stats, "prefixes") {
-            let p = row["prefix"].as_str().unwrap_or("");
+        for row in &stats.prefixes {
+            let p = row.prefix.as_str();
             // Only what the node is programmed to protect: a row for a prefix just removed would
             // bring its series back, and arbitrary strings would fill the series cap.
             if p.is_empty()
@@ -316,13 +327,7 @@ impl Collector {
             }
             let s = self.series.entry(p.into()).or_default();
             touched.insert(p.to_string());
-            let cur = [
-                n(row, "flows"),
-                n(row, "flows_dropped"),
-                n(row, "offered"),
-                n(row, "dropped"),
-                0,
-            ];
+            let cur = [row.flows, row.flows_dropped, row.offered, row.dropped, 0];
             // A node's first report is only a baseline. Its counters run from agent start, so
             // counting them from zero after a control-plane restart, a failover or a node's return
             // would book its lifetime traffic into this minute.
@@ -331,12 +336,12 @@ impl Collector {
             // class only once it has dropped one, so one that first appears after the baseline
             // counts from zero. The prefix is the packets' destination: the drops are never
             // shared.
-            for c in rows(row, "crafted") {
-                let class = c["class"].as_str().unwrap_or("");
+            for c in &row.crafted {
+                let class = c.class.as_str();
                 if !["stack", "protocol", "buffer"].contains(&class) {
                     continue;
                 }
-                let counts = [0, n(c, "flows"), 0, n(c, "dropped"), 0];
+                let counts = [0, c.flows, 0, c.dropped, 0];
                 let key = (node.into(), format!("|crafted|{class}|{p}"), false);
                 let prev = self.rule_counters.insert(key, counts);
                 if let Some(prev) = prev.or(seen.map(|_| [0; 5])) {
@@ -355,63 +360,52 @@ impl Collector {
             s.gauges.insert(
                 node.into(),
                 Gauge {
-                    rates: [
-                        n(row, "offered_pps"),
-                        n(row, "dropped_pps"),
-                        n(row, "peak_pps"),
-                    ],
-                    pulse: row["pulsing"] == true,
+                    rates: [row.offered_pps, row.dropped_pps, row.peak_pps],
+                    pulse: row.pulsing,
                     at: now,
                 },
             );
         }
         let mut moved = Vec::new();
-        for (key, filter) in [("rules", false), ("games", true)] {
-            for r in rows(stats, key) {
-                let id = r[if filter { "filter_id" } else { "rule_id" }]
-                    .as_str()
-                    .unwrap_or("");
-                let Some(scope) = attr.scopes.get(&(id.into(), filter)) else {
-                    continue;
-                };
-                if scope.prefixes.is_empty() {
-                    continue;
-                }
-                let cur = if filter {
-                    [
-                        0,
-                        n(r, "dropped"),
-                        0,
-                        n(r, "pps_dropped"),
-                        n(r, "challenged"),
-                    ]
-                } else {
-                    [0, n(r, "drops"), 0, n(r, "pps_dropped"), 0]
-                };
-                let Some(prev) = self
-                    .rule_counters
-                    .insert((node.into(), id.into(), filter), cur)
-                else {
-                    continue;
-                };
-                let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], cur[i]));
-                if diff[1] == 0 && diff[3] == 0 && diff[4] == 0 {
-                    continue;
-                }
-                for p in &scope.prefixes {
-                    if let Some(s) = self.series.get_mut(p) {
-                        // A challenge count shared by several prefixes cannot be split between
-                        // them; booking it to each would double it and show one customer
-                        // another's. The event vectors carry it, marked shared.
-                        if !scope.shared {
-                            let bucket = s.ring.entry(now / 60000).or_default();
-                            bucket.counts[4] = bucket.counts[4].saturating_add(diff[4]);
-                        }
-                        touched.insert(p.clone());
-                    }
-                }
-                moved.push((id.to_owned(), filter, scope.clone(), diff));
+        let rules = stats
+            .rules
+            .iter()
+            .map(|r| (&r.rule_id, false, [0, r.drops, 0, r.pps_dropped, 0]));
+        let games = stats.games.iter().map(|g| {
+            let cur = [0, g.dropped, 0, g.pps_dropped, g.challenged];
+            (&g.filter_id, true, cur)
+        });
+        for (id, filter, cur) in rules.chain(games) {
+            let id = id.as_str();
+            let Some(scope) = attr.scopes.get(&(id.into(), filter)) else {
+                continue;
+            };
+            if scope.prefixes.is_empty() {
+                continue;
             }
+            let Some(prev) = self
+                .rule_counters
+                .insert((node.into(), id.into(), filter), cur)
+            else {
+                continue;
+            };
+            let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], cur[i]));
+            if diff[1] == 0 && diff[3] == 0 && diff[4] == 0 {
+                continue;
+            }
+            for p in &scope.prefixes {
+                if let Some(s) = self.series.get_mut(p) {
+                    // A challenge count shared by several prefixes cannot be split between
+                    // them; booking it to each would double it and show one customer
+                    // another's. The event vectors carry it, marked shared.
+                    if !scope.shared {
+                        let bucket = s.ring.entry(now / 60000).or_default();
+                        bucket.counts[4] = bucket.counts[4].saturating_add(diff[4]);
+                    }
+                    touched.insert(p.clone());
+                }
+            }
+            moved.push((id.to_owned(), filter, scope.clone(), diff));
         }
         // An open event is judged on every report, not only when its prefix is reported, or it
         // stays open forever once no node carries the prefix any more.

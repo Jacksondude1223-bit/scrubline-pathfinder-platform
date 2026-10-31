@@ -152,6 +152,9 @@ pub struct Api {
     decides: u64,
     /// Whether a model is being fitted: one at a time, since each fit holds a copy of the samples.
     fitting: bool,
+    /// How long the last recompile took, and when it finished (see deploy).
+    compile_took: std::time::Duration,
+    compiled_at: Option<std::time::Instant>,
     last_key: String,
     recompiles: u64,
     requests: BTreeMap<(String, u16), u64>,
@@ -187,6 +190,8 @@ impl Api {
             pipes: HashMap::new(),
             decides: 0,
             fitting: false,
+            compile_took: std::time::Duration::ZERO,
+            compiled_at: None,
             last_key: String::new(),
             recompiles: 0,
             requests: BTreeMap::new(),
@@ -342,12 +347,7 @@ impl Api {
     /// so a required tunnel has to report up again before its prefixes are announced, rather than
     /// riding on a report about the tunnel it replaced.
     fn forget_health(&mut self, node: Option<&str>, tunnel: Option<&str>) {
-        for (n, rows) in self.store.tunnels.iter_mut() {
-            if node.is_none_or(|id| id == n) {
-                rows.retain(|r| tunnel.is_some_and(|t| t != r.tunnel_id));
-            }
-        }
-        self.store.tunnels.retain(|_, rows| !rows.is_empty());
+        self.store.forget_tunnels(node, tunnel);
         // The agent reports on every heartbeat what its provisioner last said, and only learns of
         // the change when it next fetches its program, so until then its reports are about the
         // tunnels as they were.
@@ -473,7 +473,7 @@ impl Api {
                         let standing_by = role == "helper" && !self.overflowing.contains(&t.node);
                         let report = self
                             .store
-                            .tunnels
+                            .tunnels()
                             .get(&n.id)
                             .and_then(|rows| rows.iter().find(|s| s.tunnel_id == t.id));
                         let (announced, withdrawn): (Vec<_>, Vec<_>) = self
@@ -678,9 +678,40 @@ impl Api {
                     .map(|n| n.id.clone()),
             )
             .collect();
+        // What a recompile depends on, written out to tell whether any of it has changed. The
+        // tunnels' states go in as a digest of each node's report: written out whole, they were
+        // most of what a heartbeat cost on a large fabric.
+        let mut fingerprint = nodes.clone();
+        for n in &mut fingerprint {
+            n.last_seen = zero_time();
+        }
+        let key = format!(
+            "{}{:?}{:?}{:?}",
+            serde_json::to_string(&fingerprint).unwrap_or_default(),
+            std::collections::BTreeSet::<_>::from_iter(overflowing.iter()),
+            BTreeMap::<_, _>::from_iter(shedding.iter()),
+            self.store.tunnel_digests(),
+        );
+        if !force {
+            if key == self.last_key {
+                return Ok(());
+            }
+            // A recompile that takes long waits until a few of its own lengths after the last,
+            // so a burst of changes (every node checking in after a restart) is folded into a few
+            // recompiles rather than one each, and heartbeats are answered between them. The
+            // next reconcile after that compiles whatever has changed by then.
+            if self.compile_took >= SLOW_COMPILE
+                && self
+                    .compiled_at
+                    .is_some_and(|at| at.elapsed() < self.compile_took * 4)
+            {
+                return Ok(());
+            }
+        }
+        let started = std::time::Instant::now();
         let health: compiler::TunnelHealth = self
             .store
-            .tunnels
+            .tunnels()
             .iter()
             .map(|(node, rows)| {
                 (
@@ -691,24 +722,6 @@ impl Api {
                 )
             })
             .collect();
-        let mut fingerprint = nodes.clone();
-        for n in &mut fingerprint {
-            n.last_seen = zero_time();
-        }
-        let key = format!(
-            "{}{:?}{:?}{:?}",
-            value(&fingerprint),
-            std::collections::BTreeSet::<_>::from_iter(overflowing.iter()),
-            BTreeMap::<_, _>::from_iter(shedding.iter()),
-            BTreeMap::<_, _>::from_iter(
-                health
-                    .iter()
-                    .map(|(n, h)| (n, BTreeMap::<_, _>::from_iter(h.iter())))
-            )
-        );
-        if !force && key == self.last_key {
-            return Ok(());
-        }
         let plan = compiler::plan_with(policy, &nodes, &shedding, &health, &overflowing);
         self.overflowing = overflowing;
         let programs = compiler::compile(policy, &nodes, &plan);
@@ -719,12 +732,17 @@ impl Api {
             })?;
         }
         self.store.plan = plan;
-        self.store.programs = programs.into_iter().collect();
+        self.store.programs = programs
+            .into_iter()
+            .map(|(id, program)| (id, Arc::new(program)))
+            .collect();
         self.pipes
             .retain(|id, _| self.store.programs.contains_key(id));
         self.collector
             .forget(&policy.protected.iter().cloned().collect());
         self.last_key = key;
+        self.compile_took = started.elapsed();
+        self.compiled_at = Some(std::time::Instant::now());
         self.recompiles += 1;
         self.compiled.send_replace(self.recompiles);
         Ok(())
@@ -837,87 +855,16 @@ impl Api {
                 Ok(json!({"retired":id}))
             }
             ("POST", ["nodes", _, "heartbeat"]) if !id.is_empty() => {
-                if !who.acts(id) {
-                    return Err((403, "a node may only heartbeat for itself".into()));
-                }
-                self.writable()?;
-                #[derive(Deserialize, Default)]
-                #[serde(default)]
-                struct Heartbeat {
-                    stats: wire::Stats,
-                    tunnels: Option<Vec<TunnelStatus>>,
-                }
-                let hb: Heartbeat = if body.is_empty() {
-                    Heartbeat::default()
+                self.may_heartbeat(&who, id)?;
+                let hb = if body.is_empty() {
+                    None
                 } else {
-                    parse(body)?
+                    Some(parse(body)?)
                 };
-                let Some(n) = self.store.data.nodes.iter_mut().find(|n| n.id == id) else {
-                    return Err((404, "unknown node".into()));
-                };
-                let fenced = self.fences.get(id);
-                n.last_seen = now;
-                n.status = "ready".into();
-                let name = n.name.clone();
-                let region = n.region.clone();
-                // A tunnel reported twice would be withdrawn on one entry while scrubline_tunnel_up
-                // reads the other.
-                let mut seen = HashSet::new();
-                for st in hb.tunnels.iter().flatten() {
-                    if st.tunnel_id.is_empty() {
-                        return Err(bad("tunnel_id required"));
-                    }
-                    crate::tunnel::validate_status(&st.state).map_err(bad)?;
-                    if !seen.insert(&st.tunnel_id) {
-                        return Err(bad(format!("duplicate tunnel_id {:?}", st.tunnel_id)));
-                    }
-                }
-                // A list, even an empty one, is everything the provisioner is saying now; leaving the
-                // field out says nothing.
-                if let Some(mut tunnels) = hb.tunnels {
-                    tunnels.retain(|t| {
-                        fenced.is_none_or(|f| {
-                            !f.contains(&None) && !f.contains(&Some(t.tunnel_id.clone()))
-                        })
-                    });
-                    for t in &mut tunnels {
-                        t.reported_at = now;
-                    }
-                    tunnels.sort_by(|a, b| a.tunnel_id.cmp(&b.tunnel_id));
-                    if tunnels.is_empty() {
-                        self.store.tunnels.remove(id);
-                    } else {
-                        self.store.tunnels.insert(id.into(), tunnels);
-                    }
-                }
-                if !body.is_empty() {
-                    let none = Program::default();
-                    let prog = self.store.programs.get(id).unwrap_or(&none);
-                    self.collector.observe(id, &value(&hb.stats), prog, ms);
-                    let report = wire::Report {
-                        node_id: id.into(),
-                        name,
-                        region,
-                        stats: hb.stats,
-                        reported_at: now,
-                    };
-                    self.store.reports.insert(id.into(), report);
-                }
-                self.reconcile(now, false).map_err(failed)?;
-                Ok(json!({"status":"ok"}))
+                self.heartbeat(&who, id, hb, now)
             }
             ("GET", ["nodes", _, "program"]) if !id.is_empty() => {
-                if !who.acts(id) {
-                    return Err((403, "a node may only fetch its own program".into()));
-                }
-                if who.role == "node" {
-                    self.fences.remove(id);
-                }
-                self.store
-                    .programs
-                    .get(id)
-                    .map(value)
-                    .ok_or((404, "no program deployed".into()))
+                self.program_for(&who, id).map(|p| value(&*p))
             }
             ("GET", ["nodes", _, "stats"]) if !id.is_empty() => {
                 if !who.acts(id) {
@@ -1419,13 +1366,13 @@ impl Api {
                 let (p, used) = self
                     .pipes
                     .entry(b.node_id.clone())
-                    .or_insert_with(|| (Pipeline::new(prog.clone()), 0));
+                    .or_insert_with(|| (Pipeline::new((*prog).clone()), 0));
                 *used = tick;
                 if p.program.policy_id != prog.policy_id
                     || p.program.version != prog.version
                     || p.program.compiled_at != prog.compiled_at
                 {
-                    p.load(prog);
+                    p.load((*prog).clone());
                 }
                 p.model = self.store.data.model.clone();
                 let mut d = p.decide(&b.flow, ms);
@@ -1614,9 +1561,93 @@ impl Api {
             _ => Err((404, "not found".into())),
         }
     }
+    /// A node's program. The node fetching it is taking in whatever the fence it was behind
+    /// waited on, so that is lifted.
+    fn program_for(&mut self, who: &Who, id: &str) -> Answer<Arc<Program>> {
+        if !who.acts(id) {
+            return Err((403, "a node may only fetch its own program".into()));
+        }
+        if who.role == "node" {
+            self.fences.remove(id);
+        }
+        self.store
+            .programs
+            .get(id)
+            .cloned()
+            .ok_or((404, "no program deployed".into()))
+    }
+    /// Whether a credential may heartbeat for a node, here.
+    fn may_heartbeat(&self, who: &Who, id: &str) -> Answer<()> {
+        if !who.acts(id) {
+            return Err((403, "a node may only heartbeat for itself".into()));
+        }
+        self.writable()
+    }
+    /// A node's heartbeat: it is live, and, when it says, what its datapath counted and what its
+    /// provisioner says about its tunnels.
+    fn heartbeat(
+        &mut self,
+        who: &Who,
+        id: &str,
+        hb: Option<Heartbeat>,
+        now: DateTime<Utc>,
+    ) -> Answer {
+        self.may_heartbeat(who, id)?;
+        let reported = hb.is_some();
+        let hb = hb.unwrap_or_default();
+        let Some(n) = self.store.data.nodes.iter_mut().find(|n| n.id == id) else {
+            return Err((404, "unknown node".into()));
+        };
+        let fenced = self.fences.get(id);
+        n.last_seen = now;
+        n.status = "ready".into();
+        let name = n.name.clone();
+        let region = n.region.clone();
+        // A tunnel reported twice would be withdrawn on one entry while scrubline_tunnel_up
+        // reads the other.
+        let mut seen = HashSet::new();
+        for st in hb.tunnels.iter().flatten() {
+            if st.tunnel_id.is_empty() {
+                return Err(bad("tunnel_id required"));
+            }
+            crate::tunnel::validate_status(&st.state).map_err(bad)?;
+            if !seen.insert(&st.tunnel_id) {
+                return Err(bad(format!("duplicate tunnel_id {:?}", st.tunnel_id)));
+            }
+        }
+        // A list, even an empty one, is everything the provisioner is saying now; leaving the
+        // field out says nothing.
+        if let Some(mut tunnels) = hb.tunnels {
+            tunnels.retain(|t| {
+                fenced.is_none_or(|f| !f.contains(&None) && !f.contains(&Some(t.tunnel_id.clone())))
+            });
+            for t in &mut tunnels {
+                t.reported_at = now;
+            }
+            tunnels.sort_by(|a, b| a.tunnel_id.cmp(&b.tunnel_id));
+            self.store.report_tunnels(id, tunnels);
+        }
+        if reported {
+            let none = Program::default();
+            let prog = self.store.programs.get(id).map_or(&none, |p| &**p);
+            self.collector
+                .observe_stats(id, &hb.stats, prog, now.timestamp_millis());
+            let report = wire::Report {
+                node_id: id.into(),
+                name,
+                region,
+                stats: hb.stats,
+                reported_at: now,
+            };
+            self.store.reports.insert(id.into(), report);
+        }
+        self.reconcile(now, false).map_err(failed)?;
+        Ok(json!({"status":"ok"}))
+    }
     /// Answers a request. The reads that carry every policy, the whole fabric, the training set or
     /// the whole state are written straight to JSON: held as a Value first, each would take
     /// several times the memory its JSON does, all of it under the lock.
+    #[allow(clippy::too_many_arguments)]
     fn answer(
         &mut self,
         method: &str,
@@ -1624,6 +1655,7 @@ impl Api {
         query: &HashMap<String, String>,
         headers: &HeaderMap,
         body: &[u8],
+        read: Option<Heartbeat>,
         now: DateTime<Utc>,
     ) -> Answer<Reply> {
         let parts: Vec<_> = path
@@ -1631,6 +1663,20 @@ impl Api {
             .unwrap_or(path)
             .split('/')
             .collect();
+        // A heartbeat read before the lock was taken (see handler).
+        if let Some(hb) = read {
+            let who = self.auth(headers)?;
+            let id = parts.get(1).copied().unwrap_or("");
+            return self.heartbeat(&who, id, Some(hb), now).map(Reply::Value);
+        }
+        // A node's program goes out as it is shared, written out after the lock is let go: every
+        // node fetches its own after each compile.
+        if let ("GET", ["nodes", id, "program"]) = (method, parts.as_slice()) {
+            if !id.is_empty() {
+                let who = self.auth(headers)?;
+                return self.program_for(&who, id).map(Reply::Program);
+            }
+        }
         let written = match (method, parts.as_slice()) {
             ("GET", ["state"]) => {
                 self.auth(headers)?.operator()?;
@@ -1653,7 +1699,7 @@ impl Api {
                 serde_json::to_vec(&Fabric {
                     announcements: &self.store.plan,
                     ml: &self.store.data.model,
-                    programs: self.store.programs.values().collect(),
+                    programs: self.store.programs.values().map(|p| &**p).collect(),
                 })
             }
             ("GET", ["ml", "samples"]) => {
@@ -1683,8 +1729,9 @@ impl Api {
             ))
             .with_state(state)
     }
+    /// The fabric's metrics, as GET /metrics renders them (see telemetry::Scrape).
     pub fn metrics(&self) -> crate::Result<String> {
-        crate::telemetry::control(self)
+        crate::telemetry::Scrape::fleet(self).render()
     }
     pub fn metric_state(&self) -> MetricState<'_> {
         (self.recompiles, &self.requests, self.steering.levels())
@@ -1767,14 +1814,32 @@ async fn health(State(s): State<Shared>) -> Response {
         ))),
     }
 }
-/// What a request is answered with: a value, or JSON already written out (see Api::answer).
+/// What a node sends with a heartbeat: its datapath's counters, and what its provisioner says
+/// about its tunnels.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Heartbeat {
+    stats: wire::Stats,
+    tunnels: Option<Vec<TunnelStatus>>,
+}
+/// The node a request heartbeats for, if it is a heartbeat.
+fn heartbeat_for<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
+    let rest = path
+        .strip_prefix("/v1/nodes/")?
+        .strip_suffix("/heartbeat")?;
+    (*method == Method::POST && !rest.is_empty() && !rest.contains('/')).then_some(rest)
+}
+/// What a request is answered with: a value, JSON already written out, or a node's program, which
+/// is written out once the lock is let go (see Api::answer).
 enum Reply {
     Value(Value),
     Json(Vec<u8>),
+    Program(Arc<Program>),
 }
 fn response(result: Answer<Reply>) -> Response {
     match result {
         Ok(Reply::Value(v)) => Json(v).into_response(),
+        Ok(Reply::Program(p)) => Json(&*p).into_response(),
         Ok(Reply::Json(written)) => (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             written,
@@ -1840,26 +1905,51 @@ async fn handler(
         }
     }
     let result = tokio::task::spawn_blocking(move || {
+        // A heartbeat's body is read before the lock is taken for it: every node sends one every
+        // couple of seconds, and the rest of the fabric would wait on the reading of each. Who
+        // sent it is checked first, so only a node's own heartbeat is read.
+        let read = match heartbeat_for(&method, &path) {
+            Some(id) if !body.is_empty() => {
+                let allowed = {
+                    let a = s.lock().unwrap();
+                    a.auth(&headers).and_then(|who| a.may_heartbeat(&who, id))
+                };
+                Some(allowed.and_then(|()| parse::<Heartbeat>(&body)))
+            }
+            _ => None,
+        };
         let (mut a, result) = if method == Method::POST && path == "/v1/ml/train" {
             let result = train(&s, &headers, &body).map(Reply::Value);
             (s.lock().unwrap(), result)
         } else {
             let mut a = s.lock().unwrap();
-            let result = a.answer(method.as_str(), &path, &query, &headers, &body, Utc::now());
+            let result = match read {
+                Some(Err(e)) => Err(e),
+                read => {
+                    let read = read.and_then(Result::ok);
+                    let now = Utc::now();
+                    a.answer(method.as_str(), &path, &query, &headers, &body, read, now)
+                }
+            };
             (a, result)
         };
         let code = result.as_ref().map(|_| 200).unwrap_or_else(|e| e.0);
         let route = route_label(&path);
         *a.requests.entry((route, code)).or_default() += 1;
-        result
+        // The answer is written out after the lock is let go, here rather than on one of the
+        // runtime's two workers.
+        drop(a);
+        response(result)
     })
     .await;
-    response(result.unwrap_or_else(|_| Err((500, "request worker failed".into()))))
+    result.unwrap_or_else(|_| response(Err((500, "request worker failed".into()))))
 }
 /// The longest a node's request for its program is held.
 const LONGEST_WAIT: i64 = 30_000;
 /// How many nodes' pipelines /v1/decide keeps: each can grow to what a node's datapath holds.
 const DECIDE_PIPELINES: usize = 8;
+/// A recompile taking at least this long is paced (see Api::deploy).
+const SLOW_COMPILE: std::time::Duration = std::time::Duration::from_millis(50);
 /// The most a request may carry: a policy as large as validation allows, or a batch of samples.
 pub const BODY_LIMIT: usize = 4 << 20;
 /// What the bodies of requests to the control plane may hold between them: a full fabric's
@@ -1871,19 +1961,64 @@ pub const CONNECTIONS: usize = 8192;
 /// Whether a node holding `held` has something to fetch: a program that differs from it in more
 /// than when it was compiled, one where it had none or none where it had one, or tunnel reports
 /// ignored until it fetches again.
-fn news(a: &Api, id: &str, held: &Option<Program>) -> bool {
+fn news(a: &Api, id: &str, held: &Option<Arc<Program>>) -> bool {
     a.fences.contains_key(id)
         || match (a.store.programs.get(id), held) {
-            (Some(now), Some(held)) => {
-                *held
-                    != Program {
-                        compiled_at: held.compiled_at,
-                        ..now.clone()
-                    }
-            }
+            // The very program the node is holding: nothing has been compiled for it since.
+            (Some(now), Some(held)) if Arc::ptr_eq(now, held) => false,
+            (Some(now), Some(held)) => !same_but_stamp(now, held),
             (None, None) => false,
             _ => true,
         }
+}
+/// Whether two programs differ in nothing but when they were compiled. Every field is named, so
+/// one added to Program is not left out of the comparison without a decision.
+fn same_but_stamp(a: &Program, b: &Program) -> bool {
+    let Program {
+        node_id,
+        policy_id,
+        version,
+        prefixes,
+        asic,
+        fpga,
+        zc,
+        announcements,
+        games,
+        challenge_secret,
+        pulse_floor_pps,
+        reputation,
+        egress,
+        ml,
+        crafted,
+        tunnels,
+        sessions,
+        tunnel_src,
+        backhaul,
+        pinned,
+        tunnel_peers,
+        compiled_at: _,
+    } = a;
+    *node_id == b.node_id
+        && *policy_id == b.policy_id
+        && *version == b.version
+        && *prefixes == b.prefixes
+        && *asic == b.asic
+        && *fpga == b.fpga
+        && *zc == b.zc
+        && *announcements == b.announcements
+        && *games == b.games
+        && *challenge_secret == b.challenge_secret
+        && *pulse_floor_pps == b.pulse_floor_pps
+        && *reputation == b.reputation
+        && *egress == b.egress
+        && *ml == b.ml
+        && *crafted == b.crafted
+        && *tunnels == b.tunnels
+        && *sessions == b.sessions
+        && *tunnel_src == b.tunnel_src
+        && *backhaul == b.backhaul
+        && *pinned == b.pinned
+        && *tunnel_peers == b.tunnel_peers
 }
 /// Holds a request for a node's program while the program is still the one the node has, the one
 /// compiled at `since`, or none for a node that has none yet: until the fabric compiles it a new
@@ -2030,16 +2165,51 @@ fn route_label(path: &str) -> String {
         _ => "unknown".into(),
     }
 }
-async fn metrics_handler(State(s): State<Shared>, method: Method, headers: HeaderMap) -> Response {
+/// How many scrapes are rendered at once.
+pub const SCRAPES: usize = 4;
+fn scrapes() -> &'static tokio::sync::Semaphore {
+    static SCRAPES_AT_ONCE: std::sync::OnceLock<tokio::sync::Semaphore> =
+        std::sync::OnceLock::new();
+    SCRAPES_AT_ONCE.get_or_init(|| tokio::sync::Semaphore::new(SCRAPES))
+}
+/// The fabric's metrics, or with ?node= one node's every series. What they are built from is
+/// copied under the lock and written out after it is let go, so a scrape holds up no heartbeat.
+async fn metrics_handler(
+    State(s): State<Shared>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let node = uri.query().and_then(|q| {
+        reqwest::Url::parse(&format!("http://local/?{q}"))
+            .ok()?
+            .query_pairs()
+            .find(|(k, _)| k == "node")
+            .map(|(_, v)| v.into_owned())
+    });
+    // Each render holds what it renders until it is sent, so only a few run at once: a scraper
+    // per node's view can arrive together.
+    let Ok(_rendering) = scrapes().acquire().await else {
+        return response(Err((503, "the control plane is stopping".into())));
+    };
     tokio::task::spawn_blocking(move || {
-        let a = s.lock().unwrap();
-        if let Err(e) = a.auth(&headers).and_then(|w| w.operator()) {
-            return response(Err(e));
-        }
-        if method != Method::GET {
-            return response(Err((405, "GET required".into())));
-        }
-        match a.metrics() {
+        let scrape = {
+            let a = s.lock().unwrap();
+            if let Err(e) = a.auth(&headers).and_then(|w| w.operator()) {
+                return response(Err(e));
+            }
+            if method != Method::GET {
+                return response(Err((405, "GET required".into())));
+            }
+            match node {
+                None => crate::telemetry::Scrape::fleet(&a),
+                Some(id) => match crate::telemetry::Scrape::node(&a, &id) {
+                    Some(scrape) => scrape,
+                    None => return response(Err((404, "unknown node".into()))),
+                },
+            }
+        };
+        match scrape.render() {
             Ok(text) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], text).into_response(),
             Err(e) => {
                 eprintln!("metrics: {e}");
@@ -2764,13 +2934,15 @@ mod tests {
         );
         let held = a.store.programs.get(&node).cloned();
         assert!(!news(&a, &node, &held));
-        let mut restamped = held.clone().unwrap();
+        let mut restamped = Program::clone(held.as_ref().unwrap());
         restamped.compiled_at = at(9);
-        a.store.programs.insert(node.clone(), restamped.clone());
+        a.store
+            .programs
+            .insert(node.clone(), Arc::new(restamped.clone()));
         assert!(!news(&a, &node, &held));
         assert!(news(&a, &node, &None), "a first program");
         restamped.announcements.clear();
-        a.store.programs.insert(node.clone(), restamped);
+        a.store.programs.insert(node.clone(), Arc::new(restamped));
         assert!(news(&a, &node, &held));
         a.store.programs.remove(&node);
         assert!(news(&a, &node, &held), "a program withdrawn");

@@ -148,6 +148,12 @@ paths:
             text/plain:
               schema:
                 type: string
+        '404':
+          description: The node named in `node` is not one the control plane knows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '405':
           description: Only GET.
           content:
@@ -173,8 +179,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      description: Node series are built from the counters each node attached to its heartbeat. The exposition
+      description: 'Node series are built from the counters each node attached to its heartbeat. The exposition
         names every node, its load and its rule hits, so a node credential cannot read it.
+
+
+        Without `node`, it carries the control plane''s own series and each node as a whole: its
+        totals, stages, crafted-packet checks, reputation and return-traffic tables, how many of its
+        tunnels are up, and how many nodes announce each prefix. A node''s series for each prefix, rule,
+        filter and tunnel are left out: a large fabric has millions of them, more than one scrape can
+        carry. With `node`, it carries that node''s every series, the ones its agent renders itself, for a
+        scraper that cannot reach the agent.'
+      parameters:
+      - name: node
+        in: query
+        required: false
+        description: A node's id, for that node's every series instead of the fabric's view.
+        schema:
+          type: string
   /v1/state:
     get:
       summary: The durable control-plane state a replica follows

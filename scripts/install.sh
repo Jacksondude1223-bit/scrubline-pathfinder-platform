@@ -674,7 +674,7 @@ RestartSec=2
 StateDirectory=scrubline
 StateDirectoryMode=0750
 LimitNOFILE=65536
-# At the most it keeps, a full fabric, it holds about 4G (tests/memory.rs); past 8G the kernel
+# At the most it keeps, a full fabric, it holds about 3G (tests/memory.rs); past 8G the kernel
 # reclaims from it, and at 10G it is restarted rather than left to starve the server.
 MemoryHigh=8G
 MemoryMax=10G

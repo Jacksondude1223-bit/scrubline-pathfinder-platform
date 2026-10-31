@@ -19,7 +19,7 @@ enrols, and every other server accepts its tunnels on the next compile.
 - 16 GB of memory on every server, the control plane's and each scrubbing
   node's, or on one server running both. That is what Scrubline is sized for:
   at the most it is built to hold (a fabric of 128 nodes, and the largest
-  policy and training set it takes), the control plane holds about 4 GB and a
+  policy and training set it takes), the control plane holds about 3 GB and a
   node agent under 300 MB, which leaves the rest to the OS and the datapath
   (README, [Sizing for a 16 GB server](../README.md#sizing-for-a-16-gb-server)).
   The script says so when a server has less, and installs anyway.

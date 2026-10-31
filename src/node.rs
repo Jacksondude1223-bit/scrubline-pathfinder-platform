@@ -164,6 +164,27 @@ impl Agent {
         self.surging = surging;
         self.mitigations = mitigations;
     }
+    /// Whether a request carries the agent's local credential.
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        let auth = headers
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.split_once(' '));
+        auth.is_some_and(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("Bearer")
+                && bool::from(token.as_bytes().ct_eq(self.local_token.as_bytes()))
+        })
+    }
+    /// What the agent's metrics are rendered from.
+    fn scraped(&mut self) -> Scraped {
+        Scraped {
+            report: self.report(),
+            announcements: self.announcements(),
+            node: self.node.clone(),
+            tunnels: self.pipe.program.tunnels.clone(),
+            health: self.health.clone(),
+        }
+    }
     fn report(&mut self) -> Value {
         json!({"node_id":self.node.id,"name":self.node.name,"region":self.node.region,"stats":self.stats(chrono::Utc::now().timestamp_millis()),"reported_at":chrono::Utc::now()})
     }
@@ -193,14 +214,7 @@ impl Agent {
         {
             return error(404, "not found");
         }
-        let auth = headers
-            .get("Authorization")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.split_once(' '));
-        if !auth.is_some_and(|(scheme, token)| {
-            scheme.eq_ignore_ascii_case("Bearer")
-                && bool::from(token.as_bytes().ct_eq(self.local_token.as_bytes()))
-        }) {
+        if !self.authorized(headers) {
             return error(401, "missing or invalid bearer token");
         }
         let query: std::collections::HashMap<_, _> = uri
@@ -216,17 +230,7 @@ impl Agent {
         let format = query.get("format").map(String::as_str).unwrap_or("");
         let ms = chrono::Utc::now().timestamp_millis();
         match (method, uri.path()) {
-            ("GET", "/metrics") => {
-                let report = self.report();
-                let mut m = Metrics::new();
-                m.reports(&[report], ms);
-                m.announcements(&self.announcements());
-                m.tunnels(&self.node, &self.pipe.program.tunnels, &self.health);
-                match m.render() {
-                    Ok(v) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], v).into_response(),
-                    Err(e) => error(500, e),
-                }
-            }
+            ("GET", "/metrics") => self.scraped().render(),
             ("GET", "/bgp") => {
                 let announcements = self.announcements();
                 let (commands, err) = match bgp::commands(&announcements, self.local_as) {
@@ -365,6 +369,27 @@ impl Agent {
         }
     }
 }
+/// What the agent's metrics are rendered from, taken under its lock. Rendering them needs
+/// nothing the datapath does, so it happens after the lock is let go.
+struct Scraped {
+    report: Value,
+    announcements: Vec<Announcement>,
+    node: Node,
+    tunnels: Vec<NodeTunnel>,
+    health: Vec<TunnelStatus>,
+}
+impl Scraped {
+    fn render(self) -> Response {
+        let mut m = Metrics::new();
+        m.reports(&[self.report], chrono::Utc::now().timestamp_millis());
+        m.announcements(&self.announcements);
+        m.tunnels(&self.node, &self.tunnels, &self.health);
+        match m.render() {
+            Ok(v) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], v).into_response(),
+            Err(e) => error(500, e),
+        }
+    }
+}
 async fn handler(
     State(s): State<Shared>,
     method: Method,
@@ -372,9 +397,21 @@ async fn handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    tokio::task::spawn_blocking(move || locked(&s).dispatch(method.as_str(), &uri, &headers, &body))
-        .await
-        .unwrap_or_else(|_| error(500, "request worker failed"))
+    tokio::task::spawn_blocking(move || {
+        if method == Method::GET && uri.path() == "/metrics" {
+            let scraped = {
+                let mut a = locked(&s);
+                if !a.authorized(&headers) {
+                    return error(401, "missing or invalid bearer token");
+                }
+                a.scraped()
+            };
+            return scraped.render();
+        }
+        locked(&s).dispatch(method.as_str(), &uri, &headers, &body)
+    })
+    .await
+    .unwrap_or_else(|_| error(500, "request worker failed"))
 }
 #[derive(Deserialize)]
 struct Enrollment {

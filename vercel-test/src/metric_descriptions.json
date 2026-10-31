@@ -343,6 +343,10 @@
     "kind": "gauge",
     "help": "Protected prefixes a node enforces policy on. Zero means the node is enforcing nothing."
   },
+  "scrubline_node_tunnels": {
+    "kind": "gauge",
+    "help": "Tunnels a node's provisioner last reported, by state. A down one withdraws its prefixes from that node; one never reported is not counted."
+  },
   "scrubline_nodes": {
     "kind": "gauge",
     "help": "Registered nodes by liveness. A stale node is withdrawn from anycast."
@@ -354,6 +358,10 @@
   "scrubline_announcements": {
     "kind": "gauge",
     "help": "Rows in the fabric's BGP announcement plan."
+  },
+  "scrubline_prefix_announcers": {
+    "kind": "gauge",
+    "help": "Nodes announcing a protected prefix of the deployed policy. Zero means nothing is drawing the prefix's traffic to the fabric."
   },
   "scrubline_programs": {
     "kind": "gauge",
