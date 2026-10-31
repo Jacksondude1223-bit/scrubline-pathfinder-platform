@@ -16,6 +16,13 @@ enrols, and every other server accepts its tunnels on the next compile.
 
 ## Before you start
 
+- 16 GB of memory on every server, the control plane's and each scrubbing
+  node's, or on one server running both. That is what Scrubline is sized for:
+  at the most it is built to hold (a fabric of 128 nodes, and the largest
+  policy and training set it takes), the control plane holds about 3 GB and a
+  node agent under 300 MB, which leaves the rest to the OS and the datapath
+  (README, [Sizing for a 16 GB server](../README.md#sizing-for-a-16-gb-server)).
+  The script says so when a server has less, and installs anyway.
 - Linux with systemd, and root: Debian 11 or later, Ubuntu 20.04 or later,
   RHEL 8 or later and its rebuilds (Rocky, Alma), Fedora, or openSUSE.
   Missing packages (`curl`, `iproute2`, or `iproute` and `iproute-tc` on the
@@ -191,6 +198,17 @@ The script writes `api.env` and `node.env` whole on every run, keeping the
 tokens and the `SCRUBLINE_*_EXTRA_OPTS` lines. Flags of the binaries that the
 script has no option for go on those lines, and take precedence over the
 script's own; restart the service after editing one.
+
+Each service has a memory limit in its unit. The control plane is reclaimed
+from past 8G and restarted at 10G; the agent past 1536M and at 2G, and it is
+the last process on the server the kernel kills for memory; the provisioner is
+held to 512M. Each is several times what the part holds at its bounds, so
+reaching one is a fault rather than load. A limit of your own goes in a drop-in,
+which the script leaves alone when it rewrites the units:
+
+```sh
+sudo systemctl edit scrubline-api      # [Service] then MemoryHigh=12G and MemoryMax=14G
+```
 
 The certificate it generated is reissued when its names change or it comes
 within 30 days of expiring, so a re-run every couple of years renews it. The

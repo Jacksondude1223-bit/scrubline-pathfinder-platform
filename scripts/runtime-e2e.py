@@ -274,12 +274,17 @@ with tempfile.TemporaryDirectory() as temporary:
         assert call(local,'/metrics',token=LOCAL).count('scrubline_ml_http_drops_total{')==1
         call(base,'/v1/ml/model','DELETE',OP)
         wait_for(lambda:not call(base,f'/v1/nodes/{runtime_id}/stats',token=OP)['stats']['ml']['ready'])
+        # The fabric's view carries each node as a whole; each node's view, all it renders.
         metrics=call(base,'/metrics',token=OP)
-        assert 'scrubline_api_requests_total' in metrics and 'scrubline_prefix_offered_total' in metrics
+        assert 'scrubline_api_requests_total' in metrics and 'scrubline_prefix_announcers{' in metrics
+        assert 'scrubline_decisions_total{' in metrics and 'scrubline_prefix_offered_total' not in metrics
         call(base,'/metrics',token=node_token,expected=403)
+        own=call(base,f'/metrics?node={runtime_id}',token=OP)
+        assert 'scrubline_prefix_offered_total{' in own, own
+        assert 'scrubline_game_http_budget_dropped_total{' in own, own
+        call(base,'/metrics?node=node-none',token=OP,expected=404)
         node_metrics = call(local,'/metrics',token=LOCAL)
         assert 'scrubline_game_http_rate_limited_total{' in node_metrics, node_metrics
-        assert 'scrubline_game_http_budget_dropped_total{' in metrics, metrics
         traffic=start('scrub-traffic','-nodes',local,'-interval','50ms','-seed','42')
         time.sleep(1); assert traffic.poll() is None; stop(traffic)
         snapshot=call(base,'/v1/state',token=OP)

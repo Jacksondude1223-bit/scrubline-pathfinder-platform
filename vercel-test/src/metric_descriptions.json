@@ -91,6 +91,10 @@
     "kind": "gauge",
     "help": "Bound on the per-source rate table. At the bound, new sources go untracked and the cap is no longer measuring every source."
   },
+  "scrubline_resident_bytes": {
+    "kind": "gauge",
+    "help": "Memory the node agent's process holds, as the kernel counts it (its resident set). Every table it keeps is bounded, so this levels off under load rather than climbing."
+  },
   "scrubline_offered_pps": {
     "kind": "gauge",
     "help": "Packet rate currently offered to a node, averaged over its load window. Load-driven steering reacts to this or to scrubline_surge_pps, whichever is higher."
@@ -339,6 +343,10 @@
     "kind": "gauge",
     "help": "Protected prefixes a node enforces policy on. Zero means the node is enforcing nothing."
   },
+  "scrubline_node_tunnels": {
+    "kind": "gauge",
+    "help": "Tunnels a node's provisioner last reported, by state. A down one withdraws its prefixes from that node; one never reported is not counted."
+  },
   "scrubline_nodes": {
     "kind": "gauge",
     "help": "Registered nodes by liveness. A stale node is withdrawn from anycast."
@@ -351,6 +359,10 @@
     "kind": "gauge",
     "help": "Rows in the fabric's BGP announcement plan."
   },
+  "scrubline_prefix_announcers": {
+    "kind": "gauge",
+    "help": "Nodes announcing a protected prefix of the deployed policy. Zero means nothing is drawing the prefix's traffic to the fabric."
+  },
   "scrubline_programs": {
     "kind": "gauge",
     "help": "Nodes holding a compiled program."
@@ -358,6 +370,10 @@
   "scrubline_fabric_recompiles_total": {
     "kind": "counter",
     "help": "Fabric recompiles, including those triggered by a node joining, recovering, or going stale."
+  },
+  "scrubline_control_resident_bytes": {
+    "kind": "gauge",
+    "help": "Memory the control plane's process holds, as the kernel counts it (its resident set). It grows with the fabric, the policies and the training set, each of which has a ceiling."
   },
   "scrubline_control_ml_model_ready": {
     "kind": "gauge",

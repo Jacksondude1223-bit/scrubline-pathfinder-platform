@@ -47,9 +47,31 @@ fn unique<'a>(values: impl Iterator<Item = &'a str>, name: &str) -> Result<()> {
     }
     Ok(())
 }
+/// The most of each thing one policy may hold. Every node is compiled a program from the policy,
+/// reports counters for its prefixes and rules, and the control plane keeps both for each node,
+/// so the policy's size is multiplied by the fabric's: these keep the largest policy on the
+/// largest fabric (store::NODES_MAX nodes) within the memory a 16 GB server can give it.
+pub const PREFIXES_MAX: usize = 1024;
+pub const RULES_MAX: usize = 1024;
+pub const GAMES_MAX: usize = 256;
+pub const TUNNELS_MAX: usize = 1024;
+pub const SESSIONS_MAX: usize = 256;
 pub fn policy(p: &Policy) -> Result<()> {
     if p.name.is_empty() || p.protected.is_empty() {
         return Err("name and protected prefixes required".into());
+    }
+    for (what, n, max) in [
+        ("protected prefixes", p.protected.len(), PREFIXES_MAX),
+        ("rules", p.rules.len(), RULES_MAX),
+        ("game filters", p.games.len(), GAMES_MAX),
+        ("tunnels", p.tunnels.len(), TUNNELS_MAX),
+        ("sessions", p.sessions.len(), SESSIONS_MAX),
+    ] {
+        if n > max {
+            return Err(format!(
+                "a policy holds at most {max} {what}, and this one has {n}; every node is compiled and reports all of them"
+            ));
+        }
     }
     let mut protected = HashSet::new();
     let mut networks = HashMap::new();
@@ -319,6 +341,11 @@ pub fn tenant(t: &Tenant) -> Result<()> {
     }
     if t.prefixes.is_empty() {
         return Err("at least one prefix required, or the tenant is entitled to nothing".into());
+    }
+    if t.prefixes.len() > PREFIXES_MAX {
+        return Err(format!(
+            "a tenant holds at most {PREFIXES_MAX} prefixes, as many as a policy protects"
+        ));
     }
     for prefix in &t.prefixes {
         let p = prefix.parse::<IpNet>().map_err(|e| e.to_string())?;

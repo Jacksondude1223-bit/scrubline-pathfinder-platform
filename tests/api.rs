@@ -289,6 +289,189 @@ async fn quiet_connections_are_closed() {
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     assert!(started.elapsed() >= Duration::from_millis(300));
 }
+#[test]
+fn reads_that_carry_everything_are_written_straight_to_json_for_operators_only() {
+    let base = serve(Store::open("").unwrap());
+    for name in ["beta", "alpha"] {
+        let policy = json!({"id":name,"name":name,"protected":["203.0.113.0/24"]});
+        assert_eq!(call(&base, "POST", "/v1/policies", Some(OP), policy).0, 200);
+    }
+    let sample = json!({"samples":[{"flow":{"src_ip":"192.0.2.1","dst_ip":"203.0.113.1","proto":"udp","dport":53,"pps":1,"payload":"AAE="},"label":1}]});
+    assert_eq!(
+        call(&base, "POST", "/v1/ml/samples", Some(OP), sample).0,
+        200
+    );
+    for path in ["/v1/state", "/v1/policies", "/v1/fabric", "/v1/ml/samples"] {
+        assert_eq!(call(&base, "GET", path, None, Value::Null).0, 401, "{path}");
+        assert_eq!(
+            call(&base, "GET", path, Some(ENROLL), Value::Null).0,
+            403,
+            "{path}"
+        );
+        let resp = reqwest::blocking::Client::new()
+            .get(format!("{base}{path}"))
+            .bearer_auth(OP)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+        assert_eq!(resp.headers()["content-type"], "application/json", "{path}");
+    }
+    let (_, policies) = call(&base, "GET", "/v1/policies", Some(OP), Value::Null);
+    let names: Vec<_> = policies
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].clone())
+        .collect();
+    assert_eq!(names, [json!("alpha"), json!("beta")]);
+    let (_, state) = call(&base, "GET", "/v1/state", Some(OP), Value::Null);
+    let state: pathfinder::store::Snapshot = serde_json::from_value(state).unwrap();
+    assert_eq!((state.policies.len(), state.samples.len()), (2, 1));
+    assert_eq!(state.samples[0].flow.payload, [0, 1]);
+    let (_, fabric) = call(&base, "GET", "/v1/fabric", Some(OP), Value::Null);
+    assert!(
+        fabric["announcements"].is_array() && fabric["programs"].is_array(),
+        "{fabric}"
+    );
+    assert!(fabric["ml"].is_object(), "{fabric}");
+    let (_, samples) = call(&base, "GET", "/v1/ml/samples", Some(OP), Value::Null);
+    assert_eq!(samples[0]["flow"]["payload"], "AAE=");
+}
+/// Serves `router` on a port of its own, on the test's runtime.
+async fn listen(router: axum::Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    addr
+}
+/// Sends `request` as written and returns the status and head of the answer.
+async fn raw(addr: std::net::SocketAddr, request: &[u8]) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    conn.write_all(request).await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0; 4096];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = conn.read(&mut buf).await.unwrap();
+        assert!(n > 0, "closed before answering");
+        got.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&got).into_owned();
+    (head[9..12].parse().unwrap(), head)
+}
+#[tokio::test]
+async fn request_bodies_share_a_budget_charged_as_they_arrive() {
+    use axum::{middleware::from_fn_with_state, routing::post};
+    use pathfinder::runtime::{bounded, Bodies};
+    // Each request holds its body until the test lets it answer.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (entered, mut inside) = tokio::sync::mpsc::unbounded_channel();
+    let held = gate.clone();
+    let router = axum::Router::new()
+        .route(
+            "/",
+            post(move |body: axum::body::Bytes| {
+                let (held, entered) = (held.clone(), entered.clone());
+                async move {
+                    entered.send(()).unwrap();
+                    let _ = held.acquire().await.unwrap();
+                    body.len().to_string()
+                }
+            })
+            .get(|| async { "ok" }),
+        )
+        .layer(from_fn_with_state(Bodies::new(8 << 10, 4 << 10), bounded));
+    let addr = listen(router).await;
+    let base = format!("http://{addr}/");
+    let client = reqwest::Client::new();
+    let post = |n: usize| client.post(&base).body(vec![1u8; n]).send();
+    let waiting: Vec<_> = (0..2).map(|_| tokio::spawn(post(4 << 10))).collect();
+    inside.recv().await.unwrap();
+    inside.recv().await.unwrap();
+    // Two bodies being answered hold the whole budget: a third is turned away, not queued.
+    let busy = post(1).await.unwrap();
+    assert_eq!(busy.status().as_u16(), 503);
+    assert_eq!(busy.headers()["retry-after"], "1");
+    let error: Value = busy.json().await.unwrap();
+    assert!(
+        error["error"].as_str().unwrap().contains("try again"),
+        "{error}"
+    );
+    // A request without a body takes none of it.
+    assert_eq!(
+        client.get(&base).send().await.unwrap().status().as_u16(),
+        200
+    );
+    gate.add_permits(3);
+    for w in waiting {
+        let answered = w.await.unwrap().unwrap();
+        assert_eq!(answered.text().await.unwrap(), "4096");
+    }
+    assert_eq!(post(4 << 10).await.unwrap().status().as_u16(), 200);
+    // A body larger than one may be is refused on what it claims, or once it has sent too much.
+    let claimed = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+        (4 << 10) + 1
+    );
+    let (status, head) = raw(addr, claimed.as_bytes()).await;
+    assert_eq!(status, 413, "{head}");
+    let mut chunked =
+        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n1001\r\n".to_vec();
+    chunked.extend(vec![b'x'; (4 << 10) + 1]);
+    chunked.extend(b"\r\n0\r\n\r\n");
+    let (status, head) = raw(addr, &chunked).await;
+    assert_eq!(status, 413, "{head}");
+    // Only the requests answered reached the handler.
+    inside.recv().await.unwrap();
+    assert!(inside.try_recv().is_err());
+}
+#[tokio::test]
+async fn the_control_plane_refuses_a_body_past_its_limit_before_reading_it() {
+    let state: Shared = Arc::new(Mutex::new(Api::new(
+        Store::open("").unwrap(),
+        OP.into(),
+        ENROLL.into(),
+        "primary".into(),
+    )));
+    let addr = listen(Api::router(state)).await;
+    let head = format!(
+        "POST /v1/policies HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {OP}\r\nContent-Length: {}\r\n\r\n",
+        pathfinder::api::BODY_LIMIT + 1
+    );
+    let (status, head) = raw(addr, head.as_bytes()).await;
+    assert_eq!(status, 413, "{head}");
+    assert!(head.contains("application/json"), "{head}");
+}
+#[tokio::test]
+async fn a_server_holds_a_bounded_number_of_connections() {
+    use axum_server::accept::Accept;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = || async {
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        (client, listener.accept().await.unwrap().0)
+    };
+    let first_byte = Duration::from_millis(300);
+    let open = pathfinder::runtime::Deadlines::new(1, first_byte, Duration::from_secs(5));
+    let (_a, server) = connect().await;
+    let Ok(first) = open.accept(server, ()).await else {
+        panic!("the first connection has a place");
+    };
+    // One past the limit waits as long as a connection may stay silent, then is closed.
+    let (_b, server) = connect().await;
+    let started = std::time::Instant::now();
+    assert!(open.accept(server, ()).await.is_err());
+    assert!(started.elapsed() >= first_byte);
+    // One waiting takes the place a connection gives up when it closes.
+    let (_c, server) = connect().await;
+    let waiting = tokio::spawn({
+        let open = open.clone();
+        async move { open.accept(server, ()).await.is_ok() }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(first);
+    assert!(waiting.await.unwrap());
+}
 fn protecting(prefixes: &[&str]) -> Program {
     Program {
         prefixes: prefixes.iter().map(|p| p.to_string()).collect(),

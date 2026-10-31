@@ -164,8 +164,35 @@ impl Agent {
         self.surging = surging;
         self.mitigations = mitigations;
     }
+    /// Whether a request carries the agent's local credential.
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        let auth = headers
+            .get("Authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.split_once(' '));
+        auth.is_some_and(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("Bearer")
+                && bool::from(token.as_bytes().ct_eq(self.local_token.as_bytes()))
+        })
+    }
+    /// What the agent's metrics are rendered from.
+    fn scraped(&mut self) -> Scraped {
+        Scraped {
+            report: self.report(),
+            announcements: self.announcements(),
+            node: self.node.clone(),
+            tunnels: self.pipe.program.tunnels.clone(),
+            health: self.health.clone(),
+        }
+    }
     fn report(&mut self) -> Value {
-        json!({"node_id":self.node.id,"name":self.node.name,"region":self.node.region,"stats":self.pipe.stats(chrono::Utc::now().timestamp_millis()),"reported_at":chrono::Utc::now()})
+        json!({"node_id":self.node.id,"name":self.node.name,"region":self.node.region,"stats":self.stats(chrono::Utc::now().timestamp_millis()),"reported_at":chrono::Utc::now()})
+    }
+    /// The datapath's counters, and what this process holds in memory.
+    fn stats(&mut self, now: i64) -> Value {
+        let mut stats = self.pipe.stats(now);
+        stats["resident_bytes"] = json!(runtime::resident_bytes());
+        stats
     }
     fn dispatch(&mut self, method: &str, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> Response {
         if uri.path() == "/health" {
@@ -187,14 +214,7 @@ impl Agent {
         {
             return error(404, "not found");
         }
-        let auth = headers
-            .get("Authorization")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.split_once(' '));
-        if !auth.is_some_and(|(scheme, token)| {
-            scheme.eq_ignore_ascii_case("Bearer")
-                && bool::from(token.as_bytes().ct_eq(self.local_token.as_bytes()))
-        }) {
+        if !self.authorized(headers) {
             return error(401, "missing or invalid bearer token");
         }
         let query: std::collections::HashMap<_, _> = uri
@@ -210,17 +230,7 @@ impl Agent {
         let format = query.get("format").map(String::as_str).unwrap_or("");
         let ms = chrono::Utc::now().timestamp_millis();
         match (method, uri.path()) {
-            ("GET", "/metrics") => {
-                let report = self.report();
-                let mut m = Metrics::new();
-                m.reports(&[report], ms);
-                m.announcements(&self.announcements());
-                m.tunnels(&self.node, &self.pipe.program.tunnels, &self.health);
-                match m.render() {
-                    Ok(v) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], v).into_response(),
-                    Err(e) => error(500, e),
-                }
-            }
+            ("GET", "/metrics") => self.scraped().render(),
             ("GET", "/bgp") => {
                 let announcements = self.announcements();
                 let (commands, err) = match bgp::commands(&announcements, self.local_as) {
@@ -359,6 +369,27 @@ impl Agent {
         }
     }
 }
+/// What the agent's metrics are rendered from, taken under its lock. Rendering them needs
+/// nothing the datapath does, so it happens after the lock is let go.
+struct Scraped {
+    report: Value,
+    announcements: Vec<Announcement>,
+    node: Node,
+    tunnels: Vec<NodeTunnel>,
+    health: Vec<TunnelStatus>,
+}
+impl Scraped {
+    fn render(self) -> Response {
+        let mut m = Metrics::new();
+        m.reports(&[self.report], chrono::Utc::now().timestamp_millis());
+        m.announcements(&self.announcements);
+        m.tunnels(&self.node, &self.tunnels, &self.health);
+        match m.render() {
+            Ok(v) => ([("Content-Type", crate::metrics::CONTENT_TYPE)], v).into_response(),
+            Err(e) => error(500, e),
+        }
+    }
+}
 async fn handler(
     State(s): State<Shared>,
     method: Method,
@@ -366,9 +397,21 @@ async fn handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    tokio::task::spawn_blocking(move || locked(&s).dispatch(method.as_str(), &uri, &headers, &body))
-        .await
-        .unwrap_or_else(|_| error(500, "request worker failed"))
+    tokio::task::spawn_blocking(move || {
+        if method == Method::GET && uri.path() == "/metrics" {
+            let scraped = {
+                let mut a = locked(&s);
+                if !a.authorized(&headers) {
+                    return error(401, "missing or invalid bearer token");
+                }
+                a.scraped()
+            };
+            return scraped.render();
+        }
+        locked(&s).dispatch(method.as_str(), &uri, &headers, &body)
+    })
+    .await
+    .unwrap_or_else(|_| error(500, "request worker failed"))
 }
 #[derive(Deserialize)]
 struct Enrollment {
@@ -578,7 +621,7 @@ pub async fn run() -> Result<()> {
                 (
                     a.node.id.clone(),
                     a.token.clone(),
-                    a.pipe.stats(now),
+                    a.stats(now),
                     a.health.clone(),
                 )
             };
@@ -637,7 +680,11 @@ pub async fn run() -> Result<()> {
         .route("/reputation", any(handler))
         .route("/decide", any(handler))
         .fallback(handler)
-        .layer(DefaultBodyLimit::max(1 << 20))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::middleware::from_fn_with_state(
+            runtime::Bodies::new(BODY_BUDGET, BODY_LIMIT),
+            runtime::bounded,
+        ))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(60),
@@ -649,9 +696,17 @@ pub async fn run() -> Result<()> {
         f.get("tls-cert"),
         f.get("tls-key"),
         f.boolean("insecure")?,
+        CONNECTIONS,
     )
     .await
 }
+/// The most a request to the agent may carry: a flow, a packet and its payload fit many times over.
+pub const BODY_LIMIT: usize = 1 << 20;
+/// What the bodies of requests to the agent may hold between them.
+pub const BODY_BUDGET: usize = 64 << 20;
+/// How many connections the agent holds open: its API serves this server's own tools, the
+/// datapath and a metrics scraper.
+pub const CONNECTIONS: usize = 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +906,27 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(a.peering_node().tunnel_src, "192.0.2.1");
+    }
+    #[tokio::test]
+    async fn the_agent_reports_the_memory_it_holds() {
+        let mut a = agent(vec![]);
+        assert!(
+            runtime::resident_bytes() > 0,
+            "this process has a resident set"
+        );
+        assert!(a.stats(0)["resident_bytes"].as_u64() > Some(0));
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer local".parse().unwrap());
+        let resp = a.dispatch("GET", &"/metrics".parse().unwrap(), &headers, b"");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let held = text
+            .lines()
+            .find(|l| l.starts_with("scrubline_resident_bytes{"))
+            .and_then(|l| l.rsplit(' ').next()?.parse::<f64>().ok());
+        assert!(held > Some(0.0), "{text}");
     }
     #[tokio::test]
     async fn tunnels_render_the_reply_path_after_the_tunnel() {

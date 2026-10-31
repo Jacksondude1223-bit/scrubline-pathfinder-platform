@@ -62,6 +62,25 @@ info:
     would compile conflicting announcement plans and flap the fabric''s BGP.
 
 
+    ## Limits
+
+
+    The control plane is sized to run on a server with 16 GB of memory, so everything it keeps has a
+    ceiling: a fabric of 128 nodes; 32 policies, each of up to 1024 protected prefixes, 1024 rules,
+    1024 tunnels, 256 game filters and 256 BGP sessions; 4096 tenants with 16384 prefixes between them;
+    and a training set of 200000 samples carrying up to 64 MiB of payloads and packets. A write that
+    would go past one answers `413`, or `400` for a policy, and says which. A node that is gone for good
+    gives its place back with `DELETE /v1/nodes/{id}`, and a policy no longer needed with `DELETE
+    /v1/policies/{id}`.
+
+
+    A request body may carry 4 MiB (`413`) and must arrive within 30 seconds (`408`). The bodies being
+    read and answered share 256 MiB between them, charged for the bytes that have arrived rather than
+    the length a request claims; a request that finds it spent answers `503` with `Retry-After: 1`
+    rather than waiting for room. At most 8192 connections are held open at once, and one past that
+    waits up to ten seconds for another to close.
+
+
     ## Durability
 
 
@@ -129,6 +148,12 @@ paths:
             text/plain:
               schema:
                 type: string
+        '404':
+          description: The node named in `node` is not one the control plane knows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '405':
           description: Only GET.
           content:
@@ -154,8 +179,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-      description: Node series are built from the counters each node attached to its heartbeat. The exposition
+      description: 'Node series are built from the counters each node attached to its heartbeat. The exposition
         names every node, its load and its rule hits, so a node credential cannot read it.
+
+
+        Without `node`, it carries the control plane''s own series and each node as a whole: its
+        totals, stages, crafted-packet checks, reputation and return-traffic tables, how many of its
+        tunnels are up, and how many nodes announce each prefix. A node''s series for each prefix, rule,
+        filter and tunnel are left out: a large fabric has millions of them, more than one scrape can
+        carry. With `node`, it carries that node''s every series, the ones its agent renders itself, for a
+        scraper that cannot reach the agent.'
+      parameters:
+      - name: node
+        in: query
+        required: false
+        description: A node's id, for that node's every series instead of the fabric's view.
+        schema:
+          type: string
   /v1/state:
     get:
       summary: The durable control-plane state a replica follows
@@ -227,6 +267,13 @@ paths:
           description: A different live node already holds this name and region, another node holds the
             tunnel_src (by an operator's assignment, or by registration while it is live), or this control
             plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The fabric already holds 128 nodes and this would be another. Retire one that is
+            gone for good with DELETE /v1/nodes/{id}; a node already registered still enrols again.
           content:
             application/json:
               schema:
@@ -418,6 +465,48 @@ paths:
         '401': *id002
         '403': *id003
       parameters: *id005
+  /v1/nodes/{id}:
+    delete:
+      summary: Retire a node that is gone for good
+      tags:
+      - Nodes
+      security: *id001
+      responses:
+        '200':
+          description: Retired.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  retired:
+                    type: string
+        '404':
+          description: No such node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The node heartbeated within the last 30 seconds, so it is still running and its
+            next heartbeat would enrol it again; or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Durable state could not be written. The change was rolled back and did not take
+            effect.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: Forgets the node, its credential, any tunnel endpoint an operator assigned it and
+        what it last reported, and recompiles the fabric without it. Its place counts towards the 128
+        nodes a fabric holds again.
+      parameters: *id005
   /v1/policies:
     get:
       summary: List policies
@@ -448,13 +537,22 @@ paths:
               schema:
                 $ref: '#/components/schemas/Policy'
         '400':
-          description: A field will not validate, or a tunnel allocated to a customer names an unknown
-            one or carries a prefix outside theirs. The message names the offending item and why.
+          description: A field will not validate, a tunnel allocated to a customer names an unknown one
+            or carries a prefix outside theirs, or the policy holds more than every node can be compiled
+            and report on (1024 protected prefixes, 1024 rules, 256 game filters, 1024 tunnels or 256
+            sessions). The message names the offending item and why.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '409': *id006
+        '413':
+          description: The control plane already keeps 32 policies and this would be another. Save over
+            one by its id, or delete one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': &id007
           description: Durable state could not be written. The change was rolled back and did not take
             effect.
@@ -478,6 +576,41 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/Policy'
+  /v1/policies/{id}:
+    delete:
+      summary: Delete a policy
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: string
+        '404':
+          description: No such policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The policy is the one deployed, or this control plane is a replica. Deploy another
+            before deleting it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503': *id007
+        '401': *id002
+        '403': *id003
+      description: Saved policies are kept whole and written out with the rest of the state, so the
+        control plane keeps 32; deleting one makes room for another.
+      parameters: *id005
   /v1/policies/{id}/deploy:
     post:
       summary: Compile a policy across the fabric
@@ -562,13 +695,15 @@ paths:
                   stored:
                     type: integer
         '400':
-          description: A sample will not validate. The message names the index.
+          description: A sample will not validate, or carries more than an IP packet's worth of payload
+            and of packet. The message names the index.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '413':
-          description: The batch would push the training set past its limit.
+          description: The batch would push the training set past 200000 samples, or past 64 MiB of
+            payloads and packets between them.
           content:
             application/json:
               schema:
@@ -578,6 +713,10 @@ paths:
                     type: string
                   stored:
                     type: integer
+                  stored_bytes:
+                    type: integer
+                    description: The bytes of payload and packet the stored samples carry, when that is
+                      the limit reached.
         '409': *id006
         '503': *id007
         '401': *id002
@@ -627,7 +766,13 @@ paths:
                       on, over the 1.0% limit'
                   model:
                     $ref: '#/components/schemas/MLModel'
-        '409': *id006
+        '409':
+          description: A model is already being trained, or this control plane is a replica. Each fit
+            holds its own copy of the training set, so one runs at a time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503': *id007
         '401': *id002
         '403': *id003
@@ -932,7 +1077,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/Tenant'
         '400':
-          description: Missing name, no prefixes, or a prefix that will not parse or is not masked.
+          description: Missing name, no prefixes or more than 1024, or a prefix that will not parse or is
+            not masked.
           content:
             application/json:
               schema:
@@ -940,6 +1086,13 @@ paths:
         '409':
           description: The change would leave a tunnel allocated to this customer carrying a prefix outside
             their prefixes, or this control plane is a replica.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The control plane already keeps 4096 customers, or 16384 prefixes between them,
+            and this would be more.
           content:
             application/json:
               schema:

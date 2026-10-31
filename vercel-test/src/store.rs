@@ -3,15 +3,27 @@ use crate::{ml, model::*, Result};
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
 };
 /// How long a node may go without heartbeating before it is stale.
 pub const STALE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
+/// The most of each the control plane keeps, so its memory has a ceiling a 16 GB server can give
+/// it. Every node is compiled a program and keeps a report, so the fabric's size multiplies the
+/// policy's (see validation::PREFIXES_MAX); policies and tenants are kept whole, every one of
+/// them, and written out with the rest of the state on every change.
+pub const NODES_MAX: usize = 128;
+pub const POLICIES_MAX: usize = 32;
+pub const TENANTS_MAX: usize = 4096;
+/// The most prefixes all tenants are entitled to between them: each may hold as many as a policy
+/// protects, but not every one of them at once.
+pub const TENANT_PREFIXES_MAX: usize = 16_384;
+/// What a registration beyond NODES_MAX is refused with.
+pub const FABRIC_FULL: &str = "the fabric holds at most 128 nodes";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
@@ -63,11 +75,24 @@ impl Default for Snapshot {
 }
 pub struct Store {
     pub data: Snapshot,
-    pub programs: BTreeMap<String, Program>,
+    /// Each node's program, shared with the requests answering with it: a fabric's worth of
+    /// nodes fetches theirs after every compile, and none of them needs its own copy.
+    pub programs: BTreeMap<String, std::sync::Arc<Program>>,
     pub plan: Vec<Announcement>,
-    pub reports: BTreeMap<String, Value>,
-    pub tunnels: BTreeMap<String, Vec<TunnelStatus>>,
+    pub reports: BTreeMap<String, crate::wire::Report>,
+    /// What each node's provisioner last said about its tunnels, sorted by tunnel id.
+    tunnels: BTreeMap<String, Vec<TunnelStatus>>,
+    /// A digest of the states in each node's report: all a recompile needs to tell whether any
+    /// changed, without going through every report every time a node heartbeats.
+    tunnel_digests: BTreeMap<String, u64>,
     path: Option<PathBuf>,
+}
+fn digest(rows: &[TunnelStatus]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for r in rows {
+        (&r.tunnel_id, &r.state).hash(&mut h);
+    }
+    h.finish()
 }
 pub fn hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
@@ -96,6 +121,7 @@ impl Store {
             plan: vec![],
             reports: BTreeMap::new(),
             tunnels: BTreeMap::new(),
+            tunnel_digests: BTreeMap::new(),
             path: if path.is_empty() {
                 None
             } else {
@@ -199,6 +225,7 @@ impl Store {
         self.plan.clear();
         self.reports.clear();
         self.tunnels.clear();
+        self.tunnel_digests.clear();
         Ok(())
     }
     /// A node as the fabric uses it: with the operator's tunnel endpoint, if one is assigned, in
@@ -273,6 +300,11 @@ impl Store {
                 );
             }
         }
+        if !self.data.nodes.iter().any(|o| o.id == n.id) && self.data.nodes.len() >= NODES_MAX {
+            return Err(format!(
+                "{FABRIC_FULL}; retire one that is gone for good with DELETE /v1/nodes/{{id}}"
+            ));
+        }
         n.last_seen = now;
         n.status = "ready".into();
         let token = secret()?;
@@ -308,6 +340,64 @@ impl Store {
             d.policies.push(p.clone());
             Ok(p)
         })
+    }
+    /// Forgets a node: its record, its credential and its assigned tunnel endpoint, and what it
+    /// last reported. False when there is no such node.
+    pub fn retire(&mut self, id: &str) -> Result<bool> {
+        if !self.data.nodes.iter().any(|n| n.id == id) {
+            return Ok(false);
+        }
+        self.transaction(|d| {
+            d.nodes.retain(|n| n.id != id);
+            d.node_tokens.remove(id);
+            d.tunnel_endpoints.remove(id);
+            Ok(())
+        })?;
+        self.reports.remove(id);
+        self.programs.remove(id);
+        self.tunnels.remove(id);
+        self.tunnel_digests.remove(id);
+        Ok(true)
+    }
+    pub fn tunnels(&self) -> &BTreeMap<String, Vec<TunnelStatus>> {
+        &self.tunnels
+    }
+    pub fn tunnel_digests(&self) -> &BTreeMap<String, u64> {
+        &self.tunnel_digests
+    }
+    /// Replaces what a node's provisioner says about its tunnels, sorted by tunnel id; an empty
+    /// report forgets it.
+    pub fn report_tunnels(&mut self, node: &str, rows: Vec<TunnelStatus>) {
+        if rows.is_empty() {
+            self.tunnels.remove(node);
+            self.tunnel_digests.remove(node);
+        } else {
+            self.tunnel_digests.insert(node.into(), digest(&rows));
+            self.tunnels.insert(node.into(), rows);
+        }
+    }
+    /// Forgets what provisioners said about a tunnel, or every tunnel, on a node or every node.
+    pub fn forget_tunnels(&mut self, node: Option<&str>, tunnel: Option<&str>) {
+        for (n, rows) in self.tunnels.iter_mut() {
+            if node.is_none_or(|id| id == n) {
+                rows.retain(|r| tunnel.is_some_and(|t| t != r.tunnel_id));
+                self.tunnel_digests.insert(n.clone(), digest(rows));
+            }
+        }
+        self.tunnels.retain(|_, rows| !rows.is_empty());
+        let reported = &self.tunnels;
+        self.tunnel_digests.retain(|n, _| reported.contains_key(n));
+    }
+    /// Forgets a policy. False when there is no such policy.
+    pub fn forget_policy(&mut self, id: &str) -> Result<bool> {
+        if !self.data.policies.iter().any(|p| p.id == id) {
+            return Ok(false);
+        }
+        self.transaction(|d| {
+            d.policies.retain(|p| p.id != id);
+            Ok(())
+        })?;
+        Ok(true)
     }
     pub fn save_tenant(&mut self, mut t: Tenant, now: DateTime<Utc>) -> Result<Tenant> {
         self.transaction(|d| {

@@ -1,5 +1,5 @@
 use pathfinder::{
-    api::{Api, Shared},
+    api::{self, Api, Shared},
     model::zero_time,
     runtime::{self, Flags},
     store::{self, Snapshot, Store},
@@ -116,6 +116,7 @@ async fn run() -> Result<()> {
         f.get("tls-cert"),
         f.get("tls-key"),
         f.boolean("insecure")?,
+        api::CONNECTIONS,
     )
     .await
 }

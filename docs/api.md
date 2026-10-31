@@ -44,10 +44,11 @@ to open the control plane.
 | `401` | No credential, or one the control plane does not know. |
 | `403` | The credential is valid but not allowed here. **Not** `404` — the API tells you it exists and you cannot have it. |
 | `404` | The thing genuinely is not there. |
-| `409` | A conflict: a duplicate live node, no live nodes to deploy onto, a tunnel address another node holds, a tunnel change with no deployed policy, a customer a tunnel is still allocated to, or a write sent to a replica. |
-| `413` | The sample batch would push the training set past its limit. |
+| `408` | A request body took more than 30 seconds to arrive. |
+| `409` | A conflict: a duplicate live node, no live nodes to deploy onto, a tunnel address another node holds, a tunnel change with no deployed policy, a customer a tunnel is still allocated to, retiring a node that is still running, deleting the deployed policy, a model already being trained, or a write sent to a replica. |
+| `413` | Past a limit (see [Limits](#limits)): a body over 4 MiB, a full fabric, as many policies or tenants as the control plane keeps, or a training set at its size. The message says which. |
 | `422` | A fitted model would drop too much clean traffic, or a known-good sample, so it was not published. The answer carries the model that would have been. |
-| `503` | Durable state could not be written. **The change was rolled back and did not take effect.** |
+| `503` | Durable state could not be written. **The change was rolled back and did not take effect.** Or, with `Retry-After: 1`, the control plane is holding as many request bodies as it has room for: try again. |
 
 `503` is the one worth internalising: a write is durable before it is
 acknowledged, so a caller is never told a policy was saved that the control
@@ -60,6 +61,40 @@ $ curl -H "Authorization: Bearer $NODE_CREDENTIAL" $API/v1/fabric
 $ curl -H "Authorization: Bearer nope" $API/v1/nodes
 {"error":"missing or invalid bearer token"}                           # 401
 ```
+
+## Limits
+
+The control plane is sized to run on a server with 16 GB of memory, so what it
+keeps has a ceiling, and a write past one is refused with what it hit:
+
+| What | At most |
+| --- | --- |
+| Nodes in the fabric | 128 |
+| Policies kept | 32 |
+| In one policy | 1024 protected prefixes, 1024 rules, 1024 tunnels, 256 game filters, 256 BGP sessions |
+| Tenants | 4096, with 16384 prefixes between them and 1024 each |
+| Training set | 200000 samples, with 64 MiB of payloads and packets between them; one sample carries at most a packet of each |
+| A request body | 4 MiB on the control plane, 1 MiB on an agent |
+| Request bodies at once | 256 MiB on the control plane, 64 MiB on an agent, charged for what has arrived |
+| Open connections | 8192 on the control plane, 1024 on an agent |
+
+Everything that grows with the fabric multiplies the policy by the nodes: each
+node is compiled a program of the whole policy and reports counters for every
+prefix, rule, tunnel and filter in it. Room is made by retiring a node that is
+gone for good and deleting a policy that is no longer needed:
+
+```console
+$ curl -X DELETE -H "Authorization: Bearer $OP" $API/v1/nodes/node-3f9a2c1b
+{"retired":"node-3f9a2c1b"}
+$ curl -X DELETE -H "Authorization: Bearer $OP" $API/v1/policies/pol-7
+{"deleted":"pol-7"}
+```
+
+A node that heartbeated in the last 30 seconds is not retired (`409`): it is
+still running, and its next heartbeat would enrol it again. Nor is the
+deployed policy deleted. One model is trained at a time, since each fit holds
+its own copy of the training set; a second answers `409` until the first is
+done.
 
 ## A walkthrough
 
@@ -506,8 +541,10 @@ PREFIX           OFFERED   SCRUBBED  MITIGATED  PEAK PPS  NOW PPS  NODES  ATTACK
 over the last 1h0m0s
 ```
 
-Per-node detail stays on `/metrics`, where the new `scrubline_prefix_*` series
-break each node's traffic down by the prefix it was aimed at:
+Per-node detail stays on each node's view of the metrics, `/metrics?node=<id>`
+on the control plane or the agent's own `/metrics`, where the
+`scrubline_prefix_*` series break each node's traffic down by the prefix it was
+aimed at:
 
 ```
 scrubline_prefix_offered_pps{node="…",name="edge-lhr",region="us-east",prefix="203.0.113.0/24"} 940000

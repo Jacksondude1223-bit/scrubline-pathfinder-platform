@@ -1,6 +1,17 @@
 //! Typed heartbeat wire contract.
 use crate::model::null_default;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+/// A node's last heartbeat as the control plane keeps it. The counters stay typed: as JSON values
+/// a fabric's worth of them would cost several times what the counters themselves do.
+#[derive(Debug, Clone, Serialize)]
+pub struct Report {
+    pub node_id: String,
+    pub name: String,
+    pub region: String,
+    pub stats: Stats,
+    pub reported_at: DateTime<Utc>,
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReputationStats {
@@ -106,11 +117,88 @@ pub struct Stats {
     pub load_window_seconds: i64,
     #[serde(deserialize_with = "null_default")]
     pub crafted: CraftedStats,
+    /// What the agent's process holds in memory, as the kernel counts it.
+    #[serde(deserialize_with = "null_default")]
+    pub resident_bytes: u64,
     #[serde(
         deserialize_with = "null_default",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub mitigation: Vec<MitigationStats>,
+}
+impl Stats {
+    /// The node as a whole: everything but its rows for each prefix, rule, filter and on-demand
+    /// tunnel, and which prefixes' return paths it sees. Every field is named, so one added to
+    /// Stats is not left out of the summary without a decision.
+    pub fn summary(&self) -> Self {
+        let Self {
+            decisions,
+            unowned,
+            stages,
+            rules: _,
+            games: _,
+            prefixes: _,
+            ml,
+            pulsing,
+            pulse_peak_pps,
+            game_sessions,
+            game_sessions_max,
+            game_http_windows,
+            game_http_windows_max,
+            reputation,
+            egress,
+            rate_buckets,
+            rate_buckets_max,
+            offered_pps,
+            dropped_pps,
+            surge_pps,
+            load_window_seconds,
+            crafted,
+            resident_bytes,
+            mitigation: _,
+        } = self;
+        let EgressStats {
+            tracker,
+            seen,
+            promoted,
+            locked_down,
+            lockdown,
+            prefix_states: _,
+        } = egress;
+        Self {
+            decisions: *decisions,
+            unowned: *unowned,
+            stages: stages.clone(),
+            rules: Vec::new(),
+            games: Vec::new(),
+            prefixes: Vec::new(),
+            ml: ml.clone(),
+            pulsing: *pulsing,
+            pulse_peak_pps: *pulse_peak_pps,
+            game_sessions: *game_sessions,
+            game_sessions_max: *game_sessions_max,
+            game_http_windows: *game_http_windows,
+            game_http_windows_max: *game_http_windows_max,
+            reputation: reputation.clone(),
+            egress: EgressStats {
+                tracker: tracker.clone(),
+                seen: *seen,
+                promoted: *promoted,
+                locked_down: *locked_down,
+                lockdown: lockdown.clone(),
+                prefix_states: Vec::new(),
+            },
+            rate_buckets: *rate_buckets,
+            rate_buckets_max: *rate_buckets_max,
+            offered_pps: *offered_pps,
+            dropped_pps: *dropped_pps,
+            surge_pps: *surge_pps,
+            load_window_seconds: *load_window_seconds,
+            crafted: crafted.clone(),
+            resident_bytes: *resident_bytes,
+            mitigation: Vec::new(),
+        }
+    }
 }
 /// What the crafted-packet checks did: in which mode, in all and per check, and how full the
 /// table of fragments in reassembly is.

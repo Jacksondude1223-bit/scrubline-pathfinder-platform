@@ -2,7 +2,11 @@
 use crate::model::Program;
 use ipnet::IpNet;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 pub fn stamp(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .unwrap()
@@ -135,6 +139,72 @@ pub struct Collector {
     prefix_counters: HashMap<(String, String), [u64; 5]>,
     rule_counters: HashMap<(String, String, bool), [u64; 5]>,
     nodes: HashMap<String, i64>,
+    /// What the programs nodes last reported under protect, by fingerprint (see Attribution).
+    attributions: HashMap<u64, Arc<Attribution>>,
+}
+/// Which prefixes a program protects, and which of them each of its rules and game filters can
+/// act on. Every report from a node needs both, and working them out takes every rule against
+/// every prefix, so it is done once for each program rather than for each report: on a large
+/// policy it was most of what handling a heartbeat cost.
+struct Attribution {
+    prefixes: HashSet<String>,
+    scopes: HashMap<(String, bool), Scope>,
+}
+/// The most programs worked out at once: nodes run one policy, compiled a little differently
+/// for some of them.
+const ATTRIBUTIONS_MAX: usize = 16;
+impl Attribution {
+    fn of(program: &Program) -> Self {
+        let nets: Vec<_> = program
+            .prefixes
+            .iter()
+            .map(|p| (p, p.parse::<IpNet>().ok()))
+            .collect();
+        let mut scopes = HashMap::new();
+        for r in &program.asic {
+            scopes.insert(
+                (r.rule_id.clone(), false),
+                scope(&r.r#match.dst_cidr, "asic", &nets),
+            );
+        }
+        for r in &program.fpga {
+            scopes.insert(
+                (r.rule_id.clone(), false),
+                scope(&r.r#match.dst_cidr, "fpga", &nets),
+            );
+        }
+        for r in &program.zc {
+            scopes.insert(
+                (r.rule_id.clone(), false),
+                scope(&r.r#match.dst_cidr, "zc", &nets),
+            );
+        }
+        for g in &program.games {
+            scopes.insert((g.id.clone(), true), scope(&g.dst_cidr, "zc", &nets));
+        }
+        Self {
+            prefixes: program.prefixes.iter().cloned().collect(),
+            scopes,
+        }
+    }
+    /// What an attribution is worked out from, hashed.
+    fn fingerprint(program: &Program) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        program.prefixes.hash(&mut h);
+        for r in &program.asic {
+            ("asic", &r.rule_id, &r.r#match.dst_cidr).hash(&mut h);
+        }
+        for r in &program.fpga {
+            ("fpga", &r.rule_id, &r.r#match.dst_cidr).hash(&mut h);
+        }
+        for r in &program.zc {
+            ("zc", &r.rule_id, &r.r#match.dst_cidr).hash(&mut h);
+        }
+        for g in &program.games {
+            ("game", &g.id, &g.dst_cidr).hash(&mut h);
+        }
+        h.finish()
+    }
 }
 /// The spacing series points actually have: a step rounded up to whole minutes, in milliseconds.
 pub fn resolution(step: i64) -> i64 {
@@ -153,19 +223,18 @@ fn delta(a: u64, b: u64) -> u64 {
         b - a
     }
 }
-fn scope(dst: &str, stage: &str, program: &Program) -> Scope {
+fn scope(dst: &str, stage: &str, nets: &[(&String, Option<IpNet>)]) -> Scope {
     let target = dst.parse::<IpNet>().ok();
-    let prefixes: Vec<_> = program
-        .prefixes
+    let prefixes: Vec<_> = nets
         .iter()
-        .filter(|p| {
+        .filter(|(_, p)| {
             target.is_none()
-                || p.parse::<IpNet>().is_ok_and(|p| {
+                || p.is_some_and(|p| {
                     let t = target.unwrap();
                     p.contains(&t.addr()) || t.contains(&p.addr())
                 })
         })
-        .cloned()
+        .map(|(p, _)| (*p).clone())
         .collect();
     Scope {
         shared: prefixes.len() > 1,
@@ -183,10 +252,42 @@ impl Collector {
                 .is_none_or(|(_, p)| live.contains(p))
         });
     }
+    /// Forgets a node that was retired: its gauges and the baselines its counters were read from.
+    pub fn forget_node(&mut self, node: &str) {
+        for s in self.series.values_mut() {
+            s.gauges.remove(node);
+        }
+        self.prefix_counters.retain(|(n, _), _| n != node);
+        self.rule_counters.retain(|(n, _, _), _| n != node);
+        self.nodes.remove(node);
+    }
     pub fn prefixes(&self) -> Vec<String> {
         self.series.keys().cloned().collect()
     }
+    /// A report given as JSON, read as a heartbeat's would be.
     pub fn observe(&mut self, node: &str, stats: &Value, program: &Program, now: i64) {
+        let stats: crate::wire::Stats = serde_json::from_value(stats.clone()).unwrap_or_default();
+        self.observe_stats(node, &stats, program, now);
+    }
+    pub fn observe_stats(
+        &mut self,
+        node: &str,
+        stats: &crate::wire::Stats,
+        program: &Program,
+        now: i64,
+    ) {
+        let key = Attribution::fingerprint(program);
+        let attr = match self.attributions.get(&key) {
+            Some(a) => a.clone(),
+            None => {
+                if self.attributions.len() >= ATTRIBUTIONS_MAX {
+                    self.attributions.clear();
+                }
+                let a = Arc::new(Attribution::of(program));
+                self.attributions.insert(key, a.clone());
+                a
+            }
+        };
         self.nodes.insert(node.into(), now);
         let expired: HashSet<_> = self
             .nodes
@@ -197,31 +298,36 @@ impl Collector {
         // Only the gauges of a silent node expire. Its baselines stay: the agent keeps counting
         // while it cannot report, and a counter that only counts up survives reports being missed.
         self.nodes.retain(|n, _| !expired.contains(n));
+        // Every report comes through here, so the day's history is trimmed from its old end
+        // rather than walked whole.
+        let oldest = now / 60000 - 1439;
         for s in self.series.values_mut() {
-            s.gauges.retain(|n, _| !expired.contains(n));
-            s.ring.retain(|minute, _| *minute >= now / 60000 - 1439);
+            if !expired.is_empty() {
+                s.gauges.retain(|n, _| !expired.contains(n));
+            }
+            while s
+                .ring
+                .first_key_value()
+                .is_some_and(|(minute, _)| *minute < oldest)
+            {
+                s.ring.pop_first();
+            }
         }
         let mut touched = HashSet::new();
         let mut crafted = Vec::new();
-        for row in rows(stats, "prefixes") {
-            let p = row["prefix"].as_str().unwrap_or("");
+        for row in &stats.prefixes {
+            let p = row.prefix.as_str();
             // Only what the node is programmed to protect: a row for a prefix just removed would
             // bring its series back, and arbitrary strings would fill the series cap.
             if p.is_empty()
-                || !program.prefixes.iter().any(|q| q == p)
+                || !attr.prefixes.contains(p)
                 || !self.series.contains_key(p) && self.series.len() >= 256
             {
                 continue;
             }
             let s = self.series.entry(p.into()).or_default();
             touched.insert(p.to_string());
-            let cur = [
-                n(row, "flows"),
-                n(row, "flows_dropped"),
-                n(row, "offered"),
-                n(row, "dropped"),
-                0,
-            ];
+            let cur = [row.flows, row.flows_dropped, row.offered, row.dropped, 0];
             // A node's first report is only a baseline. Its counters run from agent start, so
             // counting them from zero after a control-plane restart, a failover or a node's return
             // would book its lifetime traffic into this minute.
@@ -230,12 +336,12 @@ impl Collector {
             // class only once it has dropped one, so one that first appears after the baseline
             // counts from zero. The prefix is the packets' destination: the drops are never
             // shared.
-            for c in rows(row, "crafted") {
-                let class = c["class"].as_str().unwrap_or("");
+            for c in &row.crafted {
+                let class = c.class.as_str();
                 if !["stack", "protocol", "buffer"].contains(&class) {
                     continue;
                 }
-                let counts = [0, n(c, "flows"), 0, n(c, "dropped"), 0];
+                let counts = [0, c.flows, 0, c.dropped, 0];
                 let key = (node.into(), format!("|crafted|{class}|{p}"), false);
                 let prev = self.rule_counters.insert(key, counts);
                 if let Some(prev) = prev.or(seen.map(|_| [0; 5])) {
@@ -254,85 +360,52 @@ impl Collector {
             s.gauges.insert(
                 node.into(),
                 Gauge {
-                    rates: [
-                        n(row, "offered_pps"),
-                        n(row, "dropped_pps"),
-                        n(row, "peak_pps"),
-                    ],
-                    pulse: row["pulsing"] == true,
+                    rates: [row.offered_pps, row.dropped_pps, row.peak_pps],
+                    pulse: row.pulsing,
                     at: now,
                 },
             );
         }
-        let mut attr = HashMap::new();
-        for r in &program.asic {
-            attr.insert(
-                (r.rule_id.clone(), false),
-                scope(&r.r#match.dst_cidr, "asic", program),
-            );
-        }
-        for r in &program.fpga {
-            attr.insert(
-                (r.rule_id.clone(), false),
-                scope(&r.r#match.dst_cidr, "fpga", program),
-            );
-        }
-        for r in &program.zc {
-            attr.insert(
-                (r.rule_id.clone(), false),
-                scope(&r.r#match.dst_cidr, "zc", program),
-            );
-        }
-        for g in &program.games {
-            attr.insert((g.id.clone(), true), scope(&g.dst_cidr, "zc", program));
-        }
         let mut moved = Vec::new();
-        for (key, filter) in [("rules", false), ("games", true)] {
-            for r in rows(stats, key) {
-                let id = r[if filter { "filter_id" } else { "rule_id" }]
-                    .as_str()
-                    .unwrap_or("");
-                let Some(scope) = attr.get(&(id.into(), filter)) else {
-                    continue;
-                };
-                if scope.prefixes.is_empty() {
-                    continue;
-                }
-                let cur = if filter {
-                    [
-                        0,
-                        n(r, "dropped"),
-                        0,
-                        n(r, "pps_dropped"),
-                        n(r, "challenged"),
-                    ]
-                } else {
-                    [0, n(r, "drops"), 0, n(r, "pps_dropped"), 0]
-                };
-                let Some(prev) = self
-                    .rule_counters
-                    .insert((node.into(), id.into(), filter), cur)
-                else {
-                    continue;
-                };
-                let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], cur[i]));
-                if diff[1] == 0 && diff[3] == 0 && diff[4] == 0 {
-                    continue;
-                }
-                for p in &scope.prefixes {
-                    if let Some(s) = self.series.get_mut(p) {
-                        // A challenge count shared by several prefixes cannot be split between
-                        // them; booking it to each would double it and show one customer
-                        // another's. The event vectors carry it, marked shared.
-                        if !scope.shared {
-                            let bucket = s.ring.entry(now / 60000).or_default();
-                            bucket.counts[4] = bucket.counts[4].saturating_add(diff[4]);
-                        }
-                        touched.insert(p.clone());
-                    }
-                }
-                moved.push((id.to_owned(), filter, scope.clone(), diff));
+        let rules = stats
+            .rules
+            .iter()
+            .map(|r| (&r.rule_id, false, [0, r.drops, 0, r.pps_dropped, 0]));
+        let games = stats.games.iter().map(|g| {
+            let cur = [0, g.dropped, 0, g.pps_dropped, g.challenged];
+            (&g.filter_id, true, cur)
+        });
+        for (id, filter, cur) in rules.chain(games) {
+            let id = id.as_str();
+            let Some(scope) = attr.scopes.get(&(id.into(), filter)) else {
+                continue;
+            };
+            if scope.prefixes.is_empty() {
+                continue;
             }
+            let Some(prev) = self
+                .rule_counters
+                .insert((node.into(), id.into(), filter), cur)
+            else {
+                continue;
+            };
+            let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], cur[i]));
+            if diff[1] == 0 && diff[3] == 0 && diff[4] == 0 {
+                continue;
+            }
+            for p in &scope.prefixes {
+                if let Some(s) = self.series.get_mut(p) {
+                    // A challenge count shared by several prefixes cannot be split between
+                    // them; booking it to each would double it and show one customer
+                    // another's. The event vectors carry it, marked shared.
+                    if !scope.shared {
+                        let bucket = s.ring.entry(now / 60000).or_default();
+                        bucket.counts[4] = bucket.counts[4].saturating_add(diff[4]);
+                    }
+                    touched.insert(p.clone());
+                }
+            }
+            moved.push((id.to_owned(), filter, scope.clone(), diff));
         }
         // An open event is judged on every report, not only when its prefix is reported, or it
         // stays open forever once no node carries the prefix any more.
