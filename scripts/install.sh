@@ -6,9 +6,11 @@
 #                                      its tunnels, routes, firewall and shapers onto the box
 #   sudo scripts/install.sh all        both, on one server
 #   sudo scripts/install.sh uninstall  remove the services (add --purge to remove state too)
+#   sudo scripts/install.sh deploy-key let this server pull a private GitHub repository
 #
 # Run it again to upgrade: it rebuilds or recopies the binaries, rewrites the services and
-# restarts them, and keeps the credentials, certificates and options from earlier runs.
+# restarts them, and keeps the credentials, certificates and options from earlier runs. With
+# --pull it pulls this checkout first.
 # scripts/install.sh --help lists every option; docs/install.md walks through a fabric.
 set -euo pipefail
 
@@ -37,6 +39,7 @@ trap 'if [[ -n $SCRATCH ]]; then rm -rf "$SCRATCH"; fi' EXIT
 usage() {
 	cat <<'USAGE'
 Usage: sudo scripts/install.sh <api|node|all|uninstall> [options]
+       sudo scripts/install.sh deploy-key
 
 Control plane (api, all):
   --listen ADDR:PORT      address and port the API serves on (default 0.0.0.0:8080)
@@ -70,6 +73,7 @@ Scrubbing node (node, all):
   --provision             install it again after --no-provision
 
 Either:
+  --pull                  pull this checkout first, then install what it holds
   --bin-dir DIR           install the binaries from DIR instead of building them
   --no-deps               do not install missing packages
   --no-start              configure everything but do not start or restart anything
@@ -78,7 +82,98 @@ Either:
 Options are kept from one run to the next; to drop one, delete its line from
 /etc/scrubline/install.conf and run this again. Flags of the binaries that have no option here go
 on the *_EXTRA_OPTS lines in /etc/scrubline/api.env and node.env, which are kept too.
+
+deploy-key lets this server pull a private repository on GitHub with --pull. It makes a key that
+GitHub can give read-only access to the one repository, and prints it for the repository's
+Settings > Deploy keys; this checkout's origin then reaches GitHub over SSH with it.
 USAGE
+}
+
+# The checkout this script is in is pulled as whoever owns it, so its files stay theirs and git
+# does not refuse a checkout that another user owns.
+OWNER='' OWNER_HOME=''
+find_owner() {
+	OWNER=$(stat -c %U "$REPO")
+	OWNER_HOME=$(getent passwd "$OWNER" | cut -d: -f6) || true
+	[[ -n $OWNER_HOME ]] || die "$REPO belongs to $OWNER, who has no home directory to pull as"
+}
+as_owner() {
+	if [[ $OWNER == "$(id -un)" ]]; then
+		"$@"
+	else
+		runuser -u "$OWNER" -- env HOME="$OWNER_HOME" "$@"
+	fi
+}
+checkout() { as_owner git -C "$REPO" "$@"; }
+# A URL without the credentials it may carry, for saying where it points.
+redact() { sed -E 's#://[^/@]*@#://#' <<<"$1"; }
+# owner/name of a GitHub repository, from any URL git reaches it by.
+github_repo() {
+	local re='^(https://([^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/?$'
+	[[ $1 =~ $re ]] || return 1
+	printf '%s\n' "${BASH_REMATCH[3]%.git}"
+}
+
+pull() {
+	command -v git >/dev/null || die "--pull needs git"
+	find_owner
+	checkout rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$REPO is not a git checkout, so there is nothing to pull"
+	local from before
+	from=$(redact "$(checkout remote get-url origin 2>/dev/null || echo origin)")
+	before=$(checkout rev-parse HEAD)
+	say "pulling $from"
+	if ! checkout pull --ff-only; then
+		die "could not pull from $from; for a private repository on GitHub, give this server a deploy key: sudo scripts/install.sh deploy-key"
+	fi
+	if [[ $(checkout rev-parse HEAD) == "$before" ]]; then
+		say "already up to date: $(checkout log -1 --format='%h %s')"
+	else
+		say "updated to $(checkout log -1 --format='%h %s')"
+	fi
+}
+
+# GitHub's SSH host key is checked against the fingerprint GitHub publishes rather than trusted on
+# first sight, since what is pulled over it is built and installed as root.
+GITHUB_ED25519=SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
+deploy_key() {
+	local c url repo key hosts scanned fp
+	for c in git ssh ssh-keygen ssh-keyscan; do
+		command -v "$c" >/dev/null || die "deploy-key needs $c; install git and the OpenSSH client"
+	done
+	find_owner
+	checkout rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "$REPO is not a git checkout"
+	url=$(checkout remote get-url origin 2>/dev/null) || die "this checkout has no origin to pull from"
+	repo=$(github_repo "$url") || die "origin is not a repository on GitHub: $(redact "$url")"
+	key=$OWNER_HOME/.ssh/scrubline-deploy
+	hosts=$OWNER_HOME/.ssh/scrubline-known-hosts
+	as_owner mkdir -p "$OWNER_HOME/.ssh"
+	as_owner chmod 700 "$OWNER_HOME/.ssh"
+	if [[ ! -f $key ]]; then
+		as_owner ssh-keygen -q -t ed25519 -N '' -C "scrubline@$(hostname -s)" -f "$key"
+		say "made a deploy key, $key"
+	fi
+	scanned=$(timeout 30 ssh-keyscan -T 15 -t ed25519 github.com 2>/dev/null | grep '^github\.com ssh-ed25519 ') ||
+		die "could not reach github.com over SSH (TCP port 22)"
+	fp=$(ssh-keygen -lf /dev/stdin <<<"$scanned" | awk '{print $2}')
+	[[ $fp == "$GITHUB_ED25519" ]] ||
+		die "github.com answered with SSH host key $fp, not $GITHUB_ED25519, which GitHub publishes; not trusting it"
+	as_owner tee "$hosts" >/dev/null <<<"$scanned"
+	checkout remote set-url origin "git@github.com:$repo.git"
+	checkout config core.sshCommand "ssh -i '$key' -o IdentitiesOnly=yes -o UserKnownHostsFile='$hosts' -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o BatchMode=yes"
+	say "origin is now git@github.com:$repo.git, reached with $key"
+	if as_owner timeout 60 git -C "$REPO" ls-remote origin HEAD >/dev/null 2>&1; then
+		say "GitHub accepts the key: update with sudo scripts/install.sh <api|node|all> --pull"
+		return
+	fi
+	cat <<EOF
+
+GitHub does not accept the key yet. Add it at https://github.com/$repo/settings/keys
+with "Add deploy key", leaving "Allow write access" unticked:
+
+  $(cat "$key.pub")
+
+Then update with: sudo scripts/install.sh <api|node|all> --pull
+EOF
 }
 
 [[ $# -gt 0 ]] || {
@@ -88,14 +183,31 @@ USAGE
 ROLE=$1
 shift
 case $ROLE in
-api | node | all | uninstall) ;;
+api | node | all | uninstall | deploy-key) ;;
 -h | --help | help)
 	usage
 	exit 0
 	;;
-*) die "unknown role '$ROLE'; use api, node, all or uninstall" ;;
+*) die "unknown role '$ROLE'; use api, node, all, uninstall or deploy-key" ;;
 esac
 [[ $(id -u) -eq 0 ]] || die "run this as root (sudo scripts/install.sh $ROLE ...)"
+if [[ $ROLE == deploy-key ]]; then
+	[[ $# -eq 0 ]] || die "deploy-key takes no options"
+	deploy_key
+	exit 0
+fi
+# --pull goes before anything else, and then the installer the checkout holds runs, so an update
+# is installed by its own installer.
+PULL=0
+ARGS=()
+for a in "$@"; do
+	if [[ $a == --pull ]]; then PULL=1; else ARGS+=("$a"); fi
+done
+if [[ $PULL == 1 ]]; then
+	[[ $ROLE != uninstall ]] || die "--pull is for api, node and all"
+	pull
+	exec bash "$REPO/scripts/install.sh" "$ROLE" ${ARGS[@]+"${ARGS[@]}"}
+fi
 
 # What the operator gave on earlier runs, which this run starts from. Values that follow from
 # these are worked out afresh every run, so they follow when an option changes; only a node's

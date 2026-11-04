@@ -220,18 +220,41 @@ takes its IPv6 default route from them is set to keep accepting them first.
 
 ## Upgrading and changing settings
 
-Pull and run the same command again, without options:
+Run the same command again with `--pull` and no other options:
 
 ```sh
-git pull && sudo scripts/install.sh node
+sudo scripts/install.sh node --pull
 ```
 
-It rebuilds, reinstalls and restarts, and keeps the tokens, the certificates
-and the options you gave before. Pass an option to change it; whatever follows
-from it follows, such as the next hop from `--tunnel-ip`, and on `all` the
-agent's API address from `--listen`. To drop an option, so it goes back to its
-default, delete its line from `/etc/scrubline/install.conf` and run the script
-again.
+It pulls the checkout, then runs the installer the checkout now holds, so an
+update is installed by its own installer. It rebuilds, reinstalls and restarts,
+and keeps the tokens, the certificates and the options you gave before. Pass an
+option to change it; whatever follows from it follows, such as the next hop
+from `--tunnel-ip`, and on `all` the agent's API address from `--listen`. To
+drop an option, so it goes back to its default, delete its line from
+`/etc/scrubline/install.conf` and run the script again.
+
+### From a private repository
+
+A server pulls a private repository on GitHub with a deploy key: a key that
+GitHub gives read-only access to that one repository. Set one up once on each
+server:
+
+```sh
+sudo scripts/install.sh deploy-key
+```
+
+It makes the key in the checkout owner's `~/.ssh` (`scrubline-deploy`), and
+prints it with where to add it: the repository's Settings > Deploy keys >
+Add deploy key, with "Allow write access" left unticked. It points the
+checkout's `origin` at GitHub over SSH with that key, and checks GitHub's SSH
+host key against the fingerprint GitHub publishes before trusting it, since
+what is pulled is built and installed as root. Once the key is added,
+`--pull` needs no password. Run `deploy-key` again to check that GitHub
+accepts it.
+
+The server needs to reach github.com on TCP port 22, and the checkout is
+pulled as whoever owns it.
 
 A node's name and region are how the control plane knows it: changing either
 enrols the server as a new node, and the tunnels pinned to the old one stay
