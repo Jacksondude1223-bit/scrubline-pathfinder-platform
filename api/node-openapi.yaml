@@ -147,6 +147,9 @@ paths:
 
         Every customer tunnel then gets a `tc` token-bucket shaper holding what goes down it to this
         node''s share of the tunnel''s clean-traffic allowance: all of it at a pinned tunnel''s location.
+        Under the bucket, at `1:1`, an `fq_codel` queue gives each flow a queue of its own, so a game''s
+        packets do not wait behind a flow filling the allowance; its `memory_limit` is about 100 ms at the
+        rate, and never less than 128 KiB. The two lines go together.
 
 
         The rules assume the `inet scrubline` table with `forward` and `input` chains. The provisioner the
@@ -241,7 +244,9 @@ paths:
                 nft add rule inet scrubline forward iifname "scr-northwind" tcp flags syn tcp option maxseg
                 size set 1432
 
-                tc qdisc replace dev scr-northwind root tbf rate 2500000kbit burst 3125000 latency 50ms
+                tc qdisc replace dev scr-northwind root handle 1: tbf rate 2500000kbit burst 3125000 latency 5ms
+
+                tc qdisc replace dev scr-northwind parent 1:1 handle 10: fq_codel memory_limit 31250000
 
                 '
         '401':

@@ -1269,6 +1269,16 @@ share; since anycast rarely spreads traffic evenly, a node can be held to its
 share while others sit under theirs. `PUT /v1/tunnels/{id}/rate` changes only
 the speed.
 
+The shaper keeps a game's packets from waiting behind bulk traffic. Under the
+token bucket, `fq_codel` keeps the queue. Each flow waits in its own queue, so
+a game's small, steady packets go out ahead of a download, or what is left of
+a flood, filling the allowance. A queue that stands for longer than 5 ms is cut
+back. A single shared queue would hold every packet behind whatever is filling
+the allowance. The queue's memory is held to about 100 ms at the rate, and
+never less than 128 KiB. On a kernel without `fq_codel`, the token bucket keeps
+the rate over a short queue of its own. The tunnel stays up, and the
+provisioner's status says what failed.
+
 ### On-demand mitigation
 
 By default a node filters a customer's traffic all the time. A tunnel can

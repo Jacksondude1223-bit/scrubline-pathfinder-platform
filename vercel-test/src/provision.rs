@@ -5,7 +5,11 @@
 //! and apart from the agent. Each pass reconciles the box with the agent's rendered configuration
 //! rather than replaying it, so it can run every few seconds without piling up duplicates, and
 //! it removes what the agent no longer asks for.
-use crate::{model::NodeTunnel, Result};
+use crate::{
+    model::NodeTunnel,
+    tunnel::{QUEUE_MAX, QUEUE_MIN},
+    Result,
+};
 use ipnet::IpNet;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,10 +32,19 @@ pub struct Observed {
     pub links: BTreeMap<String, String>,
     /// Routes through our interfaces, as (destination, interface).
     pub routes: BTreeSet<(String, String)>,
-    /// The token-bucket rate on each interface that has one, in bytes per second.
-    pub shapers: BTreeMap<String, u64>,
+    /// Our shapers, by interface: a token bucket at the root handle the renderers give it (`1:`).
+    pub shapers: BTreeMap<String, Shaper>,
     /// Whether the `inet scrubline` table exists.
     pub table: bool,
+}
+
+/// A shaper as the box holds it.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Shaper {
+    /// The token bucket's rate, in bytes per second.
+    pub rate: u64,
+    /// What the flow queue under it may hold, in bytes, when that queue is ours.
+    pub queue: Option<u64>,
 }
 
 /// One command of a pass, and the interface it concerns, if any.
@@ -134,7 +147,7 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
     let mut adds: BTreeMap<String, &str> = BTreeMap::new();
     let mut sets = Vec::new();
     let mut routes: BTreeMap<(String, String), &str> = BTreeMap::new();
-    let mut shapers = Vec::new();
+    let mut shapes: BTreeMap<&str, Shape> = BTreeMap::new();
     let mut nft = String::from(TABLE);
     for line in desired.lines.iter().map(|l| l.trim()) {
         if line.starts_with('#') || line.is_empty() {
@@ -144,7 +157,7 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
         // Nothing that could end one command and start another reaches nft or a command line.
         if !line
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b" .:/,{}!=*\"-".contains(&c))
+            .all(|c| c.is_ascii_alphanumeric() || b" .:/,{}!=*\"-_".contains(&c))
         {
             return Err(refuse());
         }
@@ -176,7 +189,7 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
                 nft.push_str(&line[4..]);
                 nft.push('\n');
             }
-            ["tc", "qdisc", "replace", "dev", name, "root", "tbf", "rate", rate, "burst", burst, "latency", "50ms"]
+            ["tc", "qdisc", "replace", "dev", name, "root", "handle", "1:", "tbf", "rate", rate, "burst", burst, "latency", "5ms"]
                 if interface(name) && number(burst) =>
             {
                 let kbit: u64 = rate
@@ -184,9 +197,33 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
                     .filter(|v| number(v))
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(refuse)?;
-                shapers.push((*name, kbit * 125, line));
+                shapes.entry(name).or_default().bucket = Some((kbit * 125, line));
+            }
+            ["tc", "qdisc", "replace", "dev", name, "parent", "1:1", "handle", "10:", "fq_codel", "memory_limit", bytes]
+                if interface(name) =>
+            {
+                // No more than the renderers ever ask for: a queue holds kernel memory.
+                let bytes: u64 = Some(*bytes)
+                    .filter(|b| number(b))
+                    .and_then(|b| b.parse().ok())
+                    .filter(|b| (QUEUE_MIN as u64..=QUEUE_MAX as u64).contains(b))
+                    .ok_or_else(refuse)?;
+                shapes.entry(name).or_default().queue = Some((bytes, line));
             }
             _ => return Err(refuse()),
+        }
+    }
+    // A token bucket and its queue go together: a bucket set afresh comes with a FIFO of the
+    // kernel's, and a queue has nowhere to go without its bucket.
+    let mut shapers = Vec::new();
+    for (name, shape) in &shapes {
+        match (shape.bucket, shape.queue) {
+            (Some(bucket), Some(queue)) => shapers.push((*name, bucket, queue)),
+            _ => {
+                return Err(format!(
+                    "refusing to apply half a shaper on {name}: a token bucket and its queue go together"
+                ))
+            }
         }
     }
     let mut pass = Pass::default();
@@ -226,13 +263,33 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
     for ((_, dev), line) in &routes {
         pass.steps.push(step(line, dev));
     }
-    for (name, rate, line) in shapers {
-        if rebuilt.contains(name) || observed.shapers.get(name) != Some(&rate) {
-            pass.steps.push(step(line, name));
+    for (name, (rate, bucket), (memory, queue)) in shapers {
+        let seen = observed.shapers.get(name);
+        // The queue is set whenever the bucket is: a bucket set afresh has the kernel's FIFO in
+        // the queue's place, and the queue's size follows the rate.
+        let reshape = rebuilt.contains(name) || seen.map(|s| s.rate) != Some(rate);
+        if reshape {
+            pass.steps.push(step(bucket, name));
+        }
+        if reshape || seen.and_then(|s| s.queue) != Some(memory) {
+            // Not held against the tunnel. Without its queue the bucket still holds the rate,
+            // over its own short FIFO, and a tunnel reported down withdraws its prefixes.
+            pass.steps.push(Step {
+                argv: argv(queue),
+                link: None,
+            });
         }
     }
     pass.nft = nft;
     Ok(pass)
+}
+
+/// A shaper as the agent asks for it: the token bucket's rate and line, and the queue's size and
+/// line.
+#[derive(Default)]
+struct Shape<'a> {
+    bucket: Option<(u64, &'a str)>,
+    queue: Option<(u64, &'a str)>,
 }
 
 /// Runs a command, returning what it printed or why it failed.
@@ -314,11 +371,22 @@ pub fn observe(r: &mut impl Runner) -> Result<Observed> {
             }
         }
     }
-    for q in json_rows(&r.run(&words("tc -j qdisc show"), None)?)? {
+    let qdiscs = json_rows(&r.run(&words("tc -j qdisc show"), None)?)?;
+    // A bucket at another handle, as releases before the queue set them, is not ours to keep: it
+    // is replaced, queue and all.
+    for q in &qdiscs {
         let dev = q["dev"].as_str().unwrap_or_default();
-        if ours(dev) && q["kind"] == "tbf" && q["root"] == true {
+        if ours(dev) && q["kind"] == "tbf" && q["root"] == true && q["handle"] == "1:" {
             if let Some(rate) = q["options"]["rate"].as_u64() {
-                o.shapers.insert(dev.into(), rate);
+                o.shapers.insert(dev.into(), Shaper { rate, queue: None });
+            }
+        }
+    }
+    for q in &qdiscs {
+        let dev = q["dev"].as_str().unwrap_or_default();
+        if q["kind"] == "fq_codel" && q["parent"] == "1:1" && q["handle"] == "10:" {
+            if let Some(shaper) = o.shapers.get_mut(dev) {
+                shaper.queue = q["options"]["memory_limit"].as_u64();
             }
         }
     }
@@ -429,8 +497,15 @@ mod tests {
     const ADD: &str = "ip link add scr-nw type gre local 192.0.2.1 remote 198.51.100.1 key 42";
     const SET: &str = "ip link set scr-nw mtu 1472 up";
     const ROUTE: &str = "ip route replace 203.0.113.0/24 dev scr-nw";
-    const SHAPE: &str =
-        "tc qdisc replace dev scr-nw root tbf rate 1000000kbit burst 1250000 latency 50ms";
+    const BUCKET: &str =
+        "tc qdisc replace dev scr-nw root handle 1: tbf rate 1000000kbit burst 1250000 latency 5ms";
+    const QUEUE: &str =
+        "tc qdisc replace dev scr-nw parent 1:1 handle 10: fq_codel memory_limit 12500000";
+    /// What the box holds with both in place.
+    const SHAPED: Shaper = Shaper {
+        rate: 125_000_000,
+        queue: Some(12_500_000),
+    };
     #[test]
     fn a_fresh_box_gets_everything() {
         let d = desired(&[
@@ -439,7 +514,8 @@ mod tests {
             SET,
             ROUTE,
             "nft add rule inet scrubline forward oifname \"scr-nw\" tcp flags syn tcp option maxseg size set 1432",
-            SHAPE,
+            BUCKET,
+            QUEUE,
         ]);
         let pass = plan(&d, &Observed::default()).unwrap();
         assert_eq!(
@@ -449,7 +525,8 @@ mod tests {
                 format!("ip link set dev scr-nw alias '{ADD}'"),
                 SET.into(),
                 ROUTE.into(),
-                SHAPE.into(),
+                BUCKET.into(),
+                QUEUE.into(),
             ]
         );
         assert!(pass.nft.starts_with(TABLE));
@@ -459,20 +536,120 @@ mod tests {
     }
     #[test]
     fn a_box_already_in_step_is_left_alone() {
-        let d = desired(&[ADD, SET, ROUTE, SHAPE]);
+        let d = desired(&[ADD, SET, ROUTE, BUCKET, QUEUE]);
         let o = Observed {
             links: BTreeMap::from([("scr-nw".into(), ADD.into())]),
             routes: BTreeSet::from([("203.0.113.0/24".into(), "scr-nw".into())]),
-            shapers: BTreeMap::from([("scr-nw".into(), 125_000_000)]),
+            shapers: BTreeMap::from([("scr-nw".into(), SHAPED)]),
             table: true,
         };
         // Only the idempotent settings are reasserted: nothing is rebuilt or reshaped.
         assert_eq!(shown(&plan(&d, &o).unwrap()), [SET, ROUTE]);
     }
     #[test]
+    fn a_shaper_is_set_again_where_it_differs() {
+        let d = desired(&[ADD, SET, ROUTE, BUCKET, QUEUE]);
+        let with = |shaper: Option<Shaper>| Observed {
+            links: BTreeMap::from([("scr-nw".into(), ADD.into())]),
+            routes: BTreeSet::from([("203.0.113.0/24".into(), "scr-nw".into())]),
+            shapers: shaper
+                .map(|s| BTreeMap::from([("scr-nw".into(), s)]))
+                .unwrap_or_default(),
+            table: true,
+        };
+        let both = [SET, ROUTE, BUCKET, QUEUE];
+        // No bucket of ours: none at all, or one an older release left at another handle,
+        // which observe does not count. The new one takes its place, and its queue follows.
+        assert_eq!(shown(&plan(&d, &with(None)).unwrap()), both);
+        // A new rate sets the bucket again, and the queue, whose size follows it.
+        let slower = Shaper {
+            rate: 12_500_000,
+            ..SHAPED
+        };
+        assert_eq!(shown(&plan(&d, &with(Some(slower))).unwrap()), both);
+        // The bucket in step over some other queue, or none: only the queue is set.
+        for queue in [None, Some(32 << 20)] {
+            let pass = plan(&d, &with(Some(Shaper { queue, ..SHAPED }))).unwrap();
+            assert_eq!(shown(&pass), [SET, ROUTE, QUEUE]);
+            assert_eq!(
+                pass.steps[2].link, None,
+                "a queue is not held against the tunnel"
+            );
+        }
+    }
+    #[test]
+    fn a_shaper_comes_whole() {
+        for lines in [&[ADD, BUCKET][..], &[ADD, QUEUE]] {
+            let refused = plan(&desired(lines), &Observed::default()).unwrap_err();
+            assert!(refused.contains("half a shaper on scr-nw"), "{refused}");
+        }
+        assert!(plan(&desired(&[ADD, BUCKET, QUEUE]), &Observed::default()).is_ok());
+    }
+    #[test]
+    fn a_queue_that_will_not_load_leaves_the_tunnel_up() {
+        // A kernel without fq_codel: the bucket holds the rate over its own FIFO, and the
+        // tunnel delivers, so its prefixes stay announced; the pass says what failed.
+        let d = desired(&[ADD, SET, ROUTE, BUCKET, QUEUE]);
+        let pass = plan(&d, &Observed::default()).unwrap();
+        let mut r = Fake {
+            ran: vec![],
+            fail: "tc qdisc replace dev scr-nw parent",
+        };
+        let applied = apply(&mut r, &pass, &Observed::default(), &mut String::new());
+        assert!(applied.failed.is_empty(), "{applied:?}");
+        assert_eq!(applied.errors.len(), 1, "{applied:?}");
+        assert!(applied.errors[0].contains("fq_codel"), "{applied:?}");
+        assert_eq!(report(&d, &applied)["tunnels"][0]["state"], "up");
+        // The bucket failing is the tunnel failing, as it always was.
+        let mut r = Fake {
+            ran: vec![],
+            fail: "tc qdisc replace dev scr-nw root",
+        };
+        let applied = apply(&mut r, &pass, &Observed::default(), &mut String::new());
+        assert_eq!(report(&d, &applied)["tunnels"][0]["state"], "down");
+    }
+    #[test]
+    fn observe_reads_our_buckets_and_the_queues_under_them() {
+        let qdiscs = r#"[
+            {"kind":"tbf","handle":"1:","dev":"scr-nw","root":true,"refcnt":2,
+             "options":{"rate":125000000,"burst":1250000,"lat":5000}},
+            {"kind":"fq_codel","handle":"10:","dev":"scr-nw","parent":"1:1",
+             "options":{"limit":10240,"flows":1024,"quantum":1514,"target":4999,
+                        "interval":99999,"memory_limit":12500000,"ecn":true,"drop_batch":64}},
+            {"kind":"tbf","handle":"1:","dev":"scr-bare","root":true,"refcnt":2,
+             "options":{"rate":125000,"burst":32768,"lat":5000}},
+            {"kind":"tbf","handle":"8001:","dev":"scr-old","root":true,"refcnt":2,
+             "options":{"rate":125000,"burst":32768,"lat":50000}},
+            {"kind":"fq_codel","handle":"0:","dev":"eth0","root":true,"refcnt":2,
+             "options":{"limit":10240,"memory_limit":33554432}}
+        ]"#;
+        let mut r = Canned(BTreeMap::from([("tc -j qdisc show", qdiscs)]));
+        let o = observe(&mut r).unwrap();
+        assert_eq!(
+            o.shapers,
+            BTreeMap::from([
+                (
+                    "scr-bare".into(),
+                    Shaper {
+                        rate: 125_000,
+                        queue: None
+                    }
+                ),
+                ("scr-nw".into(), SHAPED),
+            ])
+        );
+    }
+    /// Answers each command with what a box would print for it, and nothing for the rest.
+    struct Canned(BTreeMap<&'static str, &'static str>);
+    impl Runner for Canned {
+        fn run(&mut self, argv: &[String], _: Option<&str>) -> Result<String> {
+            Ok(self.0.get(shell(argv).as_str()).unwrap_or(&"").to_string())
+        }
+    }
+    #[test]
     fn changed_or_unwanted_tunnels_and_routes_go() {
         let moved = "ip link add scr-nw type gre local 192.0.2.1 remote 198.51.100.9 key 42";
-        let d = desired(&[moved, SET, ROUTE, SHAPE]);
+        let d = desired(&[moved, SET, ROUTE, BUCKET, QUEUE]);
         let o = Observed {
             links: BTreeMap::from([
                 ("scr-nw".into(), ADD.into()),
@@ -486,7 +663,7 @@ mod tests {
                 ("203.0.113.0/24".into(), "scr-nw".into()),
                 ("198.51.100.0/24".into(), "scr-gone".into()),
             ]),
-            shapers: BTreeMap::from([("scr-nw".into(), 125_000_000)]),
+            shapers: BTreeMap::from([("scr-nw".into(), SHAPED)]),
             table: true,
         };
         assert_eq!(
@@ -500,7 +677,8 @@ mod tests {
                 SET.into(),
                 ROUTE.into(),
                 // Rebuilt, so its shaper went with it.
-                SHAPE.into(),
+                BUCKET.into(),
+                QUEUE.into(),
             ]
         );
         // A route the agent stopped asking for on an interface that stays is removed alone.
@@ -539,10 +717,69 @@ mod tests {
             "rm -rf /",
             "tc qdisc del dev scr-nw root",
             "tc qdisc replace dev scr-nw root tbf rate 1000kbit burst 32768 latency 50ms limit 1",
+            "tc qdisc replace dev eth0 root handle 1: tbf rate 1000kbit burst 32768 latency 5ms",
+            "tc qdisc replace dev eth0 parent 1:1 handle 10: fq_codel memory_limit 131072",
         ] {
             assert!(
                 plan(&desired(&[line]), &Observed::default()).is_err(),
                 "{line}"
+            );
+        }
+    }
+    #[test]
+    fn a_shaper_has_exactly_the_shape_the_renderers_give_it() {
+        // Each beside a part that is right, so it is the line itself that is refused.
+        let queue = |tail: &str| format!("tc qdisc replace dev scr-nw {tail}");
+        for (bucket, queue) in [
+            // The shaper as releases before the queue wrote it.
+            (
+                queue("root tbf rate 1000kbit burst 32768 latency 50ms"),
+                QUEUE.into(),
+            ),
+            (
+                queue("root handle 1: tbf rate 1000kbit burst 32768 latency 50ms"),
+                QUEUE.into(),
+            ),
+            (
+                queue("root handle 2: tbf rate 1000kbit burst 32768 latency 5ms"),
+                QUEUE.into(),
+            ),
+            // A queue anywhere but under our bucket, of a size the renderers never give, tuned,
+            // or of another kind.
+            (
+                BUCKET.into(),
+                queue("root handle 10: fq_codel memory_limit 131072"),
+            ),
+            (
+                BUCKET.into(),
+                queue("parent 1:2 handle 10: fq_codel memory_limit 131072"),
+            ),
+            (
+                BUCKET.into(),
+                queue("parent 1:1 handle 10: fq_codel memory_limit 4294967295"),
+            ),
+            (
+                BUCKET.into(),
+                queue("parent 1:1 handle 10: fq_codel memory_limit 1024"),
+            ),
+            (
+                BUCKET.into(),
+                queue("parent 1:1 handle 10: fq_codel memory_limit 32Mb"),
+            ),
+            (
+                BUCKET.into(),
+                queue("parent 1:1 handle 10: fq_codel memory_limit 131072 target 1s"),
+            ),
+            (
+                BUCKET.into(),
+                queue("parent 1:1 handle 10: netem delay 100ms"),
+            ),
+        ] {
+            let refused =
+                plan(&desired(&[ADD, &bucket, &queue]), &Observed::default()).unwrap_err();
+            assert!(
+                refused.starts_with("refusing to apply an unrecognised line"),
+                "{bucket} / {queue}: {refused}"
             );
         }
     }

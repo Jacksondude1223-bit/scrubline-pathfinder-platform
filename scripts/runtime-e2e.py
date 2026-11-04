@@ -151,7 +151,7 @@ with tempfile.TemporaryDirectory() as temporary:
                     {'rate_mbps':100})['tunnel']['rate_mbps'] == 100
         def shaped(text):
             rates = [int(line.split(' rate ')[1].split('kbit')[0]) for line in text.splitlines()
-                     if line.startswith('tc qdisc replace dev scr-customer root tbf rate ')]
+                     if line.startswith('tc qdisc replace dev scr-customer root handle 1: tbf rate ')]
             return rates and 0 < rates[0] <= 100000 and text
         wait_for(lambda: shaped(call(local, '/tunnels?format=iproute2', token=LOCAL)))
         # The panel pins the customer's tunnel to this node, which then holds the whole
@@ -164,6 +164,10 @@ with tempfile.TemporaryDirectory() as temporary:
                                  cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=30)
             return run.returncode == 0 and 'tbf rate 100000kbit' in run.stdout and run.stdout
         planned = wait_for(provisioned)
+        # Under the bucket, the flow queue that keeps a game's packets from waiting behind a
+        # download: about 100ms at the 100 Mbit/s rate.
+        assert ('tc qdisc replace dev scr-customer parent 1:1 handle 10: fq_codel memory_limit 1250000'
+                in planned), planned
         assert 'ip link add scr-customer type gre local 192.0.2.30 remote 192.0.2.100' in planned, planned
         assert 'add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != {' in planned, planned
         call(local, '/tunnels', 'POST', LOCAL,
