@@ -123,6 +123,51 @@ what that attracts, and forward the clean traffic to it over node-to-node GRE.
 `PUT /v1/tunnels/{id}/location` moves a customer to another node.
 [docs/api.md](api.md#9-getting-the-clean-traffic-back) covers the API.
 
+## The API at your own domain
+
+The script serves the API over HTTPS with a certificate from its own private
+CA. The nodes trust that certificate, but a browser or a hosted panel does
+not. To give your panel an address like `https://api.example.com`, with a
+certificate every client trusts, put [Caddy](https://caddyserver.com) in front
+of the API. Caddy gets the certificate from Let's Encrypt and renews it, and
+the nodes keep talking to the API directly.
+
+1. Point a DNS name at the server with an `A` record, and let TCP 80 and 443
+   in. Let's Encrypt checks the name over them.
+2. On a single server, keep the API to the server itself, so Caddy is the
+   only way in:
+
+   ```sh
+   sudo scripts/install.sh all --listen 127.0.0.1:8080
+   ```
+
+   With nodes on other servers, keep listening on every address instead, and
+   let only the nodes' addresses reach the API's port.
+3. [Install Caddy](https://caddyserver.com/docs/install), give it a copy of
+   the CA certificate, and write `/etc/caddy/Caddyfile`:
+
+   ```
+   api.example.com {
+   	# Nodes enrol with the API directly, never through here.
+   	@register path /v1/nodes/register
+   	respond @register 403
+   	reverse_proxy https://127.0.0.1:8080 {
+   		transport http {
+   			tls_trusted_ca_certs /etc/caddy/scrubline-ca.pem
+   		}
+   	}
+   }
+   ```
+
+   ```sh
+   sudo install -m 0644 /etc/scrubline/tls/ca.pem /etc/caddy/scrubline-ca.pem
+   sudo systemctl reload caddy
+   curl https://api.example.com/health
+   ```
+
+Your panel then calls `https://api.example.com` with the operator token, as it
+did before.
+
 ## A replica of the control plane
 
 A replica follows the primary's state, serves reads, refuses writes, and can
