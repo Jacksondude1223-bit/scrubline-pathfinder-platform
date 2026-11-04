@@ -105,6 +105,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - name: Lint
         run: shellcheck -s bash scripts/install.sh
+      # A server updates a private repository with a deploy key, and github.com's SSH host key is
+      # checked against the fingerprint GitHub publishes. The key made here is never added to the
+      # repository, so GitHub turns it away and the script says where to add it.
+      - name: Deploy key
+        run: |
+          cp -a . "$RUNNER_TEMP/checkout"
+          git -C "$RUNNER_TEMP/checkout" remote set-url origin "https://github.com/$GITHUB_REPOSITORY.git"
+          sudo "$RUNNER_TEMP/checkout/scripts/install.sh" deploy-key | tee deploy-key.out
+          grep -q '^  ssh-ed25519 ' deploy-key.out
+          test "$(git -C "$RUNNER_TEMP/checkout" remote get-url origin)" = "git@github.com:$GITHUB_REPOSITORY.git"
+          grep -q '^github.com ssh-ed25519 ' ~/.ssh/scrubline-known-hosts
+      # --pull brings the checkout up to date, then runs the installer it now holds with the rest
+      # of the options, here one that the new installer refuses.
+      - name: Pull before installing
+        run: |
+          seed="$RUNNER_TEMP/seed" origin="$RUNNER_TEMP/origin.git" work="$RUNNER_TEMP/work"
+          mkdir -p "$seed/scripts" && cp scripts/install.sh "$seed/scripts/"
+          git -C "$seed" init -q -b main
+          git -C "$seed" add -A && git -C "$seed" -c user.name=ci -c user.email=ci@localhost commit -qm one
+          git clone -q --bare "$seed" "$origin" && git clone -q "$origin" "$work"
+          sed -i 's/^set -euo pipefail$/&\necho "the pulled installer runs"/' "$seed/scripts/install.sh"
+          git -C "$seed" -c user.name=ci -c user.email=ci@localhost commit -qam two
+          git -C "$seed" push -q "$origin" main
+          if sudo "$work/scripts/install.sh" all --pull --no-such-option >pull.out 2>&1; then exit 1; fi
+          cat pull.out
+          grep -q '^==> updated to .* two$' pull.out
+          grep -q '^the pulled installer runs$' pull.out
+          grep -q 'unknown option --no-such-option' pull.out
       # The control plane and a scrubbing node on one server, built by the script itself, the way
       # a first install runs; the runner has systemd, which the units' sandboxing is checked by.
       - name: Install
