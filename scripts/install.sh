@@ -844,9 +844,13 @@ case $lhost in
 *) API_HERE=$LOCAL_URL ;;
 esac
 if has_api; then
-	if [[ $LOCAL == 127.* || $LOCAL == ::1 ]]; then
+	# By the address it listens on: one that listens on every address reaches itself on
+	# loopback too, and is not loopback only.
+	case $lhost in
+	127.* | '[::1]')
 		warn "the API listens on loopback only, so nodes on other servers cannot reach it; use --listen 0.0.0.0:$PORT for them"
-	fi
+		;;
+	esac
 	if [[ $CUSTOM_TLS == 1 ]]; then
 		API_HERE=${API_URL:-"https://<a name your certificate is for>:$PORT"}
 	fi
