@@ -968,7 +968,8 @@ mod tests {
                 "nft add rule inet scrubline forward iifname \"scr-northwind\" tcp flags syn tcp option maxseg size set 1436",
                 "nft add rule inet scrubline input meta l4proto { 47, 4 } ip saddr != { 198.51.100.1 } drop",
                 "nft add rule inet scrubline input meta nfproto ipv6 meta l4proto { 47, 4 } drop",
-                "tc qdisc replace dev scr-northwind root tbf rate 833333kbit burst 1041666 latency 50ms",
+                "tc qdisc replace dev scr-northwind root handle 1: tbf rate 833333kbit burst 1041666 latency 5ms",
+                "tc qdisc replace dev scr-northwind parent 1:1 handle 10: fq_codel memory_limit 10416662",
             ]
         );
     }

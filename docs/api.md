@@ -683,7 +683,8 @@ nft add rule inet scrubline forward oifname "sbh-b981c02c78d" tcp flags syn tcp 
 nft add rule inet scrubline forward iifname "sbh-*" ip daddr != { 203.0.113.0/24 } drop
 nft add rule inet scrubline forward iifname "sbh-*" meta nfproto ipv6 drop
 …
-tc qdisc replace dev scr-northwind root tbf rate 1000000kbit burst 1250000 latency 50ms
+tc qdisc replace dev scr-northwind root handle 1: tbf rate 1000000kbit burst 1250000 latency 5ms
+tc qdisc replace dev scr-northwind parent 1:1 handle 10: fq_codel memory_limit 12500000
 
 $ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://fra:9091/tunnels?format=iproute2'
 ip link add sbh-6deacd5f1df type gre local 192.0.2.2 remote 192.0.2.1
@@ -724,7 +725,8 @@ nft add rule inet scrubline forward oifname "scr-northwind" tcp flags syn tcp op
 nft add rule inet scrubline forward iifname "scr-northwind" ip saddr != { 203.0.113.0/24 } drop
 nft add rule inet scrubline forward iifname "scr-northwind" meta nfproto ipv6 drop
 nft add rule inet scrubline forward iifname "scr-northwind" tcp flags syn tcp option maxseg size set 1432
-tc qdisc replace dev scr-northwind root tbf rate 1250000kbit burst 1562500 latency 50ms
+tc qdisc replace dev scr-northwind root handle 1: tbf rate 1250000kbit burst 1562500 latency 5ms
+tc qdisc replace dev scr-northwind parent 1:1 handle 10: fq_codel memory_limit 15625000
 
 $ curl -H "Authorization: Bearer $NODE_API_TOKEN" 'http://node-b:9091/tunnels?format=iproute2'
 # Northwind primary return path
@@ -884,11 +886,20 @@ which `GET /v1/tunnels` shows per node as `rate_kbps`, and each node shapes
 what it sends down the tunnel to its share:
 
 ```
-tc qdisc replace dev scr-northwind root tbf rate 1000000kbit burst 1250000 latency 50ms
+tc qdisc replace dev scr-northwind root handle 1: tbf rate 1000000kbit burst 1250000 latency 5ms
+tc qdisc replace dev scr-northwind parent 1:1 handle 10: fq_codel memory_limit 12500000
 ```
 
 A shaper rather than a policer, so TCP sees queueing it backs off from rather
-than drops. When a node stops announcing (withdrawn, disabled, or gone quiet)
+than drops. The token bucket sets the rate, and `fq_codel` under it keeps the
+queue. Each flow waits in its own queue, so a game's small, steady packets go
+ahead of a download filling the allowance. A queue standing longer than 5 ms
+is cut back. The queue's `memory_limit` is about 100 ms at the rate, and never
+less than 128 KiB. The provisioner sets the two together. If `fq_codel` will
+not load, the bucket keeps the rate over its own short queue, and the tunnel
+is still reported up.
+
+When a node stops announcing (withdrawn, disabled, or gone quiet)
 the others' shares grow to cover the whole allowance on the next recompile.
 A withdrawing node keeps the same share for the traffic BGP has yet to move
 away, so for the seconds a withdrawal takes to converge the total can briefly

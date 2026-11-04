@@ -132,7 +132,8 @@ jobs:
           sudo grep -q '^ok' /run/scrubline-provision/status
           ip -d link show scr-ci | grep -q 'remote 198.51.100.1'
           ip route show 203.0.113.0/24 | grep -q 'dev scr-ci'
-          tc qdisc show dev scr-ci | grep -q tbf
+          tc qdisc show dev scr-ci | grep -q 'tbf 1: root'
+          tc qdisc show dev scr-ci | grep -q 'fq_codel 10: parent 1:1'
           sudo nft list table inet scrubline | grep -q 198.51.100.1
           # The provisioner's report reaches the control plane.
           token=$(sudo sed -n 's/^SCRUBLINE_API_TOKEN=//p' /etc/scrubline/api.env)

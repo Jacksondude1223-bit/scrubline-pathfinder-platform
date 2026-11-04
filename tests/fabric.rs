@@ -1,5 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
-use pathfinder::{bgp, compiler, model::*, steering, telemetry::Metrics, tunnel, validation};
+use pathfinder::{
+    bgp, compiler, model::*, provision, steering, telemetry::Metrics, tunnel, validation,
+};
 use std::collections::HashMap;
 fn node(id: &str, region: &str, gbps: f64, advertise: &str) -> Node {
     Node {
@@ -527,10 +529,51 @@ fn rate_limits_render_as_a_shaper_on_the_tunnel() {
         ])
         .unwrap(),
         [
-            "tc qdisc replace dev scr-fast root tbf rate 833333kbit burst 1041666 latency 50ms",
-            "tc qdisc replace dev scr-slow root tbf rate 1000kbit burst 32768 latency 50ms",
+            "tc qdisc replace dev scr-fast root handle 1: tbf rate 833333kbit burst 1041666 latency 5ms",
+            "tc qdisc replace dev scr-fast parent 1:1 handle 10: fq_codel memory_limit 10416662",
+            "tc qdisc replace dev scr-slow root handle 1: tbf rate 1000kbit burst 32768 latency 5ms",
+            "tc qdisc replace dev scr-slow parent 1:1 handle 10: fq_codel memory_limit 131072",
         ]
     );
+    // The queue holds about 100ms at the rate, never less than 128KiB, and at the most a tunnel
+    // can be given, 2.5 Gbit/s, still within fq_codel's own default.
+    assert_eq!(tunnel::queue_bytes(1000), tunnel::QUEUE_MIN);
+    assert_eq!(tunnel::queue_bytes(100_000), 1_250_000);
+    let most = tunnel::queue_bytes(tunnel::MAX_RATE_MBPS * 1000);
+    assert_eq!(most, 31_250_000);
+    assert!(most < tunnel::QUEUE_MAX);
+    assert_eq!(tunnel::queue_bytes(i64::MAX), tunnel::QUEUE_MAX);
+}
+#[test]
+fn the_provisioner_takes_every_shaper_the_renderer_gives() {
+    // From the slowest share the compiler can leave a node to the most a tunnel may have.
+    for kbps in [
+        1,
+        7,
+        1000,
+        10_485,
+        100_000,
+        833_333,
+        tunnel::MAX_RATE_MBPS * 1000,
+    ] {
+        let t = NodeTunnel {
+            rate_kbps: kbps,
+            interface: "scr-nw".into(),
+            ..node_tunnel("nw", &["203.0.113.0/24"], "")
+        };
+        let desired = provision::Desired {
+            lines: tunnel::rate_commands(std::slice::from_ref(&t)).unwrap(),
+            tunnels: vec![t],
+            error: String::new(),
+        };
+        let pass = provision::plan(&desired, &provision::Observed::default())
+            .unwrap_or_else(|e| panic!("{kbps} kbit/s: {e}"));
+        assert_eq!(
+            pass.steps.len(),
+            2,
+            "{kbps} kbit/s: the bucket and its queue"
+        );
+    }
 }
 #[test]
 fn tunnels_allocated_to_a_customer_carry_only_their_prefixes() {

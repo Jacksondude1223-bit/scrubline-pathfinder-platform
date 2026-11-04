@@ -336,10 +336,31 @@ pub fn reply_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
     }
     Ok(lines)
 }
-/// Holds the clean traffic going down each tunnel to this node's share of its allowance. A
-/// shaper rather than a policer, so TCP sees queueing it can back off from instead of drops; the
-/// burst covers 10ms at the rate, and never less than 32KiB so a slow share still passes a full
-/// frame and stays within what tbf can represent.
+/// The least the queue under a tunnel's token bucket may hold, in bytes: enough for a slow share
+/// to take a burst of full frames.
+pub const QUEUE_MIN: i64 = 128 << 10;
+/// The most it may hold, which is fq_codel's own default.
+pub const QUEUE_MAX: i64 = 32 << 20;
+/// What the queue under a token bucket at `rate_kbps` may hold: about 100ms at the rate.
+pub fn queue_bytes(rate_kbps: i64) -> i64 {
+    (rate_kbps.saturating_mul(25) / 2).clamp(QUEUE_MIN, QUEUE_MAX)
+}
+/// Holds the clean traffic going down each tunnel to this node's share of its allowance, without
+/// making a game's packets wait for it.
+///
+/// A token bucket sets the rate. It is a shaper rather than a policer, so TCP sees queueing it can
+/// back off from instead of drops. Its burst covers 10ms at the rate, and never less than 32KiB,
+/// so a slow share still passes a full frame and stays within what tbf can represent.
+///
+/// Under it, fq_codel keeps the queue. Each flow waits in its own queue, and a flow sending a
+/// little at a time, like a game's ticks, goes ahead of one filling the allowance, like a download
+/// or what is left of a flood. A queue that stands longer than 5ms is cut back. A single FIFO
+/// would hold every packet in one line instead, behind everything else at the allowance. The
+/// bucket's `latency` only sizes the FIFO the kernel gives it until fq_codel takes its place, and
+/// what is left if fq_codel cannot be loaded.
+///
+/// The queue's memory is held to about 100ms at the rate, and never less than 128KiB. That bounds
+/// what a node's queues hold together to what its links fill in about a tenth of a second.
 pub fn rate_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
     let mut rows: Vec<_> = tunnels.iter().filter(|t| t.rate_kbps > 0).collect();
     rows.sort_by_key(|t| &t.id);
@@ -348,8 +369,12 @@ pub fn rate_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
         let name = interface_name(&t.id)?;
         let burst = (t.rate_kbps.saturating_mul(5) / 4).max(32768);
         lines.push(format!(
-            "tc qdisc replace dev {name} root tbf rate {}kbit burst {burst} latency 50ms",
+            "tc qdisc replace dev {name} root handle 1: tbf rate {}kbit burst {burst} latency 5ms",
             t.rate_kbps
+        ));
+        lines.push(format!(
+            "tc qdisc replace dev {name} parent 1:1 handle 10: fq_codel memory_limit {}",
+            queue_bytes(t.rate_kbps)
         ));
     }
     Ok(lines)
