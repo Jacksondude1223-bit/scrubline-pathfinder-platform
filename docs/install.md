@@ -60,6 +60,19 @@ certificate, such as a public address the nodes reach this server on; the
 server's own hostname and addresses are always in it. Bring your own
 certificate with `--tls-cert` and `--tls-key` instead.
 
+Once the API has a hostname, every later run at a terminal asks about it:
+
+```
+The API's hostname is api.example.com. Press Enter to keep it, or type a new one ("none" removes it):
+```
+
+A new name replaces the old one in the certificate, which is issued again with
+it. Several names can be given, separated by commas or spaces. A run that
+passes `--hostname`, or that has no terminal to ask at, such as one from
+automation, keeps the hostname without asking. The summary at the end gives
+the API's address by its hostname, which is what to send API requests to and
+what to give nodes as `--api`.
+
 It finishes by printing the command to install a node, enrollment token
 included:
 
