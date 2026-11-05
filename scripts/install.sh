@@ -46,7 +46,9 @@ Control plane (api, all):
   --tls-cert FILE         certificate to serve with, with --tls-key; without them a private
   --tls-key FILE          CA and a certificate for this server are generated
   --hostname NAME         another name or address to put in the generated certificate, such as
-                          a public address the nodes reach this server on (repeatable)
+                          a public address the nodes reach this server on (repeatable). Once
+                          one is set, a run at a terminal without --hostname asks whether to
+                          keep it or change it
   --replica-of URL        follow the primary control plane at URL (api only): serve reads, refuse
                           writes, and be ready to take over
   --primary               run as the primary, as a replica should once it is promoted
@@ -252,14 +254,53 @@ while [[ $# -gt 0 ]]; do
 	esac
 	shift
 done
+hostname_ok() { [[ $1 =~ ^[A-Za-z0-9*.:-]+$ ]]; }
 # Extra certificate names accumulate across runs, once each.
 for h in ${EXTRA_HOSTS[@]+"${EXTRA_HOSTS[@]}"}; do
-	[[ $h =~ ^[A-Za-z0-9*.:-]+$ ]] || die "--hostname must be a DNS name or an IP address: '$h'"
+	hostname_ok "$h" || die "--hostname must be a DNS name or an IP address: '$h'"
 	case ",$HOSTNAMES," in
 	*",$h,"*) ;;
 	*) HOSTNAMES="${HOSTNAMES:+$HOSTNAMES,}$h" ;;
 	esac
 done
+# The API's hostname is what its clients are given to reach it at, so a run at a terminal asks
+# whether to keep it: Enter keeps it, a new name replaces it, and "none" removes it. A run that
+# names one with --hostname, or that has no terminal to ask at, keeps it as it was.
+ask_hostname() {
+	local answer h names words
+	while true; do
+		read -r -p "The API's hostname is ${HOSTNAMES//,/, }. Press Enter to keep it, or type a new one (\"none\" removes it): " answer || answer=''
+		# Names may be separated by commas or spaces, and are never expanded as file names.
+		read -r -a words <<<"${answer//,/ }"
+		if [[ ${#words[@]} -eq 0 ]]; then
+			say "keeping the API's hostname, ${HOSTNAMES//,/, }"
+			return
+		fi
+		if [[ ${#words[@]} -eq 1 && ${words[0]} == none ]]; then
+			HOSTNAMES=''
+			say "the API has no hostname now"
+			return
+		fi
+		names=''
+		for h in "${words[@]}"; do
+			if ! hostname_ok "$h"; then
+				printf "'%s' is not a DNS name or an IP address\n" "$h" >&2
+				continue 2
+			fi
+			case ",$names," in
+			*",$h,"*) ;;
+			*) names="${names:+$names,}$h" ;;
+			esac
+		done
+		HOSTNAMES=$names
+		say "the API's hostname is now ${HOSTNAMES//,/, }"
+		return
+	done
+}
+if [[ ($ROLE == api || $ROLE == all) && -n $HOSTNAMES && ${#EXTRA_HOSTS[@]} -eq 0 &&
+	-z $TLS_CERT && $CUSTOM_TLS != 1 && -t 0 ]]; then
+	ask_hostname
+fi
 
 SYSTEMD=0
 if [[ -d /run/systemd/system ]]; then SYSTEMD=1; fi
@@ -950,11 +991,22 @@ echo
 HERE=$(addresses | sed -n 1p)
 HERE=${HERE:-$(hostname -s)}
 if [[ $HERE == *:* ]]; then HERE="[$HERE]"; fi
-# The address other servers reach the API on: this server's, when it listens on every address.
+# The address other servers reach the API on, when it listens on every address: its hostname, or
+# else this server's own address. A name for many hosts (*.example.com) is not one to reach.
+IFS=, read -r -a names <<<"$HOSTNAMES"
+for h in ${names[@]+"${names[@]}"}; do
+	if [[ -n $h && $h != \** ]]; then
+		HERE=$h
+		if [[ $HERE == *:* ]]; then HERE="[$HERE]"; fi
+		break
+	fi
+done
 case $lhost in
 0.0.0.0 | '[::]') API_HERE=https://$HERE:$PORT ;;
 *) API_HERE=$LOCAL_URL ;;
 esac
+# The port HTTPS takes when none is given goes unsaid.
+API_HERE=${API_HERE%:443}
 if has_api; then
 	# By the address it listens on: one that listens on every address reaches itself on
 	# loopback too, and is not loopback only.
