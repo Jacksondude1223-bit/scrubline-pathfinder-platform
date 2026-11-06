@@ -288,6 +288,10 @@ pub fn render(raw: &[u8], view: View) -> Result<String> {
                         if !crafted.is_empty() {
                             return format!("crafted-{crafted}");
                         }
+                        let reflection = text(v, "reflection");
+                        if !reflection.is_empty() {
+                            return format!("reflection-{reflection}");
+                        }
                         let mut name = text(v, "rule_id");
                         if name.is_empty() {
                             name = text(v, "filter_id");

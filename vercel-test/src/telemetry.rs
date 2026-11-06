@@ -101,6 +101,7 @@ impl Metrics {
                     "" => vec![stats],
                     "reputation" | "egress" => vec![&stats[group]],
                     "crafted" => rows(&stats["crafted"], "checks").iter().collect(),
+                    "reflection" => rows(&stats["reflection"], "vectors").iter().collect(),
                     _ => rows(stats, group).iter().collect(),
                 };
                 for s in sources {
@@ -113,6 +114,7 @@ impl Metrics {
                         "games" => &[("filter", text("filter_id")), ("profile", text("profile"))],
                         "mitigation" => &[("tunnel", text("tunnel_id"))],
                         "crafted" => &[("check", text("check")), ("class", text("class"))],
+                        "reflection" => &[("vector", text("vector"))],
                         _ => &[],
                     };
                     for (name, value) in extra {
@@ -156,6 +158,17 @@ impl Metrics {
                 self.write(&mut own, "mode", candidate);
                 let on = f64::from(candidate == mode);
                 self.add_written("scrubline_crafted_mode", shared, &own, on);
+            }
+            // Likewise a node from before the reflection guard reports no vectors.
+            for v in rows(&stats["reflection"], "vectors") {
+                let mode = v["mode"].as_str().unwrap_or("off");
+                for candidate in ["enforce", "observe", "off"] {
+                    own.clear();
+                    self.write(&mut own, "vector", v["vector"].as_str().unwrap_or(""));
+                    self.write(&mut own, "mode", candidate);
+                    let on = f64::from(candidate == mode);
+                    self.add_written("scrubline_reflection_mode", shared, &own, on);
+                }
             }
             for p in rows(&stats["egress"], "prefix_states") {
                 own.clear();

@@ -621,5 +621,57 @@
       "crafted",
       "fragments_untracked"
     ]
+  },
+  {
+    "name": "scrubline_reflection_dropped_total",
+    "group": "reflection",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_observed_total",
+    "group": "reflection",
+    "path": [
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_asked_total",
+    "group": "reflection",
+    "path": [
+      "asked"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_fragments_dropped_total",
+    "group": "reflection",
+    "path": [
+      "fragments"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_sources",
+    "group": "",
+    "path": [
+      "reflection",
+      "sources"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_sources_max",
+    "group": "",
+    "path": [
+      "reflection",
+      "sources_max"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_sources_untracked_total",
+    "group": "",
+    "path": [
+      "reflection",
+      "sources_untracked"
+    ]
   }
 ]

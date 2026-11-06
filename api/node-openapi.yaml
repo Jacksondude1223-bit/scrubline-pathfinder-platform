@@ -668,6 +668,11 @@ components:
           - length
           - oversize
           - tiny_fragment
+        reflection:
+          type: string
+          description: The reflection vector a packet belonged to, when the reflection guard dropped it.
+          enum:
+          - cldap
         reply:
           type: string
           format: byte

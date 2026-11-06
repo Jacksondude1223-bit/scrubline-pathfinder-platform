@@ -2,7 +2,7 @@
 use crate::{
     gamefilter, httpfilter, ml,
     model::*,
-    packet,
+    packet, reflection,
     state::{Egress, Pulse, Reputation},
 };
 use ipnet::IpNet;
@@ -84,6 +84,8 @@ struct Load {
     /// Flows and their packets the crafted-packet checks dropped, per class: stack, protocol and
     /// buffer.
     crafted: [[u64; 2]; 3],
+    /// Flows and their packets the reflection guard dropped as CLDAP.
+    reflection: [u64; 2],
 }
 impl Load {
     fn observe(&mut self, now: i64, pps: u64, dropped: bool) {
@@ -387,6 +389,7 @@ pub struct Pipeline {
     lockdown_pps: i64,
     grace: i64,
     crafted: Crafted,
+    reflection: reflection::Guard,
 }
 /// The crafted-packet checks: whether they drop, only count or are off, what each check dropped
 /// and observed, in packet::Check order, and the fragments in reassembly.
@@ -469,6 +472,7 @@ impl Pipeline {
             lockdown_pps: 500,
             grace: 500,
             crafted: Crafted::default(),
+            reflection: reflection::Guard::default(),
         };
         p.load(program);
         p
@@ -602,6 +606,7 @@ impl Pipeline {
             Some(mode @ ("observe" | "off")) => mode.into(),
             _ => "enforce".into(),
         };
+        self.reflection.load(program.reflection.as_ref());
         // Programs are recompiled whenever the fabric changes, so a tunnel being mitigated stays
         // mitigated, and its meter keeps counting, across a reload.
         let mut kept: HashMap<String, Watch> = std::mem::take(&mut self.watches)
@@ -1026,6 +1031,60 @@ impl Pipeline {
         d.check = a.check.name().into();
         Some((d, a.check))
     }
+    /// Holds a flow to whether it is an answer reflected at the protected address, and returns
+    /// its drop if it is. CLDAP answers come from UDP port 389, and open as LDAP answers to a
+    /// search; nobody at a game server asks for one. An operator's permit vouches for the address
+    /// it covers, and so does the origin having sent that address an LDAP search: an answer it
+    /// asked for is no reflection. The rest of a long answer arrives in fragments that carry no port, so a source
+    /// caught reflecting has its later fragments dropped too, for as long as a host would hold
+    /// them. Its address is real, since a reflector answers from its own, but it is no strike: a
+    /// reflector is somebody's server, put to work by the attacker.
+    fn reflected(&mut self, f: &Flow, owner: &str, now: i64) -> Option<Decision> {
+        let seen = self.reflection.seen(f, now, || {
+            let (p, _) = packet::parse(&f.packet);
+            p.fragment() && !p.transport
+        });
+        if seen == reflection::Seen::Not || allowed(&self.rules, f) {
+            return None;
+        }
+        let answer = seen == reflection::Seen::Answer;
+        if answer
+            && self
+                .egress
+                .asked(owner, &f.src_ip, reflection::ASKED_WITHIN, now)
+        {
+            self.reflection.counts[2] += 1;
+            return None;
+        }
+        if answer {
+            self.reflection.caught(&f.src_ip, now);
+        }
+        if self.reflection.cldap == "observe" {
+            self.reflection.counts[1] += 1;
+            return None;
+        }
+        let mut d = if answer {
+            self.reflection.counts[0] += 1;
+            decision(
+                "drop",
+                0,
+                "",
+                "CLDAP reflection: an LDAP answer from port 389 that the server never asked for",
+            )
+        } else {
+            self.reflection.counts[3] += 1;
+            // Telling a datagram's later fragments by their source takes memory a switch does not
+            // have, so they are judged in software.
+            decision(
+                "drop",
+                2,
+                "",
+                "CLDAP reflection: a later fragment of an answer from a source caught reflecting",
+            )
+        };
+        d.reflection = "cldap".into();
+        Some(d)
+    }
     pub fn decide(&mut self, f: &Flow, now: i64) -> Decision {
         self.decisions += 1;
         let pps = f.pps.max(0) as u64;
@@ -1092,6 +1151,17 @@ impl Pipeline {
                 .entry(owner)
                 .or_default()
                 .observe(now, pps, false);
+            return d;
+        }
+        // Reflected answers are judged before the penalty box, trust and lockdown: a reflector is
+        // not a player, so neither a player's trust nor its box speaks for it.
+        if let Some(d) = self.reflected(f, &owner, now) {
+            self.record(&d, None, f);
+            self.load.observe(now, pps, true);
+            let load = self.loads.entry(owner).or_default();
+            load.observe(now, pps, true);
+            load.reflection[0] += 1;
+            load.reflection[1] = load.reflection[1].saturating_add(pps);
             return d;
         }
         let rules = &self.rules;
@@ -1166,10 +1236,19 @@ impl Pipeline {
             self.returns[0] += 1;
             // Every confirmation renews trust, not only the first: a client the origin keeps
             // answering would otherwise lose its fast path five minutes into the conversation.
-            if let Some(fresh) = self
+            let confirmed = self
                 .egress
-                .observe_return(&prefix, &f.dst_ip, f.pps.max(1), now)
+                .observe_return(&prefix, &f.dst_ip, f.pps.max(1), now);
+            // An LDAP search the origin sent, and nothing else it sent, makes an LDAP answer from
+            // that address one it asked for: anything else can be had from it by forging a query
+            // from the reflector's address that the server answers.
+            if f.proto.eq_ignore_ascii_case("udp")
+                && f.dport == reflection::CLDAP_PORT
+                && reflection::ldap_search(&f.payload)
             {
+                self.egress.searched(&prefix, &f.dst_ip, now);
+            }
+            if let Some(fresh) = confirmed {
                 self.reputation.promote(&f.dst_ip, 2, now);
                 if fresh {
                     self.returns[1] += 1;
@@ -1214,6 +1293,10 @@ impl Pipeline {
             if !crafted.is_empty() {
                 row["crafted"] = json!(crafted);
             }
+            if l.reflection[0] > 0 {
+                row["reflection"] =
+                    json!([{"vector":"cldap","flows":l.reflection[0],"dropped":l.reflection[1]}]);
+            }
             prefixes.push(row);
         }
         prefixes.sort_by(|a, b| a["prefix"].as_str().cmp(&b["prefix"].as_str()));
@@ -1233,6 +1316,6 @@ impl Pipeline {
             .collect();
         let crafted = json!({"mode":self.crafted.mode,"dropped":self.crafted.dropped.iter().sum::<u64>(),"observed":self.crafted.observed.iter().sum::<u64>(),"fragments":self.crafted.fragments.len(),"fragments_max":packet::FRAGMENTS_MAX,"fragments_untracked":self.crafted.fragments.untracked,"checks":checks});
         let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"wave":w.wave,"hold_seconds":w.hold()/1000,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }

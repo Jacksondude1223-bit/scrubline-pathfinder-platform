@@ -777,6 +777,49 @@ fn an_attack_of_crafted_packets_tells_the_customer_what_stopped_it() {
     );
 }
 #[test]
+fn a_cldap_reflection_attack_tells_the_customer_what_stopped_it() {
+    let f = Fabric::new();
+    let mut pipe = f.pipeline();
+    f.heartbeat(pipe.stats(T0), json!([]));
+    // Domain controllers answering rootDSE queries forged from Northwind's game server.
+    let flood = Flow {
+        sport: 389,
+        ..udp(
+            "198.18.7.7",
+            "203.0.113.10",
+            27015,
+            100_000,
+            &[0x30, 0x84, 0x00, 0x00, 0x0b, 0xb0, 0x02, 0x01, 0x01, 0x64],
+        )
+    };
+    let d = pipe.decide(&flood, T0 + 1000);
+    assert_eq!(
+        (d.action.as_str(), d.reflection.as_str()),
+        ("drop", "cldap")
+    );
+    f.heartbeat(pipe.stats(T0 + 1000), json!([]));
+    let (name, id) = &f.tenants[0];
+    let path = format!("/v1/tenants/{id}/token");
+    let (_, issued) = call(&f.base, "POST", &path, OP, Value::Null);
+    let token = issued["token"].as_str().unwrap();
+    let (status, events) = call(&f.base, "GET", "/v1/analytics/events", token, Value::Null);
+    assert_eq!(status, 200, "{name}: {events}");
+    assert_eq!(events["events"][0]["prefix"], "203.0.113.0/24", "{events}");
+    assert_eq!(
+        events["events"][0]["vectors"],
+        json!([{"reflection":"cldap","flows":1,"dropped":100_000}]),
+        "{events}"
+    );
+    // The fabric's metrics carry the guard on every node.
+    let (_, fleet) = call(&f.base, "GET", "/metrics", OP, Value::Null);
+    let fleet = fleet.as_str().unwrap_or_default();
+    assert!(
+        fleet.contains("scrubline_reflection_dropped_total{"),
+        "{fleet}"
+    );
+    assert!(fleet.contains("scrubline_reflection_mode{"), "{fleet}");
+}
+#[test]
 fn changes_through_the_api_reach_the_running_node_without_losing_its_state() {
     let f = Fabric::new();
     let mut pipe = f.pipeline();

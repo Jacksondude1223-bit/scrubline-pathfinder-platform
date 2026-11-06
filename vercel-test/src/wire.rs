@@ -117,6 +117,8 @@ pub struct Stats {
     pub load_window_seconds: i64,
     #[serde(deserialize_with = "null_default")]
     pub crafted: CraftedStats,
+    #[serde(deserialize_with = "null_default")]
+    pub reflection: ReflectionStats,
     /// What the agent's process holds in memory, as the kernel counts it.
     #[serde(deserialize_with = "null_default")]
     pub resident_bytes: u64,
@@ -154,6 +156,7 @@ impl Stats {
             surge_pps,
             load_window_seconds,
             crafted,
+            reflection,
             resident_bytes,
             mitigation: _,
         } = self;
@@ -195,6 +198,7 @@ impl Stats {
             surge_pps: *surge_pps,
             load_window_seconds: *load_window_seconds,
             crafted: crafted.clone(),
+            reflection: reflection.clone(),
             resident_bytes: *resident_bytes,
             mitigation: Vec::new(),
         }
@@ -231,6 +235,50 @@ pub struct CheckStats {
     pub dropped: u64,
     #[serde(deserialize_with = "null_default")]
     pub observed: u64,
+}
+/// What the reflection guard did: per vector, in which mode, what it dropped and observed, the
+/// answers it let through because the origin had asked, and the later fragments it dropped; and
+/// how full the table of sources caught reflecting is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReflectionStats {
+    #[serde(deserialize_with = "null_default")]
+    pub sources: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub sources_max: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub sources_untracked: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub vectors: Vec<VectorStats>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VectorStats {
+    #[serde(deserialize_with = "null_default")]
+    pub vector: String,
+    #[serde(deserialize_with = "null_default")]
+    pub port: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub asked: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub fragments: u64,
+}
+/// What the reflection guard dropped of one vector for a prefix: flows, and their packets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefixReflection {
+    #[serde(deserialize_with = "null_default")]
+    pub vector: String,
+    #[serde(deserialize_with = "null_default")]
+    pub flows: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
 }
 /// What the crafted-packet checks dropped of one class for a prefix: flows, and their packets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -361,6 +409,11 @@ pub struct PrefixStats {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub crafted: Vec<PrefixCrafted>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub reflection: Vec<PrefixReflection>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

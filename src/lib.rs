@@ -18,6 +18,7 @@ pub mod node;
 pub mod packet;
 pub mod pipeline;
 pub mod provision;
+pub mod reflection;
 pub mod runtime;
 pub mod state;
 pub mod store;

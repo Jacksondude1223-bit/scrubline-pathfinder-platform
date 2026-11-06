@@ -248,6 +248,7 @@ impl Collector {
         self.prefix_counters.retain(|(_, p), _| live.contains(p));
         self.rule_counters.retain(|(_, id, _), _| {
             id.strip_prefix("|crafted|")
+                .or_else(|| id.strip_prefix("|reflection|"))
                 .and_then(|rest| rest.split_once('|'))
                 .is_none_or(|(_, p)| live.contains(p))
         });
@@ -315,6 +316,7 @@ impl Collector {
         }
         let mut touched = HashSet::new();
         let mut crafted = Vec::new();
+        let mut reflected = Vec::new();
         for row in &stats.prefixes {
             let p = row.prefix.as_str();
             // Only what the node is programmed to protect: a row for a prefix just removed would
@@ -348,6 +350,22 @@ impl Collector {
                     let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], counts[i]));
                     if diff[1] > 0 || diff[3] > 0 {
                         crafted.push((p.to_string(), class.to_string(), diff));
+                    }
+                }
+            }
+            // What the reflection guard dropped for the prefix, by vector, the same way.
+            for r in &row.reflection {
+                let vector = r.vector.as_str();
+                if vector != "cldap" {
+                    continue;
+                }
+                let counts = [0, r.flows, 0, r.dropped, 0];
+                let key = (node.into(), format!("|reflection|{vector}|{p}"), false);
+                let prev = self.rule_counters.insert(key, counts);
+                if let Some(prev) = prev.or(seen.map(|_| [0; 5])) {
+                    let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], counts[i]));
+                    if diff[1] > 0 || diff[3] > 0 {
+                        reflected.push((p.to_string(), vector.to_string(), diff));
                     }
                 }
             }
@@ -414,16 +432,24 @@ impl Collector {
                 s.judge(now);
             }
         }
-        for (p, class, diff) in crafted {
+        let named = crafted
+            .into_iter()
+            .map(|(p, class, diff)| (p, "crafted", class, diff))
+            .chain(
+                reflected
+                    .into_iter()
+                    .map(|(p, vector, diff)| (p, "reflection", vector, diff)),
+            );
+        for (p, kind, name, diff) in named {
             if let Some(e) = self.series.get_mut(&p).and_then(|s| s.open.as_mut()) {
-                let key = (format!("|crafted|{class}"), String::new());
+                let key = (format!("|{kind}|{name}"), String::new());
                 if !e.vectors.contains_key(&key) && e.vectors.len() >= 32 {
                     continue;
                 }
                 let v = e
                     .vectors
                     .entry(key)
-                    .or_insert_with(|| json!({"crafted":class,"flows":0,"dropped":0}));
+                    .or_insert_with(|| json!({kind:name,"flows":0,"dropped":0}));
                 v["flows"] = json!(n(v, "flows").saturating_add(diff[1]));
                 v["dropped"] = json!(n(v, "dropped").saturating_add(diff[3]));
                 e.flows = e.flows.saturating_add(diff[1]);

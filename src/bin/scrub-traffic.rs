@@ -80,6 +80,14 @@ fn flow(g: &Generator, r: &mut StdRng, kind: u8) -> Flow {
             f.pps = 20000 + r.gen_range(0..20000);
             f.flags = "syn,fin".into();
         }
+        // Domain controllers' CLDAP answers to a rootDSE query forged from the protected address:
+        // the reflection guard drops them.
+        7 => {
+            f.sport = 389;
+            f.pps = 80000 + r.gen_range(0..40000);
+            f.payload = vec![0x30, 0x84, 0x00, 0x00, 0x0b, 0x9f, 0x02, 0x01, 0x01, 0x64];
+            f.has_payload = true;
+        }
         _ => {
             f.pps = 400000 + r.gen_range(0..200000);
             f.payload = vec![0];
@@ -181,7 +189,7 @@ async fn run() -> Result<()> {
             let started = tokio::time::Instant::now();
             while tokio::time::Instant::now() < started + duration {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                send(&flood, &mut r, &[3, 4, 6]).await;
+                send(&flood, &mut r, &[3, 4, 6, 7]).await;
             }
             // Attacks recur on a period, so "every four minutes" means four minutes apart.
             tokio::time::sleep_until(started + every).await;

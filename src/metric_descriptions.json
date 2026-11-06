@@ -514,5 +514,37 @@
   "scrubline_crafted_mode": {
     "kind": "gauge",
     "help": "1 for the crafted-packet checks' mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops a packet built to crash a customer's stack."
+  },
+  "scrubline_reflection_dropped_total": {
+    "kind": "counter",
+    "help": "Answers reflected at a protected address and dropped, by vector: for cldap, UDP from port 389 opening as an LDAP answer, which nobody behind the address asked for. Rising means someone is aiming reflectors at a customer."
+  },
+  "scrubline_reflection_observed_total": {
+    "kind": "counter",
+    "help": "Reflected answers, and their later fragments, let through because the policy only observes the vector: what enforcing would drop."
+  },
+  "scrubline_reflection_asked_total": {
+    "kind": "counter",
+    "help": "Answers let through because the protected server had sent their source an LDAP search within the last 30 seconds, so it asked for them."
+  },
+  "scrubline_reflection_fragments_dropped_total": {
+    "kind": "counter",
+    "help": "Later fragments of reflected answers dropped, by vector. They carry no port, so they are told by a source caught reflecting in the last 30 seconds."
+  },
+  "scrubline_reflection_sources": {
+    "kind": "gauge",
+    "help": "Sources caught reflecting in the last 30 seconds that the node remembers, so their answers' later fragments are dropped too."
+  },
+  "scrubline_reflection_sources_max": {
+    "kind": "gauge",
+    "help": "The most sources caught reflecting a node remembers at once."
+  },
+  "scrubline_reflection_sources_untracked_total": {
+    "kind": "counter",
+    "help": "Sources caught reflecting that the node could not remember because its table was full of others still reflecting; their later fragments are not told. Rising means more reflectors than the table holds."
+  },
+  "scrubline_reflection_mode": {
+    "kind": "gauge",
+    "help": "1 for the reflection guard's mode for each vector (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops reflected answers at a customer's address."
   }
 }
