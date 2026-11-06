@@ -1257,6 +1257,45 @@ all under `reflection`:
 and drops nothing, and `"off"` stops looking. See
 [Reflection attacks](../README.md#reflection-attacks).
 
+### 14. GRE and ACK floods
+
+GRE, or any IP protocol but TCP, UDP and ICMP, sent to a protected address is
+dropped, unless the policy's `protocols.allow` or a permit rule lets it in:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"100.64.9.47","dst_ip":"203.0.113.10","proto":"gre","pps":1}'
+{"action":"drop","stage":"asic","reason":"GRE flood: GRE sent to a protected address, which no game server receives","guard":"protocol"}
+```
+
+A record may name its protocol by number, `"proto":"47"`, and it is named as a
+packet's would be. Rules take `gre`, `esp`, `ah`, `sctp`, `ipip` and `ipv6` as
+`proto`, with no ports.
+
+TCP other than an opening SYN, from a source the server has not sent TCP to in
+the last two minutes, is dropped while the prefix takes more than
+`ack_flood.engage_pps` (5,000 unless set) a second of it, and for a minute
+after. This happens only once the node has seen the server's own traffic for
+two minutes:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"100.64.1.2","dst_ip":"203.0.113.10","proto":"tcp","dport":443,"flags":"ack","pps":10000}'
+{"action":"drop","stage":"zc","reason":"ACK flood: TCP for a connection the server never had, while the prefix is flooded with it","guard":"ack_flood"}
+```
+
+The node's stats keep both:
+
+```json
+"protocols": {"mode": "enforce", "allow": [], "dropped": 1, "observed": 0,
+              "by_protocol": [{"protocol": "gre", "dropped": 1, "observed": 0}]},
+"ack_flood": {"mode": "enforce", "engage_pps": 5000, "engaged": 1, "dropped": 1, "observed": 0}
+```
+
+Each prefix's row adds `protocols`, GRE and every other protocol apart, and
+`ack_flood`, with whether its guard is `engaged`. See
+[GRE and ACK floods](../README.md#gre-and-ack-floods).
+
 ## The node agent
 
 ```console

@@ -39,7 +39,8 @@ fn equal(a: &Value, b: &Value, path: &str) {
 }
 /// Stats as the Go datapath reported them: the counters for HTTP rules, the surge rate, what the
 /// classifiers report beyond the flow model's counts, on-demand mitigation, the crafted-packet
-/// checks and the reflection guard, none of which it had, are left out of the comparison.
+/// checks and the reflection, protocol and ACK flood guards, none of which it had, are left out of
+/// the comparison.
 fn go_shape(mut stats: Value) -> Value {
     let top = stats.as_object_mut().unwrap();
     top.remove("game_http_windows");
@@ -48,6 +49,8 @@ fn go_shape(mut stats: Value) -> Value {
     top.remove("mitigation");
     top.remove("crafted");
     top.remove("reflection");
+    top.remove("protocols");
+    top.remove("ack_flood");
     let ml = top["ml"].as_object_mut().unwrap();
     for key in [
         "observed",
@@ -80,6 +83,8 @@ fn go_shape(mut stats: Value) -> Value {
         row.remove("ml_cut");
         row.remove("crafted");
         row.remove("reflection");
+        row.remove("protocols");
+        row.remove("ack_flood");
     }
     stats["reputation"].as_object_mut().unwrap().remove("freed");
     stats

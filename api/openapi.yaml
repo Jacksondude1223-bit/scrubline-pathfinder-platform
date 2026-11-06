@@ -184,11 +184,11 @@ paths:
 
 
         Without `node`, it carries the control plane''s own series and each node as a whole: its
-        totals, stages, crafted-packet checks, reflection guard, reputation and return-traffic tables,
-        how many of its tunnels are up, and how many nodes announce each prefix. A node''s series for
-        each prefix, rule, filter and tunnel are left out: a large fabric has millions of them, more
-        than one scrape can carry. With `node`, it carries that node''s every series, the ones its agent renders itself, for a
-        scraper that cannot reach the agent.'
+        totals, stages, crafted-packet checks, reflection, protocol and ACK flood guards, reputation
+        and return-traffic tables, how many of its tunnels are up, and how many nodes announce each
+        prefix. A node''s series for each prefix, rule, filter and tunnel are left out: a large fabric
+        has millions of them, more than one scrape can carry. With `node`, it carries that node''s
+        every series, the ones its agent renders itself, for a scraper that cannot reach the agent.'
       parameters:
       - name: node
         in: query
@@ -1638,10 +1638,18 @@ components:
           example: 203.0.113.0/24
         proto:
           type: string
+          description: gre, esp, ah, sctp, ipip and ipv6 carry no ports, so a rule naming one matches no
+            port.
           enum:
           - tcp
           - udp
           - icmp
+          - gre
+          - esp
+          - ah
+          - sctp
+          - ipip
+          - ipv6
           - any
         dport:
           type: integer
@@ -1953,6 +1961,10 @@ components:
           $ref: '#/components/schemas/CraftedPolicy'
         reflection:
           $ref: '#/components/schemas/ReflectionPolicy'
+        protocols:
+          $ref: '#/components/schemas/ProtocolPolicy'
+        ack_flood:
+          $ref: '#/components/schemas/AckFloodPolicy'
         tunnels:
           type: array
           items:
@@ -2159,6 +2171,10 @@ components:
           $ref: '#/components/schemas/CraftedPolicy'
         reflection:
           $ref: '#/components/schemas/ReflectionPolicy'
+        protocols:
+          $ref: '#/components/schemas/ProtocolPolicy'
+        ack_flood:
+          $ref: '#/components/schemas/AckFloodPolicy'
         tunnels:
           type: array
           items:
@@ -2206,8 +2222,8 @@ components:
         proto:
           type: string
           example: udp
-          description: tcp, udp or icmp. Read from a packet, also gre, esp, ah, sctp, or the protocol's
-            number.
+          description: tcp, udp, icmp, gre, esp, ah, sctp, ipip or ipv6, or the protocol's number, which
+            is named the same way when it has a name. Read from a packet, the same.
         sport:
           type: integer
           minimum: 0
@@ -2305,6 +2321,14 @@ components:
           description: The reflection vector a packet belonged to, when the reflection guard dropped it.
           enum:
           - cldap
+        guard:
+          type: string
+          description: The guard that dropped a packet, when one did. protocol, for GRE or another
+            protocol a protected address does not receive; ack_flood, for TCP that belongs to no
+            connection the server has.
+          enum:
+          - protocol
+          - ack_flood
         reply:
           type: string
           format: byte
@@ -2508,6 +2532,38 @@ components:
             any. Absent until then.
           items:
             $ref: '#/components/schemas/PrefixReflection'
+        protocols:
+          type: array
+          description: What the protocol guard dropped for this prefix, GRE and every other protocol
+            apart, once it has dropped any. Absent until then.
+          items:
+            $ref: '#/components/schemas/PrefixProtocol'
+        ack_flood:
+          $ref: '#/components/schemas/PrefixAckFlood'
+    PrefixProtocol:
+      type: object
+      properties:
+        protocol:
+          type: string
+          enum:
+          - gre
+          - other
+        flows:
+          type: integer
+        dropped:
+          type: integer
+          description: The packets of those flows, as their rates add up.
+    PrefixAckFlood:
+      type: object
+      description: The prefix's ACK flood guard, present while it is engaged or once it has dropped any.
+      properties:
+        engaged:
+          type: boolean
+        flows:
+          type: integer
+        dropped:
+          type: integer
+          description: The packets of those flows, as their rates add up.
     PrefixReflection:
       type: object
       properties:
@@ -2632,6 +2688,60 @@ components:
         fragments:
           type: integer
           description: Later fragments of answers dropped.
+    ProtocolStats:
+      type: object
+      description: What the protocol guard did on this node, in all and per protocol.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+        allow:
+          type: array
+          items:
+            type: string
+        dropped:
+          type: integer
+        observed:
+          type: integer
+          description: What the guard caught and let through because the policy only observes.
+        by_protocol:
+          type: array
+          description: Every protocol the guard has caught.
+          items:
+            $ref: '#/components/schemas/ProtocolCount'
+    ProtocolCount:
+      type: object
+      properties:
+        protocol:
+          type: string
+          example: gre
+        dropped:
+          type: integer
+        observed:
+          type: integer
+    AckFloodStats:
+      type: object
+      description: What the ACK flood guard did on this node.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+        engage_pps:
+          type: integer
+        engaged:
+          type: integer
+          description: Protected prefixes whose guard is engaged now.
+        dropped:
+          type: integer
+        observed:
+          type: integer
+          description: What the guard caught and let through because the policy only observes.
     MitigationStats:
       type: object
       description: An on-demand tunnel as the node holding it sees it.
@@ -2794,6 +2904,10 @@ components:
           $ref: '#/components/schemas/CraftedStats'
         reflection:
           $ref: '#/components/schemas/ReflectionStats'
+        protocols:
+          $ref: '#/components/schemas/ProtocolStats'
+        ack_flood:
+          $ref: '#/components/schemas/AckFloodStats'
         mitigation:
           type: array
           nullable: true
@@ -2932,6 +3046,50 @@ components:
           description: UDP from port 389 opening as an LDAP answer to a search, and the later fragments
             of a source caught sending one. enforce, the default, drops them. observe counts what would
             be dropped and drops nothing. off does not look.
+    ProtocolPolicy:
+      type: object
+      description: What a node does with IP protocols a protected address does not receive, sent to
+        one. GRE, which botnets wrap their floods in, and anything but TCP, UDP and ICMP are dropped at
+        the asic stage, unless listed here or an asic or fpga permit covers the packet.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: enforce, the default, drops them. observe counts what would be dropped and drops
+            nothing. off does not look.
+        allow:
+          type: array
+          description: Protocols every protected address receives besides TCP, UDP and ICMP.
+          items:
+            type: string
+            description: gre, esp, ah, sctp, ipip, ipv6, or a protocol's number from 0 to 255.
+            example: esp
+    AckFloodPolicy:
+      type: object
+      description: What a node does with TCP other than an opening SYN from a source the protected
+        server has not sent TCP to in the last two minutes. It is dropped at the zc stage while the
+        prefix takes more of it than engage_pps, and for a minute after, once the node has seen the
+        server's own traffic for two minutes without a gap of more than 30 seconds. Behind direct
+        server return that never happens, and while the node's table of the server's peers is full
+        the guard stands down.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: enforce, the default, drops it. observe counts what would be dropped and drops
+            nothing. off does not look.
+        engage_pps:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: Packets a second of such TCP a prefix takes before the guard engages. 0, or
+            unset, is 5000.
     MlPolicy:
       type: object
       description: Where the published classifiers judge traffic, and whether they drop what they score
@@ -3753,6 +3911,19 @@ components:
           - cldap
           description: The reflection vector the reflection guard dropped, for a vector that is neither a
             rule nor a filter. It has no stage.
+        protocol:
+          type: string
+          enum:
+          - gre
+          - other
+          description: What the protocol guard dropped, GRE or any other protocol, for a vector that is
+            neither a rule nor a filter. It has no stage.
+        ack_flood:
+          type: string
+          enum:
+          - tcp
+          description: Set when the ACK flood guard dropped TCP that belongs to no connection, for a vector
+            that is neither a rule nor a filter. It has no stage.
         stage:
           type: string
           enum:

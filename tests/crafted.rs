@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use pathfinder::{
     model::{
         ACLEntry, CraftedPolicy, FPGAEntry, Flow, GameFilter, GameHttp, Match, NodeTunnel, Policy,
-        Program, ReputationPolicy,
+        Program, ProtocolPolicy, ReputationPolicy,
     },
     packet::{self, Check, ACK, CWR, ECE, FIN, PSH, RST, SYN, URG},
     pipeline::Pipeline,
@@ -368,7 +368,14 @@ fn legitimate() -> Vec<(&'static str, Vec<u8>)> {
 }
 #[test]
 fn every_kind_of_packet_a_real_stack_sends_passes() {
-    let mut pipe = Pipeline::new(node());
+    // GRE among them, which a protected address receives only when the policy lets it.
+    let mut pipe = Pipeline::new(Program {
+        protocols: Some(ProtocolPolicy {
+            allow: vec!["gre".into()],
+            ..Default::default()
+        }),
+        ..node()
+    });
     for (i, (what, bytes)) in legitimate().into_iter().enumerate() {
         let (_, found) = packet::parse(&bytes);
         assert_eq!(found, None, "{what}");

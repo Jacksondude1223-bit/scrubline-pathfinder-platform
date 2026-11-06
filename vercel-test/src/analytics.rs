@@ -249,6 +249,8 @@ impl Collector {
         self.rule_counters.retain(|(_, id, _), _| {
             id.strip_prefix("|crafted|")
                 .or_else(|| id.strip_prefix("|reflection|"))
+                .or_else(|| id.strip_prefix("|protocol|"))
+                .or_else(|| id.strip_prefix("|ack_flood|"))
                 .and_then(|rest| rest.split_once('|'))
                 .is_none_or(|(_, p)| live.contains(p))
         });
@@ -316,7 +318,7 @@ impl Collector {
         }
         let mut touched = HashSet::new();
         let mut crafted = Vec::new();
-        let mut reflected = Vec::new();
+        let mut guarded = Vec::new();
         for row in &stats.prefixes {
             let p = row.prefix.as_str();
             // Only what the node is programmed to protect: a row for a prefix just removed would
@@ -353,19 +355,32 @@ impl Collector {
                     }
                 }
             }
-            // What the reflection guard dropped for the prefix, by vector, the same way.
-            for r in &row.reflection {
-                let vector = r.vector.as_str();
-                if vector != "cldap" {
-                    continue;
-                }
-                let counts = [0, r.flows, 0, r.dropped, 0];
-                let key = (node.into(), format!("|reflection|{vector}|{p}"), false);
+            // What the reflection, protocol and ACK flood guards dropped for the prefix, by what
+            // each names, the same way.
+            let rows = row
+                .reflection
+                .iter()
+                .filter(|r| r.vector == "cldap")
+                .map(|r| ("reflection", r.vector.as_str(), r.flows, r.dropped))
+                .chain(
+                    row.protocols
+                        .iter()
+                        .filter(|r| r.protocol == "gre" || r.protocol == "other")
+                        .map(|r| ("protocol", r.protocol.as_str(), r.flows, r.dropped)),
+                )
+                .chain(
+                    row.ack_flood
+                        .iter()
+                        .map(|r| ("ack_flood", "tcp", r.flows, r.dropped)),
+                );
+            for (kind, name, flows, dropped) in rows {
+                let counts = [0, flows, 0, dropped, 0];
+                let key = (node.into(), format!("|{kind}|{name}|{p}"), false);
                 let prev = self.rule_counters.insert(key, counts);
                 if let Some(prev) = prev.or(seen.map(|_| [0; 5])) {
                     let diff = std::array::from_fn::<_, 5, _>(|i| delta(prev[i], counts[i]));
                     if diff[1] > 0 || diff[3] > 0 {
-                        reflected.push((p.to_string(), vector.to_string(), diff));
+                        guarded.push((p.to_string(), kind, name.to_string(), diff));
                     }
                 }
             }
@@ -435,11 +450,7 @@ impl Collector {
         let named = crafted
             .into_iter()
             .map(|(p, class, diff)| (p, "crafted", class, diff))
-            .chain(
-                reflected
-                    .into_iter()
-                    .map(|(p, vector, diff)| (p, "reflection", vector, diff)),
-            );
+            .chain(guarded);
         for (p, kind, name, diff) in named {
             if let Some(e) = self.series.get_mut(&p).and_then(|s| s.open.as_mut()) {
                 let key = (format!("|{kind}|{name}"), String::new());

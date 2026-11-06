@@ -219,6 +219,33 @@ pub fn policy(p: &Policy) -> Result<()> {
             ));
         }
     }
+    if let Some(g) = &p.protocols {
+        if !["", "enforce", "observe", "off"].contains(&g.mode.as_str()) {
+            return Err(format!(
+                "protocols.mode {:?}: use enforce, observe, or off to stop looking at protocols",
+                g.mode
+            ));
+        }
+        for name in &g.allow {
+            if crate::guards::protocol(name).is_none() {
+                return Err(format!(
+                    "protocols.allow {name:?}: name a protocol ({}) or give its number; tcp, udp and icmp always pass",
+                    crate::guards::PROTOCOLS.join(", ")
+                ));
+            }
+        }
+    }
+    if let Some(a) = &p.ack_flood {
+        if !["", "enforce", "observe", "off"].contains(&a.mode.as_str()) {
+            return Err(format!(
+                "ack_flood.mode {:?}: use enforce, observe, or off to stop looking for ACK floods",
+                a.mode
+            ));
+        }
+        if !(0..=1_000_000_000).contains(&a.engage_pps) {
+            return Err("ack_flood.engage_pps must be within 0..1000000000; 0 takes 5000".into());
+        }
+    }
     if let Some(e) = &p.egress {
         if !["", "off", "limit", "drop"].contains(&e.lockdown.as_str())
             || e.lockdown_pps < 0
@@ -253,13 +280,22 @@ pub fn policy(p: &Policy) -> Result<()> {
         }
         // The datapath compares these as text, so a value outside the vocabulary is a rule that
         // never matches, and proto is also written into the TCAM key.
-        if !["", "any", "tcp", "udp", "icmp"]
-            .contains(&r.r#match.proto.to_ascii_lowercase().as_str())
+        let proto = r.r#match.proto.to_ascii_lowercase();
+        if !["", "any", "tcp", "udp", "icmp"].contains(&proto.as_str())
+            && !crate::guards::PROTOCOLS.contains(&proto.as_str())
         {
             return Err(format!(
-                "rule {:?}: unknown proto {:?}; use tcp, udp, icmp or any",
-                r.id, r.r#match.proto
+                "rule {:?}: unknown proto {:?}; use tcp, udp, icmp, {} or any",
+                r.id,
+                r.r#match.proto,
+                crate::guards::PROTOCOLS.join(", ")
             ));
+        }
+        // Their packets carry no ports the node reads.
+        if crate::guards::PROTOCOLS.contains(&proto.as_str())
+            && (r.r#match.dport != 0 || r.r#match.sport != 0)
+        {
+            return Err(format!("rule {:?}: {proto} has no ports to match", r.id));
         }
         if !r
             .r#match

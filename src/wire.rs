@@ -119,6 +119,10 @@ pub struct Stats {
     pub crafted: CraftedStats,
     #[serde(deserialize_with = "null_default")]
     pub reflection: ReflectionStats,
+    #[serde(deserialize_with = "null_default")]
+    pub protocols: ProtocolStats,
+    #[serde(deserialize_with = "null_default")]
+    pub ack_flood: AckFloodStats,
     /// What the agent's process holds in memory, as the kernel counts it.
     #[serde(deserialize_with = "null_default")]
     pub resident_bytes: u64,
@@ -157,6 +161,8 @@ impl Stats {
             load_window_seconds,
             crafted,
             reflection,
+            protocols,
+            ack_flood,
             resident_bytes,
             mitigation: _,
         } = self;
@@ -199,6 +205,8 @@ impl Stats {
             load_window_seconds: *load_window_seconds,
             crafted: crafted.clone(),
             reflection: reflection.clone(),
+            protocols: protocols.clone(),
+            ack_flood: ack_flood.clone(),
             resident_bytes: *resident_bytes,
             mitigation: Vec::new(),
         }
@@ -268,6 +276,71 @@ pub struct VectorStats {
     pub asked: u64,
     #[serde(deserialize_with = "null_default")]
     pub fragments: u64,
+}
+/// What the protocol guard did: in which mode, what it lets in besides TCP, UDP and ICMP, and what
+/// it dropped and observed, in all and per protocol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtocolStats {
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub allow: Vec<String>,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub by_protocol: Vec<ProtocolCount>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtocolCount {
+    #[serde(deserialize_with = "null_default")]
+    pub protocol: String,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+}
+/// What the ACK flood guard did: in which mode, at what threshold, on how many prefixes it is
+/// engaged, and what it dropped and observed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AckFloodStats {
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub engage_pps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub engaged: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+}
+/// What the protocol guard dropped for a prefix, GRE and every other protocol apart: flows, and
+/// their packets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefixProtocol {
+    #[serde(deserialize_with = "null_default")]
+    pub protocol: String,
+    #[serde(deserialize_with = "null_default")]
+    pub flows: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+}
+/// Whether a prefix's ACK flood guard is engaged, and what it dropped there.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefixAckFlood {
+    #[serde(deserialize_with = "null_default")]
+    pub engaged: bool,
+    #[serde(deserialize_with = "null_default")]
+    pub flows: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
 }
 /// What the reflection guard dropped of one vector for a prefix: flows, and their packets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -414,6 +487,16 @@ pub struct PrefixStats {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub reflection: Vec<PrefixReflection>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub protocols: Vec<PrefixProtocol>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ack_flood: Option<PrefixAckFlood>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

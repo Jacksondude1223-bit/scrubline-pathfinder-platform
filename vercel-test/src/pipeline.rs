@@ -1,6 +1,6 @@
 //! Serialized per-node packet decisions and bounded counters/state.
 use crate::{
-    gamefilter, httpfilter, ml,
+    gamefilter, guards, httpfilter, ml,
     model::*,
     packet, reflection,
     state::{Egress, Pulse, Reputation},
@@ -86,6 +86,10 @@ struct Load {
     crafted: [[u64; 2]; 3],
     /// Flows and their packets the reflection guard dropped as CLDAP.
     reflection: [u64; 2],
+    /// Flows and their packets the protocol guard dropped, GRE and every other protocol.
+    protocols: [[u64; 2]; 2],
+    /// Flows and their packets the ACK flood guard dropped.
+    ack_flood: [u64; 2],
 }
 impl Load {
     fn observe(&mut self, now: i64, pps: u64, dropped: bool) {
@@ -390,6 +394,8 @@ pub struct Pipeline {
     grace: i64,
     crafted: Crafted,
     reflection: reflection::Guard,
+    protocols: guards::ProtocolGuard,
+    ack_flood: guards::AckGuard,
 }
 /// The crafted-packet checks: whether they drop, only count or are off, what each check dropped
 /// and observed, in packet::Check order, and the fragments in reassembly.
@@ -473,6 +479,8 @@ impl Pipeline {
             grace: 500,
             crafted: Crafted::default(),
             reflection: reflection::Guard::default(),
+            protocols: guards::ProtocolGuard::default(),
+            ack_flood: guards::AckGuard::default(),
         };
         p.load(program);
         p
@@ -496,6 +504,8 @@ impl Pipeline {
         }
         self.pulses.forget(&live);
         self.egress.forget(&live);
+        self.protocols.load(program.protocols.as_ref());
+        self.ack_flood.load(program.ack_flood.as_ref(), &live);
         // Zero is the platform default, so a policy that drops its floor must clear the old one.
         self.pulses.floor = program.pulse_floor_pps.max(0) as u64;
         self.rules = [
@@ -1085,6 +1095,63 @@ impl Pipeline {
         d.reflection = "cldap".into();
         Some(d)
     }
+    /// Holds a flow to whether its protocol is one the protected addresses receive: TCP, UDP,
+    /// ICMP and what the policy allows. GRE is what botnets wrap their floods in. An operator's
+    /// permit vouches for what it covers, a rule naming the protocol among them.
+    fn foreign(&mut self, f: &Flow) -> Option<(Decision, String)> {
+        let name = self.protocols.stopped(&f.proto)?;
+        if allowed(&self.rules, f) {
+            return None;
+        }
+        let observed = self.protocols.mode == "observe";
+        self.protocols.count(&name, observed);
+        if observed {
+            return None;
+        }
+        let mut d = decision("drop", 0, "", guards::why(&name));
+        d.guard = "protocol".into();
+        Some((d, name))
+    }
+    /// Holds a TCP segment to whether it belongs to a connection the server has: every segment of
+    /// one but the opening SYN comes from an address the server has sent TCP to. That is known
+    /// only where the server's traffic passes the node, and once it has been watched long enough
+    /// to have seen every connection open, so the guard waits for both. It drops such TCP only
+    /// while the prefix takes more of it than its threshold, and holds a minute after; below
+    /// that, a stray segment, after a restart say, passes. An operator's permit vouches for what
+    /// it covers; a player's trust does not, since its address is as easily forged.
+    fn unsolicited(&mut self, f: &Flow, owner: &str, now: i64) -> Option<Decision> {
+        if self.ack_flood.mode == "off"
+            || !f.proto.eq_ignore_ascii_case("tcp")
+            || !guards::mid_connection(&f.flags)
+            || self.egress.watched_for(owner, now) < guards::ACK_WARM
+            // A full table may have missed a connection opened since, so the guard stands down
+            // rather than drop it.
+            || self.egress.saturated()
+            || self
+                .egress
+                .talked_tcp(owner, &f.src_ip, guards::TALKED_WITHIN, now)
+            || allowed(&self.rules, f)
+        {
+            return None;
+        }
+        if !self.ack_flood.engaged_by(owner, f.pps.max(0) as u64, now) {
+            return None;
+        }
+        if self.ack_flood.mode == "observe" {
+            self.ack_flood.counts[1] += 1;
+            return None;
+        }
+        self.ack_flood.counts[0] += 1;
+        // Whom the server has sent TCP to is memory a switch does not have.
+        let mut d = decision(
+            "drop",
+            2,
+            "",
+            "ACK flood: TCP for a connection the server never had, while the prefix is flooded with it",
+        );
+        d.guard = "ack_flood".into();
+        Some(d)
+    }
     pub fn decide(&mut self, f: &Flow, now: i64) -> Decision {
         self.decisions += 1;
         let pps = f.pps.max(0) as u64;
@@ -1162,6 +1229,25 @@ impl Pipeline {
             load.observe(now, pps, true);
             load.reflection[0] += 1;
             load.reflection[1] = load.reflection[1].saturating_add(pps);
+            return d;
+        }
+        if let Some((d, name)) = self.foreign(f) {
+            self.record(&d, None, f);
+            self.load.observe(now, pps, true);
+            let load = self.loads.entry(owner).or_default();
+            load.observe(now, pps, true);
+            let c = &mut load.protocols[usize::from(name != "gre")];
+            c[0] += 1;
+            c[1] = c[1].saturating_add(pps);
+            return d;
+        }
+        if let Some(d) = self.unsolicited(f, &owner, now) {
+            self.record(&d, None, f);
+            self.load.observe(now, pps, true);
+            let load = self.loads.entry(owner).or_default();
+            load.observe(now, pps, true);
+            load.ack_flood[0] += 1;
+            load.ack_flood[1] = load.ack_flood[1].saturating_add(pps);
             return d;
         }
         let rules = &self.rules;
@@ -1248,6 +1334,10 @@ impl Pipeline {
             {
                 self.egress.searched(&prefix, &f.dst_ip, now);
             }
+            // TCP the origin sent makes TCP from the address part of a connection it has.
+            if f.proto.eq_ignore_ascii_case("tcp") {
+                self.egress.sent_tcp(&prefix, &f.dst_ip, now);
+            }
             if let Some(fresh) = confirmed {
                 self.reputation.promote(&f.dst_ip, 2, now);
                 if fresh {
@@ -1297,6 +1387,20 @@ impl Pipeline {
                 row["reflection"] =
                     json!([{"vector":"cldap","flows":l.reflection[0],"dropped":l.reflection[1]}]);
             }
+            let protocols: Vec<_> = ["gre", "other"]
+                .iter()
+                .zip(l.protocols)
+                .filter(|(_, [flows, _])| *flows > 0)
+                .map(|(p, [flows, pps])| json!({"protocol":p,"flows":flows,"dropped":pps}))
+                .collect();
+            if !protocols.is_empty() {
+                row["protocols"] = json!(protocols);
+            }
+            let engaged = self.ack_flood.engaged(prefix, now);
+            if engaged || l.ack_flood[0] > 0 {
+                row["ack_flood"] =
+                    json!({"engaged":engaged,"flows":l.ack_flood[0],"dropped":l.ack_flood[1]});
+            }
             prefixes.push(row);
         }
         prefixes.sort_by(|a, b| a["prefix"].as_str().cmp(&b["prefix"].as_str()));
@@ -1316,6 +1420,6 @@ impl Pipeline {
             .collect();
         let crafted = json!({"mode":self.crafted.mode,"dropped":self.crafted.dropped.iter().sum::<u64>(),"observed":self.crafted.observed.iter().sum::<u64>(),"fragments":self.crafted.fragments.len(),"fragments_max":packet::FRAGMENTS_MAX,"fragments_untracked":self.crafted.fragments.untracked,"checks":checks});
         let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"wave":w.wave,"hold_seconds":w.hold()/1000,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(),"protocols":self.protocols.stats(),"ack_flood":self.ack_flood.stats(now),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }

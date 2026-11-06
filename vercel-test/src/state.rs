@@ -287,12 +287,17 @@ struct Client {
     /// When the origin last sent the address an LDAP search, which makes an LDAP answer from it
     /// one the origin asked for.
     searched: i64,
+    /// When the origin last sent the address TCP, which makes TCP from it part of a connection
+    /// the origin has.
+    tcp: i64,
 }
 #[derive(Default)]
 struct ReturnSeries {
     clients: HashMap<String, Client>,
     ingress: i64,
     egress: i64,
+    /// Since when the origin's traffic has been seen without a gap of more than 30 seconds.
+    egress_since: i64,
 }
 #[derive(Default)]
 pub struct Egress {
@@ -355,7 +360,11 @@ impl Egress {
         if addr.is_empty() || packets <= 0 || !self.prefix(prefix) {
             return None;
         }
-        self.series.get_mut(prefix).unwrap().egress = now;
+        let series = self.series.get_mut(prefix).unwrap();
+        if series.egress == 0 || now - series.egress > 30000 {
+            series.egress_since = now;
+        }
+        series.egress = now;
         if now - self.last_sweep >= 5000 {
             self.last_sweep = now;
             for s in self.series.values_mut() {
@@ -405,6 +414,30 @@ impl Egress {
     pub fn searched(&mut self, p: &str, a: &str, now: i64) {
         if let Some(c) = self.series.get_mut(p).and_then(|s| s.clients.get_mut(a)) {
             c.searched = now;
+        }
+    }
+    /// Records that the origin sent the address TCP, once its reply has been observed.
+    pub fn sent_tcp(&mut self, p: &str, a: &str, now: i64) {
+        if let Some(c) = self.series.get_mut(p).and_then(|s| s.clients.get_mut(a)) {
+            c.tcp = now;
+        }
+    }
+    /// Whether the origin sent the address TCP within the last `within` milliseconds.
+    pub fn talked_tcp(&self, p: &str, a: &str, within: i64, now: i64) -> bool {
+        self.series
+            .get(p)
+            .and_then(|s| s.clients.get(a))
+            .is_some_and(|c| c.tcp != 0 && now - c.tcp < within)
+    }
+    /// Whether the table is full, so that an address the origin sends to now may go unrecorded.
+    pub fn saturated(&self) -> bool {
+        self.clients >= 65536
+    }
+    /// How long the origin's traffic has been seen without a gap, or 0 when it is not seen now.
+    pub fn watched_for(&self, p: &str, now: i64) -> i64 {
+        match self.series.get(p) {
+            Some(s) if s.egress != 0 && now - s.egress <= 30000 => now - s.egress_since,
+            _ => 0,
         }
     }
     /// Whether the origin sent the address an LDAP search within the last `within` milliseconds.
