@@ -211,6 +211,14 @@ pub fn policy(p: &Policy) -> Result<()> {
             ));
         }
     }
+    if let Some(r) = &p.reflection {
+        if !["", "enforce", "observe", "off"].contains(&r.cldap.as_str()) {
+            return Err(format!(
+                "reflection.cldap {:?}: use enforce, observe, or off to stop looking for reflected CLDAP",
+                r.cldap
+            ));
+        }
+    }
     if let Some(e) = &p.egress {
         if !["", "off", "limit", "drop"].contains(&e.lockdown.as_str())
             || e.lockdown_pps < 0

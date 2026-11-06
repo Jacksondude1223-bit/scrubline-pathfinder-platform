@@ -1990,6 +1990,7 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         egress,
         ml,
         crafted,
+        reflection,
         tunnels,
         sessions,
         tunnel_src,
@@ -2013,6 +2014,7 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         && *egress == b.egress
         && *ml == b.ml
         && *crafted == b.crafted
+        && *reflection == b.reflection
         && *tunnels == b.tunnels
         && *sessions == b.sessions
         && *tunnel_src == b.tunnel_src

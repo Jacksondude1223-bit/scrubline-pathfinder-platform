@@ -1228,6 +1228,35 @@ packet broke, and the node's counters keep every check, in a fixed order, under
 To try them first, `"crafted": {"mode": "observe"}` in the policy counts what
 would be dropped and drops nothing.
 
+### 13. Reflected CLDAP
+
+A domain controller's answer to a CLDAP query forged from a protected address
+comes from UDP port 389, and opens as an LDAP answer to a search. The node drops
+it, and names the vector:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"198.18.7.7","dst_ip":"203.0.113.10","proto":"udp","sport":389,"dport":27015,"pps":1,"payload":"MIQAAAuwAgEBZA=="}'
+{"action":"drop","stage":"asic","reason":"CLDAP reflection: an LDAP answer from port 389 that the server never asked for","reflection":"cldap"}
+```
+
+The answer's later fragments carry no port. Sent as `packet`, they are dropped
+for 30 seconds after their source's last answer, at the `zc` stage. A packet
+from port 389 that does not open as an LDAP answer passes. So does an answer
+from an address that the protected server sent an LDAP search in the last 30
+seconds, or that an `asic` or `fpga` permit covers. The node's stats keep it
+all under `reflection`:
+
+```json
+"reflection": {"sources": 1, "sources_max": 65536, "sources_untracked": 0,
+               "vectors": [{"vector": "cldap", "port": 389, "mode": "enforce", "dropped": 1,
+                            "observed": 0, "asked": 0, "fragments": 0}]}
+```
+
+`"reflection": {"cldap": "observe"}` in the policy counts what would be dropped
+and drops nothing, and `"off"` stops looking. See
+[Reflection attacks](../README.md#reflection-attacks).
+
 ## The node agent
 
 ```console

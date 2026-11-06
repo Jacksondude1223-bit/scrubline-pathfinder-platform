@@ -284,6 +284,9 @@ struct Client {
     confirmed: i64,
     last_seen: i64,
     first: i64,
+    /// When the origin last sent the address an LDAP search, which makes an LDAP answer from it
+    /// one the origin asked for.
+    searched: i64,
 }
 #[derive(Default)]
 struct ReturnSeries {
@@ -396,6 +399,21 @@ impl Egress {
             self.promotions += 1;
         }
         Some(fresh)
+    }
+    /// Records that the origin sent the address an LDAP search, once its reply has been observed,
+    /// so that an LDAP answer from the address answers something the origin asked.
+    pub fn searched(&mut self, p: &str, a: &str, now: i64) {
+        if let Some(c) = self.series.get_mut(p).and_then(|s| s.clients.get_mut(a)) {
+            c.searched = now;
+        }
+    }
+    /// Whether the origin sent the address an LDAP search within the last `within` milliseconds.
+    /// It is known only where the origin's traffic passes the node.
+    pub fn asked(&self, p: &str, a: &str, within: i64, now: i64) -> bool {
+        self.series
+            .get(p)
+            .and_then(|s| s.clients.get(a))
+            .is_some_and(|c| c.searched != 0 && now - c.searched < within)
     }
     pub fn confirmed(&self, p: &str, a: &str, now: i64) -> bool {
         self.series

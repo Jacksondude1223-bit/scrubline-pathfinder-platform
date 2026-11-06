@@ -203,6 +203,19 @@ try:
         assert (d['action'], d.get('check')) == ('drop', check), (check, d)
     crafted_flood = flow('tcp', '100.64.9.1', '203.0.113.10', 443, 100000, flags='syn,fin')
     assert decide(crafted_flood)['check'] == 'tcp_flags'
+    # A domain controller's CLDAP answer reflected at the game server, in the three fragments a
+    # 3,000-byte answer takes, then a player whose NAT maps them to port 389.
+    answer = bytes([0x30, 0x84, 0x00, 0x00, 0x0b, 0xb0, 0x02, 0x01, 0x01, 0x64]).ljust(3000, b'\x04')
+    first = udp(389, 19132, answer[:1472])[:4] + struct.pack('!H', 8 + len(answer)) + b'\0\0' + answer[:1472]
+    pieces = [ipv4('198.18.7.7', '203.0.113.10', 17, first, ident=0x77, frag=0x2000),
+              ipv4('198.18.7.7', '203.0.113.10', 17, answer[1472:2952], ident=0x77, frag=0x2000 | 185),
+              ipv4('198.18.7.7', '203.0.113.10', 17, answer[2952:], ident=0x77, frag=370)]
+    stages = [(d['action'], d['stage'], d.get('reflection')) for d in map(decide, map(raw, pieces))]
+    assert stages == [('drop', 'asic', 'cldap'), ('drop', 'zc', 'cldap'), ('drop', 'zc', 'cldap')], stages
+    cldap_flood = flow('udp', '198.18.7.8', '203.0.113.10', 19132, 100000, answer[:64], sport=389)
+    assert decide(cldap_flood)['reflection'] == 'cldap'
+    natted = flow('udp', '192.0.2.251', '203.0.113.10', 19132, payload=b'\x84', sport=389)
+    assert 'reflection' not in decide(natted)
 
     # What the node renders for its speaker, its provisioner and BIRD.
     exabgp = call(local, '/bgp?format=exabgp', token=LOCAL, text=True).splitlines()
@@ -224,6 +237,11 @@ try:
                for line in metrics.splitlines() if line.startswith('scrubline_crafted_dropped_total{')}
     assert counted['land'] == 1 and counted['tcp_flags'] == 4 and counted['fragment_overlap'] == 1, counted
     assert 'mode="enforce"} 1' in metrics, metrics
+    reflected_total = [line for line in metrics.splitlines()
+                       if line.startswith('scrubline_reflection_dropped_total{')]
+    assert reflected_total and reflected_total[0].endswith(' 2'), reflected_total
+    assert any(line.startswith('scrubline_reflection_fragments_dropped_total{') and line.endswith(' 2')
+               for line in metrics.splitlines()), metrics
     dry = subprocess.run([str(BIN / 'scrub-provision'), '-agent', local, '-once', '-dry-run'],
                          env=ENV, capture_output=True, text=True, timeout=30)
     assert dry.returncode == 0, (dry.stdout, dry.stderr)
@@ -249,6 +267,10 @@ try:
         events = call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
         return any(v.get('crafted') == 'stack' for e in events for v in e.get('vectors', []))
     wait_for(stopped_by_the_checks)
+    # And that reflected CLDAP was part of it.
+    wait_for(lambda: any(v.get('reflection') == 'cldap'
+                         for e in call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
+                         for v in e.get('vectors', [])))
     assert wait_for(lambda: call(base, f'/v1/nodes/{node_id}/stats', token=OP)['stats']['crafted']['dropped'] >= 9)
 
     # Restarted from its state, the control plane compiles the node the same program once the
@@ -263,8 +285,8 @@ try:
     assert [t['id'] for t in after['tunnels']] == [t['id'] for t in before['tunnels']]
     assert wait_for(lambda: call(base, '/v1/nodes', token=OP)[0]['status'] == 'ready')
     print('Everything on one node passed: stages, game filters, HTTP rules, classifiers, crafted '
-          'packets, reputation, on-demand mitigation, tunnels, BGP, sessions, provisioner, analytics '
-          'and restart')
+          'packets, reflected CLDAP, reputation, on-demand mitigation, tunnels, BGP, sessions, '
+          'provisioner, analytics and restart')
 except BaseException:
     for index, log in enumerate(logs):
         log.seek(0); output = log.read().decode(errors='replace')

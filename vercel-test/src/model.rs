@@ -94,6 +94,8 @@ pub struct Policy {
     #[serde(skip_serializing_if = "is_zero")]
     pub crafted: Option<CraftedPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
+    pub reflection: Option<ReflectionPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub challenge_secret: String,
     #[serde(deserialize_with = "null_time")]
@@ -117,6 +119,7 @@ impl Default for Policy {
             egress: None,
             ml: None,
             crafted: None,
+            reflection: None,
             challenge_secret: Default::default(),
             updated_at: zero_time(),
             version: Default::default(),
@@ -167,6 +170,20 @@ pub struct CraftedPolicy {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub mode: String,
+}
+/// What a node does with answers reflected at a protected address: replies from servers on the
+/// internet to requests an attacker sent them with that address forged as the source, which they
+/// answer many times over (see the reflection guard in pipeline.rs). Per vector, "enforce", the
+/// default, drops them; "observe" counts what would be dropped and drops nothing; "off" does not
+/// look.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ReflectionPolicy {
+    /// Connectionless LDAP, UDP from port 389: a rootDSE query of about 50 bytes is answered with
+    /// several kilobytes.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub cldap: String,
 }
 impl MlPolicy {
     pub fn everywhere(&self) -> bool {
@@ -327,6 +344,11 @@ pub struct Decision {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub check: String,
+    /// The reflection vector a packet belonged to, such as cldap, when the reflection guard
+    /// dropped it.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub reflection: String,
     #[serde(with = "base64_bytes", skip_serializing_if = "is_zero")]
     pub reply: Vec<u8>,
 }
@@ -414,6 +436,8 @@ pub struct Program {
     pub ml: Option<MlPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
     pub crafted: Option<CraftedPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reflection: Option<ReflectionPolicy>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub tunnels: Vec<NodeTunnel>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
@@ -456,6 +480,7 @@ impl Default for Program {
             egress: None,
             ml: None,
             crafted: None,
+            reflection: None,
             tunnels: Vec::new(),
             sessions: Vec::new(),
             tunnel_src: Default::default(),

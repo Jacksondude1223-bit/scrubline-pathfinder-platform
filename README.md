@@ -732,6 +732,67 @@ Checking a flow record costs about 25 ns, and reading and checking a whole
 packet about 400 ns more, most of it filling the record from the headers;
 `make bench` measures both.
 
+## Reflection attacks
+
+A reflection attack has servers on the internet do the attacking. The attacker
+sends them small requests with the protected address forged as the source,
+and they send their answers there, many times larger. The answers come from
+real servers at real addresses, so no rule on sources stops them. What gives
+them away is that nobody at the protected address asked.
+
+### CLDAP
+
+Connectionless LDAP (CLDAP) runs on UDP port 389, and domain controllers
+expose it to the internet by the tens of thousands. A rootDSE query of about
+50 bytes gets an answer of several kilobytes back. An answer that size arrives
+in fragments, and only the first fragment carries the port.
+
+Every node drops CLDAP answers at its protected addresses:
+
+- **The answer:** UDP from port 389 that opens the way an LDAP answer to a
+  search does. That means a BER `SEQUENCE`, a message ID, then a search entry,
+  reference or done. A packet from port 389 that opens any other way is not
+  CLDAP, and passes. A player whose NAT happens to map them to port 389 is
+  sending the game's own packets. A flow record without its payload is judged
+  by its port alone.
+- **The rest of it:** a source caught reflecting is remembered for 30
+  seconds after its last answer, as long as a host holds fragments for
+  reassembly. Its later fragments, which carry no port, are dropped with it.
+  The node remembers up to 65,536 such sources. When the table is full of
+  sources still reflecting, a new one is counted in
+  `scrubline_reflection_sources_untracked_total` and not remembered.
+
+Two things let an answer through:
+
+- **The server asked for it.** If the protected server sent an address a CLDAP
+  query, an LDAP search to its port 389, in the last 30 seconds, an answer
+  from that address answers it. A Windows server finding its domain
+  controller gets its answer. Nothing else the server sends counts. An
+  attacker can forge a game query from a reflector's address, and the server
+  would answer it. This is known only where the server's own traffic passes
+  the node. Behind direct server return, the node sees no queries, so every
+  answer is dropped unless a permit covers its source.
+- **An operator's permit** on the `asic` or `fpga` stage that covers the
+  source, such as your own directory server's address.
+
+A player's trust and the penalty box speak for neither: a reflector is no
+player. Nor is a reflector boxed for it. It is somebody's server, put to work
+by the attacker. Like the rest of mitigation, the guard holds off on an idle
+on-demand tunnel, whose meter counts the answers until they start mitigation.
+
+```json
+"reflection": {"cldap": "observe"}
+```
+
+`enforce` is the default, `observe` counts what would be dropped and drops
+nothing, and `off` does not look. A drop carries `"reflection": "cldap"` and a
+reason that says which part of an answer it was. The node counts them in
+`scrubline_reflection_dropped_total{vector}` and
+`scrubline_reflection_fragments_dropped_total{vector}`, and the answers let
+through because the server asked in `scrubline_reflection_asked_total`. A
+customer's attack shows the vector as `reflection-cldap`, beside the rules and
+filters that stopped the rest of it.
+
 ## Keeping false positives down
 
 A false positive is a customer's own traffic dropped, which can hurt them as
@@ -887,7 +948,7 @@ At those bounds, as the allocator counts it:
 
 | Part | Holds at the most | Of which |
 | --- | --- | --- |
-| Node agent | 270 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, game session and HTTP tables): 72 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
+| Node agent | 275 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables): 78 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
 | Control plane, 128 nodes | 3.0 GiB | programs and the plan 205 MiB, node and tunnel reports 64 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; writing the state out 332 MiB; metrics scrapes, four at a time, 26 MiB; the largest answer still being sent, the whole fabric, 109 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
 
 Each part grows with what the policy holds multiplied by the nodes: every node
