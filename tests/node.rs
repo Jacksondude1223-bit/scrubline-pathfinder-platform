@@ -5,7 +5,7 @@
 //! the node runs from its program, or reads back what the node renders and reports.
 use pathfinder::{
     api::{Api, Shared},
-    bgp, ml,
+    bgp, guards, ml,
     model::*,
     pipeline::Pipeline,
     provision,
@@ -273,11 +273,25 @@ fn the_stages_the_game_filters_and_the_classifiers_decide_together() {
         "drop",
         "FPGA meter 200000 pps exceeded",
     );
+    // A flood of SYNs from a source the server has no connection with is the SYN flood guard's,
+    // ahead of the operator's meter; one from a source the server answers is the meter's.
     let syn = Flow {
         flags: "syn".into(),
         ..flow("tcp", "100.64.0.2", "203.0.113.20", 30120, 30_000, &[])
     };
-    expect(&mut pipe, &syn, t, "drop", "FPGA meter 20000 pps exceeded");
+    expect(&mut pipe, &syn, t, "drop", guards::SYN_WHY);
+    answered(&mut pipe, "203.0.113.20", "100.64.0.4", t - 1_000);
+    let known = Flow {
+        src_ip: "100.64.0.4".into(),
+        ..syn.clone()
+    };
+    expect(
+        &mut pipe,
+        &known,
+        t,
+        "drop",
+        "FPGA meter 20000 pps exceeded",
+    );
     let pings = flow("icmp", "100.64.0.3", "203.0.113.30", 0, 1500, &[]);
     expect(
         &mut pipe,
@@ -850,6 +864,73 @@ fn a_gre_flood_tells_the_customer_what_stopped_it() {
         "scrubline_protocol_dropped_total{",
         "scrubline_protocol_mode{",
         "scrubline_ack_flood_mode{",
+    ] {
+        assert!(fleet.contains(series), "{series} missing from:\n{fleet}");
+    }
+}
+#[test]
+fn a_booters_multi_vector_attack_tells_the_customer_every_vector_that_stopped_it() {
+    let f = Fabric::new();
+    let mut pipe = f.pipeline();
+    f.heartbeat(pipe.stats(T0), json!([]));
+    let at = T0 + 1000;
+    // What a booter's "multi-vector" method sends at once: NTP servers' monlist answers and
+    // memcached's values reflected at Northwind's game server, a SYN flood from forged sources,
+    // and a ping flood.
+    let mut monlist = vec![0xd7, 0x00, 0x03, 0x2a, 0x00, 0x06, 0x00, 0x48];
+    monlist.resize(440, 0);
+    let mut memcached = vec![0, 1, 0, 0, 0, 9, 0, 0];
+    memcached.extend(b"VALUE a 0 1000000\r\n");
+    let reflected = [(123, "ntp", monlist), (11211, "memcached", memcached)];
+    for (port, vector, answer) in reflected {
+        let flood = Flow {
+            sport: port,
+            ..udp("198.18.9.1", "203.0.113.10", 27015, 100_000, &answer)
+        };
+        let d = pipe.decide(&flood, at);
+        assert_eq!((d.action.as_str(), d.reflection.as_str()), ("drop", vector));
+    }
+    let syn = Flow {
+        flags: "syn".into(),
+        ..flow("tcp", "100.64.9.1", "203.0.113.10", 443, 100_000, &[])
+    };
+    assert_eq!(pipe.decide(&syn, at).guard, "syn_flood");
+    let pings = flow("icmp", "100.64.9.2", "203.0.113.10", 0, 100_000, &[]);
+    assert_eq!(pipe.decide(&pings, at).guard, "icmp");
+    f.heartbeat(pipe.stats(at), json!([]));
+    let (_, id) = &f.tenants[0];
+    let (_, issued) = call(
+        &f.base,
+        "POST",
+        &format!("/v1/tenants/{id}/token"),
+        OP,
+        Value::Null,
+    );
+    let token = issued["token"].as_str().unwrap();
+    let (status, events) = call(&f.base, "GET", "/v1/analytics/events", token, Value::Null);
+    assert_eq!(status, 200, "{events}");
+    let vectors = events["events"][0]["vectors"].as_array().unwrap().clone();
+    for (kind, name) in [
+        ("reflection", "ntp"),
+        ("reflection", "memcached"),
+        ("syn_flood", "tcp"),
+        ("icmp", "flood"),
+    ] {
+        assert!(
+            vectors
+                .iter()
+                .any(|v| v[kind] == name && v["dropped"] == 100_000),
+            "{kind} {name}: {events}"
+        );
+    }
+    let (_, fleet) = call(&f.base, "GET", "/metrics", OP, Value::Null);
+    let fleet = fleet.as_str().unwrap_or_default();
+    for series in [
+        "scrubline_reflection_dropped_total{",
+        "scrubline_syn_flood_dropped_total{",
+        "scrubline_icmp_dropped_total{",
+        "scrubline_fragment_mode{",
+        "scrubline_game_http_pending{",
     ] {
         assert!(fleet.contains(series), "{series} missing from:\n{fleet}");
     }

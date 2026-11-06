@@ -1228,7 +1228,7 @@ packet broke, and the node's counters keep every check, in a fixed order, under
 To try them first, `"crafted": {"mode": "observe"}` in the policy counts what
 would be dropped and drops nothing.
 
-### 13. Reflected CLDAP
+### 13. Reflected answers
 
 A domain controller's answer to a CLDAP query forged from a protected address
 comes from UDP port 389, and opens as an LDAP answer to a search. The node drops
@@ -1240,27 +1240,54 @@ $ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
 {"action":"drop","stage":"asic","reason":"CLDAP reflection: an LDAP answer from port 389 that the server never asked for","reflection":"cldap"}
 ```
 
-The answer's later fragments carry no port. Sent as `packet`, they are dropped
-for 30 seconds after their source's last answer, at the `zc` stage. A packet
-from port 389 that does not open as an LDAP answer passes. So does an answer
-from an address that the protected server sent an LDAP search in the last 30
-seconds, or that an `asic` or `fpga` permit covers. The node's stats keep it
-all under `reflection`:
+The same goes for sixteen other vectors, each told by its port and what its
+answers open with: `dns`, `ntp`, `memcached`, `ssdp`, `snmp`, `chargen`,
+`echo`, `qotd`, `portmap`, `netbios`, `mssql`, `wsd`, `coap`, `mdns`,
+`ubiquiti` and `rip`. An NTP server's monlist answer:
 
-```json
-"reflection": {"sources": 1, "sources_max": 65536, "sources_untracked": 0,
-               "vectors": [{"vector": "cldap", "port": 389, "mode": "enforce", "dropped": 1,
-                            "observed": 0, "asked": 0, "fragments": 0}]}
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"198.18.9.1","dst_ip":"203.0.113.10","proto":"udp","sport":123,"dport":27015,"pps":1,"payload":"1wADKgAGAEg="}'
+{"action":"drop","stage":"asic","reason":"NTP reflection: a monlist or other private (mode 7) NTP answer from port 123 that the server never asked for","reflection":"ntp"}
 ```
 
-`"reflection": {"cldap": "observe"}` in the policy counts what would be dropped
-and drops nothing, and `"off"` stops looking. See
-[Reflection attacks](../README.md#reflection-attacks).
+DNS answers and NTP's time answers, which a server asks for itself, are
+dropped only while the prefix's aggregate takes more than `engage_pps` (1,000
+unless set) a second of ones it never asked for, and for a minute after, at
+the `zc` stage. A record without its payload is judged by its port: from a
+well-known one as an answer, from a high one only in a flood.
 
-### 14. GRE and ACK floods
+Answers' later fragments carry no port. Sent as `packet`, they are dropped for
+30 seconds after their source's last answer, at the `zc` stage. A packet from a
+vector's port that does not open as one of its answers passes. So does an
+answer from an address that the protected server sent a query of the vector in
+the last 30 seconds, or that an `asic` or `fpga` permit covers. The node's
+stats keep it all under `reflection`, a row for every vector:
+
+```json
+"reflection": {"sources": 1, "sources_max": 65536, "sources_untracked": 0, "engage_pps": 1000,
+               "vectors": [{"vector": "cldap", "port": 389, "mode": "enforce", "dropped": 1,
+                            "observed": 0, "asked": 0, "fragments": 0, "engaged": 0},
+                           {"vector": "dns", "port": 53, "mode": "enforce", "dropped": 0,
+                            "observed": 0, "asked": 12, "fragments": 0, "engaged": 0}]}
+```
+
+In the policy, `mode` sets every vector, `vectors` sets one by name, and
+`engage_pps` the threshold for DNS and NTP. `"cldap"`, from before the other
+vectors, still sets CLDAP's:
+
+```json
+"reflection": {"mode": "enforce", "vectors": {"mdns": "observe"}, "engage_pps": 5000}
+```
+
+`observe` counts what would be dropped and drops nothing, and `off` stops
+looking. See [Reflection attacks](../README.md#reflection-attacks).
+
+### 14. GRE, ACK and SYN floods
 
 GRE, or any IP protocol but TCP, UDP and ICMP, sent to a protected address is
-dropped, unless the policy's `protocols.allow` or a permit rule lets it in:
+dropped, unless the policy's `protocols.allow` or a permit rule lets it in.
+Protocol 0 is an IP NULL attack:
 
 ```console
 $ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
@@ -1273,10 +1300,11 @@ packet's would be. Rules take `gre`, `esp`, `ah`, `sctp`, `ipip` and `ipv6` as
 `proto`, with no ports.
 
 TCP other than an opening SYN, from a source the server has not sent TCP to in
-the last two minutes, is dropped while the prefix takes more than
-`ack_flood.engage_pps` (5,000 unless set) a second of it, and for a minute
-after. This happens only once the node has seen the server's own traffic for
-two minutes:
+the last two minutes, and a SYN-ACK from one it sent no SYN to, is dropped while
+the prefix's aggregate takes more than `ack_flood.engage_pps` (5,000 unless set)
+a second of it, and for a minute after. A client the server answered may send
+four segments of its handshake first. This happens only once the node has seen
+the server's own traffic for two minutes:
 
 ```console
 $ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
@@ -1284,17 +1312,94 @@ $ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
 {"action":"drop","stage":"zc","reason":"ACK flood: TCP for a connection the server never had, while the prefix is flooded with it","guard":"ack_flood"}
 ```
 
-The node's stats keep both:
+An opening SYN from a source the server has no connection with is held back
+while the aggregate takes more than `syn_flood.engage_pps` (2,000 unless set) a
+second of them, and for a minute after. The same connection's retry, a second
+or more later, passes:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"100.64.9.60","dst_ip":"203.0.113.10","proto":"tcp","sport":40000,"dport":443,"flags":"syn","pps":10000}'
+{"action":"drop","stage":"zc","reason":"SYN flood: an opening SYN from a source the server has no connection with, while the prefix is flooded with them; a real client sends it again a second or so later, and that passes","guard":"syn_flood"}
+```
+
+The node's stats keep them:
 
 ```json
 "protocols": {"mode": "enforce", "allow": [], "dropped": 1, "observed": 0,
               "by_protocol": [{"protocol": "gre", "dropped": 1, "observed": 0}]},
-"ack_flood": {"mode": "enforce", "engage_pps": 5000, "engaged": 1, "dropped": 1, "observed": 0}
+"ack_flood": {"mode": "enforce", "engage_pps": 5000, "engaged": 1, "dropped": 1, "observed": 0},
+"syn_flood": {"mode": "enforce", "engage_pps": 2000, "engaged": 1, "dropped": 1, "observed": 0, "retried": 0}
 ```
 
 Each prefix's row adds `protocols`, GRE and every other protocol apart, and
-`ack_flood`, with whether its guard is `engaged`. See
-[GRE and ACK floods](../README.md#gre-and-ack-floods).
+`ack_flood` and `syn_flood`, with whether each guard is `engaged`. A prefix
+narrower than a /24 (or /48) is judged with the rest of its /24 (or /48). See
+[Protocol, TCP and ICMP floods](../README.md#protocol-tcp-and-icmp-floods).
+
+### 15. Fragments and ICMP
+
+TCP and ICMP in fragments, which no real sender fragments, are dropped:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"packet":"RQAAPACZALlABs/iZEAJPcsAcQpBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"}'
+{"action":"drop","stage":"asic","reason":"fragmented ACK flood: TCP in fragments, which no TCP stack sends, since TCP sizes its segments to the path","guard":"fragment"}
+```
+
+ICMP, echo replies aside, is held to `icmp.limit_pps` (1,000 unless set) a
+second for the prefix's aggregate. Echo replies to pings the server never sent
+are dropped while the aggregate takes more than `icmp.smurf_pps` (1,000 unless
+set) a second of them, and an error that quotes no packet the prefix sent is
+dropped always:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"100.64.9.62","dst_ip":"203.0.113.10","proto":"icmp","pps":100000}'
+{"action":"drop","stage":"zc","reason":"ICMP flood: more than 1000 ICMP packets a second to the prefix, echo replies aside","guard":"icmp"}
+```
+
+```json
+"fragments": {"mode": "enforce", "dropped": 1, "observed": 0,
+              "by_protocol": [{"protocol": "tcp", "dropped": 1, "observed": 0},
+                              {"protocol": "icmp", "dropped": 0, "observed": 0}]},
+"icmp": {"mode": "enforce", "limit_pps": 1000, "smurf_pps": 1000, "smurf_engaged": 0,
+         "dropped": 1, "observed": 0,
+         "kinds": [{"kind": "flood", "dropped": 1, "observed": 0},
+                   {"kind": "smurf", "dropped": 0, "observed": 0},
+                   {"kind": "error", "dropped": 0, "observed": 0}]}
+```
+
+Each prefix's row adds `fragments` and `icmp`. `"fragments": {"mode": "observe"}`
+and `"icmp": {"mode": "observe"}` count what would be dropped and drop nothing.
+
+### 16. HTTPS and slow requests
+
+A game filter's HTTP rules count each TLS ClientHello to a port they judge
+against `rate_per_source` and `rate_total`, as a request:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $NODE_API_TOKEN" node:9091/decide \
+    -d '{"src_ip":"100.64.0.1","dst_ip":"203.0.113.20","proto":"tcp","sport":40010,"dport":443,"flags":"psh,ack","pps":1,"payload":"FgMBAgABAAH8AwM="}'
+{"action":"drop","stage":"zc","reason":"game filter http: a TLS handshake: more than 5 requests a second to this server from this source","filter":"site"}
+```
+
+And they hold a request to arriving in time: a head within 20 to 40 seconds, a
+body at 500 bytes a second after its first 20, a client's window open within
+30 seconds, and no more than 32 requests from one source left incomplete at
+once. A drop's reason says which:
+
+```text
+game filter http: a slow request: its head still arriving 25 seconds after it started, longer than servers wait for one, as Slowloris sends
+game filter http: a slow body: 3 bytes in 21 seconds, under the 500 bytes a second servers hold a request to, as R.U.D.Y. sends
+game filter http: a slow read: the client has advertised a window of under 64 bytes for 31 seconds, too small to be reading the answer
+game filter http: more than 32 requests from this source left incomplete at once, as Slowloris holds connections open
+```
+
+Each filter's row adds `http_tls_handshakes` and `http_slow_dropped`, and the
+node's stats `game_http_pending`, `game_http_pending_max` and
+`game_http_pending_untracked`. See
+[Slow requests](../README.md#slow-requests).
 
 ## The node agent
 

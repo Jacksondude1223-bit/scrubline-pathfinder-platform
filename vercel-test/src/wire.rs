@@ -100,6 +100,12 @@ pub struct Stats {
     #[serde(deserialize_with = "null_default")]
     pub game_http_windows_max: i64,
     #[serde(deserialize_with = "null_default")]
+    pub game_http_pending: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub game_http_pending_max: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub game_http_pending_untracked: u64,
+    #[serde(deserialize_with = "null_default")]
     pub reputation: ReputationStats,
     #[serde(deserialize_with = "null_default")]
     pub egress: EgressStats,
@@ -123,6 +129,12 @@ pub struct Stats {
     pub protocols: ProtocolStats,
     #[serde(deserialize_with = "null_default")]
     pub ack_flood: AckFloodStats,
+    #[serde(deserialize_with = "null_default")]
+    pub syn_flood: SynFloodStats,
+    #[serde(deserialize_with = "null_default")]
+    pub fragments: FragmentStats,
+    #[serde(deserialize_with = "null_default")]
+    pub icmp: IcmpStats,
     /// What the agent's process holds in memory, as the kernel counts it.
     #[serde(deserialize_with = "null_default")]
     pub resident_bytes: u64,
@@ -151,6 +163,9 @@ impl Stats {
             game_sessions_max,
             game_http_windows,
             game_http_windows_max,
+            game_http_pending,
+            game_http_pending_max,
+            game_http_pending_untracked,
             reputation,
             egress,
             rate_buckets,
@@ -163,6 +178,9 @@ impl Stats {
             reflection,
             protocols,
             ack_flood,
+            syn_flood,
+            fragments,
+            icmp,
             resident_bytes,
             mitigation: _,
         } = self;
@@ -188,6 +206,9 @@ impl Stats {
             game_sessions_max: *game_sessions_max,
             game_http_windows: *game_http_windows,
             game_http_windows_max: *game_http_windows_max,
+            game_http_pending: *game_http_pending,
+            game_http_pending_max: *game_http_pending_max,
+            game_http_pending_untracked: *game_http_pending_untracked,
             reputation: reputation.clone(),
             egress: EgressStats {
                 tracker: tracker.clone(),
@@ -207,6 +228,9 @@ impl Stats {
             reflection: reflection.clone(),
             protocols: protocols.clone(),
             ack_flood: ack_flood.clone(),
+            syn_flood: syn_flood.clone(),
+            fragments: fragments.clone(),
+            icmp: icmp.clone(),
             resident_bytes: *resident_bytes,
             mitigation: Vec::new(),
         }
@@ -245,8 +269,9 @@ pub struct CheckStats {
     pub observed: u64,
 }
 /// What the reflection guard did: per vector, in which mode, what it dropped and observed, the
-/// answers it let through because the origin had asked, and the later fragments it dropped; and
-/// how full the table of sources caught reflecting is.
+/// answers it let through because the origin had asked, the later fragments it dropped, and on
+/// how many aggregates it counts as flooded; how full the table of sources caught reflecting is,
+/// and the threshold for the vectors the server asks itself.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReflectionStats {
@@ -256,6 +281,8 @@ pub struct ReflectionStats {
     pub sources_max: i64,
     #[serde(deserialize_with = "null_default")]
     pub sources_untracked: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub engage_pps: u64,
     #[serde(deserialize_with = "null_default")]
     pub vectors: Vec<VectorStats>,
 }
@@ -276,6 +303,8 @@ pub struct VectorStats {
     pub asked: u64,
     #[serde(deserialize_with = "null_default")]
     pub fragments: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub engaged: i64,
 }
 /// What the protocol guard did: in which mode, what it lets in besides TCP, UDP and ICMP, and what
 /// it dropped and observed, in all and per protocol.
@@ -319,8 +348,82 @@ pub struct AckFloodStats {
     #[serde(deserialize_with = "null_default")]
     pub observed: u64,
 }
-/// What the protocol guard dropped for a prefix, GRE and every other protocol apart: flows, and
-/// their packets.
+/// What the SYN flood guard did: in which mode, at what threshold, on how many aggregates it is
+/// engaged, what it dropped and observed, and the retries it let through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SynFloodStats {
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub engage_pps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub engaged: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub retried: u64,
+}
+/// What the fragment guard did: in which mode, and what it dropped and observed, in all and per
+/// protocol (TCP and ICMP).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FragmentStats {
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub by_protocol: Vec<ProtocolCount>,
+}
+/// What the ICMP guard did: in which mode, at what rate and threshold, on how many aggregates
+/// echo replies count as a flood, and what it dropped and observed, in all and per kind (flood,
+/// smurf, error).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IcmpStats {
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    #[serde(deserialize_with = "null_default")]
+    pub limit_pps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub smurf_pps: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub smurf_engaged: i64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub kinds: Vec<IcmpCount>,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IcmpCount {
+    #[serde(deserialize_with = "null_default")]
+    pub kind: String,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub observed: u64,
+}
+/// What the ICMP guard dropped of one kind for a prefix: flows, and their packets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefixIcmp {
+    #[serde(deserialize_with = "null_default")]
+    pub kind: String,
+    #[serde(deserialize_with = "null_default")]
+    pub flows: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub dropped: u64,
+}
+/// What the protocol guard dropped for a prefix, GRE and every other protocol apart, or the
+/// fragment guard, TCP and ICMP apart: flows, and their packets.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrefixProtocol {
@@ -331,7 +434,7 @@ pub struct PrefixProtocol {
     #[serde(deserialize_with = "null_default")]
     pub dropped: u64,
 }
-/// Whether a prefix's ACK flood guard is engaged, and what it dropped there.
+/// Whether a prefix's ACK or SYN flood guard is engaged, and what it dropped there.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrefixAckFlood {
@@ -497,6 +600,21 @@ pub struct PrefixStats {
         skip_serializing_if = "Option::is_none"
     )]
     pub ack_flood: Option<PrefixAckFlood>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub syn_flood: Option<PrefixAckFlood>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub fragments: Vec<PrefixProtocol>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub icmp: Vec<PrefixIcmp>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -525,6 +643,10 @@ pub struct GameStats {
     pub http_other: u64,
     #[serde(deserialize_with = "null_default")]
     pub http_budget_dropped: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_tls_handshakes: u64,
+    #[serde(deserialize_with = "null_default")]
+    pub http_slow_dropped: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

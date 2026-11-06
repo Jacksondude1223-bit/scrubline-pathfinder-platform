@@ -275,6 +275,9 @@ if e.strikes>0{r["strikes"]=json!(e.strikes);}r}).collect();
         json!(rows)
     }
 }
+/// How long the table keeps an address the origin has sent nothing but SYN-ACKs: as long as a
+/// client the origin answered has to finish its handshake.
+const HANDSHAKE_ONLY: i64 = 10_000;
 #[derive(Default)]
 struct Client {
     packets: i64,
@@ -284,12 +287,22 @@ struct Client {
     confirmed: i64,
     last_seen: i64,
     first: i64,
-    /// When the origin last sent the address an LDAP search, which makes an LDAP answer from it
-    /// one the origin asked for.
-    searched: i64,
-    /// When the origin last sent the address TCP, which makes TCP from it part of a connection
-    /// the origin has.
+    /// What the origin last asked the address, one bit for each reflection vector it sent a
+    /// query of and one for a ping, and when: an answer of the kind from the address is one it
+    /// asked for.
+    asked: u32,
+    asked_at: i64,
+    /// When the origin last sent the address TCP of an open connection, which makes TCP from it
+    /// part of a connection the origin has.
     tcp: i64,
+    /// When the origin last sent the address a SYN, opening a connection to it, which makes the
+    /// SYN-ACK it answers with one the origin asked for.
+    opened: i64,
+    /// When the origin last answered a SYN from the address, and how many segments it has let
+    /// through on that answer since: a SYN-ACK is no proof of a connection, since a forged SYN
+    /// draws one.
+    answered: i64,
+    handshake: u32,
 }
 #[derive(Default)]
 struct ReturnSeries {
@@ -369,6 +382,18 @@ impl Egress {
             self.last_sweep = now;
             for s in self.series.values_mut() {
                 s.clients.retain(|_, c| {
+                    // An address the origin has sent nothing but SYN-ACKs is one a forged SYN drew
+                    // them to, unless its handshake finishes: kept past the handshake, a SYN flood
+                    // too small to be held back would fill the table with them.
+                    let backscatter = c.answered != 0
+                        && c.tcp == 0
+                        && c.opened == 0
+                        && c.asked == 0
+                        && c.first == 0
+                        && now >= c.confirmed;
+                    if backscatter && now - c.answered >= HANDSHAKE_ONLY {
+                        return false;
+                    }
                     now < c.confirmed
                         || now < c.window
                         || now - c.last_seen < 120000
@@ -409,25 +434,83 @@ impl Egress {
         }
         Some(fresh)
     }
-    /// Records that the origin sent the address an LDAP search, once its reply has been observed,
-    /// so that an LDAP answer from the address answers something the origin asked.
-    pub fn searched(&mut self, p: &str, a: &str, now: i64) {
-        if let Some(c) = self.series.get_mut(p).and_then(|s| s.clients.get_mut(a)) {
-            c.searched = now;
+    fn client(&mut self, p: &str, a: &str) -> Option<&mut Client> {
+        self.series.get_mut(p).and_then(|s| s.clients.get_mut(a))
+    }
+    fn known(&self, p: &str, a: &str) -> Option<&Client> {
+        self.series.get(p).and_then(|s| s.clients.get(a))
+    }
+    /// Records that the origin sent the address a query of the kind `bit` stands for, once its
+    /// reply has been observed. What it asked longer than `within` ago is forgotten first.
+    pub fn queried(&mut self, p: &str, a: &str, bit: u32, within: i64, now: i64) {
+        if let Some(c) = self.client(p, a) {
+            if now - c.asked_at >= within {
+                c.asked = 0;
+            }
+            c.asked |= bit;
+            c.asked_at = now;
         }
     }
-    /// Records that the origin sent the address TCP, once its reply has been observed.
+    /// Whether the origin sent the address a query of the kind `bit` stands for within the last
+    /// `within` milliseconds. It is known only where the origin's traffic passes the node.
+    pub fn asked(&self, p: &str, a: &str, bit: u32, within: i64, now: i64) -> bool {
+        self.known(p, a)
+            .is_some_and(|c| c.asked & bit != 0 && now - c.asked_at < within)
+    }
+    /// Records that the origin sent the address TCP of an open connection, once its reply has
+    /// been observed.
     pub fn sent_tcp(&mut self, p: &str, a: &str, now: i64) {
-        if let Some(c) = self.series.get_mut(p).and_then(|s| s.clients.get_mut(a)) {
+        if let Some(c) = self.client(p, a) {
             c.tcp = now;
         }
     }
-    /// Whether the origin sent the address TCP within the last `within` milliseconds.
+    /// Records that the origin sent the address a SYN.
+    pub fn opened(&mut self, p: &str, a: &str, now: i64) {
+        if let Some(c) = self.client(p, a) {
+            c.opened = now;
+        }
+    }
+    /// Records that the origin answered a SYN from the address, which starts its handshake over.
+    pub fn answered(&mut self, p: &str, a: &str, now: i64) {
+        if let Some(c) = self.client(p, a) {
+            c.answered = now;
+            c.handshake = 0;
+        }
+    }
+    /// Whether the origin sent the address TCP of an open connection within the last `within`
+    /// milliseconds.
     pub fn talked_tcp(&self, p: &str, a: &str, within: i64, now: i64) -> bool {
-        self.series
-            .get(p)
-            .and_then(|s| s.clients.get(a))
+        self.known(p, a)
             .is_some_and(|c| c.tcp != 0 && now - c.tcp < within)
+    }
+    /// Whether the origin sent the address a SYN within the last `within` milliseconds.
+    pub fn opened_tcp(&self, p: &str, a: &str, within: i64, now: i64) -> bool {
+        self.known(p, a)
+            .is_some_and(|c| c.opened != 0 && now - c.opened < within)
+    }
+    /// Lets `pps` segments from the address through on the origin's answer to its SYN: within
+    /// `window` of it, and no more than `segments` in all. Says whether they may pass.
+    pub fn handshake(
+        &mut self,
+        p: &str,
+        a: &str,
+        pps: u32,
+        window: i64,
+        segments: u32,
+        now: i64,
+    ) -> bool {
+        let Some(c) = self.client(p, a) else {
+            return false;
+        };
+        if c.answered == 0 || now - c.answered >= window {
+            return false;
+        }
+        let total = c.handshake.saturating_add(pps);
+        if total > segments {
+            return false;
+        }
+        c.handshake = total;
+        true
     }
     /// Whether the table is full, so that an address the origin sends to now may go unrecorded.
     pub fn saturated(&self) -> bool {
@@ -439,14 +522,6 @@ impl Egress {
             Some(s) if s.egress != 0 && now - s.egress <= 30000 => now - s.egress_since,
             _ => 0,
         }
-    }
-    /// Whether the origin sent the address an LDAP search within the last `within` milliseconds.
-    /// It is known only where the origin's traffic passes the node.
-    pub fn asked(&self, p: &str, a: &str, within: i64, now: i64) -> bool {
-        self.series
-            .get(p)
-            .and_then(|s| s.clients.get(a))
-            .is_some_and(|c| c.searched != 0 && now - c.searched < within)
     }
     pub fn confirmed(&self, p: &str, a: &str, now: i64) -> bool {
         self.series

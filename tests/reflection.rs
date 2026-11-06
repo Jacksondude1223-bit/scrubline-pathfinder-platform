@@ -6,7 +6,7 @@ use pathfinder::{
     compiler,
     model::{ACLEntry, Flow, Match, Node, NodeTunnel, Policy, Program, ReflectionPolicy},
     pipeline::Pipeline,
-    reflection::{ASKED_WITHIN, REFLECTING_FOR, SOURCES_MAX},
+    reflection::{self, ASKED_WITHIN, REFLECTING_FOR, SOURCES_MAX},
     telemetry::Metrics,
     validation,
 };
@@ -88,7 +88,10 @@ fn record(proto: &str, src: &str, sport: i64, dport: i64, payload: Option<&[u8]>
 fn node(mode: &str) -> Program {
     Program {
         prefixes: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
-        reflection: Some(ReflectionPolicy { cldap: mode.into() }),
+        reflection: Some(ReflectionPolicy {
+            cldap: mode.into(),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -316,7 +319,10 @@ fn policies_are_validated_and_reach_every_node() {
         id: "p".into(),
         name: "game-edge".into(),
         protected: vec!["203.0.113.0/24".into()],
-        reflection: Some(ReflectionPolicy { cldap: mode.into() }),
+        reflection: Some(ReflectionPolicy {
+            cldap: mode.into(),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     for mode in ["", "enforce", "observe", "off"] {
@@ -374,6 +380,430 @@ fn the_guard_is_counted_for_the_fabric_and_its_dashboards() {
         "scrubline_reflection_mode{node=\"n1\",name=\"buf-1\",region=\"buf\",vector=\"cldap\",mode=\"off\"} 0",
         "scrubline_reflection_sources{node=\"n1\",name=\"buf-1\",region=\"buf\"} 1",
         "scrubline_reflection_sources_max{node=\"n1\",name=\"buf-1\",region=\"buf\"} 65536",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+/// An answer of each vector nobody behind a game server asks, as a reflector sends it: its port,
+/// and what it opens with.
+fn answers() -> Vec<(&'static str, i64, Vec<u8>)> {
+    let mut monlist = vec![0xd7, 0x00, 0x03, 0x2a, 0x00, 0x06, 0x00, 0x48];
+    monlist.resize(440, 0);
+    let mut memcached = vec![0, 1, 0, 0, 0, 9, 0, 0];
+    memcached.extend(b"VALUE a 0 1000000\r\n");
+    let mut snmp = vec![0x30, 0x82, 0x05, 0xdc, 0x02, 0x01, 0x01, 0x04, 0x06];
+    snmp.extend(b"public");
+    snmp.extend([0xa2, 0x82, 0x05, 0xcd]);
+    let mut portmap = vec![0, 0, 0, 7, 0, 0, 0, 1];
+    portmap.resize(28, 0);
+    let mut mssql = vec![0x05, 0x40, 0x00];
+    mssql.extend(b"ServerName;SQL1;InstanceName;MSSQLSERVER;");
+    let mut mdns = vec![0, 0, 0x84, 0, 0, 0, 0, 4, 0, 0, 0, 0];
+    mdns.resize(400, 0);
+    vec![
+        ("ntp", 123, monlist),
+        ("memcached", 11211, memcached),
+        (
+            "ssdp",
+            1900,
+            b"HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\nUSN: uuid:1\r\n".to_vec(),
+        ),
+        ("snmp", 161, snmp),
+        (
+            "chargen",
+            19,
+            b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefgh\r\n"
+                .to_vec(),
+        ),
+        ("echo", 7, vec![0x41; 512]),
+        (
+            "qotd",
+            17,
+            b"\"The quote of the day.\" - Someone\r\n".to_vec(),
+        ),
+        ("portmap", 111, portmap),
+        (
+            "netbios",
+            137,
+            vec![0x12, 0x34, 0x84, 0x00, 0, 0, 0, 1, 0, 0, 0, 0, 0x20],
+        ),
+        ("mssql", 1434, mssql),
+        (
+            "wsd",
+            3702,
+            b"<?xml version=\"1.0\"?><soap:Envelope><soap:Body><wsd:ProbeMatches/>".to_vec(),
+        ),
+        ("coap", 5683, vec![0x60, 0x45, 0x12, 0x34, 0xff, b'{', b'}']),
+        ("mdns", 5353, mdns),
+        ("ubiquiti", 10001, vec![1, 0, 0, 3, 2, 0, 0]),
+        ("rip", 520, vec![2, 1, 0, 0, 0, 2, 0, 0]),
+    ]
+}
+fn from(src: &str, sport: i64, pps: i64, payload: Option<&[u8]>) -> Flow {
+    Flow {
+        pps,
+        ..record("udp", src, sport, 27015, payload)
+    }
+}
+#[test]
+fn every_vector_a_booter_reflects_off_is_dropped_however_little_of_it_arrives() {
+    let mut pipe = Pipeline::new(node(""));
+    for (i, (name, port, answer)) in answers().into_iter().enumerate() {
+        let src = format!("198.18.20.{i}");
+        let d = pipe.decide(&from(&src, port, 1, Some(&answer)), T0);
+        assert_eq!(
+            (d.action.as_str(), d.stage.as_str(), d.reflection.as_str()),
+            ("drop", "asic", name),
+            "{name}: {}",
+            d.reason
+        );
+        assert!(d.reason.contains(" reflection: "), "{name}: {}", d.reason);
+        assert!(
+            d.reason.ends_with("that the server never asked for"),
+            "{}",
+            d.reason
+        );
+        // A player whose NAT mapped them to the vector's port, sending the game's packets.
+        let game = [0xff, 0xff, 0xff, 0xff, 0x54, 0x53, 0x6f, 0x75];
+        if !["echo"].contains(&name) {
+            let nat = from("192.0.2.40", port, 1, Some(&game));
+            assert_eq!(pipe.decide(&nat, T0).reflection, "", "{name}");
+        }
+    }
+    let d = pipe.decide(&from("198.18.20.99", 19, 1, Some(b"!\"#$%\r\n")), T0);
+    assert!(
+        d.reason.starts_with("Fraggle (chargen) reflection: "),
+        "{}",
+        d.reason
+    );
+    let v = &pipe.stats(T0)["reflection"];
+    let dropped: Vec<_> = v["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["dropped"] != 0)
+        .map(|r| r["vector"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(dropped.len(), answers().len(), "{dropped:?}");
+}
+/// A DNS answer to a query of the server's, as long as an ANY answer runs.
+fn dns_answer() -> Vec<u8> {
+    let mut a = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 9, 0, 0, 0, 1];
+    a.resize(1_200, 0);
+    a
+}
+const DNS_QUERY: &[u8] = &[
+    0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1, 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
+];
+#[test]
+fn dns_and_ntp_answers_are_dropped_only_while_the_prefix_is_flooded_with_ones_never_asked_for() {
+    let mut pipe = Pipeline::new(node(""));
+    let answer = dns_answer();
+    // The server's own lookups: answers from a resolver it asked, and a trickle from one it
+    // did not, as an asymmetric path hides its queries, pass.
+    pipe.observe_return(&search_from_server("1.1.1.1", 53, DNS_QUERY), T0);
+    assert_eq!(
+        pipe.decide(&from("1.1.1.1", 53, 50, Some(&answer)), T0 + 10)
+            .action,
+        "permit"
+    );
+    assert_eq!(
+        pipe.decide(&from("8.8.8.8", 53, 50, Some(&answer)), T0 + 10)
+            .action,
+        "permit"
+    );
+    // A DNS amplification flood from open resolvers engages the guard for the prefix.
+    let flood = from("198.18.30.1", 53, 50_000, Some(&answer));
+    let d = pipe.decide(&flood, T0 + 20);
+    assert_eq!(
+        (d.action.as_str(), d.stage.as_str(), d.reflection.as_str()),
+        ("drop", "zc", "dns")
+    );
+    assert_eq!(
+        d.reason,
+        "DNS reflection: a DNS answer from port 53 that the server never asked for, while the prefix is flooded with them"
+    );
+    // The resolver the server asked still answers it; the one it did not is dropped with the rest.
+    assert_eq!(
+        pipe.decide(&from("1.1.1.1", 53, 1, Some(&answer)), T0 + 30)
+            .action,
+        "permit"
+    );
+    assert_eq!(
+        verdict(&mut pipe, &from("8.8.8.8", 53, 1, Some(&answer)), T0 + 30).2,
+        "dns"
+    );
+    // A large answer's later fragments go with it, from a source caught reflecting.
+    let later = v4([198, 18, 30, 1], UDP, &answer[..512], 77, 1480, false);
+    assert_eq!(
+        verdict(&mut pipe, &wire(&later), T0 + 31),
+        ("drop".into(), "zc".into(), "dns".into())
+    );
+    let st = &pipe.stats(T0 + 40)["reflection"];
+    let dns = st["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["vector"] == "dns")
+        .unwrap();
+    assert_eq!(
+        (
+            dns["dropped"].clone(),
+            dns["asked"].clone(),
+            dns["fragments"].clone(),
+            dns["engaged"].clone()
+        ),
+        (json!(2), json!(2), json!(1), json!(1)),
+        "{dns}"
+    );
+    assert_eq!(st["engage_pps"], 1000);
+    // A minute after the flood, answers it did not ask for pass again.
+    let after = T0 + 30 + reflection::FLOOD_HOLD;
+    assert_eq!(
+        pipe.decide(&from("8.8.8.8", 53, 1, Some(&answer)), after)
+            .action,
+        "permit"
+    );
+    // NTP: a monlist answer is dropped however few arrive; a time answer only in a flood.
+    let mut time = vec![0x24, 0x02, 0x00, 0xe7];
+    time.resize(48, 0);
+    let mut monlist = vec![0xd7, 0x00, 0x03, 0x2a, 0x00, 0x06, 0x00, 0x48];
+    monlist.resize(440, 0);
+    assert_eq!(
+        verdict(
+            &mut pipe,
+            &from("198.18.31.1", 123, 1, Some(&monlist)),
+            after
+        )
+        .2,
+        "ntp"
+    );
+    assert_eq!(
+        pipe.decide(&from("198.18.31.2", 123, 1, Some(&time)), after)
+            .action,
+        "permit"
+    );
+    let d = pipe.decide(&from("198.18.31.3", 123, 20_000, Some(&time)), after + 1);
+    assert_eq!((d.action.as_str(), d.reflection.as_str()), ("drop", "ntp"));
+    assert!(
+        d.reason.starts_with("NTP reflection: an NTP time answer"),
+        "{}",
+        d.reason
+    );
+    // The threshold is the policy's to set.
+    let mut program = node("");
+    program.reflection.as_mut().unwrap().engage_pps = 100_000;
+    let mut pipe = Pipeline::new(program);
+    assert_eq!(pipe.decide(&flood, T0).action, "permit");
+}
+#[test]
+fn a_forged_query_cannot_make_the_server_ask_a_resolver() {
+    let mut pipe = Pipeline::new(node(""));
+    // The attacker forges game queries from the reflector's port 53, and the server answers.
+    let info = [0xff, 0xff, 0xff, 0xff, 0x49, 0x11, 0x47, 0x61];
+    pipe.observe_return(&search_from_server("198.18.40.1", 53, &info), T0);
+    let flood = from("198.18.40.1", 53, 50_000, Some(&dns_answer()));
+    assert_eq!(verdict(&mut pipe, &flood, T0 + 1).2, "dns");
+}
+#[test]
+fn a_record_without_its_payload_is_judged_by_its_port_as_far_as_a_port_can_tell() {
+    let mut pipe = Pipeline::new(node(""));
+    // A well-known port no player's NAT maps to: dropped however little arrives.
+    for (port, name) in [(161, "snmp"), (19, "chargen"), (7, "echo"), (520, "rip")] {
+        let d = pipe.decide(&from("198.18.50.1", port, 1, None), T0);
+        assert_eq!(
+            (d.action.as_str(), d.reflection.as_str()),
+            ("drop", name),
+            "{port}"
+        );
+        assert!(
+            d.reason.contains(&format!("UDP from port {port} ")),
+            "{}",
+            d.reason
+        );
+    }
+    // A high one, which a player's NAT may map to, only in a flood; DNS and NTP the same.
+    for (port, name) in [
+        (11211, "memcached"),
+        (1900, "ssdp"),
+        (53, "dns"),
+        (123, "ntp"),
+    ] {
+        assert_eq!(
+            pipe.decide(&from("192.0.2.41", port, 10, None), T0).action,
+            "permit",
+            "{port}"
+        );
+        let d = pipe.decide(&from("198.18.50.2", port, 50_000, None), T0 + 1);
+        assert_eq!(
+            (d.action.as_str(), d.reflection.as_str()),
+            ("drop", name),
+            "{port}"
+        );
+    }
+}
+#[test]
+fn each_vector_takes_its_own_mode() {
+    let program = Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        reflection: Some(ReflectionPolicy {
+            mode: "observe".into(),
+            vectors: [
+                ("memcached".to_string(), "off".to_string()),
+                ("ssdp".to_string(), "enforce".to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut pipe = Pipeline::new(program);
+    let answers = answers();
+    let of = |name: &str| answers.iter().find(|(n, ..)| *n == name).unwrap().clone();
+    let (_, port, a) = of("memcached");
+    assert_eq!(
+        pipe.decide(&from("198.18.60.1", port, 1, Some(&a)), T0)
+            .action,
+        "permit"
+    );
+    let (_, port, a) = of("ssdp");
+    assert_eq!(
+        pipe.decide(&from("198.18.60.2", port, 1, Some(&a)), T0)
+            .reflection,
+        "ssdp"
+    );
+    let (_, port, a) = of("snmp");
+    assert_eq!(
+        pipe.decide(&from("198.18.60.3", port, 1, Some(&a)), T0)
+            .action,
+        "permit"
+    );
+    let st = pipe.stats(T0);
+    let row = |name: &str| {
+        st["reflection"]["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["vector"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        (
+            row("memcached")["mode"].clone(),
+            row("memcached")["observed"].clone()
+        ),
+        (json!("off"), json!(0))
+    );
+    assert_eq!(
+        (row("ssdp")["mode"].clone(), row("ssdp")["dropped"].clone()),
+        (json!("enforce"), json!(1))
+    );
+    assert_eq!(
+        (row("snmp")["mode"].clone(), row("snmp")["observed"].clone()),
+        (json!("observe"), json!(1))
+    );
+    // CLDAP's own field, from before the other vectors, still sets it.
+    assert_eq!(row("cldap")["mode"], "observe");
+}
+#[test]
+fn vectors_are_validated() {
+    let policy = |r: ReflectionPolicy| Policy {
+        id: "p".into(),
+        name: "game-edge".into(),
+        protected: vec!["203.0.113.0/24".into()],
+        reflection: Some(r),
+        ..Default::default()
+    };
+    validation::policy(&policy(ReflectionPolicy {
+        mode: "observe".into(),
+        vectors: [("dns".to_string(), "off".to_string())].into(),
+        engage_pps: 5_000,
+        ..Default::default()
+    }))
+    .unwrap();
+    for (bad, says) in [
+        (
+            ReflectionPolicy {
+                mode: "block".into(),
+                ..Default::default()
+            },
+            "reflection.mode",
+        ),
+        (
+            ReflectionPolicy {
+                vectors: [("quic".to_string(), "enforce".to_string())].into(),
+                ..Default::default()
+            },
+            "is not a vector the guard knows",
+        ),
+        (
+            ReflectionPolicy {
+                vectors: [("ntp".to_string(), "drop".to_string())].into(),
+                ..Default::default()
+            },
+            "reflection.vectors.ntp",
+        ),
+        (
+            ReflectionPolicy {
+                cldap: "off".into(),
+                vectors: [("cldap".to_string(), "enforce".to_string())].into(),
+                ..Default::default()
+            },
+            "both set",
+        ),
+        (
+            ReflectionPolicy {
+                engage_pps: -1,
+                ..Default::default()
+            },
+            "reflection.engage_pps",
+        ),
+    ] {
+        let err = validation::policy(&policy(bad)).unwrap_err();
+        assert!(err.contains(says), "{err}");
+    }
+}
+#[test]
+fn every_vector_is_counted_for_the_fabric_and_its_dashboards() {
+    let mut pipe = Pipeline::new(node(""));
+    for (i, (_, port, answer)) in answers().into_iter().enumerate() {
+        pipe.decide(
+            &from(&format!("198.18.70.{i}"), port, 10, Some(&answer)),
+            T0,
+        );
+    }
+    let stats = pipe.stats(T0);
+    let kept = serde_json::to_value(
+        serde_json::from_value::<pathfinder::wire::Stats>(stats.clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(kept["reflection"], stats["reflection"]);
+    let row = kept["prefixes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["prefix"] == "203.0.113.0/24")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        row["reflection"].as_array().unwrap().len(),
+        answers().len(),
+        "{row}"
+    );
+    let mut m = Metrics::new();
+    m.reports(
+        &[json!({"node_id":"n1","name":"buf-1","region":"buf","stats":stats})],
+        T0,
+    );
+    let text = m.render().unwrap();
+    for line in [
+        "scrubline_reflection_dropped_total{node=\"n1\",name=\"buf-1\",region=\"buf\",vector=\"memcached\"} 1",
+        "scrubline_reflection_dropped_total{node=\"n1\",name=\"buf-1\",region=\"buf\",vector=\"ntp\"} 1",
+        "scrubline_reflection_engaged_prefixes{node=\"n1\",name=\"buf-1\",region=\"buf\",vector=\"dns\"} 0",
+        "scrubline_reflection_mode{node=\"n1\",name=\"buf-1\",region=\"buf\",vector=\"ssdp\",mode=\"enforce\"} 1",
+        "scrubline_reflection_engage_pps{node=\"n1\",name=\"buf-1\",region=\"buf\"} 1000",
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }

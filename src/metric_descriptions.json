@@ -517,7 +517,7 @@
   },
   "scrubline_reflection_dropped_total": {
     "kind": "counter",
-    "help": "Answers reflected at a protected address and dropped, by vector: for cldap, UDP from port 389 opening as an LDAP answer, which nobody behind the address asked for. Rising means someone is aiming reflectors at a customer."
+    "help": "Answers reflected at a protected address and dropped, by vector: UDP from the vector's port that opens as one of its answers, which nobody behind the address asked for (CLDAP, memcached, SSDP, NTP's monlist and the rest), or for DNS and NTP's time, while the aggregate is flooded with them. Rising means someone is aiming reflectors at a customer."
   },
   "scrubline_reflection_observed_total": {
     "kind": "counter",
@@ -525,7 +525,7 @@
   },
   "scrubline_reflection_asked_total": {
     "kind": "counter",
-    "help": "Answers let through because the protected server had sent their source an LDAP search within the last 30 seconds, so it asked for them."
+    "help": "Answers let through because the protected server had sent their source a query of the vector within the last 30 seconds, so it asked for them."
   },
   "scrubline_reflection_fragments_dropped_total": {
     "kind": "counter",
@@ -582,5 +582,97 @@
   "scrubline_ack_flood_mode": {
     "kind": "gauge",
     "help": "1 for the ACK flood guard's mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops an ACK flood that rates and caps let through."
+  },
+  "scrubline_game_http_tls_handshakes_total": {
+    "kind": "counter",
+    "help": "TLS handshakes (ClientHellos) the filter's HTTP rules counted against the server's rate and budget, which an HTTPS flood is made of; what follows a handshake is encrypted and passes."
+  },
+  "scrubline_game_http_slow_dropped_total": {
+    "kind": "counter",
+    "help": "Segments dropped because their request arrives too slowly: a head unfinished after 20 to 40 seconds (Slowloris), a body under 500 bytes a second (R.U.D.Y.), a client keeping its window too small to read the answer for 30 seconds (slow read), or a source leaving more than 32 requests incomplete at once."
+  },
+  "scrubline_game_http_pending": {
+    "kind": "gauge",
+    "help": "Connections the HTTP rules are watching because a request on them is still arriving, or their client advertises a window too small to read the answer."
+  },
+  "scrubline_game_http_pending_max": {
+    "kind": "gauge",
+    "help": "The most connections the HTTP rules watch for slow requests at once; one that goes quiet for a minute leaves the table."
+  },
+  "scrubline_game_http_pending_untracked_total": {
+    "kind": "counter",
+    "help": "Connections the HTTP rules could not watch for slow requests because the table was full. Rising means more slow connections than the table holds."
+  },
+  "scrubline_reflection_engaged_prefixes": {
+    "kind": "gauge",
+    "help": "Aggregates flooded with answers of this vector the server never asked for, for the vectors it asks itself (DNS and NTP's time): their answers it did not ask for are dropped while this is above zero."
+  },
+  "scrubline_reflection_engage_pps": {
+    "kind": "gauge",
+    "help": "How many packets a second of answers it never asked for an aggregate takes, of a vector the server asks itself, before they are dropped."
+  },
+  "scrubline_syn_flood_dropped_total": {
+    "kind": "counter",
+    "help": "Opening SYNs dropped because they came from a source the server has no connection with while their aggregate was flooded with such SYNs: a SYN flood."
+  },
+  "scrubline_syn_flood_observed_total": {
+    "kind": "counter",
+    "help": "Opening SYNs the SYN flood guard would have dropped, let through because it only observes."
+  },
+  "scrubline_syn_flood_retried_total": {
+    "kind": "counter",
+    "help": "Opening SYNs let through during a SYN flood because their connection had sent one a second or more before: a real client retrying, which a forged SYN never does."
+  },
+  "scrubline_syn_flood_engaged_prefixes": {
+    "kind": "gauge",
+    "help": "Aggregates whose SYN flood guard is engaged now: taking more opening SYNs from sources the server has no connection with than the threshold, or within a minute of it."
+  },
+  "scrubline_syn_flood_engage_pps": {
+    "kind": "gauge",
+    "help": "How many packets a second of opening SYNs from sources the server has no connection with an aggregate takes before its SYN flood guard engages."
+  },
+  "scrubline_prefix_syn_flood_engaged": {
+    "kind": "gauge",
+    "help": "1 while this prefix's SYN flood guard is engaged, 0 otherwise."
+  },
+  "scrubline_fragment_dropped_total": {
+    "kind": "counter",
+    "help": "Fragments of TCP and ICMP dropped, by protocol, which no real sender fragments: fragmented ACK floods and ICMP fragmentation floods are built so to cost reassembly."
+  },
+  "scrubline_fragment_observed_total": {
+    "kind": "counter",
+    "help": "Fragments of TCP and ICMP let through because the fragment guard only observes: what enforcing would drop, by protocol."
+  },
+  "scrubline_icmp_dropped_total": {
+    "kind": "counter",
+    "help": "ICMP dropped, by kind: flood for ICMP over the aggregate's rate, smurf for echo replies to pings the server never sent while flooded with them, error for errors about packets the protected prefix never sent."
+  },
+  "scrubline_icmp_observed_total": {
+    "kind": "counter",
+    "help": "ICMP the guard would have dropped, let through because it only observes, by kind."
+  },
+  "scrubline_icmp_limit_pps": {
+    "kind": "gauge",
+    "help": "How many packets a second of ICMP, echo replies aside, an aggregate takes before the rest are dropped."
+  },
+  "scrubline_icmp_smurf_pps": {
+    "kind": "gauge",
+    "help": "How many packets a second of echo replies the server never asked for an aggregate takes before they are dropped."
+  },
+  "scrubline_icmp_smurf_engaged_prefixes": {
+    "kind": "gauge",
+    "help": "Aggregates flooded with echo replies the server never asked for, as a Smurf attack sends, now or within the last minute."
+  },
+  "scrubline_syn_flood_mode": {
+    "kind": "gauge",
+    "help": "1 for the SYN flood guard's mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then holds back a SYN flood the rules let through."
+  },
+  "scrubline_fragment_mode": {
+    "kind": "gauge",
+    "help": "1 for the fragment guard's mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops a fragmented ACK flood or an ICMP fragmentation flood."
+  },
+  "scrubline_icmp_mode": {
+    "kind": "gauge",
+    "help": "1 for the ICMP guard's mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then holds ICMP floods, Smurf or forged errors back."
   }
 }

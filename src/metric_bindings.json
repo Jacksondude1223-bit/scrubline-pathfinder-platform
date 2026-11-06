@@ -200,6 +200,27 @@
     ]
   },
   {
+    "name": "scrubline_game_http_pending",
+    "group": "",
+    "path": [
+      "game_http_pending"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_pending_max",
+    "group": "",
+    "path": [
+      "game_http_pending_max"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_pending_untracked_total",
+    "group": "",
+    "path": [
+      "game_http_pending_untracked"
+    ]
+  },
+  {
     "name": "scrubline_prefix_offered_pps",
     "group": "prefixes",
     "path": [
@@ -365,6 +386,20 @@
     "group": "games",
     "path": [
       "http_budget_dropped"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_tls_handshakes_total",
+    "group": "games",
+    "path": [
+      "http_tls_handshakes"
+    ]
+  },
+  {
+    "name": "scrubline_game_http_slow_dropped_total",
+    "group": "games",
+    "path": [
+      "http_slow_dropped"
     ]
   },
   {
@@ -651,6 +686,13 @@
     ]
   },
   {
+    "name": "scrubline_reflection_engaged_prefixes",
+    "group": "reflection",
+    "path": [
+      "engaged"
+    ]
+  },
+  {
     "name": "scrubline_reflection_sources",
     "group": "",
     "path": [
@@ -672,6 +714,14 @@
     "path": [
       "reflection",
       "sources_untracked"
+    ]
+  },
+  {
+    "name": "scrubline_reflection_engage_pps",
+    "group": "",
+    "path": [
+      "reflection",
+      "engage_pps"
     ]
   },
   {
@@ -726,6 +776,106 @@
     "path": [
       "ack_flood",
       "engaged"
+    ]
+  },
+  {
+    "name": "scrubline_syn_flood_dropped_total",
+    "group": "",
+    "path": [
+      "syn_flood",
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_syn_flood_observed_total",
+    "group": "",
+    "path": [
+      "syn_flood",
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_syn_flood_retried_total",
+    "group": "",
+    "path": [
+      "syn_flood",
+      "retried"
+    ]
+  },
+  {
+    "name": "scrubline_syn_flood_engaged_prefixes",
+    "group": "",
+    "path": [
+      "syn_flood",
+      "engaged"
+    ]
+  },
+  {
+    "name": "scrubline_syn_flood_engage_pps",
+    "group": "",
+    "path": [
+      "syn_flood",
+      "engage_pps"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_syn_flood_engaged",
+    "group": "prefixes",
+    "path": [
+      "syn_flood",
+      "engaged"
+    ]
+  },
+  {
+    "name": "scrubline_fragment_dropped_total",
+    "group": "fragments",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_fragment_observed_total",
+    "group": "fragments",
+    "path": [
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_icmp_dropped_total",
+    "group": "icmp",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_icmp_observed_total",
+    "group": "icmp",
+    "path": [
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_icmp_limit_pps",
+    "group": "",
+    "path": [
+      "icmp",
+      "limit_pps"
+    ]
+  },
+  {
+    "name": "scrubline_icmp_smurf_pps",
+    "group": "",
+    "path": [
+      "icmp",
+      "smurf_pps"
+    ]
+  },
+  {
+    "name": "scrubline_icmp_smurf_engaged_prefixes",
+    "group": "",
+    "path": [
+      "icmp",
+      "smurf_engaged"
     ]
   }
 ]

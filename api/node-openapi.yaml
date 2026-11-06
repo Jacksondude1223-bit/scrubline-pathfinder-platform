@@ -673,14 +673,35 @@ components:
           description: The reflection vector a packet belonged to, when the reflection guard dropped it.
           enum:
           - cldap
+          - dns
+          - ntp
+          - memcached
+          - ssdp
+          - snmp
+          - chargen
+          - echo
+          - qotd
+          - portmap
+          - netbios
+          - mssql
+          - wsd
+          - coap
+          - mdns
+          - ubiquiti
+          - rip
         guard:
           type: string
-          description: The guard that dropped a packet, when one did. protocol, for GRE or another
-            protocol a protected address does not receive; ack_flood, for TCP that belongs to no
-            connection the server has.
+          description: The guard that dropped a packet, when one did. protocol, for GRE, protocol 0 (IP
+            NULL) or another protocol a protected address does not receive; ack_flood, for TCP that
+            belongs to no connection the server has; syn_flood, for an opening SYN held back during a
+            SYN flood; fragment, for TCP or ICMP in fragments; icmp, for ICMP over its rate, an echo
+            reply the server never asked for, or a forged error.
           enum:
           - protocol
           - ack_flood
+          - syn_flood
+          - fragment
+          - icmp
         reply:
           type: string
           format: byte

@@ -1,6 +1,7 @@
 //! Wire-compatible policy and program types shared by the Rust components.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 pub type Action = String;
 pub type Stage = String;
 pub type AnnounceState = String;
@@ -100,6 +101,12 @@ pub struct Policy {
     #[serde(skip_serializing_if = "is_zero")]
     pub ack_flood: Option<AckFloodPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
+    pub syn_flood: Option<SynFloodPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fragments: Option<FragmentPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub icmp: Option<IcmpPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub challenge_secret: String,
     #[serde(deserialize_with = "null_time")]
@@ -126,6 +133,9 @@ impl Default for Policy {
             reflection: None,
             protocols: None,
             ack_flood: None,
+            syn_flood: None,
+            fragments: None,
+            icmp: None,
             challenge_secret: Default::default(),
             updated_at: zero_time(),
             version: Default::default(),
@@ -179,17 +189,30 @@ pub struct CraftedPolicy {
 }
 /// What a node does with answers reflected at a protected address: replies from servers on the
 /// internet to requests an attacker sent them with that address forged as the source, which they
-/// answer many times over (see the reflection guard in pipeline.rs). Per vector, "enforce", the
-/// default, drops them; "observe" counts what would be dropped and drops nothing; "off" does not
-/// look.
+/// answer many times over (see reflection.rs). Per vector, "enforce", the default, drops them;
+/// "observe" counts what would be dropped and drops nothing; "off" does not look.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ReflectionPolicy {
+    /// Every vector's mode, unless `vectors` names its own.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
     /// Connectionless LDAP, UDP from port 389: a rootDSE query of about 50 bytes is answered with
-    /// several kilobytes.
+    /// several kilobytes. The same as naming cldap in `vectors`.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub cldap: String,
+    /// Modes for single vectors, by name: cldap, dns, ntp, memcached, ssdp, snmp, chargen, echo,
+    /// qotd, portmap, netbios, mssql, wsd, coap, mdns, ubiquiti, rip.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub vectors: BTreeMap<String, String>,
+    /// How many packets a second of answers it never asked for a prefix takes, of the vectors the
+    /// server asks itself (DNS and NTP's time), before they are dropped; 1000 when unset.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub engage_pps: i64,
 }
 /// What a node does with IP protocols a game server never receives, sent to a protected address:
 /// GRE above all, which botnets flood with, and anything but TCP, UDP and ICMP (see guards.rs).
@@ -223,6 +246,55 @@ pub struct AckFloodPolicy {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub engage_pps: i64,
+}
+/// What a node does with opening SYNs from sources the protected server has no connection with
+/// while a prefix is flooded with them, as a SYN flood is made of (see guards.rs). A client's
+/// retry, a second or so later, passes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SynFloodPolicy {
+    /// "enforce", the default, holds them back while a prefix is flooded; "observe" counts what
+    /// would be dropped and drops nothing; "off" does not look.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    /// How many packets a second of such SYNs a prefix takes before the guard engages; 2000 when
+    /// unset.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub engage_pps: i64,
+}
+/// What a node does with TCP and ICMP that arrive in fragments, which no real sender fragments:
+/// fragmented ACK floods and ICMP fragmentation floods (see guards.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FragmentPolicy {
+    /// "enforce", the default, drops them; "observe" counts what would be dropped and drops
+    /// nothing; "off" does not look.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+}
+/// What a node does with ICMP to a protected address: a rate for each prefix, echo replies the
+/// server never asked for (Smurf), and errors about packets it never sent (see guards.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct IcmpPolicy {
+    /// "enforce", the default, drops what the guard catches; "observe" counts what would be
+    /// dropped and drops nothing; "off" does not look.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    /// How many packets a second of ICMP, echo replies aside, a prefix takes before the rest are
+    /// dropped; 1000 when unset.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub limit_pps: i64,
+    /// How many packets a second of echo replies the server never asked for a prefix takes before
+    /// they are dropped; 1000 when unset.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub smurf_pps: i64,
 }
 impl MlPolicy {
     pub fn everywhere(&self) -> bool {
@@ -351,6 +423,10 @@ pub struct Flow {
     pub payload: Vec<u8>,
     #[serde(skip)]
     pub has_payload: bool,
+    /// The receive window a TCP segment advertises, as written in its header, when the flow
+    /// carries the packet.
+    #[serde(skip)]
+    pub window: Option<u16>,
     /// The packet itself, from its IP header on, when the datapath hands over whole packets. The
     /// node reads the addresses, protocol, ports, flags and payload from its headers rather than
     /// from the record's fields, and holds it to the rules those headers state.
@@ -389,7 +465,9 @@ pub struct Decision {
     #[serde(deserialize_with = "null_default")]
     pub reflection: String,
     /// The guard that dropped a packet, when one did: "protocol" for a protocol a protected
-    /// address does not receive, "ack_flood" for TCP that belongs to no connection.
+    /// address does not receive, "ack_flood" for TCP that belongs to no connection, "syn_flood"
+    /// for an opening SYN held back during a SYN flood, "fragment" for TCP or ICMP in fragments,
+    /// "icmp" for ICMP over its rate, an unasked echo reply or a forged error.
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub guard: String,
@@ -486,6 +564,12 @@ pub struct Program {
     pub protocols: Option<ProtocolPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
     pub ack_flood: Option<AckFloodPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub syn_flood: Option<SynFloodPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub fragments: Option<FragmentPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub icmp: Option<IcmpPolicy>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub tunnels: Vec<NodeTunnel>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
@@ -531,6 +615,9 @@ impl Default for Program {
             reflection: None,
             protocols: None,
             ack_flood: None,
+            syn_flood: None,
+            fragments: None,
+            icmp: None,
             tunnels: Vec::new(),
             sessions: Vec::new(),
             tunnel_src: Default::default(),
@@ -986,6 +1073,7 @@ impl<'de> Deserialize<'de> for Flow {
             bps: w.bps,
             payload,
             has_payload,
+            window: None,
             packet,
         };
         crate::packet::fill(&mut f);

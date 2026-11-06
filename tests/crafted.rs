@@ -6,7 +6,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use pathfinder::{
     model::{
         ACLEntry, CraftedPolicy, FPGAEntry, Flow, GameFilter, GameHttp, Match, NodeTunnel, Policy,
-        Program, ProtocolPolicy, ReputationPolicy,
+        Program, ProtocolPolicy, ReputationPolicy, SynFloodPolicy,
     },
     packet::{self, Check, ACK, CWR, ECE, FIN, PSH, RST, SYN, URG},
     pipeline::Pipeline,
@@ -141,6 +141,23 @@ fn legitimate() -> Vec<(&'static str, Vec<u8>)> {
     ];
     // A 3,000-byte UDP datagram over a 1,500-byte MTU.
     let datagram = udp(53000, 19132, &[7; 3000]);
+    // What an error quotes of the packet it is about: the server's own, its header and the first
+    // eight bytes after it, or as much of an IPv6 one as fits.
+    let quote4 = v4(
+        SERVER,
+        CLIENT,
+        TCP,
+        &[],
+        &tcp(443, 40000, ACK | PSH, &[], &[1; 1400]),
+    )[..28]
+        .to_vec();
+    let quote6 = v6(
+        SERVER6,
+        CLIENT6,
+        TCP,
+        &tcp(443, 40000, ACK | PSH, &[], &[1; 1400]),
+    )[..1232]
+        .to_vec();
     let piece = |id: u16, at: usize, to: usize, more: bool| {
         fragment(
             v4(CLIENT, SERVER, UDP, &[], &datagram[at..to]),
@@ -263,11 +280,11 @@ fn legitimate() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "fragmentation needed",
-            v4(CLIENT, SERVER, ICMP, &[], &icmp(3, 4, &[0; 28])),
+            v4(CLIENT, SERVER, ICMP, &[], &icmp(3, 4, &quote4)),
         ),
         (
             "time exceeded",
-            v4(CLIENT, SERVER, ICMP, &[], &icmp(11, 0, &[0; 28])),
+            v4(CLIENT, SERVER, ICMP, &[], &icmp(11, 0, &quote4)),
         ),
         (
             "a timestamp request",
@@ -317,7 +334,7 @@ fn legitimate() -> Vec<(&'static str, Vec<u8>)> {
         ),
         (
             "packet too big",
-            v6(CLIENT6, SERVER6, ICMPV6, &icmp(2, 0, &[0; 48])),
+            v6(CLIENT6, SERVER6, ICMPV6, &icmp(2, 0, &quote6)),
         ),
         (
             "destination options",
@@ -1252,7 +1269,15 @@ fn observing_counts_what_would_be_dropped_and_off_does_not_look() {
 }
 #[test]
 fn a_spare_flag_bit_slips_past_no_rule() {
-    let mut pipe = Pipeline::new(guarded(""));
+    // The SYN flood guard would take these bursts for the flood they are, ahead of the rules
+    // whose matching is being tested.
+    let mut pipe = Pipeline::new(Program {
+        syn_flood: Some(SynFloodPolicy {
+            mode: "off".into(),
+            ..Default::default()
+        }),
+        ..guarded("")
+    });
     let burst = |flags: &str| Flow {
         src_ip: "192.0.2.30".into(),
         dst_ip: "203.0.113.10".into(),
@@ -1608,18 +1633,28 @@ fn no_mangled_packet_or_random_input_brings_the_node_down() {
 fn the_api_guides_examples_are_dropped_as_it_says() {
     let guide = include_str!("../docs/api.md");
     let mut pipe = Pipeline::new(node());
-    let examples: Vec<&str> = guide
+    // Each example the node decides, and the answer the guide shows under it: the crafted ones.
+    let examples: Vec<(&str, &str)> = guide
         .split("-d '")
         .skip(1)
-        .map(|rest| &rest[..rest.find('\'').unwrap()])
-        .filter(|body| body.contains("\"packet\"") || body.contains("syn,fin"))
+        .map(|rest| {
+            let body = &rest[..rest.find('\'').unwrap()];
+            let answer = rest[body.len() + 1..]
+                .trim_start()
+                .lines()
+                .next()
+                .unwrap_or("");
+            (body, answer)
+        })
+        .filter(|(_, answer)| answer.contains("\"check\""))
         .collect();
     assert_eq!(examples.len(), 2, "{examples:?}");
-    for body in examples {
+    for (body, answer) in examples {
         let f: Flow = serde_json::from_str(body).unwrap();
         let d = pipe.decide(&f, T0);
+        assert_eq!(serde_json::to_string(&d).unwrap(), answer);
         assert_eq!(
-            serde_json::to_string(&d).unwrap(),
+            answer,
             r#"{"action":"drop","stage":"asic","reason":"crafted packet (stack): SYN and FIN set together, which no stack sends","check":"tcp_flags"}"#
         );
     }

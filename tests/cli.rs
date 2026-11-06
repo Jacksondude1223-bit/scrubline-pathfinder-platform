@@ -108,6 +108,11 @@ fn renders_reports_and_empty_states() {
     assert!(reflected.contains("reflection-cldap"), "{reflected}");
     let botnet=cli::render(&serde_json::to_vec(&json!({"window":"1h","events":[{"prefix":"203.0.113.0/24","started_at":"2026-01-01T00:00:00.123Z","seconds":61.0,"ongoing":true,"pulse":false,"vectors":[{"protocol":"gre","flows":3,"dropped":300},{"ack_flood":"tcp","flows":1,"dropped":10000}]}]})).unwrap(),View::Attacks).unwrap();
     assert!(botnet.contains("protocol-gre ack-flood"), "{botnet}");
+    let booter=cli::render(&serde_json::to_vec(&json!({"window":"1h","events":[{"prefix":"203.0.113.0/24","started_at":"2026-01-01T00:00:00.123Z","seconds":61.0,"ongoing":true,"pulse":false,"vectors":[{"syn_flood":"tcp","flows":1,"dropped":9000},{"fragment":"tcp","flows":2,"dropped":20},{"icmp":"smurf","flows":1,"dropped":5000},{"reflection":"memcached","flows":1,"dropped":800}]}]})).unwrap(),View::Attacks).unwrap();
+    assert!(
+        booter.contains("syn-flood fragment-tcp icmp-smurf reflection-memcached"),
+        "{booter}"
+    );
     assert!(attacks.contains("2026-01-01T00:00:00Z"));
 }
 fn server(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {

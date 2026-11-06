@@ -310,6 +310,8 @@ pub struct Packet<'a> {
     pub sport: u16,
     pub dport: u16,
     pub flags: Option<u16>,
+    /// The receive window a TCP segment advertises, as written: unscaled.
+    pub window: Option<u16>,
     pub icmp: Option<(u8, u8)>,
     pub payload: &'a [u8],
 }
@@ -686,6 +688,7 @@ fn transport<'a>(p: &mut Packet<'a>, l4: &'a [u8]) -> Option<Anomaly> {
             p.dport = be16(l4, 2);
             let flags = u16::from(l4[12] & 1) << 8 | u16::from(l4[13]);
             p.flags = Some(flags);
+            p.window = Some(be16(l4, 14));
             let offset = usize::from(l4[12] >> 4) * 4;
             if offset < 20 {
                 return anomaly(
@@ -858,6 +861,7 @@ pub fn fill(f: &mut Flow) {
     f.sport = i64::from(p.sport);
     f.dport = i64::from(p.dport);
     f.flags = p.flags.map(flag_names).unwrap_or_default();
+    f.window = p.window;
     f.has_payload = p.transport;
     f.payload = payload;
 }

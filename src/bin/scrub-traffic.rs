@@ -95,6 +95,43 @@ fn flow(g: &Generator, r: &mut StdRng, kind: u8) -> Flow {
             f.payload = vec![0x30, 0x84, 0x00, 0x00, 0x0b, 0x9f, 0x02, 0x01, 0x01, 0x64];
             f.has_payload = true;
         }
+        // A SYN flood from forged sources, each sending its SYN once: the SYN flood guard holds
+        // them back, since none of them retries.
+        9 => {
+            f.proto = "tcp".into();
+            f.dport = 443;
+            f.flags = "syn".into();
+            f.pps = 50000 + r.gen_range(0..50000);
+        }
+        // NTP servers' monlist answers, memcached's values and SSDP's discovery answers, to
+        // queries forged from the protected address: the reflection guard drops them all.
+        10 => {
+            f.sport = 123;
+            f.pps = 60000 + r.gen_range(0..40000);
+            f.payload = vec![0xd7, 0x00, 0x03, 0x2a, 0x00, 0x06, 0x00, 0x48];
+            f.payload.resize(440, 0);
+            f.has_payload = true;
+        }
+        11 => {
+            f.sport = 11211;
+            f.pps = 60000 + r.gen_range(0..40000);
+            f.payload = vec![0, 1, 0, 0, 0, 1, 0, 0];
+            f.payload.extend(b"VALUE a 0 1000000\r\n");
+            f.has_payload = true;
+        }
+        12 => {
+            f.sport = 1900;
+            f.pps = 40000 + r.gen_range(0..20000);
+            f.payload = b"HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\n".to_vec();
+            f.has_payload = true;
+        }
+        // A ping flood: the ICMP guard holds the prefix to its rate.
+        13 => {
+            f.proto = "icmp".into();
+            f.sport = 0;
+            f.dport = 0;
+            f.pps = 50000 + r.gen_range(0..50000);
+        }
         _ => {
             f.pps = 400000 + r.gen_range(0..200000);
             f.payload = vec![0];
@@ -196,7 +233,7 @@ async fn run() -> Result<()> {
             let started = tokio::time::Instant::now();
             while tokio::time::Instant::now() < started + duration {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                send(&flood, &mut r, &[3, 4, 6, 7, 8]).await;
+                send(&flood, &mut r, &[3, 4, 6, 7, 8, 9, 10, 11, 12, 13]).await;
             }
             // Attacks recur on a period, so "every four minutes" means four minutes apart.
             tokio::time::sleep_until(started + every).await;

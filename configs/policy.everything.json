@@ -198,5 +198,12 @@
   ],
   "reputation": {"fast_pass": "egress", "penalty_box": true},
   "egress": {"lockdown": "limit", "lockdown_pps": 500, "grace_millis": 500},
-  "ml": {"scope": "all", "mode": "enforce", "probing": "tighten"}
+  "ml": {"scope": "all", "mode": "enforce", "probing": "tighten"},
+  "crafted": {"mode": "enforce"},
+  "reflection": {"mode": "enforce", "vectors": {"cldap": "enforce"}, "engage_pps": 1000},
+  "protocols": {"mode": "enforce"},
+  "ack_flood": {"mode": "enforce", "engage_pps": 5000},
+  "syn_flood": {"mode": "enforce", "engage_pps": 2000},
+  "fragments": {"mode": "enforce"},
+  "icmp": {"mode": "enforce", "limit_pps": 5000, "smurf_pps": 1000}
 }
