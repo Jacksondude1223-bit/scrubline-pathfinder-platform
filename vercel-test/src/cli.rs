@@ -292,6 +292,13 @@ pub fn render(raw: &[u8], view: View) -> Result<String> {
                         if !reflection.is_empty() {
                             return format!("reflection-{reflection}");
                         }
+                        let protocol = text(v, "protocol");
+                        if !protocol.is_empty() {
+                            return format!("protocol-{protocol}");
+                        }
+                        if !text(v, "ack_flood").is_empty() {
+                            return "ack-flood".into();
+                        }
                         let mut name = text(v, "rule_id");
                         if name.is_empty() {
                             name = text(v, "filter_id");

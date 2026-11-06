@@ -1991,6 +1991,8 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         ml,
         crafted,
         reflection,
+        protocols,
+        ack_flood,
         tunnels,
         sessions,
         tunnel_src,
@@ -2015,6 +2017,8 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         && *ml == b.ml
         && *crafted == b.crafted
         && *reflection == b.reflection
+        && *protocols == b.protocols
+        && *ack_flood == b.ack_flood
         && *tunnels == b.tunnels
         && *sessions == b.sessions
         && *tunnel_src == b.tunnel_src

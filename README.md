@@ -793,6 +793,90 @@ through because the server asked in `scrubline_reflection_asked_total`. A
 customer's attack shows the vector as `reflection-cldap`, beside the rules and
 filters that stopped the rest of it.
 
+## GRE and ACK floods
+
+IoT botnets such as Mirai flood with more than UDP. Two of their attacks get
+past filters that judge TCP and UDP by their ports: GRE floods and ACK floods.
+Every node runs a guard for each, after the reflection guard and before the
+penalty box, trust and lockdown.
+
+### GRE and other protocols
+
+A game server receives TCP, UDP and ICMP. Mirai's GRE floods wrap junk in GRE,
+protocol 47, so that a filter on ports never sees it. Every node drops GRE
+sent to a protected address, and every other IP protocol but TCP, UDP and
+ICMP, at the `asic` stage. A drop carries `"guard": "protocol"`.
+
+A customer who does receive another protocol, such as a VPN server, gets it in
+one of two ways. The policy can let a protocol in for every protected
+address, by name (`gre`, `esp`, `ah`, `sctp`, `ipip`, `ipv6`) or number:
+
+```json
+"protocols": {"allow": ["esp", "ah"]}
+```
+
+Or a permit rule can let it in for one address. Rules take those names as
+`proto`, with no ports:
+
+```json
+{"id": "vpn-gre", "stage": "asic", "action": "permit",
+ "match": {"proto": "gre", "dst_cidr": "203.0.113.50/32"}}
+```
+
+### ACK floods
+
+Every segment of a TCP connection but the opening SYN comes from an address
+the server has sent TCP to. The server's SYN-ACK starts each connection it
+accepts, and it acknowledges what it is sent. An ACK flood is TCP for
+connections that do not exist: ACKs, and RSTs, FINs and SYN-ACKs, from sources
+the server never spoke to. The node knows whom the server sends TCP to from
+the server's own traffic, the same way
+[return-traffic confirmation](#return-traffic-confirmation) does. So it drops
+TCP from a source the server has not sent TCP to in the last two minutes, at
+the `zc` stage. A drop carries `"guard": "ack_flood"`.
+
+It does so only while all three of these hold:
+
+- **The node sees the server's own traffic**, as it does when replies come
+  back up the tunnel. Behind direct server return it does not, and the guard
+  does nothing.
+- **It has seen that traffic for two minutes**, with no gap of over 30
+  seconds. That is as long as the table keeps a connection that has gone
+  quiet, so the node knows every connection that was open when it started
+  watching. A node that has just started drops nobody's connection.
+- **The prefix is flooded:** it is taking more than 5,000 packets a second of
+  such TCP, or was within the last minute. Below that, a stray segment passes.
+
+The node keeps up to 65,536 addresses the server sends to. When that table
+is full, a connection opened since may have gone unrecorded, so the guard
+stands down rather than drop it.
+
+`"ack_flood": {"engage_pps": 20000}` sets the threshold. An operator's permit
+vouches for what it covers. A player's trust does not, because trust says an
+address once proved itself, not that it has a connection.
+
+The guard stops what Mirai's `ack` attack sends. It does not stop Mirai's
+`stomp` attack, which opens real connections from the bots' own addresses and
+floods those. Rate limits, behavioural caps and the penalty box are what meet
+that.
+
+### Rolling them out
+
+Both guards take a `mode`: `enforce`, the default, `observe`, which counts
+what would be dropped and drops nothing, or `off`:
+
+```json
+"protocols": {"mode": "observe"}, "ack_flood": {"mode": "observe"}
+```
+
+The node counts their drops in `scrubline_protocol_dropped_total{protocol}`
+and `scrubline_ack_flood_dropped_total`.
+`scrubline_ack_flood_engaged_prefixes` and
+`scrubline_prefix_ack_flood_engaged{prefix}` show where the ACK flood guard is
+engaged, and each guard has a mode gauge. A customer's attack shows
+`protocol-gre` or `ack-flood` beside the rules and filters that stopped the
+rest of it.
+
 ## Keeping false positives down
 
 A false positive is a customer's own traffic dropped, which can hurt them as
@@ -948,7 +1032,7 @@ At those bounds, as the allocator counts it:
 
 | Part | Holds at the most | Of which |
 | --- | --- | --- |
-| Node agent | 275 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables): 78 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
+| Node agent | 276 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables): 79 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
 | Control plane, 128 nodes | 3.0 GiB | programs and the plan 205 MiB, node and tunnel reports 64 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; writing the state out 332 MiB; metrics scrapes, four at a time, 26 MiB; the largest answer still being sent, the whole fabric, 109 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
 
 Each part grows with what the policy holds multiplied by the nodes: every node

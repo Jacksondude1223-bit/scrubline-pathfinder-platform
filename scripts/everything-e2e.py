@@ -216,6 +216,13 @@ try:
     assert decide(cldap_flood)['reflection'] == 'cldap'
     natted = flow('udp', '192.0.2.251', '203.0.113.10', 19132, payload=b'\x84', sport=389)
     assert 'reflection' not in decide(natted)
+    # A botnet's GRE flood, as a packet carrying IPv4 and as records naming GRE or its number.
+    gre = b'\x00\x00\x08\x00' + ipv4('1.2.3.4', '5.6.7.8', 17, udp(12345, 12345, b''))
+    for f in [raw(ipv4('100.64.9.47', '203.0.113.10', 47, gre)),
+              flow('gre', '100.64.9.48', '203.0.113.10', 0, 100000, sport=0),
+              flow('47', '100.64.9.49', '203.0.113.10', 0, 1, sport=0)]:
+        d = decide(f)
+        assert (d['action'], d['stage'], d.get('guard')) == ('drop', 'asic', 'protocol'), d
 
     # What the node renders for its speaker, its provisioner and BIRD.
     exabgp = call(local, '/bgp?format=exabgp', token=LOCAL, text=True).splitlines()
@@ -237,6 +244,10 @@ try:
                for line in metrics.splitlines() if line.startswith('scrubline_crafted_dropped_total{')}
     assert counted['land'] == 1 and counted['tcp_flags'] == 4 and counted['fragment_overlap'] == 1, counted
     assert 'mode="enforce"} 1' in metrics, metrics
+    gre_total = [line for line in metrics.splitlines()
+                 if line.startswith('scrubline_protocol_dropped_total{') and 'protocol="gre"' in line]
+    assert gre_total and gre_total[0].endswith(' 3'), gre_total
+    assert 'scrubline_ack_flood_mode{' in metrics, metrics
     reflected_total = [line for line in metrics.splitlines()
                        if line.startswith('scrubline_reflection_dropped_total{')]
     assert reflected_total and reflected_total[0].endswith(' 2'), reflected_total
@@ -267,10 +278,11 @@ try:
         events = call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
         return any(v.get('crafted') == 'stack' for e in events for v in e.get('vectors', []))
     wait_for(stopped_by_the_checks)
-    # And that reflected CLDAP was part of it.
-    wait_for(lambda: any(v.get('reflection') == 'cldap'
-                         for e in call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
-                         for v in e.get('vectors', [])))
+    # And that reflected CLDAP and a GRE flood were part of it.
+    for vector in [('reflection', 'cldap'), ('protocol', 'gre')]:
+        wait_for(lambda: any(v.get(vector[0]) == vector[1]
+                             for e in call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
+                             for v in e.get('vectors', [])))
     assert wait_for(lambda: call(base, f'/v1/nodes/{node_id}/stats', token=OP)['stats']['crafted']['dropped'] >= 9)
 
     # Restarted from its state, the control plane compiles the node the same program once the
@@ -285,8 +297,8 @@ try:
     assert [t['id'] for t in after['tunnels']] == [t['id'] for t in before['tunnels']]
     assert wait_for(lambda: call(base, '/v1/nodes', token=OP)[0]['status'] == 'ready')
     print('Everything on one node passed: stages, game filters, HTTP rules, classifiers, crafted '
-          'packets, reflected CLDAP, reputation, on-demand mitigation, tunnels, BGP, sessions, '
-          'provisioner, analytics and restart')
+          'packets, reflected CLDAP, GRE floods, reputation, on-demand mitigation, tunnels, BGP, '
+          'sessions, provisioner, analytics and restart')
 except BaseException:
     for index, log in enumerate(logs):
         log.seek(0); output = log.read().decode(errors='replace')

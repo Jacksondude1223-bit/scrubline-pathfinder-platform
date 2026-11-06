@@ -80,6 +80,13 @@ fn flow(g: &Generator, r: &mut StdRng, kind: u8) -> Flow {
             f.pps = 20000 + r.gen_range(0..20000);
             f.flags = "syn,fin".into();
         }
+        // A botnet's GRE flood, as Mirai sends: the protocol guard drops it.
+        8 => {
+            f.proto = "gre".into();
+            f.sport = 0;
+            f.dport = 0;
+            f.pps = 60000 + r.gen_range(0..40000);
+        }
         // Domain controllers' CLDAP answers to a rootDSE query forged from the protected address:
         // the reflection guard drops them.
         7 => {
@@ -189,7 +196,7 @@ async fn run() -> Result<()> {
             let started = tokio::time::Instant::now();
             while tokio::time::Instant::now() < started + duration {
                 tokio::time::sleep(Duration::from_millis(250)).await;
-                send(&flood, &mut r, &[3, 4, 6, 7]).await;
+                send(&flood, &mut r, &[3, 4, 6, 7, 8]).await;
             }
             // Attacks recur on a period, so "every four minutes" means four minutes apart.
             tokio::time::sleep_until(started + every).await;

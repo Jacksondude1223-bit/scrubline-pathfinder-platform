@@ -106,6 +106,8 @@ fn renders_reports_and_empty_states() {
     assert!(attacks.contains("raknet(zc) crafted-stack"));
     let reflected=cli::render(&serde_json::to_vec(&json!({"window":"1h","events":[{"prefix":"203.0.113.0/24","started_at":"2026-01-01T00:00:00.123Z","seconds":61.0,"ongoing":true,"pulse":false,"vectors":[{"reflection":"cldap","flows":3,"dropped":300}]}]})).unwrap(),View::Attacks).unwrap();
     assert!(reflected.contains("reflection-cldap"), "{reflected}");
+    let botnet=cli::render(&serde_json::to_vec(&json!({"window":"1h","events":[{"prefix":"203.0.113.0/24","started_at":"2026-01-01T00:00:00.123Z","seconds":61.0,"ongoing":true,"pulse":false,"vectors":[{"protocol":"gre","flows":3,"dropped":300},{"ack_flood":"tcp","flows":1,"dropped":10000}]}]})).unwrap(),View::Attacks).unwrap();
+    assert!(botnet.contains("protocol-gre ack-flood"), "{botnet}");
     assert!(attacks.contains("2026-01-01T00:00:00Z"));
 }
 fn server(status: &str, body: &str) -> (String, std::thread::JoinHandle<String>) {

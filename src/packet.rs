@@ -824,11 +824,15 @@ fn tcp_options(o: &[u8], syn: bool) -> Option<Anomaly> {
     }
     None
 }
-fn protocol_name(proto: u8) -> String {
+/// What a protocol is called in a flow record and a rule: its name when it has one here, or else
+/// its number.
+pub fn protocol_name(proto: u8) -> String {
     match proto {
         TCP => "tcp".into(),
         UDP => "udp".into(),
         ICMP | ICMPV6 => "icmp".into(),
+        4 => "ipip".into(),
+        41 => "ipv6".into(),
         47 => "gre".into(),
         50 => "esp".into(),
         51 => "ah".into(),

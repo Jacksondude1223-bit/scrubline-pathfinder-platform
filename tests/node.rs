@@ -820,6 +820,41 @@ fn a_cldap_reflection_attack_tells_the_customer_what_stopped_it() {
     assert!(fleet.contains("scrubline_reflection_mode{"), "{fleet}");
 }
 #[test]
+fn a_gre_flood_tells_the_customer_what_stopped_it() {
+    let f = Fabric::new();
+    let mut pipe = f.pipeline();
+    f.heartbeat(pipe.stats(T0), json!([]));
+    // A botnet's GRE flood at Northwind's game server.
+    let flood = Flow {
+        sport: 0,
+        dport: 0,
+        ..flow("gre", "100.64.9.47", "203.0.113.10", 0, 100_000, &[])
+    };
+    let d = pipe.decide(&flood, T0 + 1000);
+    assert_eq!((d.action.as_str(), d.guard.as_str()), ("drop", "protocol"));
+    f.heartbeat(pipe.stats(T0 + 1000), json!([]));
+    let (name, id) = &f.tenants[0];
+    let path = format!("/v1/tenants/{id}/token");
+    let (_, issued) = call(&f.base, "POST", &path, OP, Value::Null);
+    let token = issued["token"].as_str().unwrap();
+    let (status, events) = call(&f.base, "GET", "/v1/analytics/events", token, Value::Null);
+    assert_eq!(status, 200, "{name}: {events}");
+    assert_eq!(
+        events["events"][0]["vectors"],
+        json!([{"protocol":"gre","flows":1,"dropped":100_000}]),
+        "{events}"
+    );
+    let (_, fleet) = call(&f.base, "GET", "/metrics", OP, Value::Null);
+    let fleet = fleet.as_str().unwrap_or_default();
+    for series in [
+        "scrubline_protocol_dropped_total{",
+        "scrubline_protocol_mode{",
+        "scrubline_ack_flood_mode{",
+    ] {
+        assert!(fleet.contains(series), "{series} missing from:\n{fleet}");
+    }
+}
+#[test]
 fn changes_through_the_api_reach_the_running_node_without_losing_its_state() {
     let f = Fabric::new();
     let mut pipe = f.pipeline();

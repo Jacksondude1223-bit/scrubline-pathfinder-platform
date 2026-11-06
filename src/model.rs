@@ -96,6 +96,10 @@ pub struct Policy {
     #[serde(skip_serializing_if = "is_zero")]
     pub reflection: Option<ReflectionPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
+    pub protocols: Option<ProtocolPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ack_flood: Option<AckFloodPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub challenge_secret: String,
     #[serde(deserialize_with = "null_time")]
@@ -120,6 +124,8 @@ impl Default for Policy {
             ml: None,
             crafted: None,
             reflection: None,
+            protocols: None,
+            ack_flood: None,
             challenge_secret: Default::default(),
             updated_at: zero_time(),
             version: Default::default(),
@@ -184,6 +190,39 @@ pub struct ReflectionPolicy {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub cldap: String,
+}
+/// What a node does with IP protocols a game server never receives, sent to a protected address:
+/// GRE above all, which botnets flood with, and anything but TCP, UDP and ICMP (see guards.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProtocolPolicy {
+    /// "enforce", the default, drops them; "observe" counts what would be dropped and drops
+    /// nothing; "off" does not look.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    /// Protocols the protected addresses do receive besides TCP, UDP and ICMP, by name (gre, esp,
+    /// ah, sctp, ipip, ipv6) or number.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub allow: Vec<String>,
+}
+/// What a node does with TCP that belongs to no connection the protected server has: ACKs and the
+/// rest of an established connection's segments from sources it never sent TCP to, as an ACK
+/// flood is made of (see guards.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AckFloodPolicy {
+    /// "enforce", the default, drops them while a prefix is flooded with them; "observe" counts
+    /// what would be dropped and drops nothing; "off" does not look.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub mode: String,
+    /// How many packets a second of such TCP a prefix takes before the guard starts dropping it;
+    /// 5000 when unset.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub engage_pps: i64,
 }
 impl MlPolicy {
     pub fn everywhere(&self) -> bool {
@@ -349,6 +388,11 @@ pub struct Decision {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub reflection: String,
+    /// The guard that dropped a packet, when one did: "protocol" for a protocol a protected
+    /// address does not receive, "ack_flood" for TCP that belongs to no connection.
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
+    pub guard: String,
     #[serde(with = "base64_bytes", skip_serializing_if = "is_zero")]
     pub reply: Vec<u8>,
 }
@@ -438,6 +482,10 @@ pub struct Program {
     pub crafted: Option<CraftedPolicy>,
     #[serde(skip_serializing_if = "is_zero")]
     pub reflection: Option<ReflectionPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub protocols: Option<ProtocolPolicy>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ack_flood: Option<AckFloodPolicy>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub tunnels: Vec<NodeTunnel>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
@@ -481,6 +529,8 @@ impl Default for Program {
             ml: None,
             crafted: None,
             reflection: None,
+            protocols: None,
+            ack_flood: None,
             tunnels: Vec::new(),
             sessions: Vec::new(),
             tunnel_src: Default::default(),
@@ -939,6 +989,9 @@ impl<'de> Deserialize<'de> for Flow {
             packet,
         };
         crate::packet::fill(&mut f);
+        if let Ok(n) = f.proto.parse::<u8>() {
+            f.proto = crate::packet::protocol_name(n);
+        }
         Ok(f)
     }
 }

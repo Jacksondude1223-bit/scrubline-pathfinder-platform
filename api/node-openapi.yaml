@@ -575,8 +575,8 @@ components:
         proto:
           type: string
           example: udp
-          description: tcp, udp or icmp. Read from a packet, also gre, esp, ah, sctp, or the protocol's
-            number.
+          description: tcp, udp, icmp, gre, esp, ah, sctp, ipip or ipv6, or the protocol's number, which
+            is named the same way when it has a name. Read from a packet, the same.
         sport:
           type: integer
           minimum: 0
@@ -673,6 +673,14 @@ components:
           description: The reflection vector a packet belonged to, when the reflection guard dropped it.
           enum:
           - cldap
+        guard:
+          type: string
+          description: The guard that dropped a packet, when one did. protocol, for GRE or another
+            protocol a protected address does not receive; ack_flood, for TCP that belongs to no
+            connection the server has.
+          enum:
+          - protocol
+          - ack_flood
         reply:
           type: string
           format: byte

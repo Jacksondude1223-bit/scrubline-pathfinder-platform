@@ -673,5 +673,59 @@
       "reflection",
       "sources_untracked"
     ]
+  },
+  {
+    "name": "scrubline_protocol_dropped_total",
+    "group": "protocols",
+    "path": [
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_protocol_observed_total",
+    "group": "protocols",
+    "path": [
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_ack_flood_dropped_total",
+    "group": "",
+    "path": [
+      "ack_flood",
+      "dropped"
+    ]
+  },
+  {
+    "name": "scrubline_ack_flood_observed_total",
+    "group": "",
+    "path": [
+      "ack_flood",
+      "observed"
+    ]
+  },
+  {
+    "name": "scrubline_ack_flood_engaged_prefixes",
+    "group": "",
+    "path": [
+      "ack_flood",
+      "engaged"
+    ]
+  },
+  {
+    "name": "scrubline_ack_flood_engage_pps",
+    "group": "",
+    "path": [
+      "ack_flood",
+      "engage_pps"
+    ]
+  },
+  {
+    "name": "scrubline_prefix_ack_flood_engaged",
+    "group": "prefixes",
+    "path": [
+      "ack_flood",
+      "engaged"
+    ]
   }
 ]

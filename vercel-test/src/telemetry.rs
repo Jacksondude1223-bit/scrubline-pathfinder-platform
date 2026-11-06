@@ -102,6 +102,7 @@ impl Metrics {
                     "reputation" | "egress" => vec![&stats[group]],
                     "crafted" => rows(&stats["crafted"], "checks").iter().collect(),
                     "reflection" => rows(&stats["reflection"], "vectors").iter().collect(),
+                    "protocols" => rows(&stats["protocols"], "by_protocol").iter().collect(),
                     _ => rows(stats, group).iter().collect(),
                 };
                 for s in sources {
@@ -115,6 +116,7 @@ impl Metrics {
                         "mitigation" => &[("tunnel", text("tunnel_id"))],
                         "crafted" => &[("check", text("check")), ("class", text("class"))],
                         "reflection" => &[("vector", text("vector"))],
+                        "protocols" => &[("protocol", text("protocol"))],
                         _ => &[],
                     };
                     for (name, value) in extra {
@@ -158,6 +160,19 @@ impl Metrics {
                 self.write(&mut own, "mode", candidate);
                 let on = f64::from(candidate == mode);
                 self.add_written("scrubline_crafted_mode", shared, &own, on);
+            }
+            // And the protocol and ACK flood guards' modes, off for a node from before them.
+            for (guard, metric) in [
+                ("protocols", "scrubline_protocol_mode"),
+                ("ack_flood", "scrubline_ack_flood_mode"),
+            ] {
+                let mode = stats[guard]["mode"].as_str().unwrap_or("off");
+                for candidate in ["enforce", "observe", "off"] {
+                    own.clear();
+                    self.write(&mut own, "mode", candidate);
+                    let on = f64::from(candidate == mode);
+                    self.add_written(metric, shared, &own, on);
+                }
             }
             // Likewise a node from before the reflection guard reports no vectors.
             for v in rows(&stats["reflection"], "vectors") {

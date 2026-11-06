@@ -546,5 +546,41 @@
   "scrubline_reflection_mode": {
     "kind": "gauge",
     "help": "1 for the reflection guard's mode for each vector (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops reflected answers at a customer's address."
+  },
+  "scrubline_protocol_dropped_total": {
+    "kind": "counter",
+    "help": "Packets of an IP protocol no protected address receives, dropped, by protocol: GRE is what botnets such as Mirai wrap their floods in. Rising means one is aimed at a customer."
+  },
+  "scrubline_protocol_observed_total": {
+    "kind": "counter",
+    "help": "Packets of an IP protocol no protected address receives, let through because the policy only observes: what enforcing would drop, by protocol."
+  },
+  "scrubline_protocol_mode": {
+    "kind": "gauge",
+    "help": "1 for the protocol guard's mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops a GRE flood."
+  },
+  "scrubline_ack_flood_dropped_total": {
+    "kind": "counter",
+    "help": "TCP segments dropped because they belong to no connection the server has, while their prefix was flooded with such TCP: an ACK flood."
+  },
+  "scrubline_ack_flood_observed_total": {
+    "kind": "counter",
+    "help": "TCP segments belonging to no connection, let through because the ACK flood guard only observes: what enforcing would drop."
+  },
+  "scrubline_ack_flood_engaged_prefixes": {
+    "kind": "gauge",
+    "help": "Protected prefixes whose ACK flood guard is engaged now: taking more TCP that belongs to no connection than the threshold, or within a minute of it."
+  },
+  "scrubline_ack_flood_engage_pps": {
+    "kind": "gauge",
+    "help": "How many packets a second of TCP belonging to no connection a prefix takes before its ACK flood guard engages."
+  },
+  "scrubline_prefix_ack_flood_engaged": {
+    "kind": "gauge",
+    "help": "1 while this prefix's ACK flood guard is engaged, 0 otherwise."
+  },
+  "scrubline_ack_flood_mode": {
+    "kind": "gauge",
+    "help": "1 for the ACK flood guard's mode (enforce, observe or off) on this node, 0 for the others. Alert on off: nothing then stops an ACK flood that rates and caps let through."
   }
 }
