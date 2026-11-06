@@ -223,6 +223,22 @@ try:
               flow('47', '100.64.9.49', '203.0.113.10', 0, 1, sport=0)]:
         d = decide(f)
         assert (d['action'], d['stage'], d.get('guard')) == ('drop', 'asic', 'protocol'), d
+    # What else a booter sells: NTP's monlist and memcached's values reflected, a SYN flood from
+    # forged sources, a fragmented ACK flood, a ping flood, and IP NULL.
+    monlist = bytes([0xd7, 0x00, 0x03, 0x2a, 0x00, 0x06, 0x00, 0x48]).ljust(440, b'\0')
+    memcached = bytes([0, 1, 0, 0, 0, 9, 0, 0]) + b'VALUE a 0 1000000\r\n'
+    for sport, answer, vector in [(123, monlist, 'ntp'), (11211, memcached, 'memcached')]:
+        d = decide(flow('udp', '198.18.9.1', '203.0.113.10', 19132, 100000, answer, sport=sport))
+        assert (d['action'], d.get('reflection')) == ('drop', vector), d
+    d = decide(flow('tcp', '100.64.9.60', '203.0.113.10', 443, 100000, flags='syn'))
+    assert (d['action'], d.get('guard')) == ('drop', 'syn_flood'), d
+    ack = tcp(40000, 443, 0x10) + bytes(2000)
+    d = decide(raw(ipv4('100.64.9.61', '203.0.113.10', 6, ack[:1480], ident=0x99, frag=0x2000)))
+    assert (d['action'], d.get('guard')) == ('drop', 'fragment'), d
+    d = decide(flow('icmp', '100.64.9.62', '203.0.113.10', 0, 100000))
+    assert (d['action'], d.get('guard')) == ('drop', 'icmp'), d
+    d = decide(raw(ipv4('100.64.9.63', '203.0.113.10', 0, bytes(32))))
+    assert d['reason'].startswith('IP NULL: '), d
 
     # What the node renders for its speaker, its provisioner and BIRD.
     exabgp = call(local, '/bgp?format=exabgp', token=LOCAL, text=True).splitlines()
@@ -248,9 +264,14 @@ try:
                  if line.startswith('scrubline_protocol_dropped_total{') and 'protocol="gre"' in line]
     assert gre_total and gre_total[0].endswith(' 3'), gre_total
     assert 'scrubline_ack_flood_mode{' in metrics, metrics
-    reflected_total = [line for line in metrics.splitlines()
-                       if line.startswith('scrubline_reflection_dropped_total{')]
-    assert reflected_total and reflected_total[0].endswith(' 2'), reflected_total
+    reflected_total = {line.split('vector="')[1].split('"')[0]: float(line.rsplit(' ', 1)[1])
+                       for line in metrics.splitlines()
+                       if line.startswith('scrubline_reflection_dropped_total{')}
+    assert (reflected_total['cldap'], reflected_total['ntp'], reflected_total['memcached']) == (2, 1, 1), reflected_total
+    for series in ['scrubline_syn_flood_dropped_total{', 'scrubline_fragment_dropped_total{',
+                   'scrubline_icmp_dropped_total{', 'scrubline_syn_flood_mode{',
+                   'scrubline_game_http_pending{']:
+        assert series in metrics, series
     assert any(line.startswith('scrubline_reflection_fragments_dropped_total{') and line.endswith(' 2')
                for line in metrics.splitlines()), metrics
     dry = subprocess.run([str(BIN / 'scrub-provision'), '-agent', local, '-once', '-dry-run'],
@@ -278,8 +299,11 @@ try:
         events = call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
         return any(v.get('crafted') == 'stack' for e in events for v in e.get('vectors', []))
     wait_for(stopped_by_the_checks)
-    # And that reflected CLDAP and a GRE flood were part of it.
-    for vector in [('reflection', 'cldap'), ('protocol', 'gre')]:
+    # And that reflected CLDAP, NTP and memcached, a GRE flood, a SYN flood, a fragmented ACK
+    # flood and a ping flood were part of it.
+    for vector in [('reflection', 'cldap'), ('protocol', 'gre'), ('reflection', 'ntp'),
+                   ('reflection', 'memcached'), ('syn_flood', 'tcp'), ('fragment', 'tcp'),
+                   ('icmp', 'flood')]:
         wait_for(lambda: any(v.get(vector[0]) == vector[1]
                              for e in call(base, '/v1/analytics/events', token=tokens['northwind'])['events']
                              for v in e.get('vectors', [])))
@@ -297,7 +321,7 @@ try:
     assert [t['id'] for t in after['tunnels']] == [t['id'] for t in before['tunnels']]
     assert wait_for(lambda: call(base, '/v1/nodes', token=OP)[0]['status'] == 'ready')
     print('Everything on one node passed: stages, game filters, HTTP rules, classifiers, crafted '
-          'packets, reflected CLDAP, GRE floods, reputation, on-demand mitigation, tunnels, BGP, '
+          'packets, reflection, GRE, SYN, fragment and ICMP floods, reputation, on-demand mitigation, tunnels, BGP, '
           'sessions, provisioner, analytics and restart')
 except BaseException:
     for index, log in enumerate(logs):

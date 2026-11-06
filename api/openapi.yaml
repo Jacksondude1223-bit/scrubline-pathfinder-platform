@@ -1965,6 +1965,12 @@ components:
           $ref: '#/components/schemas/ProtocolPolicy'
         ack_flood:
           $ref: '#/components/schemas/AckFloodPolicy'
+        syn_flood:
+          $ref: '#/components/schemas/SynFloodPolicy'
+        fragments:
+          $ref: '#/components/schemas/FragmentPolicy'
+        icmp:
+          $ref: '#/components/schemas/IcmpPolicy'
         tunnels:
           type: array
           items:
@@ -2175,6 +2181,12 @@ components:
           $ref: '#/components/schemas/ProtocolPolicy'
         ack_flood:
           $ref: '#/components/schemas/AckFloodPolicy'
+        syn_flood:
+          $ref: '#/components/schemas/SynFloodPolicy'
+        fragments:
+          $ref: '#/components/schemas/FragmentPolicy'
+        icmp:
+          $ref: '#/components/schemas/IcmpPolicy'
         tunnels:
           type: array
           items:
@@ -2321,14 +2333,35 @@ components:
           description: The reflection vector a packet belonged to, when the reflection guard dropped it.
           enum:
           - cldap
+          - dns
+          - ntp
+          - memcached
+          - ssdp
+          - snmp
+          - chargen
+          - echo
+          - qotd
+          - portmap
+          - netbios
+          - mssql
+          - wsd
+          - coap
+          - mdns
+          - ubiquiti
+          - rip
         guard:
           type: string
-          description: The guard that dropped a packet, when one did. protocol, for GRE or another
-            protocol a protected address does not receive; ack_flood, for TCP that belongs to no
-            connection the server has.
+          description: The guard that dropped a packet, when one did. protocol, for GRE, protocol 0 (IP
+            NULL) or another protocol a protected address does not receive; ack_flood, for TCP that
+            belongs to no connection the server has; syn_flood, for an opening SYN held back during a
+            SYN flood; fragment, for TCP or ICMP in fragments; icmp, for ICMP over its rate, an echo
+            reply the server never asked for, or a forged error.
           enum:
           - protocol
           - ack_flood
+          - syn_flood
+          - fragment
+          - icmp
         reply:
           type: string
           format: byte
@@ -2470,6 +2503,16 @@ components:
           type: integer
           description: Segments dropped because everyone together went over a rate_total and their source
             held no proof. Counted in http_rate_limited too.
+        http_tls_handshakes:
+          type: integer
+          description: TLS ClientHellos the rules counted against the server's rate and budget, as
+            requests. What follows a handshake is encrypted and passes.
+        http_slow_dropped:
+          type: integer
+          description: Segments dropped because their request arrives too slowly. A head unfinished after
+            20 to 40 seconds (Slowloris), a body under 500 bytes a second after its first 20 (R.U.D.Y.),
+            a window kept under 64 bytes for 30 seconds (a slow read), or a source leaving more than 32
+            requests incomplete at once.
     PrefixStats:
       type: object
       description: 'Everything one node knows about the traffic aimed at one protected prefix. Reported
@@ -2540,6 +2583,20 @@ components:
             $ref: '#/components/schemas/PrefixProtocol'
         ack_flood:
           $ref: '#/components/schemas/PrefixAckFlood'
+        syn_flood:
+          $ref: '#/components/schemas/PrefixSynFlood'
+        fragments:
+          type: array
+          description: What the fragment guard dropped for this prefix, TCP and ICMP apart, once it has
+            dropped any. Absent until then.
+          items:
+            $ref: '#/components/schemas/PrefixFragment'
+        icmp:
+          type: array
+          description: What the ICMP guard dropped for this prefix, per kind, once it has dropped any.
+            Absent until then.
+          items:
+            $ref: '#/components/schemas/PrefixIcmp'
     PrefixProtocol:
       type: object
       properties:
@@ -2564,6 +2621,45 @@ components:
         dropped:
           type: integer
           description: The packets of those flows, as their rates add up.
+    PrefixSynFlood:
+      type: object
+      description: The prefix's SYN flood guard, present while it is engaged or once it has dropped any.
+        A prefix narrower than a /24 (or /48) is engaged with the rest of its /24 (or /48).
+      properties:
+        engaged:
+          type: boolean
+        flows:
+          type: integer
+        dropped:
+          type: integer
+          description: The packets of those flows, as their rates add up.
+    PrefixFragment:
+      type: object
+      properties:
+        protocol:
+          type: string
+          enum:
+          - tcp
+          - icmp
+        flows:
+          type: integer
+        dropped:
+          type: integer
+          description: The packets of those flows, as their rates add up.
+    PrefixIcmp:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - flood
+          - smurf
+          - error
+        flows:
+          type: integer
+        dropped:
+          type: integer
+          description: The packets of those flows, as their rates add up.
     PrefixReflection:
       type: object
       properties:
@@ -2571,6 +2667,22 @@ components:
           type: string
           enum:
           - cldap
+          - dns
+          - ntp
+          - memcached
+          - ssdp
+          - snmp
+          - chargen
+          - echo
+          - qotd
+          - portmap
+          - netbios
+          - mssql
+          - wsd
+          - coap
+          - mdns
+          - ubiquiti
+          - rip
         flows:
           type: integer
         dropped:
@@ -2653,6 +2765,10 @@ components:
         sources_untracked:
           type: integer
           description: Sources not remembered because the table was full of others still reflecting.
+        engage_pps:
+          type: integer
+          description: How many packets a second of answers it never asked for an aggregate takes, of DNS
+            and NTP's time, before they are dropped.
         vectors:
           type: array
           description: Every vector, always.
@@ -2665,6 +2781,22 @@ components:
           type: string
           enum:
           - cldap
+          - dns
+          - ntp
+          - memcached
+          - ssdp
+          - snmp
+          - chargen
+          - echo
+          - qotd
+          - portmap
+          - netbios
+          - mssql
+          - wsd
+          - coap
+          - mdns
+          - ubiquiti
+          - rip
         port:
           type: integer
           description: The port the vector's answers come from.
@@ -2683,11 +2815,15 @@ components:
             observes.
         asked:
           type: integer
-          description: Answers let through because the protected server had sent their source an LDAP
-            search in the last 30 seconds.
+          description: Answers let through because the protected server had sent their source a query of
+            the vector in the last 30 seconds.
         fragments:
           type: integer
           description: Later fragments of answers dropped.
+        engaged:
+          type: integer
+          description: Aggregates flooded with answers of the vector the server never asked for, for DNS
+            and NTP's time. Always 0 for the rest, whose unasked answers are dropped however few arrive.
     ProtocolStats:
       type: object
       description: What the protocol guard did on this node, in all and per protocol.
@@ -2722,6 +2858,90 @@ components:
           type: integer
         observed:
           type: integer
+    SynFloodStats:
+      type: object
+      description: What the SYN flood guard did on this node.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+        engage_pps:
+          type: integer
+        engaged:
+          type: integer
+          description: Aggregates whose guard is engaged now.
+        dropped:
+          type: integer
+        observed:
+          type: integer
+          description: What the guard caught and let through because the policy only observes.
+        retried:
+          type: integer
+          description: SYNs let through while engaged because their connection had sent one a second or
+            more before, as a real client retries.
+    FragmentStats:
+      type: object
+      description: What the fragment guard did on this node, in all and per protocol.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+        dropped:
+          type: integer
+        observed:
+          type: integer
+          description: What the guard caught and let through because the policy only observes.
+        by_protocol:
+          type: array
+          description: TCP and ICMP, always.
+          items:
+            $ref: '#/components/schemas/ProtocolCount'
+    IcmpStats:
+      type: object
+      description: What the ICMP guard did on this node, in all and per kind.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+        limit_pps:
+          type: integer
+        smurf_pps:
+          type: integer
+        smurf_engaged:
+          type: integer
+          description: Aggregates flooded with echo replies the server never asked for now.
+        dropped:
+          type: integer
+        observed:
+          type: integer
+          description: What the guard caught and let through because the policy only observes.
+        kinds:
+          type: array
+          description: flood, smurf and error, always.
+          items:
+            $ref: '#/components/schemas/IcmpCount'
+    IcmpCount:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum:
+          - flood
+          - smurf
+          - error
+        dropped:
+          type: integer
+        observed:
+          type: integer
     AckFloodStats:
       type: object
       description: What the ACK flood guard did on this node.
@@ -2736,7 +2956,7 @@ components:
           type: integer
         engaged:
           type: integer
-          description: Protected prefixes whose guard is engaged now.
+          description: Aggregates whose guard is engaged now.
         dropped:
           type: integer
         observed:
@@ -2880,6 +3100,16 @@ components:
           type: integer
           description: Bound on that table. At the bound a new source goes unlimited rather than another
             being forgotten.
+        game_http_pending:
+          type: integer
+          description: Connections the HTTP rules are watching because a request on them is still
+            arriving, or their client advertises a window too small to read the answer.
+        game_http_pending_max:
+          type: integer
+          description: Bound on that table. A connection that goes quiet for a minute leaves it.
+        game_http_pending_untracked:
+          type: integer
+          description: Connections not watched because the table was full.
         reputation:
           $ref: '#/components/schemas/ReputationStats'
         egress:
@@ -2908,6 +3138,12 @@ components:
           $ref: '#/components/schemas/ProtocolStats'
         ack_flood:
           $ref: '#/components/schemas/AckFloodStats'
+        syn_flood:
+          $ref: '#/components/schemas/SynFloodStats'
+        fragments:
+          $ref: '#/components/schemas/FragmentStats'
+        icmp:
+          $ref: '#/components/schemas/IcmpStats'
         mitigation:
           type: array
           nullable: true
@@ -3034,9 +3270,36 @@ components:
       type: object
       description: What a node does with answers reflected at a protected address, per vector. They are
         judged on every node for every protected prefix, before the penalty box, trust and lockdown,
-        unless the protected server sent their source an LDAP search in the last 30 seconds or an
-        asic or fpga permit covers it. An idle on-demand tunnel passes them until it is mitigated.
+        unless the protected server sent their source a query of the vector in the last 30 seconds or
+        an asic or fpga permit covers it. DNS and NTP's time answers are dropped only while the
+        prefix's aggregate is flooded with ones the server never asked for. An idle on-demand tunnel
+        passes them until it is mitigated.
       properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: Every vector's mode, unless vectors names its own. enforce, the default.
+        vectors:
+          type: object
+          description: Modes for single vectors, by name.
+          additionalProperties:
+            type: string
+            enum:
+            - enforce
+            - observe
+            - 'off'
+          example:
+            dns: observe
+            mdns: 'off'
+        engage_pps:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: How many packets a second of DNS answers and NTP time answers the server never
+            asked for an aggregate takes before they are dropped. 0 takes 1000.
         cldap:
           type: string
           enum:
@@ -3044,8 +3307,9 @@ components:
           - observe
           - 'off'
           description: UDP from port 389 opening as an LDAP answer to a search, and the later fragments
-            of a source caught sending one. enforce, the default, drops them. observe counts what would
-            be dropped and drops nothing. off does not look.
+            of a source caught sending one; the same as naming cldap in vectors, which may not both be
+            set. enforce, the default, drops them. observe counts what would be dropped and drops
+            nothing. off does not look.
     ProtocolPolicy:
       type: object
       description: What a node does with IP protocols a protected address does not receive, sent to
@@ -3090,6 +3354,66 @@ components:
           maximum: 1000000000
           description: Packets a second of such TCP a prefix takes before the guard engages. 0, or
             unset, is 5000.
+    SynFloodPolicy:
+      type: object
+      description: What a node does with opening SYNs from sources the protected server has no
+        connection with. While the prefix's aggregate takes more of them than engage_pps, and for a
+        minute after, each such source's first SYN is held back at the zc stage and its retry, a
+        second or more later, passes. A source the server talks TCP to, has confirmed or verified,
+        or an asic or fpga permit covers, is not held back.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: enforce, the default, holds them back. observe counts what would be dropped and
+            drops nothing. off does not look.
+        engage_pps:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: 0 takes 2000.
+    FragmentPolicy:
+      type: object
+      description: What a node does with TCP and ICMP in fragments, which no real sender fragments.
+        They are dropped at the asic stage, unless an asic or fpga permit covers them. UDP in
+        fragments passes.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: enforce, the default, drops them. observe counts what would be dropped and drops
+            nothing. off does not look.
+    IcmpPolicy:
+      type: object
+      description: What a node does with ICMP to a protected address. Echo replies the server never
+        asked for are dropped while the prefix's aggregate takes more than smurf_pps of them, and for
+        a minute after; an error quoting no packet the prefix sent is dropped always; and the rest is
+        held to limit_pps for the aggregate.
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: enforce, the default, drops what the guard catches. observe counts what would be
+            dropped and drops nothing. off does not look.
+        limit_pps:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: 0 takes 1000.
+        smurf_pps:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: 0 takes 1000.
     MlPolicy:
       type: object
       description: Where the published classifiers judge traffic, and whether they drop what they score
@@ -3909,6 +4233,22 @@ components:
           type: string
           enum:
           - cldap
+          - dns
+          - ntp
+          - memcached
+          - ssdp
+          - snmp
+          - chargen
+          - echo
+          - qotd
+          - portmap
+          - netbios
+          - mssql
+          - wsd
+          - coap
+          - mdns
+          - ubiquiti
+          - rip
           description: The reflection vector the reflection guard dropped, for a vector that is neither a
             rule nor a filter. It has no stage.
         protocol:
@@ -3924,6 +4264,27 @@ components:
           - tcp
           description: Set when the ACK flood guard dropped TCP that belongs to no connection, for a vector
             that is neither a rule nor a filter. It has no stage.
+        syn_flood:
+          type: string
+          enum:
+          - tcp
+          description: Set when the SYN flood guard held back opening SYNs, for a vector that is neither a
+            rule nor a filter. It has no stage.
+        fragment:
+          type: string
+          enum:
+          - tcp
+          - icmp
+          description: What the fragment guard dropped fragments of, for a vector that is neither a rule
+            nor a filter. It has no stage.
+        icmp:
+          type: string
+          enum:
+          - flood
+          - smurf
+          - error
+          description: What the ICMP guard dropped, for a vector that is neither a rule nor a filter. It
+            has no stage.
         stage:
           type: string
           enum:

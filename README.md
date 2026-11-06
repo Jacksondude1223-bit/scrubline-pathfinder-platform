@@ -402,12 +402,13 @@ The rules read requests packet by packet, without reassembling TCP streams. A
 request is judged in the segment that carries its request line: at the start
 of a segment, pipelined behind other requests in it, or after a line break in
 a segment that continues a body. The rest of a request passes, and so does
-TLS, which the filter cannot read; `scrubline_game_http_other_total` counts
-those segments. A request line cut short in a short segment is dropped, since
-a client writes a line whole and only someone hiding a path splits it. But a
-client that controls its own segmentation can still split a request line where
-the filter cannot see it whole, and a rule that needs a User-Agent needs it in
-the segment that starts the request. For HTTPS, or for an attacker that crafts
+TLS past its handshake, which the filter cannot read;
+`scrubline_game_http_other_total` counts those segments. A request line cut
+short in a short segment is dropped, since a client writes a line whole and
+only someone hiding a path splits it. But a client that controls its own
+segmentation can still split a request line where the filter cannot see it
+whole, and a rule that needs a User-Agent needs it in the segment that starts
+the request. To hold what HTTPS carries to rules, or an attacker that crafts
 its own segments, terminate the connections in a proxy instead.
 
 `scrubline_game_http_requests_total{filter}`, `_dropped_total`,
@@ -416,6 +417,50 @@ rules are doing.
 `scrubline_game_http_windows` against `_max` shows the rate table; at the bound
 a new source goes unlimited rather than another being forgotten. Judging a
 request costs about half a microsecond on top of the rest of the pipeline.
+
+### HTTPS floods
+
+HTTPS is encrypted past its handshake, so no rule can read what it asks for.
+But every TLS session opens with a ClientHello that the server must answer
+with a handshake, which costs it far more than the hello costs the sender. So
+a ClientHello to a port the rules judge counts against the filter's
+`rate_per_source` and `rate_total` as a request does, and over them is
+dropped, a budget's sparing verified sources as it does for requests. A client
+makes many requests in one session, so a real one stays far under the rate it
+is held to. `scrubline_game_http_tls_handshakes_total{filter}` counts them.
+List the port in the block's `ports`, as `[30120, 443]`, for the rules to judge
+it.
+
+### Slow requests
+
+Some attacks cost a server its connections rather than its work, by sending a
+request slowly enough that the server holds a connection open for it:
+Slowloris sends a head a line at a time and never finishes it, and HTTP
+fragmentation sends it in tiny pieces; R.U.D.Y. and other slow-session attacks
+send a body a byte at a time; a slow read asks for a large answer and
+advertises a window too small to take it. Each connection with a request still
+arriving is watched, and held to what Apache's `mod_reqtimeout` allows by
+default:
+
+- **A head within 20 seconds**, and one more for every 500 bytes of it, up to
+  40. A segment that carries on a head past that is dropped.
+- **A body within 20 seconds**, and one more for every 500 bytes of it, which
+  an upload on any working link keeps ahead of.
+- **A window that opens within 30 seconds.** A client that keeps advertising
+  one under 64 bytes, as its segments write it, zero included, is not reading
+  the answer.
+- **No more than 32 requests left incomplete at once from one source.** A
+  browser opens six connections to a server, and Slowloris hundreds.
+
+Each such drop counts against the source, whose address is real, since every
+connection took a handshake, so with `penalty_box` on a source holding several
+is boxed. A head split across segments, as a large cookie makes it, completes
+in milliseconds and is never held to anything. The server times out the
+connections the node stops feeding by its own clock. The node watches up to
+16,384 connections at once, and forgets one that goes quiet for a minute;
+`scrubline_game_http_pending` against `_max` shows the table, and
+`scrubline_game_http_slow_dropped_total{filter}` counts the drops. A request
+inside TLS cannot be watched this way: only a slow read's window shows.
 
 ### What it will not do
 
@@ -740,38 +785,58 @@ and they send their answers there, many times larger. The answers come from
 real servers at real addresses, so no rule on sources stops them. What gives
 them away is that nobody at the protected address asked.
 
-### CLDAP
+### The vectors
 
-Connectionless LDAP (CLDAP) runs on UDP port 389, and domain controllers
-expose it to the internet by the tens of thousands. A rootDSE query of about
-50 bytes gets an answer of several kilobytes back. An answer that size arrives
-in fragments, and only the first fragment carries the port.
+Every node knows seventeen services that answer a small request with a large
+one. It tells each one's answers by the port they come from and by what they
+open with, so a player whose NAT maps them to one of those ports, sending the
+game's own packets, passes.
 
-Every node drops CLDAP answers at its protected addresses:
+| Vector | Port | What its answers open with |
+|---|---|---|
+| `cldap` | 389 | an LDAP search entry, reference or done |
+| `dns` | 53 | a DNS header answering a standard query |
+| `ntp` | 123 | a monlist (mode 7) or control (mode 6) answer, or a time answer |
+| `memcached` | 11211 | memcached's UDP frame, then a value or a reply |
+| `ssdp` | 1900 | `HTTP/1.1 200` or a `NOTIFY` |
+| `snmp` | 161 | an SNMPv1 or v2c GetResponse |
+| `chargen` | 19 | printable text |
+| `echo` | 7 | anything: it echoes what it is sent |
+| `qotd` | 17 | printable text |
+| `portmap` | 111 | an RPC reply |
+| `netbios` | 137 | a name service answer |
+| `mssql` | 1434 | the SQL Server Resolution Protocol's answer |
+| `wsd` | 3702 | a SOAP envelope that is no probe |
+| `coap` | 5683 | a CoAP response |
+| `mdns` | 5353 | a DNS header answering a query |
+| `ubiquiti` | 10001 | Ubiquiti's discovery answer |
+| `rip` | 520 | a RIPv1 or v2 response |
 
-- **The answer:** UDP from port 389 that opens the way an LDAP answer to a
-  search does. That means a BER `SEQUENCE`, a message ID, then a search entry,
-  reference or done. A packet from port 389 that opens any other way is not
-  CLDAP, and passes. A player whose NAT happens to map them to port 389 is
-  sending the game's own packets. A flow record without its payload is judged
-  by its port alone.
-- **The rest of it:** a source caught reflecting is remembered for 30
-  seconds after its last answer, as long as a host holds fragments for
-  reassembly. Its later fragments, which carry no port, are dropped with it.
-  The node remembers up to 65,536 such sources. When the table is full of
-  sources still reflecting, a new one is counted in
-  `scrubline_reflection_sources_untracked_total` and not remembered.
+A Fraggle attack is chargen's and echo's answers, and a drop's reason names it
+so. Nobody behind a game server asks any of these but DNS and NTP anything, so
+their answers are dropped however few arrive, at the `asic` stage.
 
-Two things let an answer through:
+### DNS and NTP's time
 
-- **The server asked for it.** If the protected server sent an address a CLDAP
-  query, an LDAP search to its port 389, in the last 30 seconds, an answer
-  from that address answers it. A Windows server finding its domain
-  controller gets its answer. Nothing else the server sends counts. An
-  attacker can forge a game query from a reflector's address, and the server
-  would answer it. This is known only where the server's own traffic passes
-  the node. Behind direct server return, the node sees no queries, so every
-  answer is dropped unless a permit covers its source.
+A server looks names up and sets its clock, so DNS answers and NTP's time
+answers reach it every day. Those are dropped only while the aggregate is
+flooded with ones the server never asked for: more than 1,000 packets a
+second, or within the minute after. Below that they pass. NTP's monlist and
+control answers are not ones a server needs, so they are dropped like the
+rest. `"reflection": {"engage_pps": 5000}` sets the threshold.
+
+### What lets an answer through
+
+- **The server asked for it.** If the protected server sent an address a query
+  of the vector in the last 30 seconds, an answer from that address answers
+  it. That means a DNS query to its port 53, an NTP query to its port 123, an
+  LDAP search to its port 389, and so on. Nothing else the server sends
+  counts: an attacker can forge a game query from a reflector's address, and
+  the server would answer it. Chargen, echo and QOTD answer anything, so
+  nothing the server sends asks them. This is known only where the server's
+  own traffic passes the node. Behind direct server return, the node sees no
+  queries, so in a DNS flood every DNS answer is dropped. Permit your
+  resolvers' addresses to keep the server's own lookups working then.
 - **An operator's permit** on the `asic` or `fpga` stage that covers the
   source, such as your own directory server's address.
 
@@ -780,32 +845,55 @@ player. Nor is a reflector boxed for it. It is somebody's server, put to work
 by the attacker. Like the rest of mitigation, the guard holds off on an idle
 on-demand tunnel, whose meter counts the answers until they start mitigation.
 
+### Records and fragments
+
+A flow record without its payload has only its port to go by. From a
+well-known port, which no player's NAT maps to, it is dropped as an answer is.
+From a high one (`memcached`, `ssdp`, `mssql`, `wsd`, `coap`, `mdns`,
+`ubiquiti`), which a player's NAT may map to, it is dropped only while the
+aggregate is flooded, as DNS and NTP are.
+
+A large answer arrives in fragments, and only the first carries the port. A
+source caught reflecting is remembered for 30 seconds after its last answer,
+as long as a host holds fragments for reassembly, and its later fragments are
+dropped with it. The node remembers up to 65,536 such sources. When the table
+is full of sources still reflecting, a new one is counted in
+`scrubline_reflection_sources_untracked_total` and not remembered.
+
+### Rolling it out
+
 ```json
-"reflection": {"cldap": "observe"}
+"reflection": {"mode": "observe", "vectors": {"dns": "enforce", "mdns": "off"}}
 ```
 
-`enforce` is the default, `observe` counts what would be dropped and drops
-nothing, and `off` does not look. A drop carries `"reflection": "cldap"` and a
-reason that says which part of an answer it was. The node counts them in
+`mode` sets every vector, and `vectors` sets one by name. `enforce` is the
+default, `observe` counts what would be dropped and drops nothing, and `off`
+does not look. `"cldap": "observe"`, from before the other vectors, still sets
+CLDAP's. A drop carries `"reflection"` with the vector's name and a reason
+that says which part of an answer it was. The node counts them by vector in
 `scrubline_reflection_dropped_total{vector}` and
-`scrubline_reflection_fragments_dropped_total{vector}`, and the answers let
-through because the server asked in `scrubline_reflection_asked_total`. A
-customer's attack shows the vector as `reflection-cldap`, beside the rules and
-filters that stopped the rest of it.
+`scrubline_reflection_fragments_dropped_total{vector}`, the answers let
+through because the server asked in `scrubline_reflection_asked_total`, and
+where DNS and NTP count as flooded in
+`scrubline_reflection_engaged_prefixes{vector}`. A customer's attack shows each
+vector as `reflection-ntp`, `reflection-memcached` and so on, beside the rules
+and filters that stopped the rest of it.
 
-## GRE and ACK floods
+## Protocol, TCP and ICMP floods
 
-IoT botnets such as Mirai flood with more than UDP. Two of their attacks get
-past filters that judge TCP and UDP by their ports: GRE floods and ACK floods.
-Every node runs a guard for each, after the reflection guard and before the
-penalty box, trust and lockdown.
+Botnets and booters flood with more than UDP. Every node runs a guard for each
+of the floods below, after the reflection guard and before the penalty box,
+trust and lockdown. Each judges a packet by what it is and what the server has
+said, so a player's trust vouches for none of them, and an operator's permit on
+the `asic` or `fpga` stage vouches for what it covers in all of them.
 
-### GRE and other protocols
+### GRE, IP NULL and other protocols
 
 A game server receives TCP, UDP and ICMP. Mirai's GRE floods wrap junk in GRE,
-protocol 47, so that a filter on ports never sees it. Every node drops GRE
-sent to a protected address, and every other IP protocol but TCP, UDP and
-ICMP, at the `asic` stage. A drop carries `"guard": "protocol"`.
+protocol 47, so that a filter on ports never sees it. An IP NULL attack sends
+protocol 0, which carries nothing. Every node drops GRE sent to a protected
+address, and every other IP protocol but TCP, UDP and ICMP, at the `asic`
+stage. A drop carries `"guard": "protocol"`.
 
 A customer who does receive another protocol, such as a VPN server, gets it in
 one of two ways. The policy can let a protocol in for every protected
@@ -823,19 +911,27 @@ Or a permit rule can let it in for one address. Rules take those names as
  "match": {"proto": "gre", "dst_cidr": "203.0.113.50/32"}}
 ```
 
-### ACK floods
+### ACK, RST/FIN and SYN-ACK floods
 
 Every segment of a TCP connection but the opening SYN comes from an address
-the server has sent TCP to. The server's SYN-ACK starts each connection it
-accepts, and it acknowledges what it is sent. An ACK flood is TCP for
-connections that do not exist: ACKs, and RSTs, FINs and SYN-ACKs, from sources
-the server never spoke to. The node knows whom the server sends TCP to from
-the server's own traffic, the same way
+the server has sent TCP to. A SYN-ACK answers a SYN the server sent. An ACK
+flood is TCP for connections that do not exist: ACKs, and RSTs, FINs and
+SYN-ACKs, from sources the server never spoke to. The node knows whom the
+server sends TCP to from the server's own traffic, the same way
 [return-traffic confirmation](#return-traffic-confirmation) does. So it drops
-TCP from a source the server has not sent TCP to in the last two minutes, at
-the `zc` stage. A drop carries `"guard": "ack_flood"`.
+TCP from a source the server has not sent TCP to in the last two minutes, and
+a SYN-ACK from one it sent no SYN to, at the `zc` stage. A drop carries
+`"guard": "ack_flood"` and a reason that names the flood: ACK, RST/FIN or
+SYN-ACK.
 
-It does so only while all three of these hold:
+A SYN-ACK the server sends proves nothing, since a forged SYN draws one. So a
+client the server has answered may finish its handshake with four segments,
+its ACK and the first of what it has to say, within ten seconds, and nothing
+more until the server's own segments say the connection is open. A fake
+session attack, a forged SYN and then a stream of ACKs to look like a
+connection, gets those four.
+
+The guard drops only while all three of these hold:
 
 - **The node sees the server's own traffic**, as it does when replies come
   back up the tunnel. Behind direct server return it does not, and the guard
@@ -844,38 +940,135 @@ It does so only while all three of these hold:
   seconds. That is as long as the table keeps a connection that has gone
   quiet, so the node knows every connection that was open when it started
   watching. A node that has just started drops nobody's connection.
-- **The prefix is flooded:** it is taking more than 5,000 packets a second of
-  such TCP, or was within the last minute. Below that, a stray segment passes.
+- **The aggregate is flooded:** it is taking more than 5,000 packets a second
+  of such TCP, or was within the last minute. Below that, a stray segment
+  passes.
 
 The node keeps up to 65,536 addresses the server sends to. When that table
 is full, a connection opened since may have gone unrecorded, so the guard
-stands down rather than drop it.
-
-`"ack_flood": {"engage_pps": 20000}` sets the threshold. An operator's permit
-vouches for what it covers. A player's trust does not, because trust says an
-address once proved itself, not that it has a connection.
+stands down rather than drop it. An address the server has sent nothing but
+SYN-ACKs, as every forged SYN draws, is forgotten once its handshake would
+have finished, so a SYN flood too small to be held back does not fill the
+table. `"ack_flood": {"engage_pps": 20000}` sets the threshold.
 
 The guard stops what Mirai's `ack` attack sends. It does not stop Mirai's
 `stomp` attack, which opens real connections from the bots' own addresses and
 floods those. Rate limits, behavioural caps and the penalty box are what meet
 that.
 
+### SYN floods
+
+A SYN flood sends opening SYNs from forged sources, each once, to fill the
+server's table of half-open connections. A real client whose SYN goes
+unanswered sends it again a second or so later (three on older Windows), from
+the same port. So while the aggregate takes more than 2,000 opening SYNs a
+second from sources the server has no connection with, or within the minute
+after, the SYN flood guard holds back each such source's first SYN, and lets
+its retry through. A source the server is talking TCP to, has confirmed or
+verified, opens connections as it likes. A drop carries `"guard": "syn_flood"`,
+at the `zc` stage.
+
+The node remembers the last five seconds of SYNs as bits set by a keyed hash
+of each connection, five MiB in all, so a flood of any size costs it no more.
+A forged SYN finds its bits set by others about once in five hundred at
+100,000 a second. A record of more SYNs a second on one connection than a
+client retries is no client's retry. `"syn_flood": {"engage_pps": 5000}` sets
+the threshold. The server's own SYN cookies still stand behind it.
+
+### Fragmented ACK and ICMP fragmentation floods
+
+TCP sizes its segments to the path, and ICMP's messages are small, so neither
+is ever fragmented by a real sender. A fragmented ACK flood sends 1,500-byte
+ACKs in fragments, and an ICMP fragmentation flood sends oversized pings, both
+to cost reassembly. The fragment guard drops every fragment of TCP and of
+ICMP, the first and the rest, at the `asic` stage. A drop carries
+`"guard": "fragment"`. UDP in fragments, as a large game datagram may be,
+passes. Only a packet shows it is a fragment: a flow record does not.
+
+### ICMP floods, Smurf and forged errors
+
+A server needs ICMP to be reached and to find its path's MTU, so the ICMP guard
+holds it to what that takes rather than dropping it:
+
+- **Echo replies** answer pings the server sent. A Smurf attack has a network's
+  broadcast address answer pings forged from the protected one, a flood of
+  replies. While the aggregate takes more than 1,000 a second of replies the
+  server never asked for, or within the minute after, those are dropped. A
+  reply to a ping the server did send still passes.
+- **Errors** quote the packet they are about, which the protected prefix must
+  have sent. One that quotes nothing of the prefix's is forged, as BlackNurse
+  floods with to tie up a firewall, and is dropped at the `asic` stage.
+- **Everything else**, echo requests and the errors that hold up among it, is
+  held to 1,000 packets a second for the aggregate. Past that, the rest of the
+  second's is dropped: a ping flood.
+
+```json
+"icmp": {"limit_pps": 5000, "smurf_pps": 2000}
+```
+
+A drop carries `"guard": "icmp"`, and a reason that names the flood, the
+Smurf or the forgery.
+
+### Floods spread thin
+
+A flood spread across many addresses keeps each one under any threshold, which
+a carpet-bombing or spread-spectrum attack counts on. So the guards judge
+floods over an aggregate rather than each protected prefix alone: a prefix
+narrower than a /24, or a /48 for IPv6, is judged with the rest of its /24 or
+/48. Twenty game servers protected as twenty /32s engage together.
+
 ### Rolling them out
 
-Both guards take a `mode`: `enforce`, the default, `observe`, which counts
+Every guard takes a `mode`: `enforce`, the default, `observe`, which counts
 what would be dropped and drops nothing, or `off`:
 
 ```json
-"protocols": {"mode": "observe"}, "ack_flood": {"mode": "observe"}
+"protocols": {"mode": "observe"}, "ack_flood": {"mode": "observe"},
+"syn_flood": {"mode": "observe"}, "fragments": {"mode": "observe"},
+"icmp": {"mode": "observe"}
 ```
 
-The node counts their drops in `scrubline_protocol_dropped_total{protocol}`
-and `scrubline_ack_flood_dropped_total`.
-`scrubline_ack_flood_engaged_prefixes` and
-`scrubline_prefix_ack_flood_engaged{prefix}` show where the ACK flood guard is
+The node counts their drops in `scrubline_protocol_dropped_total{protocol}`,
+`scrubline_ack_flood_dropped_total`, `scrubline_syn_flood_dropped_total`,
+`scrubline_fragment_dropped_total{protocol}` and
+`scrubline_icmp_dropped_total{kind}`. `scrubline_syn_flood_retried_total` counts
+the retries the SYN flood guard let through. `_engaged_prefixes` gauges and
+`scrubline_prefix_ack_flood_engaged{prefix}` and
+`scrubline_prefix_syn_flood_engaged{prefix}` show where the flood guards are
 engaged, and each guard has a mode gauge. A customer's attack shows
-`protocol-gre` or `ack-flood` beside the rules and filters that stopped the
-rest of it.
+`protocol-gre`, `ack-flood`, `syn-flood`, `fragment-tcp` or `icmp-smurf`
+beside the rules and filters that stopped the rest of it.
+
+## What it stops, attack by attack
+
+| Attack | What stops it |
+|---|---|
+| SYN flood | [SYN flood guard](#syn-floods); the server's SYN cookies behind it |
+| SYN-ACK flood | [ACK flood guard](#ack-rstfin-and-syn-ack-floods): a SYN-ACK answering no SYN the server sent |
+| ACK flood, RST/FIN flood | [ACK flood guard](#ack-rstfin-and-syn-ack-floods) |
+| Fake session attack | [ACK flood guard](#ack-rstfin-and-syn-ack-floods)'s handshake allowance, and the SYN flood guard on the forged SYN |
+| Fragmented ACK flood | [Fragment guard](#fragmented-ack-and-icmp-fragmentation-floods), after the [crafted-packet checks](#fragments) |
+| ICMP flood | [ICMP guard](#icmp-floods-smurf-and-forged-errors)'s rate |
+| ICMP fragmentation flood | [Fragment guard](#fragmented-ack-and-icmp-fragmentation-floods) |
+| Smurf attack | [ICMP guard](#icmp-floods-smurf-and-forged-errors): echo replies the server never asked for |
+| IP NULL | [Protocol guard](#gre-ip-null-and-other-protocols): protocol 0 |
+| Same source/dest (LAND), specially crafted packets | [Crafted-packet checks](#crafted-packets) |
+| Reflection and amplification attacks | [Reflection guard](#reflection-attacks), seventeen vectors |
+| NTP amplified (reflective), NTP flood | [Reflection guard](#dns-and-ntps-time): monlist and control answers always, time answers in a flood |
+| Memcached attack, SSDP amplified (reflective) | [Reflection guard](#the-vectors) |
+| Fraggle attack | [Reflection guard](#the-vectors): chargen and echo |
+| Non-spoofed UDP flood | [Game filters](#game-filtering), behavioural caps, the [penalty box](#source-reputation) and the [flow model](#the-classifiers) |
+| Spread spectrum (carpet bombing) | [Floods judged over a /24 or /48](#floods-spread-thin); [on-demand mitigation](#on-demand-mitigation) meters a tunnel's prefixes together |
+| HTTP flooding, recursive GET, random recursive GET | [HTTP rules](#http-on-the-servers-own-address-layer-7): per-source rates, budgets for everyone, `"default": "drop"`, and the request model |
+| Excessive verb (single session), multiple verb (single request) | HTTP rules: every request, pipelined or not, counts against the rates; more than 64 in a segment is dropped |
+| HTTPS floods | [HTTP rules](#https-floods): each TLS handshake counts against the rates |
+| Slowloris, HTTP fragmentation, slow session, slow read | [Slow requests](#slow-requests) |
+| Mirai botnet | Game filters, the GRE and ACK flood guards, the SYN flood guard |
+| Meris botnet | HTTP rules: its pipelined request floods meet the rates and the pipelining cap |
+| Scrapers | HTTP rules: rates, User-Agent prefixes, budgets and the request model slow them; telling a polite scraper from a player takes a bot-management product |
+| Booter/stresser sites, advanced (multi-vector, pulse, adaptive) attacks | Every guard at once; [burst detection](#burst-attacks), waves that lengthen mitigation and tightening under probing in [Attacks that adapt](#attacks-that-adapt) |
+| ARP poisoning, ARP spoofing | Out of reach: ARP never crosses a router, so it is the server's own LAN's to stop, with static ARP entries or the switch's dynamic ARP inspection |
+| API security, application security | Scrubline's own API takes TLS, tokens and rate limits. For a customer's application, the HTTP rules hold what reaches it to methods, paths, bodies and rates; they are no WAF and read no SQL or script injection |
 
 ## Keeping false positives down
 
@@ -953,8 +1146,9 @@ everything a policy can at once: TCAM, FPGA and ZC rules with a permit for
 monitoring, RakNet, A2S and custom game filters, HTTP rules with budgets, IPv4
 and IPv6 prefixes with communities, three tunnels (one on-demand, one IPv6
 whose replies leave by the customer's own transit), a customer BGP session,
-the penalty box, return-traffic confirmation with lockdown, and both
-classifiers enforcing and tightening under probing.
+the penalty box, return-traffic confirmation with lockdown, every guard
+(crafted packets, reflection, protocols, ACK and SYN floods, fragments and
+ICMP), and both classifiers enforcing and tightening under probing.
 [`tests/node.rs`](tests/node.rs) deploys it to one node through the API and
 checks that the features decide together, report together, render together
 and survive a policy change; the real binaries do the same, through the API
@@ -1032,7 +1226,7 @@ At those bounds, as the allocator counts it:
 
 | Part | Holds at the most | Of which |
 | --- | --- | --- |
-| Node agent | 276 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables): 79 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
+| Node agent | 289 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables, 16384 connections with a request still arriving, and the SYN flood guard's five seconds of SYNs): 92 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
 | Control plane, 128 nodes | 3.0 GiB | programs and the plan 205 MiB, node and tunnel reports 64 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; writing the state out 332 MiB; metrics scrapes, four at a time, 26 MiB; the largest answer still being sent, the whole fabric, 109 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
 
 Each part grows with what the policy holds multiplied by the nodes: every node
@@ -1084,8 +1278,8 @@ A node counts what its datapath did and attaches those counters to the
 heartbeat it already sends every couple of seconds, so the control plane has a
 fleet view without a second round trip. Both ends render the same metric names.
 The control plane's `/metrics` carries each node as a whole: its totals, stages,
-crafted-packet checks, reputation and return-traffic tables, and how many of its
-tunnels are up. A node's series for each prefix, rule, filter and tunnel are on
+crafted-packet checks and guards, reputation and return-traffic tables, and how
+many of its tunnels are up. A node's series for each prefix, rule, filter and tunnel are on
 that node's own view, `/metrics?node=<id>` on the control plane or the agent's
 `/metrics`: a large fabric has millions of them, more than one scrape can carry.
 A scraper that cannot reach the agents, which listen on loopback once installed,

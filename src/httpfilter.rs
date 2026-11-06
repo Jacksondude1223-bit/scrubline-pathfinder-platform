@@ -15,6 +15,18 @@
 //! A flood spread across enough sources keeps each one under its rate, so a filter or a path can
 //! also take a budget of requests a second from everyone together. Over it, only sources the
 //! fabric has verified get through.
+//!
+//! HTTPS is encrypted past its handshake, so nothing in it can be held to a rule; but every TLS
+//! session opens with a ClientHello the server must answer with a handshake, which costs it far
+//! more than the hello costs the sender. Each one counts against the server's rate and budget as
+//! a request does, so an HTTPS flood is held to them however it is spread.
+//!
+//! A request that arrives too slowly is an attack on the server's connections rather than its
+//! work: Slowloris sends a head a line at a time and never finishes it, R.U.D.Y. a body a byte at
+//! a time, a slow read advertises a window too small to take the answer, and each holds a
+//! connection open for as long as the server waits. Connections with a request still arriving are
+//! tracked, and held to what Apache's mod_reqtimeout allows by default: a head within 20 seconds,
+//! and 1 more for every 500 bytes up to 40, and a body at 500 bytes a second after its first 20.
 use crate::{
     ml,
     model::{Flow, GameHttp},
@@ -26,6 +38,25 @@ use std::{collections::HashMap, net::IpAddr};
 pub const WINDOWS_MAX: usize = 65536;
 /// Most requests judged in one segment; a segment pipelining more is dropped.
 const PIPELINED_MAX: u64 = 64;
+/// Most connections with a request still arriving, or a window too small, tracked at once.
+pub const PENDING_MAX: usize = 16384;
+/// How long a request's head may take to arrive, and how long its body before it has to keep up a
+/// rate: what Apache's mod_reqtimeout allows by default (header=20-40,MinRate=500 and
+/// body=20,MinRate=500).
+const HEAD_SECONDS: i64 = 20;
+const HEAD_SECONDS_MAX: i64 = 40;
+const BODY_SECONDS: i64 = 20;
+/// Bytes a second that buy a request a second more.
+const MIN_RATE: i64 = 500;
+/// The window, as a segment writes it, under which a client takes the answer too slowly to be
+/// reading it, and how long it may stay under: a slow read keeps it at nothing or next to it.
+const STARVED: u16 = 64;
+const STARVED_FOR: i64 = 30_000;
+/// How many requests one source may leave incomplete at once: a browser opens six connections to
+/// a server, and Slowloris hundreds.
+const OPEN_MAX: u32 = 32;
+/// How long a tracked connection is kept without a segment.
+const PENDING_IDLE: i64 = 60_000;
 
 #[derive(Debug)]
 struct Rule {
@@ -611,6 +642,31 @@ fn embedded(s: &[u8], from: usize) -> Option<usize> {
     }
     None
 }
+/// A number of requests, as a reason says it.
+fn counted(n: i64) -> String {
+    format!("{n} request{}", if n == 1 { "" } else { "s" })
+}
+/// What a request that starts at `at` in `s` leaves to arrive after the segment: the rest of its
+/// head, or of a body its head declares.
+fn pending(s: &[u8], at: usize, h: &Head) -> Option<Pending> {
+    if !h.complete {
+        let mut tail = [0; 3];
+        let last = &s[s.len().saturating_sub(3)..];
+        tail[3 - last.len()..].copy_from_slice(last);
+        return Some(Pending::Head {
+            bytes: (s.len() - at) as u64,
+            tail,
+        });
+    }
+    let body = s.len().saturating_sub(at + h.len) as u64;
+    if h.chunked {
+        return (!s.ends_with(b"0\r\n\r\n")).then_some(Pending::Body(None));
+    }
+    match h.content_length {
+        Some(length) if length > body => Some(Pending::Body(Some(length - body))),
+        _ => None,
+    }
+}
 /// Bytes for a reason, readable and short.
 fn show(s: &[u8]) -> String {
     let cut = s.len() > 96;
@@ -699,6 +755,10 @@ pub struct Judgement {
     pub reason: String,
     /// Requests judged in the segment.
     pub requests: u64,
+    /// Whether the segment opens a TLS session, which counts against the rates as a request does.
+    pub handshake: bool,
+    /// What the segment's last request leaves to arrive after it, if anything.
+    pub pending: Option<Pending>,
     /// Whether the drop was for a rate, and whether that was a budget for everyone, which the
     /// source was not verified to be spared.
     pub limited: bool,
@@ -825,14 +885,13 @@ impl Policy {
                 );
             }
         }
-        let requests = |n: i64| format!("{n} request{}", if n == 1 { "" } else { "s" });
         if let Some(src) = a.src {
             if let Some(r) = rule.filter(|r| r.rate > 0) {
                 if windows.over(r.key, src, a.n, r.rate, a.now) {
                     return refuse(
                         format!(
                             "more than {} a second to this path from this source",
-                            requests(r.rate)
+                            counted(r.rate)
                         ),
                         Limit::Source,
                     );
@@ -842,7 +901,7 @@ impl Policy {
                 return refuse(
                     format!(
                         "more than {} a second to this server from this source",
-                        requests(self.rate)
+                        counted(self.rate)
                     ),
                     Limit::Source,
                 );
@@ -855,7 +914,7 @@ impl Policy {
                 return refuse(
                     format!(
                         "more than {} a second to this path from everyone, and this source is not verified",
-                        requests(r.total)
+                        counted(r.total)
                     ),
                     Limit::Everyone,
                 );
@@ -865,7 +924,7 @@ impl Policy {
             return refuse(
                 format!(
                     "more than {} a second to this server from everyone, and this source is not verified",
-                    requests(self.total)
+                    counted(self.total)
                 ),
                 Limit::Everyone,
             );
@@ -892,22 +951,35 @@ impl Policy {
             j.reason = "cleartext HTTP/2, which the rules cannot read".into();
             return j;
         }
+        let arrival = Arrival {
+            src: f.src_ip.parse::<IpAddr>().ok(),
+            verified: cx.verified,
+            n: f.pps.max(1),
+            now,
+        };
         let mut at = if starts(s) {
             0
         } else if tls(s) {
-            j.reason = "TLS, which the filter cannot read".into();
+            // A handshake record whose first message is a ClientHello opens a session.
+            if s.get(5) != Some(&0x01) {
+                j.reason = "TLS, which the filter cannot read".into();
+                return j;
+            }
+            j.handshake = true;
+            if let Err((why, limit)) = self.handshake(windows, arrival) {
+                j.drop = true;
+                j.limited = true;
+                j.budget = limit == Limit::Everyone;
+                j.reason = why;
+                return j;
+            }
+            j.reason = "a TLS handshake, which counts against the server's rates; what follows it the filter cannot read".into();
             return j;
         } else if let Some(at) = embedded(s, 0) {
             at
         } else {
             j.reason = "not the start of an HTTP request".into();
             return j;
-        };
-        let arrival = Arrival {
-            src: f.src_ip.parse::<IpAddr>().ok(),
-            verified: cx.verified,
-            n: f.pps.max(1),
-            now,
         };
         loop {
             j.requests += 1;
@@ -952,11 +1024,292 @@ impl Policy {
             }
             match next(s, at, &h) {
                 Some(n) => at = n,
-                None => break,
+                None => {
+                    j.pending = pending(s, at, &h);
+                    break;
+                }
             }
         }
         j.reason = "HTTP requests allowed".into();
         j
+    }
+    /// Holds a TLS handshake to the server's rate for its source and its budget for everyone, as
+    /// a request with no path is held. Err carries why it is dropped, and which it was over.
+    fn handshake(
+        &self,
+        windows: &mut Windows,
+        a: Arrival,
+    ) -> std::result::Result<(), (String, Limit)> {
+        if let Some(src) = a.src {
+            if self.rate > 0 && windows.over(self.key, src, a.n, self.rate, a.now) {
+                return Err((
+                    format!(
+                        "a TLS handshake: more than {} a second to this server from this source",
+                        counted(self.rate)
+                    ),
+                    Limit::Source,
+                ));
+            }
+        }
+        if self.total > 0 && windows.over_total(self.key, a.n, self.total, a.now) && !a.verified {
+            return Err((
+                format!(
+                    "a TLS handshake: more than {} a second to this server from everyone, and this source is not verified",
+                    counted(self.total)
+                ),
+                Limit::Everyone,
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What a request still has to arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pending {
+    /// The rest of its head: how much of it has arrived, and its last three bytes, so a blank line
+    /// split across segments is seen.
+    Head { bytes: u64, tail: [u8; 3] },
+    /// The rest of its body: how many bytes, or None for a chunked one, which ends at its last
+    /// chunk.
+    Body(Option<u64>),
+}
+/// A TCP connection to a server, from its client's side: source, source port, destination and
+/// destination port.
+pub type Connection = (IpAddr, u16, IpAddr, u16);
+/// A connection being watched, and what for.
+#[derive(Debug)]
+struct Watched {
+    /// What its request still has to arrive, since when, and how many bytes of it have.
+    pending: Option<Pending>,
+    since: i64,
+    bytes: u64,
+    /// Since when its client has advertised a window too small to take the answer; 0 if not.
+    starved: i64,
+    /// When its last segment arrived.
+    last: i64,
+}
+/// The connections with a request still arriving or a client starving the server's answer, and
+/// how many requests each source has left incomplete. Bounded at PENDING_MAX connections, which a
+/// connection that goes quiet for PENDING_IDLE leaves.
+#[derive(Default)]
+pub struct Slow {
+    watched: HashMap<Connection, Watched>,
+    open: HashMap<IpAddr, u32>,
+    last_sweep: i64,
+    /// Connections not tracked because the table was full of others.
+    pub untracked: u64,
+}
+fn unopen(open: &mut HashMap<IpAddr, u32>, src: IpAddr) {
+    if let Some(n) = open.get_mut(&src) {
+        *n -= 1;
+        if *n == 0 {
+            open.remove(&src);
+        }
+    }
+}
+/// Whether a blank line, which ends a head, is in `s`.
+fn blank_line(s: &[u8]) -> bool {
+    s.windows(4).any(|w| w == b"\r\n\r\n") || s.windows(2).any(|w| w == b"\n\n")
+}
+impl Slow {
+    pub fn len(&self) -> usize {
+        self.watched.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.watched.is_empty()
+    }
+    /// Forgets connections that have gone quiet, at most once every ten seconds.
+    fn sweep(&mut self, now: i64) {
+        if now - self.last_sweep < 10_000 {
+            return;
+        }
+        self.last_sweep = now;
+        let open = &mut self.open;
+        self.watched.retain(|k, w| {
+            let keep = now - w.last < PENDING_IDLE;
+            if !keep && w.pending.is_some() {
+                unopen(open, k.0);
+            }
+            keep
+        });
+    }
+    /// Whether there is room to watch a connection not watched yet.
+    fn room(&mut self, key: &Connection, now: i64) -> bool {
+        self.sweep(now);
+        if self.watched.contains_key(key) || self.watched.len() < PENDING_MAX {
+            return true;
+        }
+        self.untracked += 1;
+        false
+    }
+    /// Holds a client's segment to the window it advertises: one too small to take the answer, for
+    /// longer than a reader leaves it so, is a slow read. A segment that opens or ends the
+    /// connection says nothing of it. Err is why the segment is dropped.
+    pub fn window(
+        &mut self,
+        key: Connection,
+        flags: u16,
+        window: u16,
+        now: i64,
+    ) -> std::result::Result<(), String> {
+        use crate::packet::{FIN, RST, SYN};
+        if flags & (SYN | FIN | RST) != 0 {
+            return Ok(());
+        }
+        if window >= STARVED {
+            if let Some(w) = self.watched.get_mut(&key) {
+                w.starved = 0;
+                w.last = now;
+                if w.pending.is_none() {
+                    self.watched.remove(&key);
+                }
+            }
+            return Ok(());
+        }
+        if !self.room(&key, now) {
+            return Ok(());
+        }
+        let w = self.watched.entry(key).or_insert(Watched {
+            pending: None,
+            since: now,
+            bytes: 0,
+            starved: now,
+            last: now,
+        });
+        w.last = now;
+        if w.starved == 0 {
+            w.starved = now;
+        }
+        if now - w.starved >= STARVED_FOR {
+            return Err(format!(
+                "a slow read: the client has advertised a window of under {STARVED} bytes for {} seconds, too small to be reading the answer",
+                (now - w.starved) / 1000
+            ));
+        }
+        Ok(())
+    }
+    /// What a segment that starts requests the rules allowed leaves to arrive. Err is why it is
+    /// dropped: its source leaving more requests incomplete at once than any client does.
+    pub fn started(
+        &mut self,
+        key: Connection,
+        pending: Option<Pending>,
+        now: i64,
+    ) -> std::result::Result<(), String> {
+        let was = self.watched.get(&key).and_then(|w| w.pending);
+        let Some(p) = pending else {
+            if let Some(w) = self.watched.get_mut(&key) {
+                w.last = now;
+                if w.pending.take().is_some() {
+                    unopen(&mut self.open, key.0);
+                }
+                if w.starved == 0 {
+                    self.watched.remove(&key);
+                }
+            }
+            return Ok(());
+        };
+        if was.is_none() {
+            if self.open.get(&key.0).copied().unwrap_or(0) >= OPEN_MAX {
+                return Err(format!(
+                    "more than {OPEN_MAX} requests from this source left incomplete at once, as Slowloris holds connections open"
+                ));
+            }
+            if !self.room(&key, now) {
+                return Ok(());
+            }
+            *self.open.entry(key.0).or_default() += 1;
+        }
+        let w = self.watched.entry(key).or_insert(Watched {
+            pending: None,
+            since: now,
+            bytes: 0,
+            starved: 0,
+            last: now,
+        });
+        w.last = now;
+        // The head it started sent again, as a retransmission is, is still the head it started.
+        if !matches!((was, p), (Some(Pending::Head { .. }), Pending::Head { .. })) {
+            w.since = now;
+            w.bytes = match p {
+                Pending::Head { bytes, .. } => bytes,
+                Pending::Body(_) => 0,
+            };
+        }
+        w.pending = Some(p);
+        Ok(())
+    }
+    /// A segment that carries on what the connection has to arrive. Err is why it is dropped: it
+    /// arrives later than a server waits for it.
+    pub fn continued(
+        &mut self,
+        key: Connection,
+        payload: &[u8],
+        now: i64,
+    ) -> std::result::Result<(), String> {
+        let Some(w) = self.watched.get_mut(&key) else {
+            return Ok(());
+        };
+        w.last = now;
+        let Some(p) = w.pending else {
+            return Ok(());
+        };
+        w.bytes = w.bytes.saturating_add(payload.len() as u64);
+        let elapsed = now - w.since;
+        let rate = i64::try_from(w.bytes / MIN_RATE as u64).unwrap_or(i64::MAX);
+        let done = match p {
+            Pending::Head { tail, .. } => {
+                let mut joined = tail.to_vec();
+                joined.extend_from_slice(payload);
+                if !blank_line(&joined) {
+                    let mut tail = [0; 3];
+                    tail.copy_from_slice(&joined[joined.len() - 3..]);
+                    w.pending = Some(Pending::Head {
+                        bytes: w.bytes,
+                        tail,
+                    });
+                    let allowed = HEAD_SECONDS.saturating_add(rate).min(HEAD_SECONDS_MAX);
+                    if elapsed > allowed * 1000 {
+                        return Err(format!(
+                            "a slow request: its head still arriving {} seconds after it started, longer than servers wait for one, as Slowloris sends",
+                            elapsed / 1000
+                        ));
+                    }
+                    return Ok(());
+                }
+                true
+            }
+            Pending::Body(Some(left)) if payload.len() as u64 >= left => true,
+            Pending::Body(None) if payload.ends_with(b"0\r\n\r\n") => true,
+            Pending::Body(left) => {
+                w.pending = Some(Pending::Body(left.map(|l| l - payload.len() as u64)));
+                if elapsed > BODY_SECONDS.saturating_add(rate) * 1000 {
+                    return Err(format!(
+                        "a slow body: {} bytes in {} seconds, under the {MIN_RATE} bytes a second servers hold a request to, as R.U.D.Y. sends",
+                        w.bytes,
+                        elapsed / 1000
+                    ));
+                }
+                false
+            }
+        };
+        if done {
+            w.pending = None;
+            unopen(&mut self.open, key.0);
+            if w.starved == 0 {
+                self.watched.remove(&key);
+            }
+        }
+        Ok(())
+    }
+    /// Forgets a connection its client closes or resets.
+    pub fn closed(&mut self, key: Connection) {
+        if let Some(w) = self.watched.remove(&key) {
+            if w.pending.is_some() {
+                unopen(&mut self.open, key.0);
+            }
+        }
     }
 }
 

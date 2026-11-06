@@ -211,13 +211,54 @@ pub fn policy(p: &Policy) -> Result<()> {
             ));
         }
     }
+    let mode = |m: &str| ["", "enforce", "observe", "off"].contains(&m);
+    // A threshold in packets a second: zero takes the guard's own.
+    let pps = |v: i64, what: &str, default: u64| {
+        if (0..=1_000_000_000).contains(&v) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what} must be within 0..1000000000; 0 takes {default}"
+            ))
+        }
+    };
     if let Some(r) = &p.reflection {
-        if !["", "enforce", "observe", "off"].contains(&r.cldap.as_str()) {
+        if !mode(&r.cldap) {
             return Err(format!(
                 "reflection.cldap {:?}: use enforce, observe, or off to stop looking for reflected CLDAP",
                 r.cldap
             ));
         }
+        if !mode(&r.mode) {
+            return Err(format!(
+                "reflection.mode {:?}: use enforce, observe, or off to stop looking for reflected answers",
+                r.mode
+            ));
+        }
+        for (name, m) in &r.vectors {
+            if crate::reflection::vector(name).is_none() {
+                let names: Vec<_> = crate::reflection::VECTORS.iter().map(|v| v.name).collect();
+                return Err(format!(
+                    "reflection.vectors: {name:?} is not a vector the guard knows; use {}",
+                    names.join(", ")
+                ));
+            }
+            if !mode(m) {
+                return Err(format!(
+                    "reflection.vectors.{name} {m:?}: use enforce, observe, or off"
+                ));
+            }
+        }
+        if !r.cldap.is_empty() && r.vectors.get("cldap").is_some_and(|m| !m.is_empty()) {
+            return Err(
+                "reflection.cldap and reflection.vectors.cldap are both set; set one".into(),
+            );
+        }
+        pps(
+            r.engage_pps,
+            "reflection.engage_pps",
+            crate::reflection::ENGAGE_PPS,
+        )?;
     }
     if let Some(g) = &p.protocols {
         if !["", "enforce", "observe", "off"].contains(&g.mode.as_str()) {
@@ -242,9 +283,42 @@ pub fn policy(p: &Policy) -> Result<()> {
                 a.mode
             ));
         }
-        if !(0..=1_000_000_000).contains(&a.engage_pps) {
-            return Err("ack_flood.engage_pps must be within 0..1000000000; 0 takes 5000".into());
+        pps(
+            a.engage_pps,
+            "ack_flood.engage_pps",
+            crate::guards::ENGAGE_PPS,
+        )?;
+    }
+    if let Some(g) = &p.syn_flood {
+        if !mode(&g.mode) {
+            return Err(format!(
+                "syn_flood.mode {:?}: use enforce, observe, or off to stop looking for SYN floods",
+                g.mode
+            ));
         }
+        pps(
+            g.engage_pps,
+            "syn_flood.engage_pps",
+            crate::guards::SYN_ENGAGE_PPS,
+        )?;
+    }
+    if let Some(g) = &p.fragments {
+        if !mode(&g.mode) {
+            return Err(format!(
+                "fragments.mode {:?}: use enforce, observe, or off to stop looking at fragments",
+                g.mode
+            ));
+        }
+    }
+    if let Some(g) = &p.icmp {
+        if !mode(&g.mode) {
+            return Err(format!(
+                "icmp.mode {:?}: use enforce, observe, or off to stop looking at ICMP",
+                g.mode
+            ));
+        }
+        pps(g.limit_pps, "icmp.limit_pps", crate::guards::ICMP_LIMIT_PPS)?;
+        pps(g.smurf_pps, "icmp.smurf_pps", crate::guards::SMURF_PPS)?;
     }
     if let Some(e) = &p.egress {
         if !["", "off", "limit", "drop"].contains(&e.lockdown.as_str())

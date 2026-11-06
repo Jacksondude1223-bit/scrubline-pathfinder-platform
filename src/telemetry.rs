@@ -103,6 +103,8 @@ impl Metrics {
                     "crafted" => rows(&stats["crafted"], "checks").iter().collect(),
                     "reflection" => rows(&stats["reflection"], "vectors").iter().collect(),
                     "protocols" => rows(&stats["protocols"], "by_protocol").iter().collect(),
+                    "fragments" => rows(&stats["fragments"], "by_protocol").iter().collect(),
+                    "icmp" => rows(&stats["icmp"], "kinds").iter().collect(),
                     _ => rows(stats, group).iter().collect(),
                 };
                 for s in sources {
@@ -116,7 +118,8 @@ impl Metrics {
                         "mitigation" => &[("tunnel", text("tunnel_id"))],
                         "crafted" => &[("check", text("check")), ("class", text("class"))],
                         "reflection" => &[("vector", text("vector"))],
-                        "protocols" => &[("protocol", text("protocol"))],
+                        "protocols" | "fragments" => &[("protocol", text("protocol"))],
+                        "icmp" => &[("kind", text("kind"))],
                         _ => &[],
                     };
                     for (name, value) in extra {
@@ -161,10 +164,13 @@ impl Metrics {
                 let on = f64::from(candidate == mode);
                 self.add_written("scrubline_crafted_mode", shared, &own, on);
             }
-            // And the protocol and ACK flood guards' modes, off for a node from before them.
+            // And the other guards' modes, off for a node from before them.
             for (guard, metric) in [
                 ("protocols", "scrubline_protocol_mode"),
                 ("ack_flood", "scrubline_ack_flood_mode"),
+                ("syn_flood", "scrubline_syn_flood_mode"),
+                ("fragments", "scrubline_fragment_mode"),
+                ("icmp", "scrubline_icmp_mode"),
             ] {
                 let mode = stats[guard]["mode"].as_str().unwrap_or("off");
                 for candidate in ["enforce", "observe", "off"] {

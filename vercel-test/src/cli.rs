@@ -299,6 +299,17 @@ pub fn render(raw: &[u8], view: View) -> Result<String> {
                         if !text(v, "ack_flood").is_empty() {
                             return "ack-flood".into();
                         }
+                        if !text(v, "syn_flood").is_empty() {
+                            return "syn-flood".into();
+                        }
+                        let fragment = text(v, "fragment");
+                        if !fragment.is_empty() {
+                            return format!("fragment-{fragment}");
+                        }
+                        let icmp = text(v, "icmp");
+                        if !icmp.is_empty() {
+                            return format!("icmp-{icmp}");
+                        }
                         let mut name = text(v, "rule_id");
                         if name.is_empty() {
                             name = text(v, "filter_id");

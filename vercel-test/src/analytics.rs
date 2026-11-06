@@ -247,10 +247,10 @@ impl Collector {
         self.series.retain(|p, _| live.contains(p));
         self.prefix_counters.retain(|(_, p), _| live.contains(p));
         self.rule_counters.retain(|(_, id, _), _| {
-            id.strip_prefix("|crafted|")
-                .or_else(|| id.strip_prefix("|reflection|"))
-                .or_else(|| id.strip_prefix("|protocol|"))
-                .or_else(|| id.strip_prefix("|ack_flood|"))
+            ["|crafted|", "|reflection|", "|protocol|", "|ack_flood|"]
+                .into_iter()
+                .chain(["|syn_flood|", "|fragment|", "|icmp|"])
+                .find_map(|kind| id.strip_prefix(kind))
                 .and_then(|rest| rest.split_once('|'))
                 .is_none_or(|(_, p)| live.contains(p))
         });
@@ -355,12 +355,13 @@ impl Collector {
                     }
                 }
             }
-            // What the reflection, protocol and ACK flood guards dropped for the prefix, by what
-            // each names, the same way.
+            // What the reflection, protocol, ACK and SYN flood, fragment and ICMP guards dropped for
+            // the prefix, by what each names, the same way. Only names a guard has: a counter key
+            // is made of them.
             let rows = row
                 .reflection
                 .iter()
-                .filter(|r| r.vector == "cldap")
+                .filter(|r| crate::reflection::vector(&r.vector).is_some())
                 .map(|r| ("reflection", r.vector.as_str(), r.flows, r.dropped))
                 .chain(
                     row.protocols
@@ -372,6 +373,23 @@ impl Collector {
                     row.ack_flood
                         .iter()
                         .map(|r| ("ack_flood", "tcp", r.flows, r.dropped)),
+                )
+                .chain(
+                    row.syn_flood
+                        .iter()
+                        .map(|r| ("syn_flood", "tcp", r.flows, r.dropped)),
+                )
+                .chain(
+                    row.fragments
+                        .iter()
+                        .filter(|r| crate::guards::FRAGMENTED.contains(&r.protocol.as_str()))
+                        .map(|r| ("fragment", r.protocol.as_str(), r.flows, r.dropped)),
+                )
+                .chain(
+                    row.icmp
+                        .iter()
+                        .filter(|r| crate::guards::ICMP_KINDS.contains(&r.kind.as_str()))
+                        .map(|r| ("icmp", r.kind.as_str(), r.flows, r.dropped)),
                 );
             for (kind, name, flows, dropped) in rows {
                 let counts = [0, flows, 0, dropped, 0];

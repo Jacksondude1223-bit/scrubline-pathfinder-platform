@@ -81,16 +81,26 @@ fn peak<T>(run: impl FnOnce() -> T) -> (T, usize) {
     (v, PEAK.load(Relaxed) - before)
 }
 /// Fills every table a node's pipeline keeps by source past its bound, through every kind of
-/// traffic: a game server, a capped service, a site behind an HTTP filter, a reflected CLDAP
-/// answer, the penalty box and return traffic.
+/// traffic: a game server, a capped service, a SYN, a site behind an HTTP filter and a request
+/// to it left unfinished, a reflected CLDAP answer, the penalty box and return traffic.
 fn fill(pipe: &mut Pipeline) {
     for i in 0..70_000 {
         let src = source(i);
         pipe.decide(&flow(&src, "udp", 19132, &[0x05]), T0 + 1);
         pipe.decide(&flow(&src, "udp", 19132, &[0x07]), T0 + 1);
         pipe.decide(&flow(&src, "tcp", 443, &[]), T0 + 1);
+        let syn = Flow {
+            flags: "syn".into(),
+            ..flow(&src, "tcp", 443, &[])
+        };
+        pipe.decide(&syn, T0 + 1);
         let request = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
         pipe.decide(&flow(&src, "tcp", 80, request), T0 + 1);
+        let unfinished = Flow {
+            sport: 50001,
+            ..flow(&src, "tcp", 80, b"GET / HTTP/1.1\r\nHost: a\r\n")
+        };
+        pipe.decide(&unfinished, T0 + 1);
         let answer = [0x30, 0x84, 0x00, 0x00, 0x0b, 0xb0, 0x02, 0x01, 0x01, 0x64];
         let reflected = Flow {
             sport: 389,
@@ -234,6 +244,7 @@ fn the_fabric_at_its_bounds_fits_a_16_gb_server() {
         (&full["egress"]["clients"], 65536),
         (&full["rate_buckets"], 65536),
         (&full["reflection"]["sources"], 65536),
+        (&full["game_http_pending"], 16384),
     ] {
         assert_eq!(table, &json!(bound), "a table was not filled");
     }

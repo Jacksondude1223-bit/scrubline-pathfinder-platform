@@ -59,6 +59,10 @@ pub struct Inspection {
     pub score: f64,
     pub classified: bool,
     pub observed: bool,
+    /// Whether the segment opened a TLS session, and whether it was dropped for a request that
+    /// arrives too slowly.
+    pub handshake: bool,
+    pub slow: bool,
 }
 fn bytes(v: &[i64], name: &str) -> Result<Vec<u8>> {
     v.iter()
@@ -272,6 +276,15 @@ fn framing(p: &Profile, payload: &[u8]) -> Result<()> {
     }
     Ok(())
 }
+/// The TCP connection a flow is a segment of, if its addresses and ports say.
+fn connection(f: &Flow) -> Option<httpfilter::Connection> {
+    Some((
+        f.src_ip.parse().ok()?,
+        u16::try_from(f.sport).ok()?,
+        f.dst_ip.parse().ok()?,
+        u16::try_from(f.dport).ok()?,
+    ))
+}
 #[derive(Default)]
 pub struct Engine {
     pub bindings: Vec<Binding>,
@@ -281,6 +294,8 @@ pub struct Engine {
     order: VecDeque<(String, String)>,
     last_sweep: i64,
     windows: httpfilter::Windows,
+    /// The connections with a request still arriving, or a client too slow to take the answer.
+    slow: httpfilter::Slow,
     /// Where request paths are normalised, kept so a request costs no allocation for it.
     scratch: Vec<u8>,
     /// Whether any filter's HTTP rules hold a budget for everyone, the one thing that asks
@@ -305,6 +320,11 @@ impl Engine {
     /// (rule, source) pairs the HTTP rate limits are tracking.
     pub fn windows(&self) -> usize {
         self.windows.len()
+    }
+    /// Connections the HTTP rules are watching for a request that arrives too slowly, and those
+    /// they could not watch for want of room.
+    pub fn pending(&self) -> (usize, u64) {
+        (self.slow.len(), self.slow.untracked)
     }
     /// Whether any filter's HTTP rules hold a budget for everyone.
     pub fn budgeted(&self) -> bool {
@@ -349,9 +369,21 @@ impl Engine {
             profile: "http".into(),
             ..Default::default()
         };
-        if f.payload.is_empty() {
+        let key = connection(f);
+        let flags = crate::packet::tcp_flags(&f.flags);
+        // A client is held to the window it advertises in every segment, data or none.
+        let starved = match (key, flags, f.window) {
+            (Some(k), Some(flags), Some(window)) => self.slow.window(k, flags, window, now).err(),
+            _ => None,
+        };
+        if starved.is_none() && f.payload.is_empty() {
             if f.has_payload {
                 // A segment with no data (a handshake, an acknowledgement) carries no request.
+                if let (Some(k), Some(flags)) = (key, flags) {
+                    if flags & (crate::packet::FIN | crate::packet::RST) != 0 {
+                        self.slow.closed(k);
+                    }
+                }
                 return Inspection {
                     verdict: "pass".into(),
                     ..Default::default()
@@ -362,22 +394,49 @@ impl Engine {
             return r;
         }
         let policy = b.http.as_ref().expect("an HTTP binding has HTTP rules");
-        let j = policy.judge(&mut self.windows, &mut self.scratch, f, now, cx);
-        r.requests = j.requests;
-        r.limited = j.drop && j.limited;
-        r.budget = j.drop && j.budget;
-        r.other = j.requests == 0;
-        r.scored = j.scored;
-        r.score = j.score;
-        let mut drop = j.drop;
-        r.reason = j.reason;
-        if !drop && !j.flagged.is_empty() {
-            if enforce {
-                drop = true;
-                r.classified = true;
-                r.reason = j.flagged;
-            } else {
-                r.observed = true;
+        let mut drop;
+        if let Some(why) = starved {
+            drop = true;
+            r.slow = true;
+            r.reason = why;
+        } else {
+            let j = policy.judge(&mut self.windows, &mut self.scratch, f, now, cx);
+            r.requests = j.requests;
+            r.handshake = j.handshake;
+            r.limited = j.drop && j.limited;
+            r.budget = j.drop && j.budget;
+            r.other = j.requests == 0 && !j.handshake;
+            r.scored = j.scored;
+            r.score = j.score;
+            drop = j.drop;
+            r.reason = j.reason;
+            // A request the rules allow is held to arriving in time: what it leaves to arrive
+            // after this segment, or what this segment carries on.
+            if let Some(k) = key.filter(|_| !drop) {
+                let slow = if j.requests > 0 || j.handshake {
+                    self.slow.started(k, j.pending, now)
+                } else {
+                    self.slow.continued(k, &f.payload, now)
+                };
+                if let Err(why) = slow {
+                    drop = true;
+                    r.slow = true;
+                    r.reason = why;
+                }
+            }
+            if !drop && !j.flagged.is_empty() {
+                if enforce {
+                    drop = true;
+                    r.classified = true;
+                    r.reason = j.flagged;
+                } else {
+                    r.observed = true;
+                }
+            }
+        }
+        if let (Some(k), Some(flags)) = (key, flags) {
+            if flags & (crate::packet::FIN | crate::packet::RST) != 0 {
+                self.slow.closed(k);
             }
         }
         r.verdict = if drop { "drop" } else { "pass" }.into();
@@ -386,6 +445,7 @@ impl Engine {
             r.verdict = "pass".into();
             r.limited = false;
             r.budget = false;
+            r.slow = false;
             r.observed |= r.classified;
             r.classified = false;
         }
