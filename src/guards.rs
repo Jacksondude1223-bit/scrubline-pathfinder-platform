@@ -30,10 +30,9 @@
 //! Floods are judged over an aggregate rather than each protected prefix alone: a prefix narrower
 //! than a /24, or a /48 for IPv6, is judged with the rest of its /24 or /48, so an attack spread
 //! thin across many addresses protected one by one shows whole.
-use crate::model::{
-    AckFloodPolicy, Flow, FragmentPolicy, IcmpPolicy, ProtocolPolicy, SynFloodPolicy,
-};
+use crate::model::Flow;
 use crate::packet;
+use crate::tuning::{self, Mode};
 use ipnet::IpNet;
 use serde_json::{json, Value};
 use std::{
@@ -57,22 +56,19 @@ pub fn protocol(name: &str) -> Option<String> {
     let lower = name.trim().to_ascii_lowercase();
     (ALWAYS.contains(&lower.as_str()) || PROTOCOLS.contains(&lower.as_str())).then_some(lower)
 }
-/// Whether a mode is one a guard runs in.
-fn mode(m: Option<&str>) -> String {
-    match m {
-        Some(mode @ ("observe" | "off")) => mode.into(),
-        _ => "enforce".into(),
-    }
-}
 
 /// An aggregate's name, shared by every flow to it without being copied.
 pub type Key = Arc<str>;
 /// The aggregate a protected prefix's floods are judged over: the prefix itself, or for one
 /// narrower than a /24 (IPv4) or a /48 (IPv6), the /24 or /48 that holds it.
 pub fn aggregate(prefix: &str, net: &IpNet) -> String {
+    aggregate_at(prefix, net, (24, 48))
+}
+/// The same, at the policy's lengths for IPv4 and IPv6.
+pub fn aggregate_at(prefix: &str, net: &IpNet, (v4, v6): (u8, u8)) -> String {
     let wide = match net {
-        IpNet::V4(_) => 24,
-        IpNet::V6(_) => 48,
+        IpNet::V4(_) => v4,
+        IpNet::V6(_) => v6,
     };
     if net.prefix_len() <= wide {
         return prefix.into();
@@ -138,38 +134,21 @@ impl<K: Hash + Eq + Clone> Engagement<K> {
     }
 }
 
-/// What the protocol guard does and has done.
+/// What the protocol guard has done.
+#[derive(Default)]
 pub struct ProtocolGuard {
-    /// "enforce", "observe" or "off".
-    pub mode: String,
-    allow: Vec<String>,
     /// Per protocol: flows dropped, and flows observed.
     counts: BTreeMap<String, [u64; 2]>,
 }
-impl Default for ProtocolGuard {
-    fn default() -> Self {
-        Self {
-            mode: "enforce".into(),
-            allow: Vec::new(),
-            counts: BTreeMap::new(),
-        }
-    }
-}
 impl ProtocolGuard {
-    pub fn load(&mut self, policy: Option<&ProtocolPolicy>) {
-        self.mode = mode(policy.map(|p| p.mode.as_str()));
-        self.allow = policy
-            .map(|p| p.allow.iter().filter_map(|a| protocol(a)).collect())
-            .unwrap_or_default();
-    }
     /// The protocol a flow carries, when it is one the protected addresses do not receive. A flow
     /// that names no protocol, or one the node does not know, is not judged.
-    pub fn stopped(&self, proto: &str) -> Option<String> {
-        if self.mode == "off" || proto.is_empty() || proto.eq_ignore_ascii_case("any") {
+    pub fn stopped(&self, proto: &str, s: &tuning::Protocols) -> Option<String> {
+        if s.mode == Mode::Off || proto.is_empty() || proto.eq_ignore_ascii_case("any") {
             return None;
         }
         let name = protocol(proto)?;
-        if ALWAYS.contains(&name.as_str()) || self.allow.contains(&name) {
+        if ALWAYS.contains(&name.as_str()) || s.allow.contains(&name) {
             return None;
         }
         Some(name)
@@ -179,15 +158,15 @@ impl ProtocolGuard {
         // At most one entry for each of the 256 protocols.
         self.counts.entry(name.into()).or_default()[usize::from(observed)] += 1;
     }
-    pub fn stats(&self) -> Value {
+    pub fn stats(&self, s: &tuning::Protocols) -> Value {
         let rows: Vec<_> = self
             .counts
             .iter()
             .map(|(p, [d, o])| json!({"protocol": p, "dropped": d, "observed": o}))
             .collect();
         json!({
-            "mode": self.mode,
-            "allow": self.allow,
+            "mode": s.mode.name(),
+            "allow": s.allow,
             "dropped": self.counts.values().map(|c| c[0]).sum::<u64>(),
             "observed": self.counts.values().map(|c| c[1]).sum::<u64>(),
             "by_protocol": rows,
@@ -224,24 +203,12 @@ pub const TALKED_WITHIN: i64 = 120_000;
 pub const HANDSHAKE: i64 = 10_000;
 pub const HANDSHAKE_SEGMENTS: u32 = 4;
 
-/// What the ACK flood guard does and has done.
+/// What the ACK flood guard has done.
+#[derive(Default)]
 pub struct AckGuard {
-    /// "enforce", "observe" or "off".
-    pub mode: String,
-    pub engage_pps: u64,
     floods: Engagement<Key>,
     /// Segments dropped, and segments observed.
     pub counts: [u64; 2],
-}
-impl Default for AckGuard {
-    fn default() -> Self {
-        Self {
-            mode: "enforce".into(),
-            engage_pps: ENGAGE_PPS,
-            floods: Engagement::default(),
-            counts: [0; 2],
-        }
-    }
 }
 /// Whether a segment's flags say it belongs to an open connection: anything but a SYN that opens
 /// one. A record that names no flags says nothing either way.
@@ -271,28 +238,24 @@ pub fn unsolicited_why(flags: &str) -> &'static str {
     }
 }
 impl AckGuard {
-    pub fn load(&mut self, policy: Option<&AckFloodPolicy>, live: &dyn Fn(&str) -> bool) {
-        self.mode = mode(policy.map(|p| p.mode.as_str()));
-        self.engage_pps = policy
-            .map(|p| p.engage_pps)
-            .filter(|&p| p > 0)
-            .map_or(ENGAGE_PPS, |p| p as u64);
+    /// Forgets the aggregates no longer in the program.
+    pub fn load(&mut self, live: &dyn Fn(&str) -> bool) {
         self.floods.retain(|a| live(a));
     }
     /// Counts TCP that belongs to no connection at an aggregate, and says whether its guard is
     /// engaged: by this second's TCP being over the threshold, or by an earlier second's within
     /// the hold.
-    pub fn engaged_by(&mut self, aggregate: &Key, pps: u64, now: i64) -> bool {
+    pub fn engaged_by(&mut self, aggregate: &Key, pps: u64, s: &tuning::Ack, now: i64) -> bool {
         self.floods
-            .engaged_by(aggregate, pps, self.engage_pps, ACK_HOLD, now)
+            .engaged_by(aggregate, pps, s.engage_pps, s.hold, now)
     }
     pub fn engaged(&self, aggregate: &str, now: i64) -> bool {
         self.floods.engaged(aggregate, now)
     }
-    pub fn stats(&self, now: i64) -> Value {
+    pub fn stats(&self, s: &tuning::Ack, now: i64) -> Value {
         json!({
-            "mode": self.mode,
-            "engage_pps": self.engage_pps,
+            "mode": s.mode.name(),
+            "engage_pps": s.engage_pps,
             "engaged": self.floods.count(now, |_| true),
             "dropped": self.counts[0],
             "observed": self.counts[1],
@@ -314,11 +277,8 @@ pub const SYN_RETRIES: i64 = 3;
 /// others rarely: about one in five hundred at 100,000 a second.
 const SYN_BITS: usize = 1 << 23;
 const SYN_SECONDS: usize = 5;
-/// What the SYN flood guard does and has done.
+/// What the SYN flood guard has done.
 pub struct SynGuard {
-    /// "enforce", "observe" or "off".
-    pub mode: String,
-    pub engage_pps: u64,
     floods: Engagement<Key>,
     /// The opening SYNs seen in each of the last SYN_SECONDS seconds, as bits set by a keyed hash
     /// of their connection, and which second each holds. Allocated on the first SYN.
@@ -331,8 +291,6 @@ pub struct SynGuard {
 impl Default for SynGuard {
     fn default() -> Self {
         Self {
-            mode: "enforce".into(),
-            engage_pps: SYN_ENGAGE_PPS,
             floods: Engagement::default(),
             seen: Vec::new(),
             seconds: [i64::MIN; SYN_SECONDS],
@@ -342,17 +300,13 @@ impl Default for SynGuard {
     }
 }
 impl SynGuard {
-    pub fn load(&mut self, policy: Option<&SynFloodPolicy>, live: &dyn Fn(&str) -> bool) {
-        self.mode = mode(policy.map(|p| p.mode.as_str()));
-        self.engage_pps = policy
-            .map(|p| p.engage_pps)
-            .filter(|&p| p > 0)
-            .map_or(SYN_ENGAGE_PPS, |p| p as u64);
+    /// Forgets the aggregates no longer in the program.
+    pub fn load(&mut self, live: &dyn Fn(&str) -> bool) {
         self.floods.retain(|a| live(a));
     }
-    /// Records an opening SYN, and says whether its connection sent one in an earlier second the
-    /// guard still remembers: whether it is a retry.
-    pub fn retried(&mut self, f: &Flow, now: i64) -> bool {
+    /// Records an opening SYN, and says whether its connection sent one within the last `within`
+    /// seconds before this one's: whether it is a retry.
+    pub fn retried(&mut self, f: &Flow, within: i64, now: i64) -> bool {
         const WORDS: usize = SYN_BITS / 64;
         if self.seen.is_empty() {
             self.seen = vec![0; WORDS * SYN_SECONDS];
@@ -371,7 +325,8 @@ impl SynGuard {
             |seen: &[u64], s: usize, b: usize| seen[s * WORDS + b / 64] & (1 << (b % 64)) != 0;
         let found = (0..SYN_SECONDS).any(|s| {
             let age = second.saturating_sub(self.seconds[s]);
-            (1..SYN_SECONDS as i64).contains(&age) && bits.iter().all(|&b| set(&self.seen, s, b))
+            (1..=within.min(SYN_SECONDS as i64 - 1)).contains(&age)
+                && bits.iter().all(|&b| set(&self.seen, s, b))
         });
         for b in bits {
             self.seen[slot * WORDS + b / 64] |= 1 << (b % 64);
@@ -380,9 +335,9 @@ impl SynGuard {
     }
     /// Counts opening SYNs from sources the server has no connection with at an aggregate, and
     /// says whether its guard is engaged.
-    pub fn engaged_by(&mut self, aggregate: &Key, pps: u64, now: i64) -> bool {
+    pub fn engaged_by(&mut self, aggregate: &Key, pps: u64, s: &tuning::Syn, now: i64) -> bool {
         self.floods
-            .engaged_by(aggregate, pps, self.engage_pps, SYN_HOLD, now)
+            .engaged_by(aggregate, pps, s.engage_pps, s.hold, now)
     }
     pub fn engaged(&self, aggregate: &str, now: i64) -> bool {
         self.floods.engaged(aggregate, now)
@@ -391,10 +346,10 @@ impl SynGuard {
     pub fn bytes(&self) -> usize {
         self.seen.len() * 8
     }
-    pub fn stats(&self, now: i64) -> Value {
+    pub fn stats(&self, s: &tuning::Syn, now: i64) -> Value {
         json!({
-            "mode": self.mode,
-            "engage_pps": self.engage_pps,
+            "mode": s.mode.name(),
+            "engage_pps": s.engage_pps,
             "engaged": self.floods.count(now, |_| true),
             "dropped": self.counts[0],
             "observed": self.counts[1],
@@ -405,47 +360,45 @@ impl SynGuard {
 /// Why an opening SYN is dropped.
 pub const SYN_WHY: &str = "SYN flood: an opening SYN from a source the server has no connection with, while the prefix is flooded with them; a real client sends it again a second or so later, and that passes";
 
-/// The protocols whose fragments the fragment guard drops, in the order of its counters.
-pub const FRAGMENTED: [&str; 2] = ["tcp", "icmp"];
-/// What the fragment guard does and has done.
+/// The protocols whose fragments the fragment guard can drop, in the order of its counters.
+pub const FRAGMENTED: [&str; 4] = ["tcp", "icmp", "udp", "other"];
+/// What the fragment guard has done.
+#[derive(Default)]
 pub struct FragmentGuard {
-    /// "enforce", "observe" or "off".
-    pub mode: String,
     /// Per protocol in FRAGMENTED order: fragments dropped, and fragments observed.
-    pub counts: [[u64; 2]; 2],
-}
-impl Default for FragmentGuard {
-    fn default() -> Self {
-        Self {
-            mode: "enforce".into(),
-            counts: [[0; 2]; 2],
-        }
-    }
+    pub counts: [[u64; 2]; 4],
 }
 impl FragmentGuard {
-    pub fn load(&mut self, policy: Option<&FragmentPolicy>) {
-        self.mode = mode(policy.map(|p| p.mode.as_str()));
-    }
-    /// Which of FRAGMENTED a packet is a fragment of, if it is one: its first fragment or any
-    /// after, which carry the protocol in their IP header (IPv4) or fragment header (IPv6).
-    pub fn fragment(&self, p: &packet::Packet) -> Option<usize> {
-        if self.mode == "off" || !p.fragment() {
+    /// Which of FRAGMENTED a packet is a fragment of, if it is one the settings drop: its first
+    /// fragment or any after, which carry the protocol in their IP header (IPv4) or fragment
+    /// header (IPv6).
+    pub fn fragment(&self, p: &packet::Packet, s: &tuning::Fragments) -> Option<usize> {
+        if s.mode == Mode::Off || !p.fragment() {
             return None;
         }
-        match p.proto {
-            6 => Some(0),
-            1 | 58 => Some(1),
-            _ => None,
-        }
+        let i = match p.proto {
+            6 => 0,
+            1 | 58 => 1,
+            17 => 2,
+            _ => 3,
+        };
+        s.protocols[i].then_some(i)
     }
-    pub fn stats(&self) -> Value {
+    pub fn stats(&self, s: &tuning::Fragments) -> Value {
         let rows: Vec<_> = FRAGMENTED
             .iter()
             .zip(self.counts)
             .map(|(p, [d, o])| json!({"protocol": p, "dropped": d, "observed": o}))
             .collect();
+        let on: Vec<_> = FRAGMENTED
+            .iter()
+            .zip(s.protocols)
+            .filter(|(_, on)| *on)
+            .map(|(p, _)| *p)
+            .collect();
         json!({
-            "mode": self.mode,
+            "mode": s.mode.name(),
+            "protocols": on,
             "dropped": self.counts.iter().map(|c| c[0]).sum::<u64>(),
             "observed": self.counts.iter().map(|c| c[1]).sum::<u64>(),
             "by_protocol": rows,
@@ -454,10 +407,11 @@ impl FragmentGuard {
 }
 /// Why a fragment of the protocol is dropped.
 pub fn fragment_why(i: usize) -> &'static str {
-    if i == 0 {
-        "fragmented ACK flood: TCP in fragments, which no TCP stack sends, since TCP sizes its segments to the path"
-    } else {
-        "ICMP fragmentation flood: ICMP in fragments, which no ping or error a game server needs arrives as"
+    match i {
+        0 => "fragmented ACK flood: TCP in fragments, which no TCP stack sends, since TCP sizes its segments to the path",
+        1 => "ICMP fragmentation flood: ICMP in fragments, which no ping or error a game server needs arrives as",
+        2 => "UDP fragment flood: UDP in fragments, which the policy says the protected addresses never receive",
+        _ => "a fragment of a protocol the policy says arrives whole",
     }
 }
 
@@ -472,7 +426,7 @@ pub const SMURF_HOLD: i64 = 60_000;
 /// reflection guard's vectors.
 pub const ECHO_BIT: u32 = 1 << 31;
 /// What the ICMP guard drops, in the order of its counters.
-pub const ICMP_KINDS: [&str; 3] = ["flood", "smurf", "error"];
+pub const ICMP_KINDS: [&str; 4] = ["flood", "smurf", "error", "type"];
 /// What an ICMP message is to the guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icmp {
@@ -520,43 +474,25 @@ pub fn echo_request(p: &packet::Packet) -> bool {
     p.icmp
         .is_some_and(|(kind, _)| kind == if p.v6 { 128 } else { 8 })
 }
-/// What the ICMP guard does and has done.
+/// What the ICMP guard has done.
+#[derive(Default)]
 pub struct IcmpGuard {
-    /// "enforce", "observe" or "off".
-    pub mode: String,
-    pub limit_pps: u64,
-    pub smurf_pps: u64,
     /// The ICMP each aggregate took this second, echo replies aside: one for each aggregate that
     /// has taken any.
     seconds: HashMap<Key, (i64, u64)>,
     replies: Engagement<Key>,
     /// Per kind in ICMP_KINDS order: packets dropped, and packets observed.
-    pub counts: [[u64; 2]; 3],
-}
-impl Default for IcmpGuard {
-    fn default() -> Self {
-        Self {
-            mode: "enforce".into(),
-            limit_pps: ICMP_LIMIT_PPS,
-            smurf_pps: SMURF_PPS,
-            seconds: HashMap::new(),
-            replies: Engagement::default(),
-            counts: [[0; 2]; 3],
-        }
-    }
+    pub counts: [[u64; 2]; 4],
 }
 impl IcmpGuard {
-    pub fn load(&mut self, policy: Option<&IcmpPolicy>, live: &dyn Fn(&str) -> bool) {
-        self.mode = mode(policy.map(|p| p.mode.as_str()));
-        let pps = |v: Option<i64>, default: u64| v.filter(|&p| p > 0).map_or(default, |p| p as u64);
-        self.limit_pps = pps(policy.map(|p| p.limit_pps), ICMP_LIMIT_PPS);
-        self.smurf_pps = pps(policy.map(|p| p.smurf_pps), SMURF_PPS);
+    /// Forgets the aggregates no longer in the program.
+    pub fn load(&mut self, live: &dyn Fn(&str) -> bool) {
         self.seconds.retain(|a, _| live(a));
         self.replies.retain(|a| live(a));
     }
     /// Counts ICMP that is not an echo reply at an aggregate, and says whether this second's is
     /// over the limit.
-    pub fn over_limit(&mut self, aggregate: &Key, pps: u64, now: i64) -> bool {
+    pub fn over_limit(&mut self, aggregate: &Key, pps: u64, limit: u64, now: i64) -> bool {
         if !self.seconds.contains_key(aggregate) {
             self.seconds.insert(aggregate.clone(), (0, 0));
         }
@@ -567,27 +503,27 @@ impl IcmpGuard {
             *count = 0;
         }
         *count = count.saturating_add(pps);
-        *count > self.limit_pps
+        *count > limit
     }
     /// Counts echo replies the server never asked for at an aggregate, and says whether it is
     /// flooded with them.
-    pub fn smurfed_by(&mut self, aggregate: &Key, pps: u64, now: i64) -> bool {
+    pub fn smurfed_by(&mut self, aggregate: &Key, pps: u64, s: &tuning::Icmp, now: i64) -> bool {
         self.replies
-            .engaged_by(aggregate, pps, self.smurf_pps, SMURF_HOLD, now)
+            .engaged_by(aggregate, pps, s.smurf_pps, s.hold, now)
     }
     pub fn smurfed(&self, aggregate: &str, now: i64) -> bool {
         self.replies.engaged(aggregate, now)
     }
-    pub fn stats(&self, now: i64) -> Value {
+    pub fn stats(&self, s: &tuning::Icmp, now: i64) -> Value {
         let rows: Vec<_> = ICMP_KINDS
             .iter()
             .zip(self.counts)
             .map(|(k, [d, o])| json!({"kind": k, "dropped": d, "observed": o}))
             .collect();
         json!({
-            "mode": self.mode,
-            "limit_pps": self.limit_pps,
-            "smurf_pps": self.smurf_pps,
+            "mode": s.mode.name(),
+            "limit_pps": s.limit_pps,
+            "smurf_pps": s.smurf_pps,
             "smurf_engaged": self.replies.count(now, |_| true),
             "dropped": self.counts.iter().map(|c| c[0]).sum::<u64>(),
             "observed": self.counts.iter().map(|c| c[1]).sum::<u64>(),
@@ -596,17 +532,23 @@ impl IcmpGuard {
     }
 }
 /// Why ICMP of a kind is dropped.
-pub fn icmp_why(i: usize, limit: u64) -> String {
+pub fn icmp_why(i: usize, limit: u64, kind: u8) -> String {
     match i {
         0 => format!("ICMP flood: more than {limit} ICMP packets a second to the prefix, echo replies aside"),
         1 => "Smurf: an echo reply to a ping the server never sent, while the prefix is flooded with them".into(),
-        _ => "forged ICMP error: an error about a packet the protected prefix never sent, as BlackNurse floods with".into(),
+        2 => "forged ICMP error: an error about a packet the protected prefix never sent, as BlackNurse floods with".into(),
+        _ => format!("ICMP type {kind}, which the policy drops"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Program, ProtocolPolicy};
+    /// The policy's settings for a program, as the pipeline resolves them.
+    fn settings(p: Program) -> tuning::Guards {
+        tuning::resolve(&p).guards.remove(0)
+    }
     #[test]
     fn protocols_are_known_by_name_or_number() {
         assert_eq!(protocol("GRE").as_deref(), Some("gre"));
@@ -621,28 +563,37 @@ mod tests {
     }
     #[test]
     fn the_protocol_guard_stops_what_is_neither_always_received_nor_allowed() {
-        let mut g = ProtocolGuard::default();
+        let g = ProtocolGuard::default();
+        let s = settings(Program::default()).protocols;
         for passes in ["tcp", "UDP", "icmp", "", "any", "quic"] {
-            assert_eq!(g.stopped(passes), None, "{passes}");
+            assert_eq!(g.stopped(passes, &s), None, "{passes}");
         }
-        assert_eq!(g.stopped("gre").as_deref(), Some("gre"));
-        assert_eq!(g.stopped("47").as_deref(), Some("gre"));
-        assert_eq!(g.stopped("esp").as_deref(), Some("esp"));
+        assert_eq!(g.stopped("gre", &s).as_deref(), Some("gre"));
+        assert_eq!(g.stopped("47", &s).as_deref(), Some("gre"));
+        assert_eq!(g.stopped("esp", &s).as_deref(), Some("esp"));
         // IP NULL: protocol 0.
-        assert_eq!(g.stopped("0").as_deref(), Some("0"));
+        assert_eq!(g.stopped("0", &s).as_deref(), Some("0"));
         assert!(why("0").starts_with("IP NULL: "));
-        g.load(Some(&ProtocolPolicy {
-            mode: String::new(),
-            allow: vec!["50".into(), "AH".into()],
-        }));
-        assert_eq!(g.stopped("esp"), None);
-        assert_eq!(g.stopped("ah"), None);
-        assert_eq!(g.stopped("gre").as_deref(), Some("gre"));
-        g.load(Some(&ProtocolPolicy {
-            mode: "off".into(),
-            allow: vec![],
-        }));
-        assert_eq!(g.stopped("gre"), None);
+        let s = settings(Program {
+            protocols: Some(ProtocolPolicy {
+                mode: String::new(),
+                allow: vec!["50".into(), "AH".into()],
+            }),
+            ..Default::default()
+        })
+        .protocols;
+        assert_eq!(g.stopped("esp", &s), None);
+        assert_eq!(g.stopped("ah", &s), None);
+        assert_eq!(g.stopped("gre", &s).as_deref(), Some("gre"));
+        let s = settings(Program {
+            protocols: Some(ProtocolPolicy {
+                mode: "off".into(),
+                allow: vec![],
+            }),
+            ..Default::default()
+        })
+        .protocols;
+        assert_eq!(g.stopped("gre", &s), None);
     }
     #[test]
     fn only_segments_of_an_open_connection_are_mid_connection() {
@@ -689,16 +640,17 @@ mod tests {
     #[test]
     fn the_ack_guard_engages_over_its_threshold_and_holds() {
         let mut g = AckGuard::default();
+        let s = settings(Program::default()).ack;
         let p: Key = "203.0.113.0/24".into();
-        assert!(!g.engaged_by(&p, 4000, 1_000));
-        assert!(!g.engaged_by(&p, 1000, 1_500));
-        assert!(g.engaged_by(&p, 1, 1_900));
+        assert!(!g.engaged_by(&p, 4000, &s, 1_000));
+        assert!(!g.engaged_by(&p, 1000, &s, 1_500));
+        assert!(g.engaged_by(&p, 1, &s, 1_900));
         // Quiet again, it holds for a minute after the last second over.
-        assert!(g.engaged_by(&p, 1, 2_100));
+        assert!(g.engaged_by(&p, 1, &s, 2_100));
         assert!(g.engaged(&p, 1_900 + ACK_HOLD - 1));
         assert!(!g.engaged(&p, 1_900 + ACK_HOLD));
         assert!(!g.engaged("198.51.100.0/24", 1_900));
-        g.load(None, &|_| false);
+        g.load(&|_| false);
         assert!(
             !g.engaged(&p, 2_000),
             "a prefix no longer in the program is forgotten"
@@ -720,18 +672,18 @@ mod tests {
     fn a_retry_is_a_syn_on_the_same_connection_a_second_or_more_later() {
         let mut g = SynGuard::default();
         let first = syn("192.0.2.1", 50_000);
-        assert!(!g.retried(&first, 10_000));
+        assert!(!g.retried(&first, 4, 10_000));
         // Within the same second is no retry; one to four seconds later is.
-        assert!(!g.retried(&first, 10_900));
-        assert!(g.retried(&first, 11_000));
-        assert!(g.retried(&first, 14_999));
+        assert!(!g.retried(&first, 4, 10_900));
+        assert!(g.retried(&first, 4, 11_000));
+        assert!(g.retried(&first, 4, 14_999));
         // Another port, or another source, is another connection.
-        assert!(!g.retried(&syn("192.0.2.1", 50_001), 11_000));
-        assert!(!g.retried(&syn("192.0.2.2", 50_000), 11_000));
+        assert!(!g.retried(&syn("192.0.2.1", 50_001), 4, 11_000));
+        assert!(!g.retried(&syn("192.0.2.2", 50_000), 4, 11_000));
         // Five seconds on, the first second's record is gone.
         let lone = syn("192.0.2.3", 1);
-        assert!(!g.retried(&lone, 20_000));
-        assert!(!g.retried(&lone, 25_000));
+        assert!(!g.retried(&lone, 4, 20_000));
+        assert!(!g.retried(&lone, 4, 25_000));
         assert_eq!(g.bytes(), SYN_BITS / 8 * SYN_SECONDS);
         // A forged flood from a fresh source each time finds no retry among its own, or almost
         // none: the bits are set by a keyed hash of each connection.
@@ -741,7 +693,7 @@ mod tests {
                 &format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255),
                 1024 + i64::from(i % 60_000),
             );
-            passed += u32::from(g.retried(&f, 30_000 + i64::from(i) / 50));
+            passed += u32::from(g.retried(&f, 4, 30_000 + i64::from(i) / 50));
         }
         assert!(
             passed < 100,
@@ -751,12 +703,16 @@ mod tests {
     #[test]
     fn icmp_is_held_to_a_limit_and_echo_replies_to_what_was_asked() {
         let mut g = IcmpGuard::default();
+        let s = settings(Program::default()).icmp;
         let a: Key = "203.0.113.0/24".into();
-        assert!(!g.over_limit(&a, ICMP_LIMIT_PPS, 1_000));
-        assert!(g.over_limit(&a, 1, 1_500));
-        assert!(!g.over_limit(&a, 1, 2_000), "a new second starts over");
-        assert!(!g.smurfed_by(&a, SMURF_PPS, 1_000));
-        assert!(g.smurfed_by(&a, 1, 1_001));
+        assert!(!g.over_limit(&a, ICMP_LIMIT_PPS, s.limit_pps, 1_000));
+        assert!(g.over_limit(&a, 1, s.limit_pps, 1_500));
+        assert!(
+            !g.over_limit(&a, 1, s.limit_pps, 2_000),
+            "a new second starts over"
+        );
+        assert!(!g.smurfed_by(&a, SMURF_PPS, &s, 1_000));
+        assert!(g.smurfed_by(&a, 1, &s, 1_001));
         assert!(g.smurfed(&a, 1_001 + SMURF_HOLD - 1));
         assert!(!g.smurfed(&a, 1_001 + SMURF_HOLD));
     }

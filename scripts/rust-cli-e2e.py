@@ -82,6 +82,10 @@ with tempfile.TemporaryFile() as log:
         ctl("apply", "configs/policy.demo.json")
         ctl("policies")
         ctl("deploy", "managed-protection")
+        assert "syn_flood.hold_seconds" in ctl("settings")
+        resolved = json.loads(ctl("settings", "managed-protection"))
+        assert resolved["policy_id"] == "managed-protection", resolved
+        assert resolved["policy"]["syn_flood"]["engage_pps"] > 0, resolved
         ctl("fabric")
         assert "PREFIX" in ctl("bgp")
         ctl("ml-load", "configs/ml.samples.json")
@@ -113,7 +117,7 @@ with tempfile.TemporaryFile() as log:
             }))
             decision = json.loads(ctl("decide", node["node"]["id"], str(flow)))
             assert "action" in decision, decision
-        print("All 16 Rust scrubctl commands succeeded against the Rust API")
+        print("All 17 Rust scrubctl commands succeeded against the Rust API")
     finally:
         api.terminate()
         api.wait(timeout=10)

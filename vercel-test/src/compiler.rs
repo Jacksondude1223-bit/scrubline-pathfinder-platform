@@ -661,6 +661,12 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                 syn_flood: p.syn_flood.clone(),
                 fragments: p.fragments.clone(),
                 icmp: p.icmp.clone(),
+                aggregation: p.aggregation.clone(),
+                pulse: p.pulse.clone(),
+                mitigation: p.mitigation.clone(),
+                sensitivity: p.sensitivity.clone(),
+                profiles: p.profiles.clone(),
+                lists: p.lists.clone(),
                 tunnels: tunnels_with(&idx, n, &prefixes),
                 backhaul: backhaul_with(&idx, nodes, n, &prefixes),
                 pinned: pinned_at(&idx, n),
@@ -679,16 +685,7 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                         action: r.action.clone(),
                         r#match: r.r#match.clone(),
                         rule_id: r.id.clone(),
-                        tcam_key: format!(
-                            "{} src={} dst={} proto={} dport={} sport={} pri={}",
-                            family(&r.r#match),
-                            or_any(&r.r#match.src_cidr),
-                            or_any(&r.r#match.dst_cidr),
-                            or_any(&r.r#match.proto),
-                            r.r#match.dport,
-                            r.r#match.sport,
-                            r.priority
-                        ),
+                        tcam_key: tcam_key(r),
                     }),
                     "fpga" => prog.fpga.push(FPGAEntry {
                         table: "scrub_meter".into(),
@@ -718,6 +715,74 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
         .collect();
     share_rates(&mut programs, nodes);
     programs
+}
+/// The key a switch installs a rule under: its five-tuple, then whatever else of the headers it
+/// matches, each only when the rule sets it.
+fn tcam_key(r: &Rule) -> String {
+    let m = &r.r#match;
+    let mut key = format!(
+        "{} src={} dst={} proto={} dport={} sport={} pri={}",
+        family(m),
+        or_any(&m.src_cidr),
+        or_any(&m.dst_cidr),
+        or_any(&m.proto),
+        m.dport,
+        m.sport,
+        r.priority
+    );
+    let range = |lo: i64, hi: i64| {
+        let end = |v: i64| {
+            if v == 0 {
+                "*".to_string()
+            } else {
+                v.to_string()
+            }
+        };
+        format!("{}-{}", end(lo), end(hi))
+    };
+    let mut add = |part: String| {
+        key.push(' ');
+        key.push_str(&part);
+    };
+    if m.dport_to != 0 {
+        add(format!("dport_to={}", m.dport_to));
+    }
+    if m.sport_to != 0 {
+        add(format!("sport_to={}", m.sport_to));
+    }
+    if m.length_min != 0 || m.length_max != 0 {
+        add(format!("len={}", range(m.length_min, m.length_max)));
+    }
+    if m.ttl_min != 0 || m.ttl_max != 0 {
+        add(format!("ttl={}", range(m.ttl_min, m.ttl_max)));
+    }
+    if let Some(d) = m.dscp {
+        add(format!("dscp={d}"));
+    }
+    if let Some(t) = m.icmp_type {
+        add(match m.icmp_code {
+            Some(c) => format!("icmp={t}/{c}"),
+            None => format!("icmp={t}"),
+        });
+    }
+    if !m.fragment.is_empty() {
+        add(format!("frag={}", m.fragment));
+    }
+    // A switch holds a list as one entry for each of its prefixes.
+    if !m.src_list.is_empty() {
+        add(format!("src_list={}", m.src_list));
+    }
+    if !m.dst_list.is_empty() {
+        add(format!("dst_list={}", m.dst_list));
+    }
+    // Installed only while the destination's prefix is under attack.
+    if m.attack_pps != 0 {
+        add(format!("attack_pps={}", m.attack_pps));
+    }
+    if m.attack_mbps != 0 {
+        add(format!("attack_mbps={}", m.attack_mbps));
+    }
+    key
 }
 /// The TCAM table a rule belongs in: v4 or v6 by the addresses it matches, and any for a rule
 /// matching none, which a switch has to install in both.

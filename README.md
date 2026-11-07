@@ -1015,7 +1015,10 @@ A flood spread across many addresses keeps each one under any threshold, which
 a carpet-bombing or spread-spectrum attack counts on. So the guards judge
 floods over an aggregate rather than each protected prefix alone: a prefix
 narrower than a /24, or a /48 for IPv6, is judged with the rest of its /24 or
-/48. Twenty game servers protected as twenty /32s engage together.
+/48. Twenty game servers protected as twenty /32s engage together. The widths
+are `aggregation.v4` and `aggregation.v6`, and a [profile](#profiles)'s addresses
+are judged together apart from the rest (see
+[Tuning every setting](#tuning-every-setting)).
 
 ### Rolling them out
 
@@ -1104,6 +1107,285 @@ back from doing more harm than it must:
 
 When one gets through anyway, mark it `known_good` among the samples and
 retrain: no model that would drop it again can be published.
+
+## Tuning every setting
+
+Every number, mode and list a node judges traffic by is a setting a policy can
+set: each guard's thresholds, holds and mode, single crafted-packet checks and
+reflection vectors, how widely floods are judged, the penalty box, return-traffic
+confirmation, burst detection, how long on-demand mitigation holds, the
+classifiers' probing, and each game filter's sessions, HTTP limits and
+slow-request timing. Each has a default, which is what a setting left unset
+takes, so a policy names only what it changes.
+
+The settings live in one catalog, [`src/tuning.rs`](src/tuning.rs): where each
+sits in a policy, what it takes, its default, bounds and unit, and what it does.
+Validation holds a policy to it, the nodes take their defaults from it, and the
+API serves it, so none of them can drift from the others:
+
+```console
+$ curl -H "Authorization: Bearer $OP" $API/v1/settings
+{"settings":[{"about":"How readily the flood guards engage: medium multiplies every flood threshold left unset by 4, low by 16.","default":"high","options":["high","medium","low"],"path":"sensitivity","profile":true,"type":"choice"}, ...]}
+$ scrubctl settings
+SETTING                             DEFAULT    TAKES                                                         PROFILE
+sensitivity                         high       high | medium | low                                           yes
+...
+syn_flood.hold_seconds              60         0..86400 seconds                                              yes
+...
+rules[].action                      drop       drop | permit | rate_limit | shape | inspect | count          -
+```
+
+A key that is neither a setting nor a field of the policy, a game filter or a
+rule is refused, so a mistyped name cannot leave the setting it meant, or a
+whole section of them, at its default without a word:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $OP" $API/v1/policies \
+    -d '{"name":"edge","protected":["203.0.113.0/24"],"syn_flood":{"hold_secnods":30}}'
+{"error":"syn_flood.hold_secnods is not a setting; syn_flood takes engage_pps, hold_seconds, mode, retries_pps, retry_within_seconds"}
+```
+
+[`configs/policy.reference.json`](configs/policy.reference.json) writes out every
+setting at its default, with example rules, game filters, lists, a profile and a
+vector of your own. A test holds it to the catalog: every setting in it, every
+default as the catalog states it, and the defaults written out resolving
+exactly as leaving them unset does.
+
+### When to filter
+
+Most guards act only while what they count is over a threshold, and then for a
+while after:
+
+- **Thresholds.** `syn_flood.engage_pps`, `ack_flood.engage_pps`,
+  `icmp.limit_pps`, `icmp.smurf_pps` and `reflection.engage_pps` say how much an
+  aggregate takes a second before its guard engages.
+- **Holds.** Each guard's `hold_seconds` says how long it stays engaged after
+  the last second over.
+- **Sensitivity.** `"sensitivity": "medium"` multiplies every flood threshold the
+  policy leaves unset by 4, and `"low"` by 16; `"high"`, the default, keeps them.
+  A threshold the policy sets is taken as set.
+- **Width.** `aggregation.v4` and `aggregation.v6` (24 and 48) say how wide the
+  aggregate a flood is judged over is. At 32 and 128 every protected address is
+  judged alone.
+- **Only under attack.** A rule with `attack_pps` or `attack_mbps` in its match
+  applies only while the destination's protected prefix takes at least that
+  much, over the last second: a rule that would be too strict in peacetime can
+  wait for an attack.
+- **Modes.** Every guard takes `enforce`, `observe` or `off`, and so does each
+  crafted-packet check (`crafted.checks`), each reflection vector
+  (`reflection.vectors`) and each game filter's slow-request timing
+  (`games[].http.slow.mode`). Observing counts what would be dropped and drops
+  nothing.
+
+### Profiles
+
+A profile holds some of the protected addresses to settings of their own, as a
+hostgroup does: a busy web server that takes 20,000 SYNs a second, a lobby that
+should answer no pings.
+
+```json
+"profiles": [
+  {"name": "web", "prefixes": ["203.0.113.20/32"],
+   "syn_flood": {"engage_pps": 20000}},
+  {"name": "lobby", "prefixes": ["203.0.113.32/27"], "sensitivity": "low",
+   "icmp": {"drop_types": [8]}, "reflection": {"vectors": {"dns": "observe"}}}
+]
+```
+
+A profile sets the guards' sections (`crafted`, `reflection`, `protocols`,
+`ack_flood`, `syn_flood`, `fragments`, `icmp`) and the `sensitivity`. What it
+leaves unset is the policy's, and what both leave unset is the default. An
+address takes the most specific profile that holds it. A profile's addresses
+are judged for floods together and apart from the rest of the policy's, so a
+flood its neighbours take holds no guard engaged for them, and one they take
+engages only their own. Its prefixes must lie within the protected ones, and no
+prefix may be in two profiles. A policy holds at most 64 profiles, with 1024
+prefixes between them.
+
+### Rules on every header
+
+A rule's `match` takes the five-tuple and TCP flags as it always has, and:
+
+| Field | Matches |
+|---|---|
+| `dport_to`, `sport_to` | a range of ports from `dport` or `sport` |
+| `length_min`, `length_max` | the IP packet's length, header and all |
+| `ttl_min`, `ttl_max` | its TTL or hop limit |
+| `dscp` | the DSCP code point it is marked with |
+| `icmp_type`, `icmp_code` | an ICMP or ICMPv6 type and code; `proto` must be `icmp` |
+| `fragment` | `yes` for fragments alone, `no` for whole packets alone |
+| `payload_hex` at `payload_offset` | bytes the payload holds where it says, up to 64 |
+| `payload_contains` | bytes the payload holds anywhere, up to 64 |
+| `src_list`, `dst_list` | a list of the policy's, by name |
+| `attack_pps`, `attack_mbps` | only while the destination's prefix is under attack |
+
+Payloads are matched at the fpga and zc stages; the asic stage matches headers
+alone. A switch installs a rule's header fields with its five-tuple, which its
+`tcam_key` shows. Besides `rate_limit`, which holds each source to `pps`, a
+`shape` rule holds everything it matches, from every source together, to
+`pps`, at the fpga or zc stage:
+
+```json
+{"id": "pings", "stage": "fpga", "action": "shape", "pps": 2000,
+ "match": {"proto": "icmp", "icmp_type": 8}}
+```
+
+### Lists
+
+`lists` names lists of prefixes for rules to match against, so a set of
+addresses is written once:
+
+```json
+"lists": {"office": ["198.51.100.0/24", "2001:db8:ffff::/48"],
+          "servers": ["203.0.113.10/32", "203.0.113.20/32"]},
+"rules": [{"id": "office", "stage": "asic", "action": "permit",
+           "match": {"src_list": "office", "dst_list": "servers"}}]
+```
+
+A policy holds at most 64 lists with 4096 prefixes between them.
+
+### What a policy resolves to
+
+`GET /v1/policies/{id}/settings`, or `scrubctl settings <id>`, answers every
+setting a saved policy resolves to, the policy's and each profile's, as its
+nodes resolve them: what it sets, the defaults for the rest, and thresholds
+scaled by their sensitivity. Times are in seconds.
+
+```console
+$ scrubctl settings edge
+{"policy":{...,"icmp":{"drop_types":[],"drop_types_v6":[],"errors":"verify","hold_seconds":60.0,"limit_pps":1000,"mode":"enforce","smurf_pps":1000},...},"policy_id":"edge",
+ "profiles":[{...,"icmp":{"drop_types":[8],"drop_types_v6":[],"errors":"verify","hold_seconds":60.0,"limit_pps":16000,"mode":"enforce","smurf_pps":16000},"name":"lobby","prefixes":["203.0.113.32/27"],...,"sensitivity":"low",...}],"version":1}
+```
+
+### Every setting
+
+`[]` marks a list whose every item takes the setting. A setting marked for
+profiles can also be set in one.
+
+| Setting | Default | Takes | What it does | Profile |
+|---|---|---|---|---|
+| `sensitivity` | `high` | `high`, `medium`, `low` | How readily the flood guards engage: medium multiplies every flood threshold left unset by 4, low by 16. | yes |
+| `pulse_floor_pps` | 10000 | 0 to 1000000000 pps; 0 for the default | The least a quarter second's traffic must reach to count toward a burst. |  |
+| `lists` | - | lists of CIDRs, by name | Named lists of addresses that rules match their sources or destinations against (src_list, dst_list). |  |
+| `crafted.mode` | `enforce` | `enforce`, `observe`, `off` | What the crafted-packet checks do: drop, count only, or not look. | yes |
+| `crafted.checks` | - | check name to enforce, observe or off | Modes for single checks (land, tcp_flags, martian_source, source_route, low_mss, fragment_overlap, ip_header, ip_options, extension_headers, tcp_header, udp_header, icmp, port_zero, fragment, length, oversize, tiny_fragment), over crafted.mode. | yes |
+| `crafted.low_mss` | 500 | 0 to 1460 bytes | The largest MSS a SYN may offer and still be dropped as SACK Panic's shape; 0 drops none for it. | yes |
+| `crafted.min_fragment` | 256 | 8 to 1480 bytes | The smallest fragment short of a datagram's last that is not dropped as too small. | yes |
+| `reflection.mode` | `enforce` | `enforce`, `observe`, `off` | Every reflection vector's mode, unless reflection.vectors names its own. | yes |
+| `reflection.cldap` | `enforce` | `enforce`, `observe`, `off` | CLDAP's mode, from before the other vectors; the same as reflection.vectors.cldap. | yes |
+| `reflection.vectors` | - | vector name to enforce, observe or off | Modes for single vectors: cldap, dns, ntp, memcached, ssdp, snmp, chargen, echo, qotd, portmap, netbios, mssql, wsd, coap, mdns, ubiquiti, rip, and your own. | yes |
+| `reflection.judge` | - | vector name to always or flood | How a vector's answers the server never asked for are judged: always, however few arrive, or flood, only while the prefix is flooded with them. | yes |
+| `reflection.engage_pps` | 1000 | 0 to 1000000000 pps; 0 for the default | Answers the server never asked for, a second, past which an aggregate counts as flooded, for the vectors judged in floods. | yes |
+| `reflection.hold_seconds` | 60 | 0 to 86400 seconds | How long an aggregate counts as flooded after its last second over reflection.engage_pps. | yes |
+| `reflection.asked_within_seconds` | 30 | 1 to 3600 seconds | How recently the server must have queried an address for its answer to count as asked for. | yes |
+| `reflection.reflecting_for_seconds` | 30 | 1 to 3600 seconds | How long a source caught reflecting has the later fragments of its answers dropped. |  |
+| `reflection.custom` | - | vectors of your own | Reflection vectors the guard does not know, at most 8: each a name, the UDP port its answers come from, what they open with, and how they are judged. |  |
+| `reflection.custom[].name` | - | lowercase letters, digits and _ | The vector's name, as drops, counters and reflection.vectors name it. |  |
+| `reflection.custom[].port` | - | 1 to 65535 port | The UDP port the vector's answers come from; not one a vector the guard knows uses. |  |
+| `reflection.custom[].payload_hex` | - | up to 64 bytes in hex | What the vector's answers open with; any payload from the port when unset. |  |
+| `reflection.custom[].judge` | `always` | `always`, `flood` | How its answers the server never asked for are judged. |  |
+| `protocols.mode` | `enforce` | `enforce`, `observe`, `off` | What the protocol guard does with IP protocols a protected address does not receive. | yes |
+| `protocols.allow` | - | protocol names or numbers | Protocols every protected address receives besides TCP, UDP and ICMP: gre, esp, ah, sctp, ipip, ipv6, or a number. | yes |
+| `ack_flood.mode` | `enforce` | `enforce`, `observe`, `off` | What the ACK flood guard does. | yes |
+| `ack_flood.engage_pps` | 5000 | 0 to 1000000000 pps; 0 for the default | TCP for no connection, a second, past which an aggregate's guard engages. | yes |
+| `ack_flood.hold_seconds` | 60 | 0 to 86400 seconds | How long the guard stays engaged after the last second over ack_flood.engage_pps. | yes |
+| `ack_flood.warm_seconds` | 120 | 0 to 3600 seconds | How long the node must have watched the server's own traffic before the guard may engage. | yes |
+| `ack_flood.talked_within_seconds` | 120 | 1 to 3600 seconds | How recently the server must have sent a source TCP for the source's segments to belong to a connection. | yes |
+| `ack_flood.handshake_seconds` | 10 | 0 to 300 seconds | How long a client the server answered may take to finish its handshake. | yes |
+| `ack_flood.handshake_segments` | 4 | 0 to 1000 segments | How many segments a client the server answered may send before the server's own say the connection is open. | yes |
+| `syn_flood.mode` | `enforce` | `enforce`, `observe`, `off` | What the SYN flood guard does. | yes |
+| `syn_flood.engage_pps` | 2000 | 0 to 1000000000 pps; 0 for the default | Opening SYNs from sources the server has no connection with, a second, past which an aggregate's guard engages. | yes |
+| `syn_flood.hold_seconds` | 60 | 0 to 86400 seconds | How long the guard stays engaged after the last second over syn_flood.engage_pps. | yes |
+| `syn_flood.retry_within_seconds` | 4 | 1 to 4 seconds | How long after a SYN its connection's next one still counts as a retry. | yes |
+| `syn_flood.retries_pps` | 3 | 1 to 100 pps | The most SYNs a second one connection may send and still be a client retrying. | yes |
+| `fragments.mode` | `enforce` | `enforce`, `observe`, `off` | What the fragment guard does. | yes |
+| `fragments.protocols` | - | tcp, icmp, udp, other | Whose fragments are dropped; tcp and icmp when unset. udp drops every fragmented datagram, which some games send. | yes |
+| `icmp.mode` | `enforce` | `enforce`, `observe`, `off` | What the ICMP guard does. | yes |
+| `icmp.limit_pps` | 1000 | 0 to 1000000000 pps; 0 for the default | ICMP, echo replies aside, an aggregate takes a second before the rest is dropped. | yes |
+| `icmp.smurf_pps` | 1000 | 0 to 1000000000 pps; 0 for the default | Echo replies the server never asked for, a second, past which an aggregate counts as flooded with them. | yes |
+| `icmp.hold_seconds` | 60 | 0 to 86400 seconds | How long an aggregate counts as flooded with echo replies after its last second over. | yes |
+| `icmp.drop_types` | - | ICMP types, 0 to 255 | ICMP types dropped whatever their rate, such as 8 to answer no pings. Dropping 3, destination unreachable, breaks path MTU discovery. | yes |
+| `icmp.drop_types_v6` | - | ICMPv6 types, 0 to 255 | ICMPv6 types dropped whatever their rate, such as 128 to answer no pings. Dropping 2, packet too big, breaks path MTU discovery. | yes |
+| `icmp.errors` | `verify` | `verify`, `allow` | Whether an error that quotes no packet the prefix sent is dropped, or let through to the rate. | yes |
+| `aggregation.v4` | 24 | 0 to 32 prefix length | IPv4 prefixes narrower than this are judged for floods with the rest of the prefix of this length that holds them. |  |
+| `aggregation.v6` | 48 | 0 to 128 prefix length | IPv6 prefixes narrower than this are judged for floods with the rest of the prefix of this length that holds them. |  |
+| `reputation.fast_pass` | `challenge` | `challenge`, `egress`, `handshake`, `off` | The weakest proof that takes a source past the classifiers and the challenge: an answered challenge, confirmed return traffic, or a completed handshake. |  |
+| `reputation.penalty_box` | false | `true`, `false` | Whether sources that keep breaking the rules are boxed. |  |
+| `reputation.trust_seconds` | 300 | 1 to 86400 seconds | How long a proof keeps a source trusted. |  |
+| `reputation.strikes` | 4 | 1 to 1000 strikes | How many strikes within reputation.strike_window_seconds box a source. |  |
+| `reputation.strike_window_seconds` | 30 | 1 to 3600 seconds | How long strikes count toward the box. |  |
+| `reputation.penalty_seconds` | - | 1 to 8 durations in seconds | Each sentence in the box in turn, the last repeating; 60, 600 and 3600 when unset. |  |
+| `reputation.forgive_seconds` | 3600 | 1 to 604800 seconds | How long a source must stay clean for its next sentence to drop back a step. |  |
+| `egress.lockdown` | `off` | `off`, `limit`, `drop` | What happens to unconfirmed sources while a prefix is under attack. |  |
+| `egress.lockdown_pps` | 500 | 0 to 1000000000 pps; 0 for the default | What an unconfirmed source may send a second while lockdown limits it. |  |
+| `egress.grace_millis` | 500 | 0 to 600000 milliseconds; 0 for the default | How long a new source passes lockdown before it must be confirmed. |  |
+| `egress.confirm_packets` | 10 | 1 to 100000 packets | Packets the origin must send a client to confirm it. |  |
+| `egress.confirm_ticks` | 3 | 1 to 40 quarter seconds | Quarter seconds those packets must spread over. |  |
+| `egress.confirm_window_seconds` | 10 | 1 to 300 seconds | How long the packets and quarter seconds have to add up. |  |
+| `egress.confirmed_seconds` | 120 | 1 to 86400 seconds | How long a confirmation lasts. |  |
+| `egress.visible_seconds` | 30 | 1 to 3600 seconds | How recently the origin's traffic must have been seen for its return path to count as visible. |  |
+| `pulse.crest` | 4 | 1 to 1000 | How many times its mean a prefix's peak must reach to be shaped like a burst attack. |  |
+| `pulse.duty` | 0.5 | 0.01 to 1 | The most of the last minute's quarter seconds a burst attack's traffic may fill. |  |
+| `pulse.bursts` | 3 | 1 to 240 bursts | How many bursts in the last minute make a prefix pulsing. |  |
+| `pulse.latch_seconds` | 300 | 0 to 86400 seconds | How long a prefix is held as pulsing after the shape was last seen. |  |
+| `mitigation.hold_seconds` | 300 | 0 to 86400 seconds | How long an on-demand tunnel's first wave of mitigation lasts after its traffic falls under its thresholds; each later wave of the same attack holds twice as long. |  |
+| `mitigation.campaign_seconds` | 3600 | 0 to 86400 seconds | How soon after the last a wave must start to be part of the same attack. |  |
+| `mitigation.hold_max_seconds` | 3600 | 0 to 86400 seconds | The longest any wave's mitigation holds. |  |
+| `ml.scope` | `all` | `all`, `inspect` | Where the classifiers judge traffic: everything the stages let through, or only what zc inspect rules send them. |  |
+| `ml.mode` | `enforce` | `enforce`, `observe` | Whether the classifiers drop what they score at their threshold. |  |
+| `ml.probing` | `tighten` | `tighten`, `ignore` | Whether probing lowers a target's thresholds for a while. |  |
+| `ml.probe_hold_seconds` | 300 | 1 to 86400 seconds | How long a step of tightening holds after the probing that set it. |  |
+| `ml.probe_min` | 20 | 1 to 100000 near misses | Near misses in ten seconds, a quarter of what was scored, that make a target probed. |  |
+| `games[].idle_seconds` | 120 | 1 to 86400 seconds | How long a player that cleared a filter's gate stays admitted after its last packet. |  |
+| `games[].http.ports` | - | ports | TCP ports the HTTP rules judge; the filter's own when unset. |  |
+| `games[].http.methods` | - | methods | Methods allowed; GET, HEAD and POST when unset. |  |
+| `games[].http.user_agents` | - | prefixes | Prefixes one of which a request's User-Agent must start with. |  |
+| `games[].http.rate_per_source` | 0 | 0 to 1000000000 requests a second | Requests a second one source may make; no limit at 0. |  |
+| `games[].http.rate_total` | 0 | 0 to 1000000000 requests a second | Requests a second from everyone together, past which only verified sources pass; no budget at 0. |  |
+| `games[].http.max_body_bytes` | 0 | 0 to 1000000000000 bytes | The largest body a request may declare; no limit at 0. |  |
+| `games[].http.default` | `allow` | `allow`, `drop` | What a path no rule names gets. |  |
+| `games[].http.paths` | - | path rules | Rules for single paths or prefixes. |  |
+| `games[].http.pipelined_max` | 64 | 1 to 1024 requests | The most requests one segment may pipeline. |  |
+| `games[].http.line_max` | 8192 | 256 to 65536 bytes | The longest request or header line. |  |
+| `games[].http.headers_max` | 100 | 1 to 1000 lines | The most header lines a request may carry. |  |
+| `games[].http.split_bytes` | 512 | 0 to 65536 bytes | A segment shorter than this that ends inside a request line is dropped as split on purpose. |  |
+| `games[].http.tls` | `count` | `count`, `ignore` | Whether each TLS ClientHello counts against the rates as a request. |  |
+| `games[].http.slow.mode` | `enforce` | `enforce`, `observe`, `off` | What happens to a request that arrives too slowly. |  |
+| `games[].http.slow.head_seconds` | 20 | 1 to 3600 seconds | How long a head may take, one more second for every min_rate bytes of it. |  |
+| `games[].http.slow.head_seconds_max` | 40 | 1 to 3600 seconds | The longest a head may take however fast it arrives. |  |
+| `games[].http.slow.body_seconds` | 20 | 1 to 3600 seconds | How long a body may take, one more second for every min_rate bytes of it. |  |
+| `games[].http.slow.min_rate` | 500 | 0 to 1000000000 bytes a second | The bytes that buy a request one more second. |  |
+| `games[].http.slow.window_min` | 64 | 0 to 65535 bytes | The window, as a segment writes it, under which a client is not reading. |  |
+| `games[].http.slow.starved_seconds` | 30 | 1 to 3600 seconds | How long a client may keep its window under window_min. |  |
+| `games[].http.slow.incomplete_max` | 32 | 1 to 65535 requests | The most requests one source may leave incomplete at once. |  |
+| `rules[].stage` | `asic` | `asic`, `fpga`, `zc` | Where the rule runs. |  |
+| `rules[].action` | `drop` | `drop`, `permit`, `rate_limit`, `shape`, `inspect`, `count` | What the rule does: shape holds everything it matches, from every source together, to pps. |  |
+| `rules[].pps` | 0 | 0 to 1000000000 pps | The rate a rate_limit, shape, inspect or fpga meter holds to. |  |
+| `rules[].match.src_cidr` | - | a CIDR | The source's prefix. |  |
+| `rules[].match.dst_cidr` | - | a CIDR | The destination's prefix. |  |
+| `rules[].match.proto` | `any` | `any`, `tcp`, `udp`, `icmp`, `gre`, `esp`, `ah`, `sctp`, `ipip`, `ipv6` | The IP protocol. |  |
+| `rules[].match.dport` | 0 | 0 to 65535 port | The destination port, or the first of a range. |  |
+| `rules[].match.dport_to` | 0 | 0 to 65535 port | The last destination port of a range from dport. |  |
+| `rules[].match.sport` | 0 | 0 to 65535 port | The source port, or the first of a range. |  |
+| `rules[].match.sport_to` | 0 | 0 to 65535 port | The last source port of a range from sport. |  |
+| `rules[].match.tcp_flags` | - | flag names joined by , | or + | TCP flags, compared as a set: syn, ack, fin, rst, psh, urg, ece, cwr, ns, or none. |  |
+| `rules[].match.length_min` | 0 | 0 to 65535 bytes | The shortest IP packet, header and all. |  |
+| `rules[].match.length_max` | 0 | 0 to 65535 bytes | The longest IP packet, header and all. |  |
+| `rules[].match.ttl_min` | 0 | 0 to 255 hops | The lowest TTL or hop limit. |  |
+| `rules[].match.ttl_max` | 0 | 0 to 255 hops | The highest TTL or hop limit. |  |
+| `rules[].match.dscp` | - | 0 to 63 code point | The DSCP code point the packet is marked with; any when unset. |  |
+| `rules[].match.icmp_type` | - | 0 to 255 type | An ICMP or ICMPv6 type; any when unset. |  |
+| `rules[].match.icmp_code` | - | 0 to 255 code | An ICMP or ICMPv6 code; any when unset. |  |
+| `rules[].match.fragment` | - | `yes`, `no` | yes for fragments only, no for whole packets only. |  |
+| `rules[].match.payload_hex` | - | up to 64 bytes in hex | Bytes the payload holds at payload_offset. |  |
+| `rules[].match.payload_offset` | 0 | 0 to 1500 bytes | Where in the payload payload_hex sits. |  |
+| `rules[].match.payload_contains` | - | up to 64 bytes in hex | Bytes the payload holds anywhere. |  |
+| `rules[].match.src_list` | - | a list's name | A list the source is in. |  |
+| `rules[].match.dst_list` | - | a list's name | A list the destination is in. |  |
+| `rules[].match.attack_pps` | 0 | 0 to 1000000000 pps | Match only while the destination's protected prefix takes at least this many packets a second. |  |
+| `rules[].match.attack_mbps` | 0 | 0 to 10000000 Mbps | Match only while the destination's protected prefix takes at least this many megabits a second. |  |
+| `profiles[].name` | - | a name | The profile's name. |  |
+| `profiles[].prefixes` | - | CIDRs within the protected prefixes | The addresses the profile's settings hold for; a protected address takes the most specific. |  |
 
 ## Run
 
@@ -1214,7 +1496,8 @@ What it is built to hold:
 
 - a fabric of **128 nodes**;
 - **32 policies**, each of up to **1024 protected prefixes, 1024 rules, 1024
-  tunnels, 256 game filters and 256 BGP sessions**;
+  tunnels, 256 game filters and 256 BGP sessions**, and **64 profiles holding
+  1024 prefixes and 64 lists holding 4096** between them;
 - **4096 tenants** with 16384 prefixes between them;
 - a training set of **200000 samples** with 64 MiB of payloads and packets.
 
@@ -1226,8 +1509,8 @@ At those bounds, as the allocator counts it:
 
 | Part | Holds at the most | Of which |
 | --- | --- | --- |
-| Node agent | 289 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables, 16384 connections with a request still arriving, and the SYN flood guard's five seconds of SYNs): 92 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
-| Control plane, 128 nodes | 3.0 GiB | programs and the plan 205 MiB, node and tunnel reports 64 MiB, a day of analytics 922 MiB, policies, training set and tenants 140 MiB; writing the state out 332 MiB; metrics scrapes, four at a time, 26 MiB; the largest answer still being sent, the whole fabric, 109 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
+| Node agent | 292 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables, 16384 connections with a request still arriving, and the SYN flood guard's five seconds of SYNs): 94 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
+| Control plane, 128 nodes | 3.5 GiB | programs and the plan 384 MiB, node and tunnel reports 84 MiB, a day of analytics 922 MiB, policies, training set and tenants 188 MiB; writing the state out 568 MiB; metrics scrapes, four at a time, 37 MiB; the largest answer still being sent, the whole fabric, 164 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
 
 Each part grows with what the policy holds multiplied by the nodes: every node
 is compiled the whole policy and reports counters for every prefix, rule,

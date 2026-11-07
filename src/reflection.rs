@@ -18,6 +18,7 @@
 use crate::{
     guards::{Engagement, Key},
     model::{Flow, ReflectionPolicy},
+    tuning::{self, Custom, Mode},
 };
 use serde_json::{json, Value};
 use std::{collections::HashMap, net::IpAddr};
@@ -340,8 +341,11 @@ fn rip_query(p: &[u8]) -> bool {
     p.len() >= 4 && p[0] == 1 && matches!(p[1], 1 | 2)
 }
 
-/// How many vectors the guard knows.
+/// How many vectors the guard knows, how many of an operator's own a policy may add, and so how
+/// many any table of vectors holds.
 pub const VECTORS_LEN: usize = 17;
+pub const CUSTOM_MAX: usize = 8;
+pub const VECTORS_MAX: usize = VECTORS_LEN + CUSTOM_MAX;
 /// Every vector, CLDAP first.
 pub const VECTORS: [Vector; VECTORS_LEN] = [
     Vector {
@@ -518,27 +522,22 @@ pub fn mode_of(policy: Option<&ReflectionPolicy>, name: &str) -> &'static str {
 
 /// What the guard knows and has done.
 pub struct Guard {
-    /// Each vector's mode, in VECTORS order: "enforce", "observe" or "off".
-    pub modes: [&'static str; VECTORS_LEN],
-    pub engage_pps: u64,
-    /// Per vector: answers dropped, answers observed, answers let through because the origin had
-    /// asked, and later fragments dropped.
-    pub counts: [[u64; 4]; VECTORS_LEN],
+    /// Per vector, the guard's own then the operator's: answers dropped, answers observed,
+    /// answers let through because the origin had asked, and later fragments dropped.
+    pub counts: [[u64; 4]; VECTORS_MAX],
     /// The sources caught reflecting, when each last was, and the vector it was caught at.
     sources: HashMap<IpAddr, (i64, u8)>,
     /// Sources not remembered because the table was full of ones still reflecting.
     pub untracked: u64,
     last_sweep: i64,
-    /// Which aggregates are flooded with answers they did not ask for, per vector the server
-    /// asks itself.
+    /// Which aggregates are flooded with answers they did not ask for, per vector judged in
+    /// floods.
     floods: Engagement<(Key, usize)>,
 }
 impl Default for Guard {
     fn default() -> Self {
         Self {
-            modes: ["enforce"; VECTORS_LEN],
-            engage_pps: ENGAGE_PPS,
-            counts: [[0; 4]; VECTORS_LEN],
+            counts: [[0; 4]; VECTORS_MAX],
             sources: HashMap::new(),
             untracked: 0,
             last_sweep: 0,
@@ -553,66 +552,90 @@ pub enum Seen {
     Not,
     /// An answer of the vector at this index: UDP from its port that opens as one of its answers
     /// when its payload is there to read. How it is judged, and what it is, which a record
-    /// without its payload cannot say.
+    /// without its payload, and an operator's vector, cannot say.
     Answer(usize, Kind, Option<&'static str>),
     /// A fragment after the first, from a source caught reflecting the vector at this index.
     Fragment(usize),
 }
-impl Guard {
-    pub fn load(&mut self, policy: Option<&ReflectionPolicy>, live: &dyn Fn(&str) -> bool) {
-        for (i, v) in VECTORS.iter().enumerate() {
-            self.modes[i] = mode_of(policy, v.name);
+/// A vector's name, what its answers are called, and its port: one of the guard's own, or past
+/// them one of the operator's.
+pub fn about(i: usize, custom: &[Custom]) -> (&str, &str, u16) {
+    match VECTORS.get(i) {
+        Some(v) => (v.name, v.label, v.port),
+        None => {
+            let c = &custom[i - VECTORS_LEN];
+            (&c.name, &c.name, c.port)
         }
-        self.engage_pps = policy
-            .map(|p| p.engage_pps)
-            .filter(|&p| p > 0)
-            .map_or(ENGAGE_PPS, |p| p as u64);
+    }
+}
+impl Guard {
+    /// Forgets the aggregates no longer in the program.
+    pub fn load(&mut self, live: &dyn Fn(&str) -> bool) {
         self.floods.retain(|(aggregate, _)| live(aggregate));
     }
     /// What the flow is, by its port and payload, or for a fragment after the first, which
     /// carries neither, by its source. `later_fragment` is asked only for a flow that could be
     /// one, since telling takes reading the packet.
-    pub fn seen(&self, f: &Flow, now: i64, later_fragment: impl FnOnce() -> bool) -> Seen {
+    pub fn seen(
+        &self,
+        f: &Flow,
+        now: i64,
+        s: &tuning::Reflection,
+        custom: &[Custom],
+        reflecting_for: i64,
+        later_fragment: impl FnOnce() -> bool,
+    ) -> Seen {
         if !f.proto.eq_ignore_ascii_case("udp") {
             return Seen::Not;
         }
+        let mode = |i: usize| s.modes.get(i).copied().unwrap_or_default();
         if let Some(i) = VECTORS.iter().position(|v| i64::from(v.port) == f.sport) {
-            if self.modes[i] == "off" {
+            if mode(i) == Mode::Off {
                 return Seen::Not;
             }
             let v = &VECTORS[i];
+            let kind = |k: Kind| s.kinds.get(i).copied().flatten().unwrap_or(k);
             // A payload that does not open as one of the vector's answers is not one: a player
             // whose NAT happened to map them to its port, say. A record without its payload has
             // only the port to go by.
             if !f.has_payload {
-                return Seen::Answer(i, v.bare, None);
+                return Seen::Answer(i, kind(v.bare), None);
             }
             return match (v.answer)(&f.payload) {
-                Some((kind, what)) => Seen::Answer(i, kind, Some(what)),
+                Some((k, what)) => Seen::Answer(i, kind(k), Some(what)),
                 None => Seen::Not,
             };
         }
+        if let Some(j) = custom.iter().position(|c| i64::from(c.port) == f.sport) {
+            let i = VECTORS_LEN + j;
+            let c = &custom[j];
+            if mode(i) == Mode::Off || f.has_payload && !f.payload.starts_with(&c.prefix) {
+                return Seen::Not;
+            }
+            let kind = s.kinds.get(i).copied().flatten().unwrap_or(c.kind);
+            return Seen::Answer(i, kind, None);
+        }
         if f.sport == 0 && !f.packet.is_empty() {
-            if let Some(i) = self.reflecting(&f.src_ip, now) {
-                if self.modes[i] != "off" && later_fragment() {
+            if let Some(i) = self.reflecting(&f.src_ip, now, reflecting_for) {
+                if mode(i) != Mode::Off && later_fragment() {
                     return Seen::Fragment(i);
                 }
             }
         }
         Seen::Not
     }
-    /// The vector a source was caught reflecting within the last REFLECTING_FOR, if one was.
-    fn reflecting(&self, src: &str, now: i64) -> Option<usize> {
+    /// The vector a source was caught reflecting within the last `reflecting_for`, if one was.
+    fn reflecting(&self, src: &str, now: i64, reflecting_for: i64) -> Option<usize> {
         src.parse::<IpAddr>()
             .ok()
             .and_then(|a| self.sources.get(&a))
-            .filter(|&&(t, _)| now - t < REFLECTING_FOR)
+            .filter(|&&(t, _)| now - t < reflecting_for)
             .map(|&(_, i)| usize::from(i))
     }
     /// Remembers a source caught reflecting a vector. A full table is swept of sources no longer
     /// reflecting at most once a second, so a flood of new sources costs the node a sweep a
     /// second rather than one each; a source that finds it full of live ones is not remembered.
-    pub fn caught(&mut self, src: &str, i: usize, now: i64) {
+    pub fn caught(&mut self, src: &str, i: usize, now: i64, reflecting_for: i64) {
         let Ok(addr) = src.parse::<IpAddr>() else {
             return;
         };
@@ -620,7 +643,7 @@ impl Guard {
             if now - self.last_sweep >= 1000 {
                 self.last_sweep = now;
                 self.sources
-                    .retain(|_, &mut (t, _)| now - t < REFLECTING_FOR);
+                    .retain(|_, &mut (t, _)| now - t < reflecting_for);
             }
             if self.sources.len() >= SOURCES_MAX {
                 self.untracked += 1;
@@ -629,31 +652,32 @@ impl Guard {
         }
         self.sources.insert(addr, (now, i as u8));
     }
-    /// Counts answers of a vector the server asks itself that it did not ask for, and says
+    /// Counts answers of a vector judged in floods that the server did not ask for, and says
     /// whether the aggregate is flooded with them: this second over the threshold, or an earlier
     /// second within the hold.
-    pub fn flooded_by(&mut self, aggregate: &Key, i: usize, pps: u64, now: i64) -> bool {
-        self.floods.engaged_by(
-            &(aggregate.clone(), i),
-            pps,
-            self.engage_pps,
-            FLOOD_HOLD,
-            now,
-        )
+    pub fn flooded_by(
+        &mut self,
+        aggregate: &Key,
+        i: usize,
+        pps: u64,
+        s: &tuning::Reflection,
+        now: i64,
+    ) -> bool {
+        self.floods
+            .engaged_by(&(aggregate.clone(), i), pps, s.engage_pps, s.hold, now)
     }
     pub fn sources(&self) -> usize {
         self.sources.len()
     }
-    pub fn stats(&self, now: i64) -> Value {
-        let vectors: Vec<_> = VECTORS
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
+    pub fn stats(&self, s: &tuning::Reflection, custom: &[Custom], now: i64) -> Value {
+        let vectors: Vec<_> = (0..VECTORS_LEN + custom.len())
+            .map(|i| {
+                let (name, _, port) = about(i, custom);
                 let [dropped, observed, asked, fragments] = self.counts[i];
                 json!({
-                    "vector": v.name,
-                    "port": v.port,
-                    "mode": self.modes[i],
+                    "vector": name,
+                    "port": port,
+                    "mode": s.modes.get(i).copied().unwrap_or_default().name(),
                     "dropped": dropped,
                     "observed": observed,
                     "asked": asked,
@@ -666,7 +690,7 @@ impl Guard {
             "sources": self.sources.len(),
             "sources_max": SOURCES_MAX,
             "sources_untracked": self.untracked,
-            "engage_pps": self.engage_pps,
+            "engage_pps": s.engage_pps,
             "vectors": vectors,
         })
     }
@@ -831,7 +855,7 @@ mod tests {
             mode: "observe".into(),
             cldap: "off".into(),
             vectors: [("dns".to_string(), "enforce".to_string())].into(),
-            engage_pps: 0,
+            ..Default::default()
         };
         assert_eq!(mode_of(Some(&p), "dns"), "enforce");
         assert_eq!(mode_of(Some(&p), "cldap"), "off");
@@ -847,21 +871,31 @@ mod tests {
         let mut g = Guard::default();
         let addr = |i: usize| format!("10.{}.{}.{}", i >> 16, (i >> 8) & 255, i & 255);
         for i in 0..SOURCES_MAX {
-            g.caught(&addr(i), 0, 1);
+            g.caught(&addr(i), 0, 1, REFLECTING_FOR);
         }
         assert_eq!(g.sources(), SOURCES_MAX);
         // Full of sources still reflecting: the new one is counted, not kept.
-        g.caught("192.0.2.1", 3, 2);
+        g.caught("192.0.2.1", 3, 2, REFLECTING_FOR);
         assert_eq!((g.sources(), g.untracked), (SOURCES_MAX, 1));
-        assert_eq!(g.reflecting(&addr(7), 2), Some(0));
-        assert_eq!(g.reflecting("192.0.2.1", 2), None);
+        assert_eq!(g.reflecting(&addr(7), 2, REFLECTING_FOR), Some(0));
+        assert_eq!(g.reflecting("192.0.2.1", 2, REFLECTING_FOR), None);
         // Once they have stopped, the sweep makes room, and a source seen again is renewed.
-        g.caught("192.0.2.1", 3, 1 + REFLECTING_FOR);
+        g.caught("192.0.2.1", 3, 1 + REFLECTING_FOR, REFLECTING_FOR);
         assert_eq!(g.sources(), 1);
-        assert_eq!(g.reflecting("192.0.2.1", REFLECTING_FOR + 2), Some(3));
-        assert_eq!(g.reflecting(&addr(7), REFLECTING_FOR + 2), None);
-        g.caught("192.0.2.1", 3, 2 * REFLECTING_FOR);
-        assert!(g.reflecting("192.0.2.1", 3 * REFLECTING_FOR - 1).is_some());
-        assert!(g.reflecting("192.0.2.1", 3 * REFLECTING_FOR).is_none());
+        assert_eq!(
+            g.reflecting("192.0.2.1", REFLECTING_FOR + 2, REFLECTING_FOR),
+            Some(3)
+        );
+        assert_eq!(
+            g.reflecting(&addr(7), REFLECTING_FOR + 2, REFLECTING_FOR),
+            None
+        );
+        g.caught("192.0.2.1", 3, 2 * REFLECTING_FOR, REFLECTING_FOR);
+        assert!(g
+            .reflecting("192.0.2.1", 3 * REFLECTING_FOR - 1, REFLECTING_FOR)
+            .is_some());
+        assert!(g
+            .reflecting("192.0.2.1", 3 * REFLECTING_FOR, REFLECTING_FOR)
+            .is_none());
     }
 }

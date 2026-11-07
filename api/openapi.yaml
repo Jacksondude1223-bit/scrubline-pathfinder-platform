@@ -537,10 +537,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/Policy'
         '400':
-          description: A field will not validate, a tunnel allocated to a customer names an unknown one
-            or carries a prefix outside theirs, or the policy holds more than every node can be compiled
-            and report on (1024 protected prefixes, 1024 rules, 256 game filters, 1024 tunnels or 256
-            sessions). The message names the offending item and why.
+          description: A field will not validate, a key of the policy, a section, a game filter or a
+            rule is neither a setting GET /v1/settings lists nor a field, a tunnel allocated to a
+            customer names an unknown one or carries a prefix outside theirs, or the policy holds
+            more than every node can be compiled and report on (1024 protected prefixes, 1024 rules,
+            256 game filters, 1024 tunnels, 256 sessions, 64 profiles holding 1024 prefixes, or 64
+            lists holding 4096). The message names the offending item and why.
           content:
             application/json:
               schema:
@@ -647,6 +649,52 @@ paths:
         The plan covers every registered node, not only the live ones: a node that stopped answering needs
         an explicit withdrawal, and one that comes back finds its program already compiled.'
       parameters: *id005
+  /v1/policies/{id}/settings:
+    get:
+      summary: Every setting a policy resolves to
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: The policy's settings and each profile's, every one of them, with the defaults
+            for what they leave unset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveSettings'
+        '404':
+          description: No such policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': *id002
+        '403': *id003
+      description: 'Resolves a saved policy''s settings as its nodes resolve them, deployed or not: what
+        it sets, the default for whatever it leaves unset, and for each profile its own settings over
+        the policy''s. Thresholds a sensitivity scales are shown scaled, and times are in seconds.'
+      parameters: *id005
+  /v1/settings:
+    get:
+      summary: Every setting a policy can tune
+      tags:
+      - Policy
+      security: *id001
+      responses:
+        '200':
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsCatalog'
+        '401': *id002
+        '403': *id003
+      description: 'The catalog validation holds a policy to and the nodes take their defaults from:
+        each setting''s place in a policy, what it takes, its default, bounds and unit, whether a profile
+        may set it, and what it does. A policy naming a key that is neither a setting nor a field of
+        the policy, a game filter or a rule is refused rather than the setting it meant left at its
+        default.'
   /v1/fabric:
     get:
       summary: The BGP announcement plan and the compiled programs
@@ -1662,6 +1710,86 @@ components:
         tcp_flags:
           type: string
           example: syn
+        dport_to:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The last destination port of a range from dport.
+        sport_to:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The last source port of a range from sport.
+        length_min:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The shortest IP packet, header and all.
+        length_max:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The longest IP packet, header and all.
+        ttl_min:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: The lowest TTL or hop limit.
+        ttl_max:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: The highest TTL or hop limit.
+        dscp:
+          type: integer
+          minimum: 0
+          maximum: 63
+          description: The DSCP code point the packet is marked with; any when unset.
+        icmp_type:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: An ICMP or ICMPv6 type; any when unset.
+        icmp_code:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: An ICMP or ICMPv6 code; any when unset.
+        fragment:
+          type: string
+          enum:
+          - 'yes'
+          - 'no'
+          description: yes for fragments only, no for whole packets only. Unset when empty.
+        payload_hex:
+          type: string
+          description: Bytes the payload holds at payload_offset.
+        payload_offset:
+          type: integer
+          minimum: 0
+          maximum: 1500
+          description: Where in the payload payload_hex sits.
+        payload_contains:
+          type: string
+          description: Bytes the payload holds anywhere.
+        src_list:
+          type: string
+          description: A list the source is in.
+        dst_list:
+          type: string
+          description: A list the destination is in.
+        attack_pps:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: Match only while the destination's protected prefix takes at least this many packets a
+            second.
+        attack_mbps:
+          type: integer
+          minimum: 0
+          maximum: 10000000
+          description: Match only while the destination's protected prefix takes at least this many megabits a
+            second.
     Rule:
       type: object
       required:
@@ -1687,17 +1815,19 @@ components:
           - drop
           - permit
           - rate_limit
+          - shape
           - inspect
           - count
           description: drop and permit are terminal. count is observe-only and never drops. rate_limit
-            meters. inspect hands the flow to the ZC path.
+            meters each source to pps. shape holds everything the rule matches, from every source
+            together, to pps. inspect hands the flow to the ZC path.
         match:
           $ref: '#/components/schemas/Match'
         pps:
           type: integer
           minimum: 0
-          description: Only an fpga rate_limit, and a zc rate_limit or inspect, consume this. Set anywhere
-            else the policy is refused rather than the value silently ignored.
+          description: Only an fpga rate_limit or shape, and a zc rate_limit, shape or inspect, consume
+            this. Set anywhere else the policy is refused rather than the value silently ignored.
         priority:
           type: integer
           description: First match decides, on every stage. Equal priorities keep policy order.
@@ -1880,6 +2010,35 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GameHttpPath'
+        pipelined_max:
+          type: integer
+          minimum: 1
+          maximum: 1024
+          description: The most requests one segment may pipeline. Default 64 requests.
+        line_max:
+          type: integer
+          minimum: 256
+          maximum: 65536
+          description: The longest request or header line. Default 8192 bytes.
+        headers_max:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: The most header lines a request may carry. Default 100 lines.
+        split_bytes:
+          type: integer
+          minimum: 0
+          maximum: 65536
+          description: A segment shorter than this that ends inside a request line is dropped as split on purpose.
+            Default 512 bytes.
+        tls:
+          type: string
+          enum:
+          - count
+          - ignore
+          description: Whether each TLS ClientHello counts against the rates as a request. Default count.
+        slow:
+          $ref: '#/components/schemas/GameHttpSlow'
     GameFilter:
       type: object
       required:
@@ -1920,6 +2079,12 @@ components:
           description: Record what the filter would have done without acting on it.
         comment:
           type: string
+        idle_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: How long a player that cleared a filter's gate stays admitted after its last packet. Default
+            120 seconds.
     Policy:
       type: object
       required:
@@ -1995,6 +2160,38 @@ components:
         version:
           type: integer
           description: Bumped on every save of the same id.
+        sensitivity:
+          type: string
+          enum:
+          - high
+          - medium
+          - low
+          description: 'How readily the flood guards engage: medium multiplies every flood threshold left unset
+            by 4, low by 16. Default high.'
+        lists:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          maxProperties: 64
+          description: Named lists of addresses that rules match their sources or destinations against (src_list,
+            dst_list).
+        aggregation:
+          $ref: '#/components/schemas/AggregationPolicy'
+        pulse:
+          $ref: '#/components/schemas/PulsePolicy'
+        mitigation:
+          $ref: '#/components/schemas/MitigationPolicy'
+        profiles:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/Profile'
+          description: 'Settings for some of the protected addresses: each profile names prefixes within the protected
+            ones, and an address takes the most specific profile that holds it. A profile sets the guards'' sections
+            and the sensitivity; what it leaves unset is the policy''s, and what both leave unset the default.
+            Its addresses are judged for floods together, apart from the rest of the policy''s.'
     Node:
       type: object
       properties:
@@ -2223,6 +2420,31 @@ components:
           description: Every address this node accepts GRE and IPIP from, the other nodes' tunnel endpoints
             and the customer end of each tunnel it builds. Compiled from the fabric, so a node that joins is
             accepted everywhere on the next compile.
+        aggregation:
+          $ref: '#/components/schemas/AggregationPolicy'
+        pulse:
+          $ref: '#/components/schemas/PulsePolicy'
+        mitigation:
+          $ref: '#/components/schemas/MitigationPolicy'
+        sensitivity:
+          type: string
+          enum:
+          - high
+          - medium
+          - low
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/Profile'
+          description: The policy's profiles, which the node resolves its guards' settings from for the
+            addresses each holds.
+        lists:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          description: The policy's lists, which its rules match sources and destinations against.
     Flow:
       type: object
       description: One flow record.
@@ -2275,6 +2497,34 @@ components:
             (see crafted packets in the README). Only what the headers declare may be in it, and at most
             64 bytes of a link''s padding past them, so a capture cut short reads as a packet that lies
             about its length.'
+        length:
+          type: integer
+          minimum: 0
+          description: The IP packet's length, header and all, for rules matching lengths. Read from
+            packet when it is given.
+        ttl:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: Its TTL or hop limit, for rules matching TTLs. Read from packet when it is given.
+        dscp:
+          type: integer
+          minimum: 0
+          maximum: 63
+          description: The DSCP code point it is marked with. Read from packet when it is given.
+        icmp_type:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: For ICMP, its type. Read from packet when it is given.
+        icmp_code:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: For ICMP, its code. Read from packet when it is given.
+        fragment:
+          type: boolean
+          description: Whether it is a fragment. Read from packet when it is given.
     Decision:
       type: object
       properties:
@@ -2513,6 +2763,10 @@ components:
             20 to 40 seconds (Slowloris), a body under 500 bytes a second after its first 20 (R.U.D.Y.),
             a window kept under 64 bytes for 30 seconds (a slow read), or a source leaving more than 32
             requests incomplete at once.
+        http_slow_observed:
+          type: integer
+          description: Requests the slow-request rules would have dropped had their mode been enforce; with
+            http.slow.mode at observe they pass and are counted here.
     PrefixStats:
       type: object
       description: 'Everything one node knows about the traffic aimed at one protected prefix. Reported
@@ -2902,6 +3156,16 @@ components:
           description: TCP and ICMP, always.
           items:
             $ref: '#/components/schemas/ProtocolCount'
+        protocols:
+          type: array
+          items:
+            type: string
+            enum:
+            - tcp
+            - icmp
+            - udp
+            - other
+          description: Whose fragments the guard drops, as fragments.protocols sets it.
     IcmpStats:
       type: object
       description: What the ICMP guard did on this node, in all and per kind.
@@ -3251,6 +3515,35 @@ components:
             them walk every stage to the same verdict. Off by default: it is an escalation of consequence
             beyond what one packet earned. With it off, strikes and would-be demotions are still counted
             and exposed, which is how it is sized before being switched on.'
+        trust_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: How long a proof keeps a source trusted. Default 300 seconds.
+        strikes:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: How many strikes within reputation.strike_window_seconds box a source. Default 4 strikes.
+        strike_window_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How long strikes count toward the box. Default 30 seconds.
+        penalty_seconds:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+            maximum: 604800
+          maxItems: 8
+          description: Each sentence in the box in turn, the last repeating; 60, 600 and 3600 when unset.
+        forgive_seconds:
+          type: integer
+          minimum: 1
+          maximum: 604800
+          description: How long a source must stay clean for its next sentence to drop back a step. Default 3600
+            seconds.
     CraftedPolicy:
       type: object
       description: What a node does with a packet built to harm the stack that receives it rather than
@@ -3266,6 +3559,29 @@ components:
           - 'off'
           description: enforce, the default, drops it. observe counts what would be dropped and drops
             nothing. off does not look.
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum:
+            - enforce
+            - observe
+            - 'off'
+          description: Modes for single checks (land, tcp_flags, martian_source, source_route, low_mss, fragment_overlap,
+            ip_header, ip_options, extension_headers, tcp_header, udp_header, icmp, port_zero, fragment, length,
+            oversize, tiny_fragment), over crafted.mode.
+        low_mss:
+          type: integer
+          minimum: 0
+          maximum: 1460
+          description: The largest MSS a SYN may offer and still be dropped as SACK Panic's shape; 0 drops none
+            for it. Default 500 bytes.
+        min_fragment:
+          type: integer
+          minimum: 8
+          maximum: 1480
+          description: The smallest fragment short of a datagram's last that is not dropped as too small. Default
+            256 bytes.
     ReflectionPolicy:
       type: object
       description: What a node does with answers reflected at a protected address, per vector. They are
@@ -3310,6 +3626,40 @@ components:
             of a source caught sending one; the same as naming cldap in vectors, which may not both be
             set. enforce, the default, drops them. observe counts what would be dropped and drops
             nothing. off does not look.
+        judge:
+          type: object
+          additionalProperties:
+            type: string
+            enum:
+            - always
+            - flood
+          description: 'How a vector''s answers the server never asked for are judged: always, however few arrive,
+            or flood, only while the prefix is flooded with them.'
+        hold_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long an aggregate counts as flooded after its last second over reflection.engage_pps.
+            Default 60 seconds.
+        asked_within_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How recently the server must have queried an address for its answer to count as asked for.
+            Default 30 seconds.
+        reflecting_for_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How long a source caught reflecting has the later fragments of its answers dropped. Default
+            30 seconds.
+        custom:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/CustomVector'
+          description: 'Reflection vectors the guard does not know, at most 8: each a name, the UDP port its answers
+            come from, what they open with, and how they are judged.'
     ProtocolPolicy:
       type: object
       description: What a node does with IP protocols a protected address does not receive, sent to
@@ -3354,6 +3704,35 @@ components:
           maximum: 1000000000
           description: Packets a second of such TCP a prefix takes before the guard engages. 0, or
             unset, is 5000.
+        hold_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long the guard stays engaged after the last second over ack_flood.engage_pps. Default
+            60 seconds.
+        warm_seconds:
+          type: integer
+          minimum: 0
+          maximum: 3600
+          description: How long the node must have watched the server's own traffic before the guard may engage.
+            Default 120 seconds.
+        talked_within_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How recently the server must have sent a source TCP for the source's segments to belong
+            to a connection. Default 120 seconds.
+        handshake_seconds:
+          type: integer
+          minimum: 0
+          maximum: 300
+          description: How long a client the server answered may take to finish its handshake. Default 10 seconds.
+        handshake_segments:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: How many segments a client the server answered may send before the server's own say the
+            connection is open. Default 4 segments.
     SynFloodPolicy:
       type: object
       description: What a node does with opening SYNs from sources the protected server has no
@@ -3375,6 +3754,23 @@ components:
           minimum: 0
           maximum: 1000000000
           description: 0 takes 2000.
+        hold_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long the guard stays engaged after the last second over syn_flood.engage_pps. Default
+            60 seconds.
+        retry_within_seconds:
+          type: integer
+          minimum: 1
+          maximum: 4
+          description: How long after a SYN its connection's next one still counts as a retry. Default 4 seconds.
+        retries_pps:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: The most SYNs a second one connection may send and still be a client retrying. Default
+            3 pps.
     FragmentPolicy:
       type: object
       description: What a node does with TCP and ICMP in fragments, which no real sender fragments.
@@ -3389,6 +3785,17 @@ components:
           - 'off'
           description: enforce, the default, drops them. observe counts what would be dropped and drops
             nothing. off does not look.
+        protocols:
+          type: array
+          items:
+            type: string
+            enum:
+            - tcp
+            - icmp
+            - udp
+            - other
+          description: Whose fragments are dropped; tcp and icmp when unset. udp drops every fragmented datagram,
+            which some games send.
     IcmpPolicy:
       type: object
       description: What a node does with ICMP to a protected address. Echo replies the server never
@@ -3414,6 +3821,35 @@ components:
           minimum: 0
           maximum: 1000000000
           description: 0 takes 1000.
+        hold_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long an aggregate counts as flooded with echo replies after its last second over. Default
+            60 seconds.
+        drop_types:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: ICMP types dropped whatever their rate, such as 8 to answer no pings. Dropping 3, destination
+            unreachable, breaks path MTU discovery.
+        drop_types_v6:
+          type: array
+          items:
+            type: integer
+            minimum: 0
+            maximum: 255
+          description: ICMPv6 types dropped whatever their rate, such as 128 to answer no pings. Dropping 2, packet
+            too big, breaks path MTU discovery.
+        errors:
+          type: string
+          enum:
+          - verify
+          - allow
+          description: Whether an error that quotes no packet the prefix sent is dropped, or let through to the
+            rate. Default verify.
     MlPolicy:
       type: object
       description: Where the published classifiers judge traffic, and whether they drop what they score
@@ -3448,6 +3884,17 @@ components:
             seconds, both models drop 0.1 lower for that prefix, and 0.2 lower if it happens again
             there, each no further than its max_cut. Each step lapses five minutes after the probing
             that set it was last seen. ignore keeps the thresholds where they are.'
+        probe_hold_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: How long a step of tightening holds after the probing that set it. Default 300 seconds.
+        probe_min:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          description: Near misses in ten seconds, a quarter of what was scored, that make a target probed. Default
+            20 near misses.
     EgressPolicy:
       type: object
       description: What the fabric does with the return path it can see. Watching what the origin sends
@@ -3478,6 +3925,32 @@ components:
             Zero takes the platform default of 500ms. Without it lockdown cannot be escaped: a new client
             is unconfirmed, so it is held back, so its packets never reach the origin, so the origin never
             answers, so it is never confirmed.'
+        confirm_packets:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          description: Packets the origin must send a client to confirm it. Default 10 packets.
+        confirm_ticks:
+          type: integer
+          minimum: 1
+          maximum: 40
+          description: Quarter seconds those packets must spread over. Default 3 quarter seconds.
+        confirm_window_seconds:
+          type: integer
+          minimum: 1
+          maximum: 300
+          description: How long the packets and quarter seconds have to add up. Default 10 seconds.
+        confirmed_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: How long a confirmation lasts. Default 120 seconds.
+        visible_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How recently the origin's traffic must have been seen for its return path to count as visible.
+            Default 30 seconds.
     EgressPrefixState:
       type: object
       properties:
@@ -4541,3 +5014,251 @@ components:
           type: string
         flow:
           $ref: '#/components/schemas/Flow'
+    AggregationPolicy:
+      type: object
+      description: 'How widely floods are judged: the prefix lengths protected addresses are grouped by, so
+        a flood spread thin across addresses protected one by one engages the guards together.'
+      properties:
+        v4:
+          type: integer
+          minimum: 0
+          maximum: 32
+          description: IPv4 prefixes narrower than this are judged for floods with the rest of the prefix
+            of this length that holds them. Default 24 prefix length.
+        v6:
+          type: integer
+          minimum: 0
+          maximum: 128
+          description: IPv6 prefixes narrower than this are judged for floods with the rest of the prefix
+            of this length that holds them. Default 48 prefix length.
+    PulsePolicy:
+      type: object
+      description: 'What shape of traffic counts as a burst attack: short loud bursts with quiet between them.'
+      properties:
+        crest:
+          type: number
+          minimum: 1
+          maximum: 1000
+          description: How many times its mean a prefix's peak must reach to be shaped like a burst attack.
+            Default 4.
+        duty:
+          type: number
+          minimum: 0.01
+          maximum: 1
+          description: The most of the last minute's quarter seconds a burst attack's traffic may fill. Default
+            0.5.
+        bursts:
+          type: integer
+          minimum: 1
+          maximum: 240
+          description: How many bursts in the last minute make a prefix pulsing. Default 3 bursts.
+        latch_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long a prefix is held as pulsing after the shape was last seen. Default 300 seconds.
+    MitigationPolicy:
+      type: object
+      description: How long an on-demand tunnel stays mitigated once its traffic falls back under its thresholds.
+      properties:
+        hold_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How long an on-demand tunnel's first wave of mitigation lasts after its traffic falls
+            under its thresholds; each later wave of the same attack holds twice as long. Default 300 seconds.
+        campaign_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: How soon after the last a wave must start to be part of the same attack. Default 3600
+            seconds.
+        hold_max_seconds:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          description: The longest any wave's mitigation holds. Default 3600 seconds.
+    CustomVector:
+      type: object
+      required:
+      - name
+      - port
+      description: 'A reflection vector of the operator''s own: UDP from a port the guard does not know, and
+        what its answers open with.'
+      properties:
+        name:
+          type: string
+          description: The vector's name, as drops, counters and reflection.vectors name it.
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: The UDP port the vector's answers come from; not one a vector the guard knows uses.
+        payload_hex:
+          type: string
+          description: What the vector's answers open with; any payload from the port when unset.
+        judge:
+          type: string
+          enum:
+          - always
+          - flood
+          description: How its answers the server never asked for are judged. Default always.
+    GameHttpSlow:
+      type: object
+      description: 'How slowly a request may arrive before it is cut off, as Apache''s mod_reqtimeout holds
+        requests: Slowloris''s heads, R.U.D.Y.''s bodies, slow reads and requests left incomplete.'
+      properties:
+        mode:
+          type: string
+          enum:
+          - enforce
+          - observe
+          - 'off'
+          description: What happens to a request that arrives too slowly. Default enforce.
+        head_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How long a head may take, one more second for every min_rate bytes of it. Default 20
+            seconds.
+        head_seconds_max:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: The longest a head may take however fast it arrives. Default 40 seconds.
+        body_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How long a body may take, one more second for every min_rate bytes of it. Default 20
+            seconds.
+        min_rate:
+          type: integer
+          minimum: 0
+          maximum: 1000000000
+          description: The bytes that buy a request one more second. Default 500 bytes a second.
+        window_min:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          description: The window, as a segment writes it, under which a client is not reading. Default 64
+            bytes.
+        starved_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          description: How long a client may keep its window under window_min. Default 30 seconds.
+        incomplete_max:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: The most requests one source may leave incomplete at once. Default 32 requests.
+    Profile:
+      type: object
+      required:
+      - name
+      - prefixes
+      description: Settings for the protected addresses a profile holds, over the policy's.
+      properties:
+        name:
+          type: string
+          description: The profile's name.
+        prefixes:
+          type: array
+          items:
+            type: string
+          description: The addresses the profile's settings hold for; a protected address takes the most specific.
+        sensitivity:
+          type: string
+          enum:
+          - high
+          - medium
+          - low
+          description: 'How readily the flood guards engage: medium multiplies every flood threshold left
+            unset by 4, low by 16. Default high.'
+        crafted:
+          $ref: '#/components/schemas/CraftedPolicy'
+        reflection:
+          $ref: '#/components/schemas/ReflectionPolicy'
+        protocols:
+          $ref: '#/components/schemas/ProtocolPolicy'
+        ack_flood:
+          $ref: '#/components/schemas/AckFloodPolicy'
+        syn_flood:
+          $ref: '#/components/schemas/SynFloodPolicy'
+        fragments:
+          $ref: '#/components/schemas/FragmentPolicy'
+        icmp:
+          $ref: '#/components/schemas/IcmpPolicy'
+    Setting:
+      type: object
+      description: One setting a policy can tune.
+      properties:
+        path:
+          type: string
+          example: syn_flood.hold_seconds
+          description: Where it sits in a policy; [] marks a list of items, each of which takes it.
+        type:
+          type: string
+          enum:
+          - integer
+          - number
+          - choice
+          - flag
+          - list
+          - map
+          - text
+        default:
+          description: What it is when unset.
+        min:
+          type: number
+        max:
+          type: number
+        unit:
+          type: string
+          example: seconds
+        zero_takes_default:
+          type: boolean
+          description: Whether 0 means the default rather than 0, as for the thresholds that came before the
+            rest.
+        options:
+          type: array
+          items:
+            type: string
+        of:
+          type: string
+          description: What a list, map or text holds.
+        profile:
+          type: boolean
+          description: Whether a profile may set it too.
+        about:
+          type: string
+    SettingsCatalog:
+      type: object
+      properties:
+        settings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Setting'
+    EffectiveSettings:
+      type: object
+      description: 'Every setting a policy resolves to, as its nodes resolve them: what it sets, and the default
+        for what it leaves unset. The guards'' sections appear for the policy and for each profile, which
+        takes its own, then the policy''s, then the default; the rest are the policy''s alone. Times are seconds.'
+      properties:
+        policy_id:
+          type: string
+        version:
+          type: integer
+        policy:
+          type: object
+          additionalProperties: true
+          description: 'sensitivity, crafted, reflection, protocols, ack_flood, syn_flood, fragments and icmp,
+            and the policy''s alone: pulse_floor_pps, aggregation, reputation, egress, pulse, mitigation,
+            ml and lists.'
+        profiles:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            description: A profile's name and prefixes, and its guards' sections resolved.

@@ -10,10 +10,31 @@ struct PulseSeries {
     cached: Value,
     last_write: i64,
 }
+/// How a burst attack is told from a prefix's last minute of traffic: its peak at least `crest`
+/// times its mean, its traffic in at most `duty` of the minute's quarter seconds, at least
+/// `bursts` bursts, held as pulsing for `latch` milliseconds after.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PulseConfig {
+    pub crest: f64,
+    pub duty: f64,
+    pub bursts: u32,
+    pub latch: i64,
+}
+impl Default for PulseConfig {
+    fn default() -> Self {
+        Self {
+            crest: 4.0,
+            duty: 0.5,
+            bursts: 3,
+            latch: 300_000,
+        }
+    }
+}
 #[derive(Default)]
 pub struct Pulse {
     series: HashMap<String, PulseSeries>,
     pub floor: u64,
+    pub cfg: PulseConfig,
     last_sweep: i64,
 }
 impl Pulse {
@@ -91,10 +112,11 @@ impl Pulse {
                 0.0
             };
             let duty = active as f64 / 240.0;
-            let shaped = crest >= 4.0 && duty <= 0.5 && peak >= floor;
-            let pulsing = shaped && bursts >= 3;
+            let cfg = &self.cfg;
+            let shaped = crest >= cfg.crest && duty <= cfg.duty && peak >= floor;
+            let pulsing = shaped && bursts >= cfg.bursts;
             if pulsing || shaped && bursts >= 1 && s.latched > now {
-                s.latched = now + 300000;
+                s.latched = now + cfg.latch;
             }
             s.cached = json!({"pulsing":pulsing,"peak_pps":peak,"mean_pps":mean,"crest":crest,"duty_cycle":duty,"bursts":bursts,"held_for":0});
             s.cached_at = slot;
@@ -120,12 +142,35 @@ struct RepEntry {
     window: i64,
     last_strike: i64,
 }
+/// How the penalty box judges a source: how long a proof keeps it trusted, how many strikes in
+/// how long box it, each sentence in turn (the last repeating), and how long it must stay clean
+/// for its next sentence to drop back a step. Milliseconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReputationConfig {
+    pub trust: i64,
+    pub strikes: i64,
+    pub window: i64,
+    pub penalties: Vec<i64>,
+    pub forgive: i64,
+}
+impl Default for ReputationConfig {
+    fn default() -> Self {
+        Self {
+            trust: 300_000,
+            strikes: 4,
+            window: 30_000,
+            penalties: vec![60_000, 600_000, 3_600_000],
+            forgive: 3_600_000,
+        }
+    }
+}
 #[derive(Default)]
 pub struct Reputation {
     entries: HashMap<String, RepEntry>,
     pub proof: u8,
     pub no_fast: bool,
     pub boxing: bool,
+    pub cfg: ReputationConfig,
     last_sweep: i64,
     counts: [u64; 8],
 }
@@ -137,11 +182,12 @@ impl Reputation {
         if self.entries.len() >= 65536 {
             if now - self.last_sweep >= 5000 {
                 self.last_sweep = now;
+                let forgive = self.cfg.forgive;
                 self.entries.retain(|_, e| {
                     now < e.trusted
                         || now < e.penalised
                         || now < e.window
-                        || e.level > 0 && now - e.last_strike.max(e.penalised) < 3600000
+                        || e.level > 0 && now - e.last_strike.max(e.penalised) < forgive
                 });
             }
             if self.entries.len() >= 65536 {
@@ -199,7 +245,7 @@ impl Reputation {
         if e.trusted < now {
             self.counts[2] += 1;
         }
-        e.trusted = now + 300000;
+        e.trusted = now + self.cfg.trust;
         e.proof = proof;
         e.strikes = 0;
     }
@@ -215,23 +261,30 @@ impl Reputation {
         if !self.create(src, now) {
             return;
         }
+        let cfg = &self.cfg;
         let e = self.entries.get_mut(src).unwrap();
         let mut clean = e.last_strike.max(e.penalised);
-        while e.level > 0 && clean != 0 && now - clean >= 3600000 {
+        while e.level > 0 && clean != 0 && now - clean >= cfg.forgive {
             e.level -= 1;
-            clean += 3600000;
+            clean += cfg.forgive;
         }
         e.last_strike = now;
         if now > e.window {
             e.strikes = 0;
-            e.window = now + 30000;
+            e.window = now + cfg.window;
         }
         e.strikes += 1;
-        if e.strikes >= 4 {
+        if e.strikes >= cfg.strikes {
+            let last = cfg.penalties.len().max(1) - 1;
             e.strikes = 0;
             e.window = 0;
-            e.penalised = now + [60000, 600000, 3600000][e.level.min(2)];
-            e.level = (e.level + 1).min(2);
+            e.penalised = now
+                + cfg
+                    .penalties
+                    .get(e.level.min(last))
+                    .copied()
+                    .unwrap_or(60_000);
+            e.level = (e.level + 1).min(last);
             self.counts[3] += 1;
         }
     }
@@ -312,10 +365,36 @@ struct ReturnSeries {
     /// Since when the origin's traffic has been seen without a gap of more than 30 seconds.
     egress_since: i64,
 }
+/// What confirms a client from the origin's traffic to it: at least `confirm_packets` packets
+/// over `confirm_ticks` quarters of a second, within `confirm_window`, which then holds for
+/// `confirmed`. A return path is visible while the origin's traffic was seen within `visible`, and
+/// a client the origin has gone quiet to is kept for `keep`. Milliseconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EgressConfig {
+    pub confirm_packets: i64,
+    pub confirm_ticks: i64,
+    pub confirm_window: i64,
+    pub confirmed: i64,
+    pub visible: i64,
+    pub keep: i64,
+}
+impl Default for EgressConfig {
+    fn default() -> Self {
+        Self {
+            confirm_packets: 10,
+            confirm_ticks: 3,
+            confirm_window: 10_000,
+            confirmed: 120_000,
+            visible: 30_000,
+            keep: 120_000,
+        }
+    }
+}
 #[derive(Default)]
 pub struct Egress {
     series: HashMap<String, ReturnSeries>,
     clients: usize,
+    pub cfg: EgressConfig,
     last_sweep: i64,
     promotions: u64,
     full: u64,
@@ -373,8 +452,9 @@ impl Egress {
         if addr.is_empty() || packets <= 0 || !self.prefix(prefix) {
             return None;
         }
+        let cfg = self.cfg.clone();
         let series = self.series.get_mut(prefix).unwrap();
-        if series.egress == 0 || now - series.egress > 30000 {
+        if series.egress == 0 || now - series.egress > cfg.visible {
             series.egress_since = now;
         }
         series.egress = now;
@@ -396,8 +476,8 @@ impl Egress {
                     }
                     now < c.confirmed
                         || now < c.window
-                        || now - c.last_seen < 120000
-                        || c.first != 0 && now - c.first < 120000
+                        || now - c.last_seen < cfg.keep
+                        || c.first != 0 && now - c.first < cfg.keep
                 });
             }
             self.clients = self.series.values().map(|s| s.clients.len()).sum();
@@ -417,18 +497,18 @@ impl Egress {
             c.packets = 0;
             c.ticks = 0;
             c.last_tick = 0;
-            c.window = now + 10000;
+            c.window = now + cfg.confirm_window;
         }
         c.packets = c.packets.saturating_add(packets);
         if now / 250 != c.last_tick {
             c.last_tick = now / 250;
             c.ticks += 1;
         }
-        if c.packets < 10 || c.ticks < 3 {
+        if c.packets < cfg.confirm_packets || c.ticks < cfg.confirm_ticks {
             return None;
         }
         let fresh = now >= c.confirmed;
-        c.confirmed = now + 120000;
+        c.confirmed = now + cfg.confirmed;
         if fresh {
             self.promotions += 1;
         }
@@ -519,7 +599,7 @@ impl Egress {
     /// How long the origin's traffic has been seen without a gap, or 0 when it is not seen now.
     pub fn watched_for(&self, p: &str, now: i64) -> i64 {
         match self.series.get(p) {
-            Some(s) if s.egress != 0 && now - s.egress <= 30000 => now - s.egress_since,
+            Some(s) if s.egress != 0 && now - s.egress <= self.cfg.visible => now - s.egress_since,
             _ => 0,
         }
     }
@@ -533,9 +613,9 @@ impl Egress {
         let Some(s) = self.series.get(p) else {
             return "unknown";
         };
-        if s.egress != 0 && now - s.egress <= 30000 {
+        if s.egress != 0 && now - s.egress <= self.cfg.visible {
             "visible"
-        } else if s.ingress != 0 && now - s.ingress <= 30000 {
+        } else if s.ingress != 0 && now - s.ingress <= self.cfg.visible {
             "asymmetric"
         } else {
             "unknown"

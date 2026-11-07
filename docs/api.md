@@ -71,7 +71,7 @@ keeps has a ceiling, and a write past one is refused with what it hit:
 | --- | --- |
 | Nodes in the fabric | 128 |
 | Policies kept | 32 |
-| In one policy | 1024 protected prefixes, 1024 rules, 1024 tunnels, 256 game filters, 256 BGP sessions |
+| In one policy | 1024 protected prefixes, 1024 rules, 1024 tunnels, 256 game filters, 256 BGP sessions, 64 profiles holding 1024 prefixes, 64 lists holding 4096 |
 | Tenants | 4096, with 16384 prefixes between them and 1024 each |
 | Training set | 200000 samples, with 64 MiB of payloads and packets between them; one sample carries at most a packet of each |
 | A request body | 4 MiB on the control plane, 1 MiB on an agent |
@@ -1400,6 +1400,58 @@ Each filter's row adds `http_tls_handshakes` and `http_slow_dropped`, and the
 node's stats `game_http_pending`, `game_http_pending_max` and
 `game_http_pending_untracked`. See
 [Slow requests](../README.md#slow-requests).
+
+### 17. Tuning every setting
+
+Every setting a policy can tune, with its default, bounds, unit and whether a
+profile may set it:
+
+```console
+$ curl -H "Authorization: Bearer $OP" $API/v1/settings
+{"settings":[{"about":"How readily the flood guards engage: medium multiplies every flood threshold left unset by 4, low by 16.","default":"high","options":["high","medium","low"],"path":"sensitivity","profile":true,"type":"choice"},{"about":"The least a quarter second's traffic must reach to count toward a burst.","default":10000.0,"max":1000000000.0,"min":0.0,"path":"pulse_floor_pps","profile":false,"type":"integer","unit":"pps","zero_takes_default":true}, ...]}
+```
+
+A policy naming a key that is neither a setting nor a field of the policy, a
+game filter or a rule is refused with what that object takes:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $OP" $API/v1/policies \
+    -d '{"name":"edge","protected":["203.0.113.0/24"],"icmp":{"limit":5000}}'
+{"error":"icmp.limit is not a setting; icmp takes drop_types, drop_types_v6, errors, hold_seconds, limit_pps, mode, smurf_pps"}
+```
+
+A profile holds some protected addresses to settings of their own, over the
+policy's, and a rule can match a list, a port range, lengths, TTLs, DSCP, ICMP
+types, fragments and payloads, or only while its prefix is under attack:
+
+```console
+$ curl -X POST -H "Authorization: Bearer $OP" $API/v1/policies -d '{
+    "id": "edge", "name": "edge", "protected": ["203.0.113.0/24"],
+    "lists": {"office": ["198.51.100.0/24"]},
+    "profiles": [{"name": "lobby", "prefixes": ["203.0.113.32/27"], "sensitivity": "low",
+                  "icmp": {"drop_types": [8]}}],
+    "rules": [
+      {"id": "office", "stage": "asic", "action": "permit", "match": {"src_list": "office"}},
+      {"id": "game-ports", "stage": "fpga", "action": "rate_limit", "pps": 50000,
+       "match": {"proto": "udp", "dport": 27015, "dport_to": 27030, "length_max": 1400}},
+      {"id": "pings", "stage": "fpga", "action": "shape", "pps": 2000,
+       "match": {"proto": "icmp", "icmp_type": 8}},
+      {"id": "udp-under-attack", "stage": "zc", "action": "rate_limit", "pps": 1000,
+       "match": {"proto": "udp", "attack_pps": 200000}}]}'
+```
+
+What that resolves to, the policy's settings and the profile's, every one of
+them, with the defaults for what they leave unset:
+
+```console
+$ curl -H "Authorization: Bearer $OP" $API/v1/policies/edge/settings
+{"policy":{...,"icmp":{"drop_types":[],"drop_types_v6":[],"errors":"verify","hold_seconds":60.0,"limit_pps":1000,"mode":"enforce","smurf_pps":1000},...},"policy_id":"edge",
+ "profiles":[{...,"icmp":{"drop_types":[8],"drop_types_v6":[],"errors":"verify","hold_seconds":60.0,"limit_pps":16000,"mode":"enforce","smurf_pps":16000},"name":"lobby","prefixes":["203.0.113.32/27"],...,"sensitivity":"low",...}],"version":1}
+```
+
+`scrubctl settings` prints the catalog as a table and `scrubctl settings edge`
+the policy's settings. Every setting, and what each does, is in
+[Tuning every setting](../README.md#tuning-every-setting).
 
 ## The node agent
 

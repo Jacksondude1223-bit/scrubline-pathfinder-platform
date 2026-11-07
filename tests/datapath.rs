@@ -82,6 +82,7 @@ fn go_shape(mut stats: Value) -> Value {
             "http_budget_dropped",
             "http_tls_handshakes",
             "http_slow_dropped",
+            "http_slow_observed",
         ] {
             row.remove(key);
         }
@@ -249,6 +250,7 @@ fn gated(games: Vec<GameFilter>, fast_pass: &str) -> Program {
         reputation: Some(ReputationPolicy {
             fast_pass: fast_pass.into(),
             penalty_box: true,
+            ..Default::default()
         }),
         ..Default::default()
     }
@@ -423,6 +425,7 @@ fn http_server(paths: Vec<GameHttpPath>, http: GameHttp, penalty_box: bool) -> P
         reputation: Some(ReputationPolicy {
             fast_pass: "egress".into(),
             penalty_box,
+            ..Default::default()
         }),
         ..Default::default()
     }

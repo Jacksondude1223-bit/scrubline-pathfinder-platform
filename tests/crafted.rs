@@ -1095,6 +1095,7 @@ fn guarded(mode: &str) -> Program {
         reputation: Some(ReputationPolicy {
             fast_pass: "egress".into(),
             penalty_box: true,
+            ..Default::default()
         }),
         tunnels: vec![NodeTunnel {
             id: "contoso".into(),
@@ -1104,7 +1105,10 @@ fn guarded(mode: &str) -> Program {
             attack_kbps: 1_000_000,
             ..Default::default()
         }],
-        crafted: Some(CraftedPolicy { mode: mode.into() }),
+        crafted: Some(CraftedPolicy {
+            mode: mode.into(),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -1258,7 +1262,10 @@ fn observing_counts_what_would_be_dropped_and_off_does_not_look() {
     let policy = |mode: &str| Policy {
         name: "p".into(),
         protected: vec!["203.0.113.0/24".into()],
-        crafted: Some(CraftedPolicy { mode: mode.into() }),
+        crafted: Some(CraftedPolicy {
+            mode: mode.into(),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     for mode in ["", "enforce", "observe", "off"] {

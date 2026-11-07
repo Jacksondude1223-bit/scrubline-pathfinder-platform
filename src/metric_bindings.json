@@ -403,6 +403,13 @@
     ]
   },
   {
+    "name": "scrubline_game_http_slow_observed_total",
+    "group": "games",
+    "path": [
+      "http_slow_observed"
+    ]
+  },
+  {
     "name": "scrubline_rule_matches_total",
     "group": "rules",
     "path": [

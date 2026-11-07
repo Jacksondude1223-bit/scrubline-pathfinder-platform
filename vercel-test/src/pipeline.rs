@@ -5,15 +5,88 @@ use crate::{
     httpfilter, ml,
     model::*,
     packet,
-    reflection::{self, VECTORS, VECTORS_LEN},
+    reflection::{self, VECTORS_LEN, VECTORS_MAX},
     state::{Egress, Pulse, Reputation},
+    tuning::{self, Mode},
 };
 use ipnet::IpNet;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,
+    sync::Arc,
 };
+/// A list of addresses a rule matches against, kept by prefix length, so an address is looked up
+/// once for each length the list holds rather than against each of its entries.
+#[derive(Default)]
+pub struct PrefixSet {
+    v4: Vec<(u8, HashSet<u32>)>,
+    v6: Vec<(u8, HashSet<u128>)>,
+}
+impl PrefixSet {
+    pub fn of(cidrs: &[String]) -> Self {
+        let mut s = PrefixSet::default();
+        for net in cidrs.iter().filter_map(|c| c.parse::<IpNet>().ok()) {
+            let len = net.prefix_len();
+            match net.trunc() {
+                IpNet::V4(n) => {
+                    let at = match s.v4.iter().position(|(l, _)| *l == len) {
+                        Some(at) => at,
+                        None => {
+                            s.v4.push((len, HashSet::new()));
+                            s.v4.len() - 1
+                        }
+                    };
+                    s.v4[at].1.insert(u32::from(n.network()));
+                }
+                IpNet::V6(n) => {
+                    let at = match s.v6.iter().position(|(l, _)| *l == len) {
+                        Some(at) => at,
+                        None => {
+                            s.v6.push((len, HashSet::new()));
+                            s.v6.len() - 1
+                        }
+                    };
+                    s.v6[at].1.insert(u128::from(n.network()));
+                }
+            }
+        }
+        s
+    }
+    pub fn contains(&self, a: IpAddr) -> bool {
+        match a {
+            IpAddr::V4(a) => {
+                let a = u32::from(a);
+                self.v4.iter().any(|(len, set)| {
+                    let mask = if *len == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - u32::from(*len))
+                    };
+                    set.contains(&(a & mask))
+                })
+            }
+            IpAddr::V6(a) => {
+                let a = u128::from(a);
+                self.v6.iter().any(|(len, set)| {
+                    let mask = if *len == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - u32::from(*len))
+                    };
+                    set.contains(&(a & mask))
+                })
+            }
+        }
+    }
+}
+/// What the protected prefix a flow goes to takes, over the last second, that rules for when it
+/// is under attack are matched against.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Surge {
+    pub pps: u64,
+    pub bps: u64,
+}
 #[derive(Clone)]
 struct Matcher {
     m: Match,
@@ -21,20 +94,52 @@ struct Matcher {
     dst: Option<IpNet>,
     flags: Option<u16>,
     never: bool,
+    src_list: Option<Arc<PrefixSet>>,
+    dst_list: Option<Arc<PrefixSet>>,
+    payload: Vec<u8>,
+    contains: Vec<u8>,
+}
+/// The length of the IP packet a flow stands for: its header's, or what its record says, or else
+/// what its rates or its payload make it.
+fn length(f: &Flow) -> u64 {
+    if let Some(l) = f.length {
+        return u64::from(l);
+    }
+    if f.bps > 0 && f.pps > 0 {
+        return (f.bps / 8 / f.pps) as u64;
+    }
+    bits(&Flow {
+        pps: 1,
+        bps: 0,
+        ..f.clone()
+    }) / 8
 }
 impl Matcher {
-    fn new(m: Match) -> Self {
+    fn new(m: Match, lists: &HashMap<String, Arc<PrefixSet>>) -> Self {
         let src = m.src_cidr.parse().ok();
         let dst = m.dst_cidr.parse().ok();
         let flags = packet::tcp_flags(&m.tcp_flags);
-        let never =
-            !m.src_cidr.is_empty() && src.is_none() || !m.dst_cidr.is_empty() && dst.is_none();
+        let list = |name: &str| {
+            (!name.is_empty())
+                .then(|| lists.get(name).cloned())
+                .flatten()
+        };
+        let (src_list, dst_list) = (list(&m.src_list), list(&m.dst_list));
+        // A list the program does not have matches nothing, as a prefix that does not parse.
+        let never = !m.src_cidr.is_empty() && src.is_none()
+            || !m.dst_cidr.is_empty() && dst.is_none()
+            || !m.src_list.is_empty() && src_list.is_none()
+            || !m.dst_list.is_empty() && dst_list.is_none();
         Self {
+            payload: tuning::hex(&m.payload_hex),
+            contains: tuning::hex(&m.payload_contains),
             m,
             src,
             dst,
             flags,
             never,
+            src_list,
+            dst_list,
         }
     }
     /// Flags named on both sides compare as sets (see packet::flags_meet); anything else as text.
@@ -47,7 +152,10 @@ impl Matcher {
             _ => self.m.tcp_flags.eq_ignore_ascii_case(&f.flags),
         }
     }
-    fn matches(&self, f: &Flow) -> bool {
+    fn matches(&self, f: &Flow, surge: &Surge) -> bool {
+        let m = &self.m;
+        let port = |from: i64, to: i64, at: i64| from == 0 || (from..=to.max(from)).contains(&at);
+        let within = |lo: i64, hi: i64, v: i64| (lo == 0 || v >= lo) && (hi == 0 || v <= hi);
         !self.never
             && self
                 .src
@@ -55,12 +163,48 @@ impl Matcher {
             && self
                 .dst
                 .is_none_or(|p| f.dst_ip.parse::<IpAddr>().is_ok_and(|a| p.contains(&a)))
-            && (self.m.proto.is_empty()
-                || self.m.proto.eq_ignore_ascii_case("any")
-                || self.m.proto.eq_ignore_ascii_case(&f.proto))
-            && (self.m.dport == 0 || self.m.dport == f.dport)
-            && (self.m.sport == 0 || self.m.sport == f.sport)
+            && (m.proto.is_empty()
+                || m.proto.eq_ignore_ascii_case("any")
+                || m.proto.eq_ignore_ascii_case(&f.proto))
+            && port(m.dport, m.dport_to, f.dport)
+            && port(m.sport, m.sport_to, f.sport)
             && self.flags(f)
+            && (m.length_min == 0 && m.length_max == 0
+                || within(m.length_min, m.length_max, length(f) as i64))
+            && (m.ttl_min == 0 && m.ttl_max == 0
+                || f.ttl
+                    .is_some_and(|t| within(m.ttl_min, m.ttl_max, i64::from(t))))
+            && m.dscp
+                .is_none_or(|d| f.dscp.is_some_and(|v| i64::from(v) == d))
+            && m.icmp_type
+                .is_none_or(|t| f.icmp_type.is_some_and(|v| i64::from(v) == t))
+            && m.icmp_code
+                .is_none_or(|c| f.icmp_code.is_some_and(|v| i64::from(v) == c))
+            && match m.fragment.as_str() {
+                "yes" => f.fragment,
+                "no" => !f.fragment,
+                _ => true,
+            }
+            && (self.payload.is_empty()
+                || f.payload
+                    .get(m.payload_offset.max(0) as usize..)
+                    .is_some_and(|p| p.starts_with(&self.payload)))
+            && (self.contains.is_empty()
+                || f.payload
+                    .windows(self.contains.len())
+                    .any(|w| w == self.contains.as_slice()))
+            && self
+                .src_list
+                .as_ref()
+                .is_none_or(|l| f.src_ip.parse::<IpAddr>().is_ok_and(|a| l.contains(a)))
+            && self
+                .dst_list
+                .as_ref()
+                .is_none_or(|l| f.dst_ip.parse::<IpAddr>().is_ok_and(|a| l.contains(a)))
+            && (m.attack_pps == 0 && m.attack_mbps == 0
+                || m.attack_pps > 0 && surge.pps >= m.attack_pps as u64
+                || m.attack_mbps > 0
+                    && surge.bps >= (m.attack_mbps as u64).saturating_mul(1_000_000))
     }
 }
 #[derive(Clone)]
@@ -88,16 +232,19 @@ struct Load {
     /// buffer.
     crafted: [[u64; 2]; 3],
     /// Flows and their packets the reflection guard dropped, per vector.
-    reflection: [[u64; 2]; VECTORS_LEN],
+    reflection: [[u64; 2]; VECTORS_MAX],
     /// Flows and their packets the protocol guard dropped, GRE and every other protocol.
     protocols: [[u64; 2]; 2],
     /// Flows and their packets the ACK and SYN flood guards dropped.
     ack_flood: [u64; 2],
     syn_flood: [u64; 2],
-    /// Flows and their packets the fragment guard dropped, TCP and ICMP.
-    fragments: [[u64; 2]; 2],
+    /// Flows and their packets the fragment guard dropped, per protocol.
+    fragments: [[u64; 2]; 4],
     /// Flows and their packets the ICMP guard dropped, per kind.
-    icmp: [[u64; 2]; 3],
+    icmp: [[u64; 2]; 4],
+    /// What reaches the prefix over the last two seconds, in packets and bits, for the rules that
+    /// match only while it is under attack.
+    meter: Meter,
 }
 impl Load {
     fn observe(&mut self, now: i64, pps: u64, dropped: bool) {
@@ -157,7 +304,7 @@ pub const CAMPAIGN: i64 = 3_600_000;
 /// The longest any wave's mitigation holds.
 pub const MITIGATION_HOLD_MAX: i64 = 3_600_000;
 /// What reaches a tunnel's prefixes, in packets and bits, over the last two seconds.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Meter {
     slots: [i64; 2],
     packets: [u64; 2],
@@ -209,6 +356,8 @@ struct Watch {
     /// Mitigations started, and flows let through unfiltered while it was idle.
     mitigations: u64,
     unfiltered: u64,
+    /// How long its waves hold, and how close together they are one attack.
+    timing: tuning::Mitigation,
 }
 impl Watch {
     /// Counts a flow to the tunnel and says whether the tunnel is being mitigated: from the moment
@@ -218,7 +367,7 @@ impl Watch {
         let (pps, bps) = self.meter.rates(now);
         if pps >= self.attack_pps || bps >= self.attack_bps {
             if !self.active(now) {
-                self.wave = if self.since.is_some() && now - self.until <= CAMPAIGN {
+                self.wave = if self.since.is_some() && now - self.until <= self.timing.campaign {
                     self.wave.saturating_add(1)
                 } else {
                     1
@@ -234,18 +383,16 @@ impl Watch {
         self.since.is_some() && now <= self.until
     }
     /// How long the traffic has to stay under both thresholds before this wave's mitigation ends:
-    /// MITIGATION_HOLD for the first wave, doubling with each one after it.
+    /// the settings' hold for the first wave, MITIGATION_HOLD unless they say otherwise, doubling
+    /// with each one after it.
     fn hold(&self) -> i64 {
-        (MITIGATION_HOLD << self.wave.saturating_sub(1).min(4)).min(MITIGATION_HOLD_MAX)
+        (self.timing.hold << self.wave.saturating_sub(1).min(4)).min(self.timing.hold_max)
     }
 }
 /// How long a step of tightening holds after the probing that set it was last seen. A score
 /// within ml::PROBE_MARGIN under the threshold in force is a near miss, and each step lowers the
 /// thresholds by as much, ml::PROBE_STEPS at most.
 pub const PROBE_HOLD: i64 = 300_000;
-/// Near misses over the last ten seconds that say a target is being probed, when they are also a
-/// quarter or more of what the classifiers scored for it.
-const PROBE_MIN: u64 = 20;
 /// What the classifiers scored for one protected prefix over the last ten seconds, how much of
 /// that was a near miss, and how many steps the prefix's thresholds are lowered.
 ///
@@ -263,17 +410,17 @@ struct Probe {
 impl Probe {
     /// How far under their thresholds the classifiers drop for this prefix: a step for each level
     /// of probing seen, each lapsing PROBE_HOLD after the probing was last seen.
-    fn cut(&mut self, now: i64) -> f64 {
+    fn cut(&mut self, now: i64, hold: i64) -> f64 {
         while self.step > 0 && now > self.until {
             self.step -= 1;
-            self.until += PROBE_HOLD;
+            self.until += hold.max(1);
         }
         f64::from(self.step) * ml::PROBE_MARGIN
     }
     /// Counts a flow the classifiers scored, and whether it was a near miss. Near misses at
     /// PROBE_MIN or more, and at a quarter or more of what was scored, are probing: with `tighten`
     /// they lower the thresholds a step, or hold them at the last. Says whether they lowered them.
-    fn observe(&mut self, now: i64, near: bool, tighten: bool) -> bool {
+    fn observe(&mut self, now: i64, near: bool, tighten: bool, hold: i64, min: u64) -> bool {
         let sec = now / 1000;
         let i = sec.rem_euclid(10) as usize;
         if self.slots[i] != sec {
@@ -293,10 +440,10 @@ impl Probe {
                 .sum()
         };
         let (scored, near) = (live(&self.scored), live(&self.near));
-        if !tighten || near < PROBE_MIN || near * 4 < scored {
+        if !tighten || near < min || near * 4 < scored {
             return false;
         }
-        self.until = now + PROBE_HOLD;
+        self.until = now + hold;
         if self.step >= ml::PROBE_STEPS {
             return false;
         }
@@ -373,7 +520,7 @@ pub struct Pipeline {
     /// rules requests judged, requests dropped, requests over a rate, segments with none,
     /// segments dropped for a budget for everyone, TLS handshakes, and segments dropped for a
     /// request that arrives too slowly.
-    game_stats: HashMap<String, (String, [u64; 12])>,
+    game_stats: HashMap<String, (String, [u64; 13])>,
     stages: [[u64; 4]; 3],
     decisions: u64,
     unowned: u64,
@@ -410,24 +557,27 @@ pub struct Pipeline {
     syn_flood: guards::SynGuard,
     fragments: guards::FragmentGuard,
     icmp: guards::IcmpGuard,
+    /// The guards' settings, the policy's at 0 and then each profile's, which addresses each
+    /// profile holds, and the settings that are the policy's alone.
+    settings: Vec<Arc<tuning::Guards>>,
+    profiled: Vec<(IpNet, usize)>,
+    /// The aggregate each profile's addresses are judged for floods in, apart from the rest of
+    /// their prefixes, by the profile's own thresholds; empty at 0, for the policy's.
+    profile_aggregates: Vec<Key>,
+    global: tuning::Global,
+    /// The longest any settings hold a query as asking for an answer.
+    asked_within: i64,
+    /// What the protected prefix of the flow being decided takes, for rules that match only under
+    /// attack.
+    surge: Surge,
 }
-/// The crafted-packet checks: whether they drop, only count or are off, what each check dropped
-/// and observed, in packet::Check order, and the fragments in reassembly.
+/// The crafted-packet checks: what each check dropped and observed, in packet::Check order, and
+/// the fragments in reassembly. Whether each drops, only counts or is off is in the settings.
+#[derive(Default)]
 struct Crafted {
-    mode: String,
     dropped: [u64; 17],
     observed: [u64; 17],
     fragments: packet::Fragments,
-}
-impl Default for Crafted {
-    fn default() -> Self {
-        Self {
-            mode: "enforce".into(),
-            dropped: [0; 17],
-            observed: [0; 17],
-            fragments: Default::default(),
-        }
-    }
 }
 fn class(check: packet::Check) -> usize {
     match check.class() {
@@ -440,13 +590,13 @@ fn class(check: packet::Check) -> usize {
 /// the first rule on the asic stage, or failing one there the fpga stage, that matches it and drops
 /// or permits, permits. The checks made before the stages, lockdown and the penalty box, and an
 /// idle tunnel's HTTP rules honour it as the stages behind the rule do.
-fn allowed(rules: &[Vec<Entry>; 3], f: &Flow) -> bool {
+fn allowed(rules: &[Vec<Entry>; 3], f: &Flow, surge: &Surge) -> bool {
     rules[..2]
         .iter()
         .find_map(|stage| {
-            stage
-                .iter()
-                .find(|r| (r.action == "drop" || r.action == "permit") && r.matcher.matches(f))
+            stage.iter().find(|r| {
+                (r.action == "drop" || r.action == "permit") && r.matcher.matches(f, surge)
+            })
         })
         .is_some_and(|r| r.action == "permit")
 }
@@ -498,18 +648,30 @@ impl Pipeline {
             syn_flood: guards::SynGuard::default(),
             fragments: guards::FragmentGuard::default(),
             icmp: guards::IcmpGuard::default(),
+            settings: Vec::new(),
+            profiled: Vec::new(),
+            profile_aggregates: Vec::new(),
+            global: tuning::resolve(&Program::default()).global,
+            asked_within: reflection::ASKED_WITHIN,
+            surge: Surge::default(),
         };
         p.load(program);
         p
     }
     pub fn load(&mut self, program: Program) {
+        let resolved = tuning::resolve(&program);
+        let lengths = resolved.global.aggregation;
         self.prefixes = program
             .prefixes
             .iter()
             .filter_map(|p| {
-                p.parse::<IpNet>()
-                    .ok()
-                    .map(|net| (p.clone(), net, guards::aggregate(p, &net).into()))
+                p.parse::<IpNet>().ok().map(|net| {
+                    (
+                        p.clone(),
+                        net,
+                        guards::aggregate_at(p, &net, lengths).into(),
+                    )
+                })
             })
             .collect();
         // Lookups take the first match, so the most specific prefix has to come first or a /24
@@ -517,10 +679,26 @@ impl Pipeline {
         self.prefixes
             .sort_by_key(|(_, net, _)| std::cmp::Reverse(net.prefix_len()));
         let live: HashSet<_> = program.prefixes.iter().cloned().collect();
+        // A profile's addresses are judged together and apart from the rest of the policy's:
+        // judged with their neighbours, a flood the neighbours took would hold the guards engaged
+        // for them however high the profile set its thresholds.
+        let profile_aggregates: Vec<Key> = resolved
+            .guards
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                if i == 0 {
+                    Key::from("")
+                } else {
+                    Key::from(format!("profile:{}", g.name))
+                }
+            })
+            .collect();
         let aggregates: HashSet<String> = self
             .prefixes
             .iter()
             .map(|(_, _, a)| a.to_string())
+            .chain(profile_aggregates.iter().skip(1).map(|a| a.to_string()))
             .collect();
         let kept = |a: &str| aggregates.contains(a);
         self.loads.retain(|p, _| live.contains(p));
@@ -531,20 +709,32 @@ impl Pipeline {
         }
         self.pulses.forget(&live);
         self.egress.forget(&live);
-        self.protocols.load(program.protocols.as_ref());
-        self.ack_flood.load(program.ack_flood.as_ref(), &kept);
-        self.syn_flood.load(program.syn_flood.as_ref(), &kept);
-        self.fragments.load(program.fragments.as_ref());
-        self.icmp.load(program.icmp.as_ref(), &kept);
-        self.reflection.load(program.reflection.as_ref(), &kept);
+        self.ack_flood.load(&kept);
+        self.syn_flood.load(&kept);
+        self.icmp.load(&kept);
+        self.reflection.load(&kept);
+        self.reputation.cfg = resolved.global.reputation.clone();
+        self.egress.cfg = resolved.global.egress.clone();
+        self.pulses.cfg = resolved.global.pulse.clone();
+        self.asked_within = resolved
+            .guards
+            .iter()
+            .map(|g| g.reflection.asked_within)
+            .max()
+            .unwrap_or(reflection::ASKED_WITHIN);
         // Zero is the platform default, so a policy that drops its floor must clear the old one.
         self.pulses.floor = program.pulse_floor_pps.max(0) as u64;
+        let lists: HashMap<String, Arc<PrefixSet>> = program
+            .lists
+            .iter()
+            .map(|(name, cidrs)| (name.clone(), Arc::new(PrefixSet::of(cidrs))))
+            .collect();
         self.rules = [
             program
                 .asic
                 .iter()
                 .map(|r| Entry {
-                    matcher: Matcher::new(r.r#match.clone()),
+                    matcher: Matcher::new(r.r#match.clone(), &lists),
                     action: r.action.clone(),
                     id: r.rule_id.clone(),
                     limit: 0,
@@ -554,7 +744,7 @@ impl Pipeline {
                 .fpga
                 .iter()
                 .map(|r| Entry {
-                    matcher: Matcher::new(r.r#match.clone()),
+                    matcher: Matcher::new(r.r#match.clone(), &lists),
                     action: r.action.clone(),
                     id: r.rule_id.clone(),
                     limit: r.meter_pps,
@@ -564,7 +754,7 @@ impl Pipeline {
                 .zc
                 .iter()
                 .map(|r| Entry {
-                    matcher: Matcher::new(r.r#match.clone()),
+                    matcher: Matcher::new(r.r#match.clone(), &lists),
                     action: r.action.clone(),
                     id: r.rule_id.clone(),
                     limit: r.pps,
@@ -608,7 +798,7 @@ impl Pipeline {
                 .get(&b.id)
                 .filter(|(name, _)| name == &b.profile.name)
                 .cloned()
-                .unwrap_or((b.profile.name.clone(), [0; 12]));
+                .unwrap_or((b.profile.name.clone(), [0; 13]));
             stats.insert(b.id.clone(), old);
         }
         self.game_stats = stats;
@@ -643,10 +833,6 @@ impl Pipeline {
             }
         }
         self.ml = program.ml.clone().unwrap_or_default();
-        self.crafted.mode = match program.crafted.as_ref().map(|c| c.mode.as_str()) {
-            Some(mode @ ("observe" | "off")) => mode.into(),
-            _ => "enforce".into(),
-        };
         // Programs are recompiled whenever the fabric changes, so a tunnel being mitigated stays
         // mitigated, and its meter keeps counting, across a reload.
         let mut kept: HashMap<String, Watch> = std::mem::take(&mut self.watches)
@@ -669,7 +855,9 @@ impl Pipeline {
                 wave: 0,
                 mitigations: 0,
                 unfiltered: 0,
+                timing: resolved.global.mitigation.clone(),
             });
+            w.timing = resolved.global.mitigation.clone();
             w.attack_pps = t.attack_pps.max(1) as u64;
             w.attack_bps = (t.attack_kbps.max(1) as u64).saturating_mul(1000);
             for prefix in &t.prefixes {
@@ -677,7 +865,24 @@ impl Pipeline {
             }
             self.watches.push(w);
         }
+        self.settings = resolved.guards.into_iter().map(Arc::new).collect();
+        self.profiled = resolved.profiled;
+        self.profile_aggregates = profile_aggregates;
+        self.global = resolved.global;
         self.program = program;
+    }
+    /// The guards' settings for a destination, and which they are: the most specific profile
+    /// that holds it, or the policy's at 0.
+    fn settings_for(&self, dst: Option<IpAddr>) -> (usize, Arc<tuning::Guards>) {
+        let i = dst
+            .and_then(|a| {
+                self.profiled
+                    .iter()
+                    .find(|(net, _)| net.contains(&a))
+                    .map(|(_, i)| *i)
+            })
+            .unwrap_or(0);
+        (i, self.settings[i].clone())
     }
     /// Mitigations started on this node's on-demand tunnels, for whoever wants to know at once.
     pub fn mitigations(&self) -> u64 {
@@ -702,7 +907,7 @@ impl Pipeline {
         };
         // What an operator permits passes a mitigating tunnel's stages unjudged, so it passes an
         // idle one's HTTP rules too.
-        if allowed(&self.rules, f) {
+        if allowed(&self.rules, f, &self.surge) {
             self.watches[i].unfiltered += 1;
             return watching(&self.watches[i]);
         }
@@ -727,10 +932,15 @@ impl Pipeline {
         watching(&self.watches[i])
     }
     fn over_rate(&mut self, id: &str, limit: i64, f: &Flow, now: i64) -> bool {
+        self.over_rate_for(id, &f.src_ip, f.pps, limit, now)
+    }
+    /// Counts `pps` against a rule's rate for `who`, a source or, for a shape, everyone, and says
+    /// whether it is over over the last second.
+    fn over_rate_for(&mut self, id: &str, who: &str, pps: i64, limit: i64, now: i64) -> bool {
         if limit <= 0 {
             return false;
         }
-        let key = (id.into(), f.src_ip.clone());
+        let key = (id.into(), who.to_string());
         let slot = now / 250;
         if !self.buckets.contains_key(&key) && self.buckets.len() >= 65536 {
             if now - self.last_sweep < 1000 {
@@ -749,7 +959,7 @@ impl Pipeline {
             b.slots[i] = slot;
             b.count[i] = 0;
         }
-        b.count[i] = b.count[i].saturating_add(f.pps);
+        b.count[i] = b.count[i].saturating_add(pps);
         b.count
             .iter()
             .zip(b.slots)
@@ -847,6 +1057,7 @@ impl Pipeline {
             s[5] += r.requests;
             s[8] += u64::from(r.other);
             s[10] += u64::from(r.handshake);
+            s[12] += u64::from(r.slow_observed);
         }
         if r.cleared > 0 {
             self.reputation.promote(&f.src_ip, r.cleared, now);
@@ -922,10 +1133,31 @@ impl Pipeline {
                 }
             }
             for i in 0..self.rules[stage].len() {
-                if !self.rules[stage][i].matcher.matches(f) {
+                if !self.rules[stage][i].matcher.matches(f, &self.surge) {
                     continue;
                 }
                 let r = self.rules[stage][i].clone();
+                // A shape holds everything the rule matches, from every source together, to its
+                // rate, whoever sends it; under the rate, the stages behind it go on judging.
+                if r.action == "shape" {
+                    self.seen(&r.id, f);
+                    if self.over_rate_for(&r.id, "", f.pps, r.limit, now) {
+                        return (
+                            decision(
+                                "drop",
+                                stage,
+                                &r.id,
+                                format!(
+                                    "{} shaped to {} pps",
+                                    ["TCAM ACL", "FPGA", "PF_RING ZC"][stage],
+                                    r.limit
+                                ),
+                            ),
+                            (!trusted).then(|| r.id.clone()),
+                        );
+                    }
+                    continue;
+                }
                 if trusted {
                     // Trust skips the challenge and the classifier, nothing else. A count is still
                     // observe-only and the behavioural cap still applies, so a match that decides
@@ -1035,20 +1267,23 @@ impl Pipeline {
     /// Holds a flow to what a packet can legitimately be, and returns the drop and the check it
     /// broke if it is crafted. It is judged whoever sent it: a permit or a verified source vouches
     /// for an address, which a crafted packet forges as easily as the rest of itself. Nor is its
-    /// source boxed for it, since that address is as likely to be the forgery.
+    /// source boxed for it, since that address is as likely to be the forgery. Each check takes the
+    /// mode its settings give it.
     fn crafted(
         &mut self,
         f: &Flow,
         dst: Option<IpAddr>,
         now: i64,
+        g: &tuning::Guards,
     ) -> Option<(Decision, packet::Check)> {
-        if self.crafted.mode == "off" {
+        let c = &g.crafted;
+        if c.checks.iter().all(|m| *m == Mode::Off) {
             return None;
         }
         let (found, stage) = if f.packet.is_empty() {
             (packet::record(f, dst), 0)
         } else {
-            let (p, found) = packet::parse(&f.packet);
+            let (p, found) = packet::parse_with(&f.packet, &c.limits);
             match found {
                 Some(a) => (Some(a), 0),
                 // Telling one datagram's fragments from another's takes memory a switch does not
@@ -1059,9 +1294,13 @@ impl Pipeline {
         };
         let a = found?;
         let i = a.check as usize;
-        if self.crafted.mode == "observe" {
-            self.crafted.observed[i] += 1;
-            return None;
+        match c.checks[i] {
+            Mode::Off => return None,
+            Mode::Observe => {
+                self.crafted.observed[i] += 1;
+                return None;
+            }
+            Mode::Enforce => {}
         }
         self.crafted.dropped[i] += 1;
         let mut d = decision(
@@ -1077,66 +1316,70 @@ impl Pipeline {
     /// its drop, with the vector it belongs to, if it is. Each vector's answers come from its
     /// port and open the way its answers do (see reflection.rs). An operator's permit vouches for
     /// the address it covers, and so does the origin having sent that address a query of the
-    /// vector: an answer it asked for is no reflection. Answers of a vector the server asks
-    /// itself, DNS and NTP's time, are dropped only while the aggregate is flooded with ones it
-    /// never asked for. The rest of a long answer arrives in fragments that carry no port, so a
-    /// source caught reflecting has its later fragments dropped too, for as long as a host would
-    /// hold them. Its address is real, since a reflector answers from its own, but it is no
-    /// strike: a reflector is somebody's server, put to work by the attacker.
+    /// vector: an answer it asked for is no reflection. Answers of a vector judged in floods,
+    /// DNS and NTP's time unless the settings say otherwise, are dropped only while the aggregate
+    /// is flooded with ones it never asked for. The rest of a long answer arrives in fragments
+    /// that carry no port, so a source caught reflecting has its later fragments dropped too, for
+    /// as long as a host would hold them. Its address is real, since a reflector answers from its
+    /// own, but it is no strike: a reflector is somebody's server, put to work by the attacker.
     fn reflected(
         &mut self,
         f: &Flow,
         owner: &str,
         aggregate: &Key,
         now: i64,
+        g: &tuning::Guards,
     ) -> Option<(Decision, usize)> {
-        let seen = self.reflection.seen(f, now, || {
-            let (p, _) = packet::parse(&f.packet);
-            p.fragment() && !p.transport
-        });
+        let s = &g.reflection;
+        let reflecting_for = self.global.reflecting_for;
+        let seen = self
+            .reflection
+            .seen(f, now, s, &self.global.custom, reflecting_for, || {
+                let (p, _) = packet::parse(&f.packet);
+                p.fragment() && !p.transport
+            });
         let (i, answer) = match seen {
             reflection::Seen::Not => return None,
             reflection::Seen::Answer(i, kind, what) => (i, Some((kind, what))),
             reflection::Seen::Fragment(i) => (i, None),
         };
-        if allowed(&self.rules, f) {
+        if allowed(&self.rules, f, &self.surge) {
             return None;
         }
-        let v = &VECTORS[i];
+        let (name, label, port) = {
+            let (n, l, p) = reflection::about(i, &self.global.custom);
+            (n.to_string(), l.to_string(), p)
+        };
         let mut flood = false;
         if let Some((kind, _)) = answer {
-            if self.egress.asked(
-                owner,
-                &f.src_ip,
-                reflection::bit(i),
-                reflection::ASKED_WITHIN,
-                now,
-            ) {
+            if self
+                .egress
+                .asked(owner, &f.src_ip, reflection::bit(i), s.asked_within, now)
+            {
                 self.reflection.counts[i][2] += 1;
                 return None;
             }
             if kind == reflection::Kind::Flood {
                 if !self
                     .reflection
-                    .flooded_by(aggregate, i, f.pps.max(0) as u64, now)
+                    .flooded_by(aggregate, i, f.pps.max(0) as u64, s, now)
                 {
                     return None;
                 }
                 flood = true;
             }
-            self.reflection.caught(&f.src_ip, i, now);
+            self.reflection.caught(&f.src_ip, i, now, reflecting_for);
         }
-        if self.reflection.modes[i] == "observe" {
+        if s.modes.get(i) == Some(&Mode::Observe) {
             self.reflection.counts[i][1] += 1;
             return None;
         }
         let mut d = match answer {
             Some((_, what)) => {
                 self.reflection.counts[i][0] += 1;
-                let what = what.map_or_else(|| format!("UDP from port {}", v.port), String::from);
+                let what = what.map_or_else(|| format!("UDP from port {port}"), String::from);
                 let reason = format!(
-                    "{} reflection: {what} that the server never asked for{}",
-                    v.label,
+                    "{label} reflection: {what} that the server never asked for{}",
                     if flood {
                         ", while the prefix is flooded with them"
                     } else {
@@ -1155,24 +1398,23 @@ impl Pipeline {
                     2,
                     "",
                     format!(
-                        "{} reflection: a later fragment of an answer from a source caught reflecting",
-                        v.label
+                        "{label} reflection: a later fragment of an answer from a source caught reflecting"
                     ),
                 )
             }
         };
-        d.reflection = v.name.into();
+        d.reflection = name;
         Some((d, i))
     }
     /// Holds a flow to whether its protocol is one the protected addresses receive: TCP, UDP,
-    /// ICMP and what the policy allows. GRE is what botnets wrap their floods in. An operator's
+    /// ICMP and what the settings allow. GRE is what botnets wrap their floods in. An operator's
     /// permit vouches for what it covers, a rule naming the protocol among them.
-    fn foreign(&mut self, f: &Flow) -> Option<(Decision, String)> {
-        let name = self.protocols.stopped(&f.proto)?;
-        if allowed(&self.rules, f) {
+    fn foreign(&mut self, f: &Flow, g: &tuning::Guards) -> Option<(Decision, String)> {
+        let name = self.protocols.stopped(&f.proto, &g.protocols)?;
+        if allowed(&self.rules, f, &self.surge) {
             return None;
         }
-        let observed = self.protocols.mode == "observe";
+        let observed = g.protocols.mode == Mode::Observe;
         self.protocols.count(&name, observed);
         if observed {
             return None;
@@ -1181,21 +1423,22 @@ impl Pipeline {
         d.guard = "protocol".into();
         Some((d, name))
     }
-    /// Holds a packet to whether it is TCP or ICMP in fragments, and returns its drop, with
-    /// which of the two it is, if it is: no real sender fragments either, since TCP sizes its
-    /// segments to the path and ICMP's messages are small. Fragmented ACK floods and ICMP
-    /// fragmentation floods are built that way to cost reassembly. Only a packet shows it is a
-    /// fragment. An operator's permit vouches for what it covers.
-    fn fragmented(&mut self, f: &Flow) -> Option<(Decision, usize)> {
-        if f.packet.is_empty() || self.fragments.mode == "off" {
+    /// Holds a packet to whether it is a fragment of a protocol the settings say arrives whole,
+    /// TCP and ICMP unless they say more, and returns its drop, with which protocol it is, if it
+    /// is: no real sender fragments either, since TCP sizes its segments to the path and ICMP's
+    /// messages are small. Fragmented ACK floods and ICMP fragmentation floods are built that way
+    /// to cost reassembly. Only a packet shows it is a fragment. An operator's permit vouches for
+    /// what it covers.
+    fn fragmented(&mut self, f: &Flow, g: &tuning::Guards) -> Option<(Decision, usize)> {
+        if f.packet.is_empty() || g.fragments.mode == Mode::Off {
             return None;
         }
         let (p, _) = packet::parse(&f.packet);
-        let i = self.fragments.fragment(&p)?;
-        if allowed(&self.rules, f) {
+        let i = self.fragments.fragment(&p, &g.fragments)?;
+        if allowed(&self.rules, f, &self.surge) {
             return None;
         }
-        if self.fragments.mode == "observe" {
+        if g.fragments.mode == Mode::Observe {
             self.fragments.counts[i][1] += 1;
             return None;
         }
@@ -1205,12 +1448,13 @@ impl Pipeline {
         Some((d, i))
     }
     /// Holds ICMP to what a protected address needs of it, and returns its drop, with its kind
-    /// in guards::ICMP_KINDS, if it is caught. An echo reply answers a ping the server sent, so
-    /// one it never asked for is dropped while the aggregate is flooded with them, as a Smurf
-    /// attack floods. An error quotes the packet it is about, which the protected prefix must
-    /// have sent; one that quotes nothing of the prefix's is forged, as BlackNurse floods with.
-    /// Everything else, echo requests and errors that hold up among it, is held to a rate for
-    /// the aggregate. An operator's permit vouches for what it covers.
+    /// in guards::ICMP_KINDS, if it is caught. A type the settings drop is dropped whatever its
+    /// rate. An echo reply answers a ping the server sent, so one it never asked for is dropped
+    /// while the aggregate is flooded with them, as a Smurf attack floods. An error quotes the
+    /// packet it is about, which the protected prefix must have sent; one that quotes nothing of
+    /// the prefix's is forged, as BlackNurse floods with, unless the settings let errors through
+    /// unread. Everything else, echo requests and errors that hold up among it, is held to a rate
+    /// for the aggregate. An operator's permit vouches for what it covers.
     fn icmp_guard(
         &mut self,
         f: &Flow,
@@ -1218,57 +1462,75 @@ impl Pipeline {
         net: &IpNet,
         aggregate: &Key,
         now: i64,
+        g: &tuning::Guards,
     ) -> Option<(Decision, usize)> {
-        if self.icmp.mode == "off"
+        let s = &g.icmp;
+        if s.mode == Mode::Off
             || !f.proto.eq_ignore_ascii_case("icmp")
-            || allowed(&self.rules, f)
+            || allowed(&self.rules, f, &self.surge)
         {
             return None;
         }
         let pps = f.pps.max(0) as u64;
-        let what = if f.packet.is_empty() {
-            guards::Icmp::Other
+        let (what, kind) = if f.packet.is_empty() {
+            // A record says what it is in its fields, if it says at all.
+            (
+                guards::Icmp::Other,
+                f.icmp_type.map(|t| (t, matches!(net, IpNet::V6(_)))),
+            )
         } else {
             let (p, _) = packet::parse(&f.packet);
             // A later fragment holds no ICMP header to judge: the fragment guard's to drop.
             if !p.transport {
                 return None;
             }
-            guards::icmp_of(&p, net)
+            (guards::icmp_of(&p, net), p.icmp.map(|(t, _)| (t, p.v6)))
         };
-        let i = match what {
-            guards::Icmp::Reply => {
-                if self.egress.asked(
-                    owner,
-                    &f.src_ip,
-                    guards::ECHO_BIT,
-                    reflection::ASKED_WITHIN,
-                    now,
-                ) || !self.icmp.smurfed_by(aggregate, pps, now)
-                {
-                    return None;
-                }
-                1
+        let dropped_type = kind.filter(|(t, v6)| {
+            if *v6 {
+                s.drop_v6.has(*t)
+            } else {
+                s.drop.has(*t)
             }
-            guards::Icmp::Error { from_prefix: false } => 2,
-            _ => {
-                if !self.icmp.over_limit(aggregate, pps, now) {
-                    return None;
+        });
+        let i = if dropped_type.is_some() {
+            3
+        } else {
+            match what {
+                guards::Icmp::Reply => {
+                    if self.egress.asked(
+                        owner,
+                        &f.src_ip,
+                        guards::ECHO_BIT,
+                        g.reflection.asked_within,
+                        now,
+                    ) || !self.icmp.smurfed_by(aggregate, pps, s, now)
+                    {
+                        return None;
+                    }
+                    1
                 }
-                0
+                guards::Icmp::Error { from_prefix: false } if s.verify_errors => 2,
+                _ => {
+                    if !self.icmp.over_limit(aggregate, pps, s.limit_pps, now) {
+                        return None;
+                    }
+                    0
+                }
             }
         };
-        if self.icmp.mode == "observe" {
+        if s.mode == Mode::Observe {
             self.icmp.counts[i][1] += 1;
             return None;
         }
         self.icmp.counts[i][0] += 1;
-        // A quote a switch can read; rates and what the server asked are memory it does not have.
+        // A quote or a type a switch can read; rates and what the server asked are memory it does
+        // not have.
         let mut d = decision(
             "drop",
-            if i == 2 { 0 } else { 2 },
+            if i >= 2 { 0 } else { 2 },
             "",
-            guards::icmp_why(i, self.icmp.limit_pps),
+            guards::icmp_why(i, s.limit_pps, dropped_type.map_or(0, |(t, _)| t)),
         );
         d.guard = "icmp".into();
         Some((d, i))
@@ -1281,7 +1543,7 @@ impl Pipeline {
     /// followed by a stream of ACKs, gets those few. That is known only where the server's
     /// traffic passes the node, and once it has been watched long enough to have seen every
     /// connection open, so the guard waits for both. It drops such TCP only while the aggregate
-    /// takes more of it than its threshold, and holds a minute after; below that, a stray
+    /// takes more of it than its threshold, and holds a while after; below that, a stray
     /// segment, after a restart say, passes. An operator's permit vouches for what it covers; a
     /// player's trust does not, since its address is as easily forged.
     fn unsolicited(
@@ -1290,21 +1552,23 @@ impl Pipeline {
         owner: &str,
         aggregate: &Key,
         now: i64,
+        g: &tuning::Guards,
     ) -> Option<Decision> {
-        if self.ack_flood.mode == "off"
+        let s = &g.ack;
+        if s.mode == Mode::Off
             || !f.proto.eq_ignore_ascii_case("tcp")
             || !guards::mid_connection(&f.flags)
-            || self.egress.watched_for(owner, now) < guards::ACK_WARM
+            || self.egress.watched_for(owner, now) < s.warm
             // A full table may have missed a connection opened since, so the guard stands down
             // rather than drop it.
             || self.egress.saturated()
             || self
                 .egress
-                .talked_tcp(owner, &f.src_ip, guards::TALKED_WITHIN, now)
+                .talked_tcp(owner, &f.src_ip, s.talked_within, now)
             || self
                 .egress
-                .opened_tcp(owner, &f.src_ip, guards::TALKED_WITHIN, now)
-            || allowed(&self.rules, f)
+                .opened_tcp(owner, &f.src_ip, s.talked_within, now)
+            || allowed(&self.rules, f, &self.surge)
         {
             return None;
         }
@@ -1313,8 +1577,8 @@ impl Pipeline {
                 owner,
                 &f.src_ip,
                 u32::try_from(f.pps.max(0)).unwrap_or(u32::MAX),
-                guards::HANDSHAKE,
-                guards::HANDSHAKE_SEGMENTS,
+                s.handshake,
+                s.handshake_segments,
                 now,
             )
         {
@@ -1322,11 +1586,11 @@ impl Pipeline {
         }
         if !self
             .ack_flood
-            .engaged_by(aggregate, f.pps.max(0) as u64, now)
+            .engaged_by(aggregate, f.pps.max(0) as u64, s, now)
         {
             return None;
         }
-        if self.ack_flood.mode == "observe" {
+        if s.mode == Mode::Observe {
             self.ack_flood.counts[1] += 1;
             return None;
         }
@@ -1342,23 +1606,31 @@ impl Pipeline {
     /// its first SYN held back during a flood, and passes on the retry its stack sends a second or
     /// so later, which a forged SYN, sent once from a made-up address, never has. An operator's
     /// permit vouches for what it covers.
-    fn syn_flood(&mut self, f: &Flow, owner: &str, aggregate: &Key, now: i64) -> Option<Decision> {
-        if self.syn_flood.mode == "off"
+    fn syn_flood(
+        &mut self,
+        f: &Flow,
+        owner: &str,
+        aggregate: &Key,
+        now: i64,
+        g: &tuning::Guards,
+    ) -> Option<Decision> {
+        let s = &g.syn;
+        if s.mode == Mode::Off
             || !f.proto.eq_ignore_ascii_case("tcp")
             || !guards::opening(&f.flags)
             || self
                 .egress
-                .talked_tcp(owner, &f.src_ip, guards::TALKED_WITHIN, now)
+                .talked_tcp(owner, &f.src_ip, g.ack.talked_within, now)
             || self.egress.confirmed(owner, &f.src_ip, now)
             || self.reputation.verified(&f.src_ip, now)
-            || allowed(&self.rules, f)
+            || allowed(&self.rules, f, &self.surge)
         {
             return None;
         }
-        let retry = self.syn_flood.retried(f, now) && f.pps <= guards::SYN_RETRIES;
+        let retry = self.syn_flood.retried(f, s.retry_within, now) && f.pps <= s.retries_pps;
         if !self
             .syn_flood
-            .engaged_by(aggregate, f.pps.max(0) as u64, now)
+            .engaged_by(aggregate, f.pps.max(0) as u64, s, now)
         {
             return None;
         }
@@ -1366,7 +1638,7 @@ impl Pipeline {
             self.syn_flood.counts[2] += 1;
             return None;
         }
-        if self.syn_flood.mode == "observe" {
+        if s.mode == Mode::Observe {
             self.syn_flood.counts[1] += 1;
             return None;
         }
@@ -1390,16 +1662,18 @@ impl Pipeline {
         self.decisions += 1;
         let pps = f.pps.max(0) as u64;
         let dst = f.dst_ip.parse::<IpAddr>().ok();
+        let (profile, g) = self.settings_for(dst);
+        self.surge = Surge::default();
         let owner = dst.and_then(|a| {
             self.prefixes
                 .iter()
                 .find(|(_, p, _)| p.contains(&a))
                 .map(|(s, net, aggregate)| (s.clone(), *net, aggregate.clone()))
         });
-        let Some((owner, net, aggregate)) = owner else {
+        let Some((owner, net, mut aggregate)) = owner else {
             // A packet too broken to say where it is going is no one's traffic to pass.
             if !f.packet.is_empty() && dst.is_none() {
-                if let Some((d, _)) = self.crafted(f, dst, now) {
+                if let Some((d, _)) = self.crafted(f, dst, now, &g) {
                     self.record(&d, None, f);
                     self.load.observe(now, pps, true);
                     return d;
@@ -1409,9 +1683,19 @@ impl Pipeline {
             self.load.observe(now, pps, false);
             return decision("permit", 0, "", "prefix not assigned to this node");
         };
+        if profile > 0 {
+            aggregate = self.profile_aggregates[profile].clone();
+        }
         self.pulses.observe(&owner, pps, now);
         if self.lockdown != "off" {
             self.egress.ingress(&owner, now);
+        }
+        // What the prefix takes, this flow included, for the rules that match only under attack.
+        {
+            let meter = &mut self.loads.entry(owner.clone()).or_default().meter;
+            meter.observe(now, pps, bits(f));
+            let (pps, bps) = meter.rates(now);
+            self.surge = Surge { pps, bps };
         }
         // Without a model there is nothing to score, and nothing to look up for it.
         let tighten = self.ml.tightens() && self.model.usable();
@@ -1420,7 +1704,7 @@ impl Pipeline {
                 .probes
                 .get_mut(&owner)
                 .filter(|_| tighten)
-                .map_or(0.0, |p| p.cut(now)),
+                .map_or(0.0, |p| p.cut(now, self.global.probe_hold)),
             ..Default::default()
         };
         // An on-demand tunnel's traffic is only watched until it reaches the tunnel's thresholds,
@@ -1433,7 +1717,7 @@ impl Pipeline {
             .filter(|&i| !self.watches[i].mitigating(now, pps, bits(f)));
         // A crafted packet is judged first, on a watched tunnel too: it needs no volume to do its
         // harm, so no threshold would ever start mitigation for it.
-        if let Some((d, check)) = self.crafted(f, dst, now) {
+        if let Some((d, check)) = self.crafted(f, dst, now, &g) {
             self.record(&d, None, f);
             self.load.observe(now, pps, true);
             let load = self.loads.entry(owner).or_default();
@@ -1461,35 +1745,36 @@ impl Pipeline {
             c[0] += 1;
             c[1] = c[1].saturating_add(pps);
         };
-        if let Some((d, i)) = self.reflected(f, &owner, &aggregate, now) {
+        if let Some((d, i)) = self.reflected(f, &owner, &aggregate, now, &g) {
             count(&mut self.guarded(&d, f, &owner, now).reflection[i], pps);
             return d;
         }
-        if let Some((d, name)) = self.foreign(f) {
+        if let Some((d, name)) = self.foreign(f, &g) {
             let c = usize::from(name != "gre");
             count(&mut self.guarded(&d, f, &owner, now).protocols[c], pps);
             return d;
         }
-        if let Some((d, i)) = self.fragmented(f) {
+        if let Some((d, i)) = self.fragmented(f, &g) {
             count(&mut self.guarded(&d, f, &owner, now).fragments[i], pps);
             return d;
         }
-        if let Some((d, i)) = self.icmp_guard(f, &owner, &net, &aggregate, now) {
+        if let Some((d, i)) = self.icmp_guard(f, &owner, &net, &aggregate, now, &g) {
             count(&mut self.guarded(&d, f, &owner, now).icmp[i], pps);
             return d;
         }
-        if let Some(d) = self.unsolicited(f, &owner, &aggregate, now) {
+        if let Some(d) = self.unsolicited(f, &owner, &aggregate, now, &g) {
             count(&mut self.guarded(&d, f, &owner, now).ack_flood, pps);
             return d;
         }
-        if let Some(d) = self.syn_flood(f, &owner, &aggregate, now) {
+        if let Some(d) = self.syn_flood(f, &owner, &aggregate, now, &g) {
             count(&mut self.guarded(&d, f, &owner, now).syn_flood, pps);
             return d;
         }
         let rules = &self.rules;
+        let surge = self.surge;
         let state = self
             .reputation
-            .check_sparing(&f.src_ip, now, || allowed(rules, f));
+            .check_sparing(&f.src_ip, now, || allowed(rules, f, &surge));
         let (d, by) = if state == 2 {
             (
                 decision("drop", 0, "", "source is in the penalty box"),
@@ -1505,7 +1790,7 @@ impl Pipeline {
                 && self.egress.visibility(&owner, now) == "visible"
                 && !self.egress.confirmed(&owner, &f.src_ip, now)
                 && !self.egress.grace(&owner, &f.src_ip, self.grace, now)
-                && !allowed(&self.rules, f);
+                && !allowed(&self.rules, f, &self.surge);
             if held {
                 self.returns[2] += 1;
             }
@@ -1544,7 +1829,9 @@ impl Pipeline {
         let tighten = self.ml.tightens();
         if let Some(p) = self.probes.get_mut(owner) {
             self.probe_counts[0] += u64::from(self.scoring.near);
-            self.probe_counts[1] += u64::from(p.observe(now, self.scoring.near, tighten));
+            let (hold, min) = (self.global.probe_hold, self.global.probe_min);
+            self.probe_counts[1] +=
+                u64::from(p.observe(now, self.scoring.near, tighten, hold, min));
         }
     }
     pub fn observe_return(&mut self, f: &Flow, now: i64) {
@@ -1568,7 +1855,7 @@ impl Pipeline {
             if let Some(i) = reflection::queried(f) {
                 let bit = reflection::bit(i);
                 self.egress
-                    .queried(&prefix, &f.dst_ip, bit, reflection::ASKED_WITHIN, now);
+                    .queried(&prefix, &f.dst_ip, bit, self.asked_within, now);
             }
             if f.proto.eq_ignore_ascii_case("icmp")
                 && !f.packet.is_empty()
@@ -1576,7 +1863,7 @@ impl Pipeline {
             {
                 let bit = guards::ECHO_BIT;
                 self.egress
-                    .queried(&prefix, &f.dst_ip, bit, reflection::ASKED_WITHIN, now);
+                    .queried(&prefix, &f.dst_ip, bit, self.asked_within, now);
             }
             // TCP of an open connection the origin sent makes TCP from the address part of a
             // connection it has. Its SYN opens one, whose SYN-ACK it then expects; its SYN-ACK
@@ -1612,7 +1899,7 @@ impl Pipeline {
         let stages:Vec<_>=self.stages.iter().enumerate().map(|(i,s)|json!({"stage":(["asic","fpga","zc"][i]),"dropped":s[0],"permitted":s[1],"pps_dropped":s[2],"pps_permitted":s[3]})).collect();
         let mut rules:Vec<_>=self.rule_stats.iter().map(|(id,(stage,s))|json!({"rule_id":id,"stage":stage,"matches":s[0],"drops":s[1],"pps_seen":s[2],"pps_dropped":s[3]})).collect();
         rules.sort_by(|a, b| a["rule_id"].as_str().cmp(&b["rule_id"].as_str()));
-        let mut games:Vec<_>=self.game_stats.iter().map(|(id,(profile,s))|json!({"filter_id":id,"profile":profile,"inspected":s[0],"dropped":s[1],"challenged":s[2],"uninspectable":s[3],"pps_dropped":s[4],"http_requests":s[5],"http_dropped":s[6],"http_rate_limited":s[7],"http_other":s[8],"http_budget_dropped":s[9],"http_tls_handshakes":s[10],"http_slow_dropped":s[11]})).collect();
+        let mut games:Vec<_>=self.game_stats.iter().map(|(id,(profile,s))|json!({"filter_id":id,"profile":profile,"inspected":s[0],"dropped":s[1],"challenged":s[2],"uninspectable":s[3],"pps_dropped":s[4],"http_requests":s[5],"http_dropped":s[6],"http_rate_limited":s[7],"http_other":s[8],"http_budget_dropped":s[9],"http_tls_handshakes":s[10],"http_slow_dropped":s[11],"http_slow_observed":s[12]})).collect();
         games.sort_by(|a, b| a["filter_id"].as_str().cmp(&b["filter_id"].as_str()));
         let mut pulsing = false;
         let mut peak = 0;
@@ -1629,7 +1916,7 @@ impl Pipeline {
                 .probes
                 .get_mut(prefix)
                 .filter(|_| tighten)
-                .map_or(0.0, |p| p.cut(now));
+                .map_or(0.0, |p| p.cut(now, self.global.probe_hold));
             let (o, d) = l.rates(now);
             if a["pulsing"] == true {
                 pulsing = true;
@@ -1645,11 +1932,13 @@ impl Pipeline {
             if !crafted.is_empty() {
                 row["crafted"] = json!(crafted);
             }
-            let reflected: Vec<_> = VECTORS
-                .iter()
+            let reflected: Vec<_> = (0..VECTORS_LEN + self.global.custom.len())
                 .zip(l.reflection)
                 .filter(|(_, [flows, _])| *flows > 0)
-                .map(|(v, [flows, pps])| json!({"vector":v.name,"flows":flows,"dropped":pps}))
+                .map(|(i, [flows, pps])| {
+                    let (name, _, _) = reflection::about(i, &self.global.custom);
+                    json!({"vector":name,"flows":flows,"dropped":pps})
+                })
                 .collect();
             if !reflected.is_empty() {
                 row["reflection"] = json!(reflected);
@@ -1709,8 +1998,9 @@ impl Pipeline {
             .enumerate()
             .map(|(i, c)| json!({"check":c.name(),"class":c.class(),"dropped":self.crafted.dropped[i],"observed":self.crafted.observed[i]}))
             .collect();
-        let crafted = json!({"mode":self.crafted.mode,"dropped":self.crafted.dropped.iter().sum::<u64>(),"observed":self.crafted.observed.iter().sum::<u64>(),"fragments":self.crafted.fragments.len(),"fragments_max":packet::FRAGMENTS_MAX,"fragments_untracked":self.crafted.fragments.untracked,"checks":checks});
+        let base = self.settings[0].clone();
+        let crafted = json!({"mode":base.crafted.mode.name(),"dropped":self.crafted.dropped.iter().sum::<u64>(),"observed":self.crafted.observed.iter().sum::<u64>(),"fragments":self.crafted.fragments.len(),"fragments_max":packet::FRAGMENTS_MAX,"fragments_untracked":self.crafted.fragments.untracked,"checks":checks});
         let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"wave":w.wave,"hold_seconds":w.hold()/1000,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"game_http_pending":self.games.pending().0,"game_http_pending_max":crate::httpfilter::PENDING_MAX,"game_http_pending_untracked":self.games.pending().1,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(now),"protocols":self.protocols.stats(),"ack_flood":self.ack_flood.stats(now),"syn_flood":self.syn_flood.stats(now),"fragments":self.fragments.stats(),"icmp":self.icmp.stats(now),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
+        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"game_http_pending":self.games.pending().0,"game_http_pending_max":crate::httpfilter::PENDING_MAX,"game_http_pending_untracked":self.games.pending().1,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(&base.reflection,&self.global.custom,now),"protocols":self.protocols.stats(&base.protocols),"ack_flood":self.ack_flood.stats(&base.ack,now),"syn_flood":self.syn_flood.stats(&base.syn,now),"fragments":self.fragments.stats(&base.fragments),"icmp":self.icmp.stats(&base.icmp,now),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }

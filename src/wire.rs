@@ -366,13 +366,16 @@ pub struct SynFloodStats {
     #[serde(deserialize_with = "null_default")]
     pub retried: u64,
 }
-/// What the fragment guard did: in which mode, and what it dropped and observed, in all and per
-/// protocol (TCP and ICMP).
+/// What the fragment guard did: in which mode, whose fragments it drops, and what it dropped and
+/// observed, in all and per protocol (TCP, ICMP, UDP and the rest).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FragmentStats {
     #[serde(deserialize_with = "null_default")]
     pub mode: String,
+    /// Whose fragments are dropped.
+    #[serde(deserialize_with = "null_default")]
+    pub protocols: Vec<String>,
     #[serde(deserialize_with = "null_default")]
     pub dropped: u64,
     #[serde(deserialize_with = "null_default")]
@@ -382,7 +385,7 @@ pub struct FragmentStats {
 }
 /// What the ICMP guard did: in which mode, at what rate and threshold, on how many aggregates
 /// echo replies count as a flood, and what it dropped and observed, in all and per kind (flood,
-/// smurf, error).
+/// smurf, error, and type for the types a policy drops).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IcmpStats {
@@ -647,6 +650,9 @@ pub struct GameStats {
     pub http_tls_handshakes: u64,
     #[serde(deserialize_with = "null_default")]
     pub http_slow_dropped: u64,
+    /// Requests the slow-HTTP rules would have dropped had their mode been enforce.
+    #[serde(deserialize_with = "null_default")]
+    pub http_slow_observed: u64,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

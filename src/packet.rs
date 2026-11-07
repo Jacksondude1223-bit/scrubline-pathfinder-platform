@@ -54,6 +54,22 @@ pub const MIN_FRAGMENT: usize = 256;
 /// The largest MSS a SYN may offer and still be refused: SACK Panic (CVE-2019-11477) needs a tiny
 /// one, and the published mitigation drops SYNs offering 500 bytes or less.
 pub const LOW_MSS: u16 = 500;
+/// The two thresholds the checks take from a policy: the largest MSS a SYN may offer and still be
+/// dropped as SACK Panic's shape, and the smallest fragment short of a datagram's last that is not
+/// dropped as too small.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub low_mss: u16,
+    pub min_fragment: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            low_mss: LOW_MSS,
+            min_fragment: MIN_FRAGMENT,
+        }
+    }
+}
 
 /// One rule a crafted packet breaks. The order is the order of the node's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -312,6 +328,11 @@ pub struct Packet<'a> {
     pub flags: Option<u16>,
     /// The receive window a TCP segment advertises, as written: unscaled.
     pub window: Option<u16>,
+    /// The datagram's length as its header gives it, header and all, its TTL or hop limit, and
+    /// the DSCP code point its traffic class or type of service carries.
+    pub length: u32,
+    pub ttl: u8,
+    pub dscp: u8,
     pub icmp: Option<(u8, u8)>,
     pub payload: &'a [u8],
 }
@@ -337,10 +358,14 @@ fn sum(h: &[u8]) -> u16 {
 /// Reads a packet from its IP header on, and the first rule it breaks, if it breaks one. What was
 /// read before the break is kept, so a flow still has the addresses and ports it got that far.
 pub fn parse(b: &[u8]) -> (Packet<'_>, Option<Anomaly>) {
+    parse_with(b, &Limits::default())
+}
+/// As parse(), held to a policy's limits.
+pub fn parse_with<'a>(b: &'a [u8], lim: &Limits) -> (Packet<'a>, Option<Anomaly>) {
     let mut p = Packet::default();
     let found = match b.first().map(|v| v >> 4) {
-        Some(4) => v4(b, &mut p),
-        Some(6) => v6(b, &mut p),
+        Some(4) => v4(b, &mut p, lim),
+        Some(6) => v6(b, &mut p, lim),
         Some(v) => anomaly(
             Check::IpHeader,
             format!("IP version {v}, which is neither 4 nor 6"),
@@ -393,7 +418,7 @@ pub fn record(f: &Flow, dst: Option<IpAddr>) -> Option<Anomaly> {
     }
     None
 }
-fn v4<'a>(b: &'a [u8], p: &mut Packet<'a>) -> Option<Anomaly> {
+fn v4<'a>(b: &'a [u8], p: &mut Packet<'a>, lim: &Limits) -> Option<Anomaly> {
     if b.len() < 20 {
         return anomaly(
             Check::Length,
@@ -403,6 +428,9 @@ fn v4<'a>(b: &'a [u8], p: &mut Packet<'a>) -> Option<Anomaly> {
     p.src = Some(IpAddr::V4(Ipv4Addr::new(b[12], b[13], b[14], b[15])));
     p.dst = Some(IpAddr::V4(Ipv4Addr::new(b[16], b[17], b[18], b[19])));
     p.proto = b[9];
+    p.ttl = b[8];
+    p.dscp = b[1] >> 2;
+    p.length = u32::from(be16(b, 2));
     p.id = u32::from(be16(b, 4));
     let frag = be16(b, 6);
     p.more = frag & 0x2000 != 0;
@@ -454,7 +482,7 @@ fn v4<'a>(b: &'a [u8], p: &mut Packet<'a>) -> Option<Anomaly> {
     if let Some(a) = ip_options(&b[20..ihl]) {
         return Some(a);
     }
-    datagram(p, &b[ihl..total], ihl, 0)
+    datagram(p, &b[ihl..total], ihl, 0, lim)
 }
 fn ip_options(o: &[u8]) -> Option<Anomaly> {
     let mut i = 0;
@@ -498,7 +526,7 @@ const HOP_BY_HOP: u8 = 0;
 const ROUTING: u8 = 43;
 const FRAGMENT: u8 = 44;
 const AH: u8 = 51;
-fn v6<'a>(b: &'a [u8], p: &mut Packet<'a>) -> Option<Anomaly> {
+fn v6<'a>(b: &'a [u8], p: &mut Packet<'a>, lim: &Limits) -> Option<Anomaly> {
     p.v6 = true;
     if b.len() < 40 {
         return anomaly(
@@ -514,6 +542,9 @@ fn v6<'a>(b: &'a [u8], p: &mut Packet<'a>) -> Option<Anomaly> {
     p.src = Some(address(8));
     p.dst = Some(address(24));
     let len = usize::from(be16(b, 4));
+    p.ttl = b[7];
+    p.dscp = ((b[0] & 0x0f) << 2) | (b[1] >> 6);
+    p.length = 40 + len as u32;
     if 40 + len > b.len() {
         return anomaly(
             Check::Length,
@@ -615,14 +646,20 @@ fn v6<'a>(b: &'a [u8], p: &mut Packet<'a>) -> Option<Anomaly> {
     p.proto = next;
     match fragmentable {
         // What precedes the fragment header counts towards the reassembled datagram's 65,535.
-        Some(f) => datagram(p, &body[f..], f - 8, at - f),
-        None => datagram(p, body, 0, at),
+        Some(f) => datagram(p, &body[f..], f - 8, at - f, lim),
+        None => datagram(p, body, 0, at, lim),
     }
 }
 /// Holds a packet's share of its datagram to the rules fragments keep, then reads the transport
 /// header if the share starts the datagram at `l4` bytes in. `head` is what every fragment
 /// repeats ahead of its share, which counts towards the datagram's size.
-fn datagram<'a>(p: &mut Packet<'a>, data: &'a [u8], head: usize, l4: usize) -> Option<Anomaly> {
+fn datagram<'a>(
+    p: &mut Packet<'a>,
+    data: &'a [u8],
+    head: usize,
+    l4: usize,
+    lim: &Limits,
+) -> Option<Anomaly> {
     p.data = data.len() as u32;
     if p.fragment() {
         let end = head as u64 + u64::from(p.offset) + data.len() as u64;
@@ -645,14 +682,14 @@ fn datagram<'a>(p: &mut Packet<'a>, data: &'a [u8], head: usize, l4: usize) -> O
             );
         }
         if p.offset > 0 {
-            return tiny(p, data);
+            return tiny(p, data, lim);
         }
     }
     // A first fragment too short for its transport header says so before it is called small.
-    transport(p, &data[l4..]).or_else(|| tiny(p, data))
+    transport(p, &data[l4..], lim).or_else(|| tiny(p, data, lim))
 }
-fn tiny(p: &Packet, data: &[u8]) -> Option<Anomaly> {
-    if p.more && data.len() < MIN_FRAGMENT {
+fn tiny(p: &Packet, data: &[u8], lim: &Limits) -> Option<Anomaly> {
+    if p.more && data.len() < lim.min_fragment {
         return anomaly(
             Check::TinyFragment,
             format!("a fragment of {} bytes before the last, smaller than any real link makes, as FragmentSmack sends to exhaust reassembly", data.len()),
@@ -660,7 +697,7 @@ fn tiny(p: &Packet, data: &[u8]) -> Option<Anomaly> {
     }
     None
 }
-fn transport<'a>(p: &mut Packet<'a>, l4: &'a [u8]) -> Option<Anomaly> {
+fn transport<'a>(p: &mut Packet<'a>, l4: &'a [u8], lim: &Limits) -> Option<Anomaly> {
     let first = p.fragment();
     let short = |what: &str, need: usize| {
         if first {
@@ -699,7 +736,7 @@ fn transport<'a>(p: &mut Packet<'a>, l4: &'a [u8]) -> Option<Anomaly> {
             if offset > l4.len() {
                 return short("TCP", offset);
             }
-            if let Some(a) = tcp_options(&l4[20..offset], flags & SYN != 0) {
+            if let Some(a) = tcp_options(&l4[20..offset], flags & SYN != 0, lim) {
                 return Some(a);
             }
             p.payload = &l4[offset..];
@@ -775,7 +812,7 @@ fn transport<'a>(p: &mut Packet<'a>, l4: &'a [u8]) -> Option<Anomaly> {
     }
     None
 }
-fn tcp_options(o: &[u8], syn: bool) -> Option<Anomaly> {
+fn tcp_options(o: &[u8], syn: bool, lim: &Limits) -> Option<Anomaly> {
     let mut i = 0;
     while i < o.len() {
         let kind = o[i];
@@ -814,7 +851,7 @@ fn tcp_options(o: &[u8], syn: bool) -> Option<Anomaly> {
                 }
                 if kind == 2 && syn {
                     let mss = be16(o, i + 2);
-                    if mss <= LOW_MSS {
+                    if mss <= lim.low_mss {
                         return anomaly(
                             Check::LowMss,
                             format!("a SYN offering an MSS of {mss} bytes, the shape of SACK Panic (CVE-2019-11477)"),
@@ -862,6 +899,12 @@ pub fn fill(f: &mut Flow) {
     f.dport = i64::from(p.dport);
     f.flags = p.flags.map(flag_names).unwrap_or_default();
     f.window = p.window;
+    f.length = Some(p.length);
+    f.ttl = Some(p.ttl);
+    f.dscp = Some(p.dscp);
+    f.icmp_type = p.icmp.map(|(t, _)| t);
+    f.icmp_code = p.icmp.map(|(_, c)| c);
+    f.fragment = p.fragment();
     f.has_payload = p.transport;
     f.payload = payload;
 }

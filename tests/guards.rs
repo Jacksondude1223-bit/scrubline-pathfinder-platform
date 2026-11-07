@@ -348,6 +348,7 @@ fn the_ack_guard_observes_holds_off_and_takes_its_threshold_from_the_policy() {
     let observe = AckFloodPolicy {
         mode: "observe".into(),
         engage_pps: 0,
+        ..Default::default()
     };
     let mut pipe = Pipeline::new(node(None, Some(observe)));
     watch(&mut pipe, now);
@@ -364,6 +365,7 @@ fn the_ack_guard_observes_holds_off_and_takes_its_threshold_from_the_policy() {
     let off = AckFloodPolicy {
         mode: "off".into(),
         engage_pps: 0,
+        ..Default::default()
     };
     let mut pipe = Pipeline::new(node(None, Some(off)));
     watch(&mut pipe, now);
@@ -373,6 +375,7 @@ fn the_ack_guard_observes_holds_off_and_takes_its_threshold_from_the_policy() {
     let high = AckFloodPolicy {
         mode: String::new(),
         engage_pps: 50_000,
+        ..Default::default()
     };
     let mut pipe = Pipeline::new(node(None, Some(high)));
     watch(&mut pipe, now);
@@ -403,6 +406,7 @@ fn policies_are_validated_and_reach_every_node() {
         Some(AckFloodPolicy {
             mode: "enforce".into(),
             engage_pps: 20_000,
+            ..Default::default()
         }),
     );
     validation::policy(&p).unwrap();
@@ -433,6 +437,7 @@ fn policies_are_validated_and_reach_every_node() {
                 Some(AckFloodPolicy {
                     mode: "drop".into(),
                     engage_pps: 0,
+                    ..Default::default()
                 }),
             ),
             "ack_flood.mode",
@@ -443,6 +448,7 @@ fn policies_are_validated_and_reach_every_node() {
                 Some(AckFloodPolicy {
                     mode: String::new(),
                     engage_pps: -1,
+                    ..Default::default()
                 }),
             ),
             "engage_pps",

@@ -30,13 +30,13 @@
 use crate::{
     ml,
     model::{Flow, GameHttp},
-    Result,
+    tuning, Result,
 };
 use std::{collections::HashMap, net::IpAddr};
 
 /// Most (rule, source) rate windows tracked at once.
 pub const WINDOWS_MAX: usize = 65536;
-/// Most requests judged in one segment; a segment pipelining more is dropped.
+/// Most requests judged in one segment by default; a segment pipelining more is dropped.
 const PIPELINED_MAX: u64 = 64;
 /// Most connections with a request still arriving, or a window too small, tracked at once.
 pub const PENDING_MAX: usize = 16384;
@@ -57,6 +57,53 @@ const STARVED_FOR: i64 = 30_000;
 const OPEN_MAX: u32 = 32;
 /// How long a tracked connection is kept without a segment.
 const PENDING_IDLE: i64 = 60_000;
+/// How a filter reads a request: the most it may pipeline into a segment, its longest line, its
+/// most header lines, and the shortest segment that may end inside a request line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub pipelined_max: u64,
+    pub line_max: usize,
+    pub headers_max: usize,
+    pub split: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            pipelined_max: PIPELINED_MAX,
+            line_max: LINE_MAX,
+            headers_max: HEADERS_MAX,
+            split: SPLIT,
+        }
+    }
+}
+/// How slowly a filter lets a request arrive: a head's seconds and their cap, a body's, the bytes
+/// a second that buy one more, the window under which a client is not reading and for how long
+/// (milliseconds), and the most requests one source may leave incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowLimits {
+    pub mode: tuning::Mode,
+    pub head: i64,
+    pub head_max: i64,
+    pub body: i64,
+    pub min_rate: i64,
+    pub window_min: u16,
+    pub starved_for: i64,
+    pub incomplete_max: u32,
+}
+impl Default for SlowLimits {
+    fn default() -> Self {
+        Self {
+            mode: tuning::Mode::Enforce,
+            head: HEAD_SECONDS,
+            head_max: HEAD_SECONDS_MAX,
+            body: BODY_SECONDS,
+            min_rate: MIN_RATE,
+            window_min: STARVED,
+            starved_for: STARVED_FOR,
+            incomplete_max: OPEN_MAX,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Rule {
@@ -89,6 +136,11 @@ pub struct Policy {
     default_drop: bool,
     rules: Vec<Rule>,
     key: u64,
+    /// How requests are read, whether a TLS handshake counts against the rates, and how slowly a
+    /// request may arrive.
+    pub limits: Limits,
+    pub tls: bool,
+    pub slow: SlowLimits,
 }
 
 /// What judging a segment takes besides the rules: whether its source is verified, which a budget
@@ -231,6 +283,31 @@ pub fn compile(filter: &str, h: &GameHttp, dport: i64) -> Result<Policy> {
             max_body: p.max_body_bytes,
         });
     }
+    let d = Limits::default();
+    let ds = SlowLimits::default();
+    let sl = h.slow.clone().unwrap_or_default();
+    let n = |v: Option<i64>, default: i64| v.unwrap_or(default);
+    if !["", "count", "ignore"].contains(&h.tls.as_str()) {
+        return Err(format!(
+            "http.tls {:?}: use count, or ignore to let TLS handshakes pass uncounted",
+            h.tls
+        ));
+    }
+    if !sl.mode.is_empty() && tuning::Mode::of(&sl.mode).is_none() {
+        return Err(format!(
+            "http.slow.mode {:?}: use enforce, observe, or off to stop timing requests",
+            sl.mode
+        ));
+    }
+    let (head, head_max) = (
+        n(sl.head_seconds, ds.head),
+        n(sl.head_seconds_max, ds.head_max),
+    );
+    if head > head_max {
+        return Err(format!(
+            "http.slow.head_seconds {head} is past head_seconds_max {head_max}; a head is given no longer than the most"
+        ));
+    }
     Ok(Policy {
         ports,
         methods: allowed,
@@ -241,6 +318,25 @@ pub fn compile(filter: &str, h: &GameHttp, dport: i64) -> Result<Policy> {
         default_drop: action(&h.default, "http.default")?,
         rules,
         key: key(filter, false, b"*"),
+        limits: Limits {
+            pipelined_max: n(h.pipelined_max, d.pipelined_max as i64).max(1) as u64,
+            line_max: n(h.line_max, d.line_max as i64).max(1) as usize,
+            headers_max: n(h.headers_max, d.headers_max as i64).max(1) as usize,
+            split: n(h.split_bytes, d.split as i64).max(0) as usize,
+        },
+        tls: h.tls != "ignore",
+        slow: SlowLimits {
+            mode: tuning::Mode::of(&sl.mode).unwrap_or_default(),
+            head: n(sl.head_seconds, ds.head),
+            head_max: n(sl.head_seconds_max, ds.head_max),
+            body: n(sl.body_seconds, ds.body),
+            min_rate: n(sl.min_rate, ds.min_rate).max(0),
+            window_min: u16::try_from(n(sl.window_min, i64::from(ds.window_min)))
+                .unwrap_or(u16::MAX),
+            starved_for: n(sl.starved_seconds, ds.starved_for / 1000).saturating_mul(1000),
+            incomplete_max: u32::try_from(n(sl.incomplete_max, i64::from(ds.incomplete_max)))
+                .unwrap_or(u32::MAX),
+        },
     })
 }
 
@@ -465,18 +561,19 @@ fn trim(s: &[u8]) -> &[u8] {
 }
 /// Parses the request starting at `s`, in a segment `whole` bytes long. What a server would
 /// refuse as malformed, and what no client sends, is an error.
-fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
+fn head<'a>(s: &'a [u8], whole: usize, lim: &Limits) -> std::result::Result<Head<'a>, String> {
+    let (split, line_max, headers_max) = (lim.split, lim.line_max, lim.headers_max);
     let m = method(s).unwrap_or(0);
     let long = |what: &str| {
-        Err(format!("a {what} line longer than {LINE_MAX} bytes, which servers refuse and buffer overflows are built from"))
+        Err(format!("a {what} line longer than {line_max} bytes, which servers refuse and buffer overflows are built from"))
     };
     let Some((request, mut at)) = line(s) else {
         // A line that runs past a full segment is long, and what it shows of the target is
         // judged; one cut short in a short segment is someone hiding a path.
-        if whole < SPLIT {
+        if whole < split {
             return Err("a request line split across segments, which no client needs".into());
         }
-        if s.len() > LINE_MAX {
+        if s.len() > line_max {
             return long("request");
         }
         let rest = &s[m + 1..];
@@ -492,7 +589,7 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
             ..Default::default()
         });
     };
-    if request.len() > LINE_MAX {
+    if request.len() > line_max {
         return long("request");
     }
     let rest = &request[m + 1..];
@@ -520,12 +617,12 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
             break;
         }
         h.headers += 1;
-        if field.len() > LINE_MAX {
+        if field.len() > line_max {
             return long("header");
         }
-        if h.headers > HEADERS_MAX {
+        if h.headers > headers_max {
             return Err(format!(
-                "more than {HEADERS_MAX} header lines, which servers refuse"
+                "more than {headers_max} header lines, which servers refuse"
             ));
         }
         if field[0] == b' ' || field[0] == b'\t' {
@@ -578,7 +675,7 @@ fn head(s: &[u8], whole: usize) -> std::result::Result<Head<'_>, String> {
         );
     }
     // A header line the segment ends inside is as long as what it shows of it, at least.
-    if !h.complete && s.len() - at > LINE_MAX {
+    if !h.complete && s.len() - at > line_max {
         return long("header");
     }
     h.len = at;
@@ -617,8 +714,9 @@ pub fn requests(f: &Flow) -> Vec<ml::Request> {
     let Some(mut at) = (if starts(s) { Some(0) } else { embedded(s, 0) }) else {
         return out;
     };
-    while out.len() < PIPELINED_MAX as usize {
-        let Ok(h) = head(&s[at..], s.len()) else {
+    let lim = Limits::default();
+    while out.len() < lim.pipelined_max as usize {
+        let Ok(h) = head(&s[at..], s.len(), &lim) else {
             break;
         };
         out.push(h.request(out.len() as u64 + 1));
@@ -960,8 +1058,9 @@ impl Policy {
         let mut at = if starts(s) {
             0
         } else if tls(s) {
-            // A handshake record whose first message is a ClientHello opens a session.
-            if s.get(5) != Some(&0x01) {
+            // A handshake record whose first message is a ClientHello opens a session, unless the
+            // filter lets TLS through untouched.
+            if !self.tls || s.get(5) != Some(&0x01) {
                 j.reason = "TLS, which the filter cannot read".into();
                 return j;
             }
@@ -983,12 +1082,15 @@ impl Policy {
         };
         loop {
             j.requests += 1;
-            if j.requests > PIPELINED_MAX {
+            if j.requests > self.limits.pipelined_max {
                 j.drop = true;
-                j.reason = format!("more than {PIPELINED_MAX} requests pipelined into a segment");
+                j.reason = format!(
+                    "more than {} requests pipelined into a segment",
+                    self.limits.pipelined_max
+                );
                 return j;
             }
-            let h = match head(&s[at..], s.len()) {
+            let h = match head(&s[at..], s.len(), &self.limits) {
                 Ok(h) => h,
                 Err(e) => {
                     j.drop = true;
@@ -1152,12 +1254,13 @@ impl Slow {
         flags: u16,
         window: u16,
         now: i64,
+        lim: &SlowLimits,
     ) -> std::result::Result<(), String> {
         use crate::packet::{FIN, RST, SYN};
         if flags & (SYN | FIN | RST) != 0 {
             return Ok(());
         }
-        if window >= STARVED {
+        if window >= lim.window_min {
             if let Some(w) = self.watched.get_mut(&key) {
                 w.starved = 0;
                 w.last = now;
@@ -1181,9 +1284,10 @@ impl Slow {
         if w.starved == 0 {
             w.starved = now;
         }
-        if now - w.starved >= STARVED_FOR {
+        if now - w.starved >= lim.starved_for {
             return Err(format!(
-                "a slow read: the client has advertised a window of under {STARVED} bytes for {} seconds, too small to be reading the answer",
+                "a slow read: the client has advertised a window of under {} bytes for {} seconds, too small to be reading the answer",
+                lim.window_min,
                 (now - w.starved) / 1000
             ));
         }
@@ -1196,6 +1300,7 @@ impl Slow {
         key: Connection,
         pending: Option<Pending>,
         now: i64,
+        lim: &SlowLimits,
     ) -> std::result::Result<(), String> {
         let was = self.watched.get(&key).and_then(|w| w.pending);
         let Some(p) = pending else {
@@ -1211,9 +1316,10 @@ impl Slow {
             return Ok(());
         };
         if was.is_none() {
-            if self.open.get(&key.0).copied().unwrap_or(0) >= OPEN_MAX {
+            if self.open.get(&key.0).copied().unwrap_or(0) >= lim.incomplete_max {
                 return Err(format!(
-                    "more than {OPEN_MAX} requests from this source left incomplete at once, as Slowloris holds connections open"
+                    "more than {} requests from this source left incomplete at once, as Slowloris holds connections open",
+                    lim.incomplete_max
                 ));
             }
             if !self.room(&key, now) {
@@ -1247,6 +1353,7 @@ impl Slow {
         key: Connection,
         payload: &[u8],
         now: i64,
+        lim: &SlowLimits,
     ) -> std::result::Result<(), String> {
         let Some(w) = self.watched.get_mut(&key) else {
             return Ok(());
@@ -1257,7 +1364,11 @@ impl Slow {
         };
         w.bytes = w.bytes.saturating_add(payload.len() as u64);
         let elapsed = now - w.since;
-        let rate = i64::try_from(w.bytes / MIN_RATE as u64).unwrap_or(i64::MAX);
+        let rate = if lim.min_rate > 0 {
+            i64::try_from(w.bytes / lim.min_rate as u64).unwrap_or(i64::MAX)
+        } else {
+            0
+        };
         let done = match p {
             Pending::Head { tail, .. } => {
                 let mut joined = tail.to_vec();
@@ -1269,7 +1380,7 @@ impl Slow {
                         bytes: w.bytes,
                         tail,
                     });
-                    let allowed = HEAD_SECONDS.saturating_add(rate).min(HEAD_SECONDS_MAX);
+                    let allowed = lim.head.saturating_add(rate).min(lim.head_max);
                     if elapsed > allowed * 1000 {
                         return Err(format!(
                             "a slow request: its head still arriving {} seconds after it started, longer than servers wait for one, as Slowloris sends",
@@ -1284,11 +1395,12 @@ impl Slow {
             Pending::Body(None) if payload.ends_with(b"0\r\n\r\n") => true,
             Pending::Body(left) => {
                 w.pending = Some(Pending::Body(left.map(|l| l - payload.len() as u64)));
-                if elapsed > BODY_SECONDS.saturating_add(rate) * 1000 {
+                if elapsed > lim.body.saturating_add(rate) * 1000 {
                     return Err(format!(
-                        "a slow body: {} bytes in {} seconds, under the {MIN_RATE} bytes a second servers hold a request to, as R.U.D.Y. sends",
+                        "a slow body: {} bytes in {} seconds, under the {} bytes a second servers hold a request to, as R.U.D.Y. sends",
                         w.bytes,
-                        elapsed / 1000
+                        elapsed / 1000,
+                        lim.min_rate
                     ));
                 }
                 false
@@ -1318,7 +1430,7 @@ mod tests {
     use super::*;
     use crate::model::GameHttpPath;
     fn head_of(s: &[u8]) -> std::result::Result<Head<'_>, String> {
-        head(s, s.len())
+        head(s, s.len(), &Limits::default())
     }
     fn norm(target: &str) -> String {
         let mut out = Vec::new();
