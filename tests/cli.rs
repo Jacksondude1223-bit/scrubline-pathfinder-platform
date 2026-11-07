@@ -27,6 +27,12 @@ fn routes_all_read_and_id_commands() {
             "/v1/tenants/ten-1/token",
         ),
         (vec!["tenant-rm", "ten-1"], "DELETE", "/v1/tenants/ten-1"),
+        (vec!["settings"], "GET", "/v1/settings"),
+        (
+            vec!["settings", "pol-1"],
+            "GET",
+            "/v1/policies/pol-1/settings",
+        ),
     ] {
         let r = cli::request(&args(&cmd)).unwrap();
         assert_eq!(r.method, method);
@@ -56,6 +62,7 @@ fn routes_all_read_and_id_commands() {
         &["decide", "n"],
         &["tenant-token", "../x"],
         &["tenant-rm", "id?other=1"],
+        &["settings", "../x"],
     ] {
         assert!(cli::request(&args(cmd)).is_err());
     }
@@ -193,4 +200,33 @@ fn private_ca_bundle_is_validated() {
     std::fs::write(&path, b"not a certificate").unwrap();
     assert!(transport::client(Some(&path), Duration::from_secs(1)).is_err());
     std::fs::remove_file(path).unwrap();
+}
+#[test]
+fn the_settings_catalog_renders_as_a_table() {
+    let catalog = serde_json::to_vec(&pathfinder::tuning::catalog()).unwrap();
+    let out = cli::render(&catalog, View::Settings).unwrap();
+    let mut lines = out.lines();
+    assert!(lines.next().unwrap().starts_with("SETTING"));
+    let row = |path: &str| {
+        out.lines()
+            .find(|l| l.split_whitespace().next() == Some(path))
+            .unwrap_or_else(|| panic!("{path} missing:\n{out}"))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert_eq!(
+        row("syn_flood.hold_seconds"),
+        "syn_flood.hold_seconds 60 0..86400 seconds yes"
+    );
+    assert_eq!(row("pulse.duty"), "pulse.duty 0.5 0.01..1 -");
+    assert_eq!(
+        row("egress.lockdown"),
+        "egress.lockdown off off | limit | drop -"
+    );
+    assert_eq!(
+        row("reputation.penalty_box"),
+        "reputation.penalty_box false true | false -"
+    );
+    assert_eq!(out.lines().count(), pathfinder::tuning::SETTINGS.len() + 1);
 }

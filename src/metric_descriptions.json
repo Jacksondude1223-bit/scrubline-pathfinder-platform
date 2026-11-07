@@ -591,6 +591,10 @@
     "kind": "counter",
     "help": "Segments dropped because their request arrives too slowly: a head unfinished after 20 to 40 seconds (Slowloris), a body under 500 bytes a second (R.U.D.Y.), a client keeping its window too small to read the answer for 30 seconds (slow read), or a source leaving more than 32 requests incomplete at once."
   },
+  "scrubline_game_http_slow_observed_total": {
+    "kind": "counter",
+    "help": "Requests the slow-HTTP rules would have dropped had the filter's http.slow.mode been enforce; with the mode at observe they pass and are counted here instead."
+  },
   "scrubline_game_http_pending": {
     "kind": "gauge",
     "help": "Connections the HTTP rules are watching because a request on them is still arriving, or their client advertises a window too small to read the answer."

@@ -223,6 +223,7 @@ fn the_syn_guard_observes_holds_off_and_takes_its_threshold_from_the_policy() {
             syn_flood: Some(SynFloodPolicy {
                 mode: mode.into(),
                 engage_pps,
+                ..Default::default()
             }),
             ..node()
         })
@@ -322,13 +323,21 @@ fn tcp_and_icmp_in_fragments_are_dropped_and_udp_in_fragments_is_not() {
     assert_eq!(st["dropped"], 7, "{st}");
     assert_eq!(
         st["by_protocol"],
-        json!([{"protocol":"tcp","dropped":4,"observed":0},{"protocol":"icmp","dropped":3,"observed":0}])
+        json!([
+            {"protocol":"tcp","dropped":4,"observed":0},
+            {"protocol":"icmp","dropped":3,"observed":0},
+            {"protocol":"udp","dropped":0,"observed":0},
+            {"protocol":"other","dropped":0,"observed":0}
+        ])
     );
     // Observing counts what enforcing would drop; off does not look.
     let first = v4(CLIENT, SERVER, TCP, &ack[..1480], 0, true);
     for (mode, observed) in [("observe", 1), ("off", 0)] {
         let mut pipe = Pipeline::new(Program {
-            fragments: Some(FragmentPolicy { mode: mode.into() }),
+            fragments: Some(FragmentPolicy {
+                mode: mode.into(),
+                ..Default::default()
+            }),
             ..node()
         });
         assert_eq!(verdict(&mut pipe, &wire(&first, 1), T0), passed());
@@ -455,7 +464,8 @@ fn icmp_is_held_to_a_rate_and_echo_replies_and_errors_to_what_the_server_sent() 
         json!([
             {"kind":"flood","dropped":1,"observed":0},
             {"kind":"smurf","dropped":3,"observed":0},
-            {"kind":"error","dropped":4,"observed":0}
+            {"kind":"error","dropped":4,"observed":0},
+            {"kind":"type","dropped":0,"observed":0}
         ]),
         "{st}"
     );
@@ -634,12 +644,17 @@ fn policies_are_validated_and_reach_every_node() {
         syn_flood: Some(SynFloodPolicy {
             mode: "observe".into(),
             engage_pps: 50_000,
+            ..Default::default()
         }),
-        fragments: Some(FragmentPolicy { mode: "off".into() }),
+        fragments: Some(FragmentPolicy {
+            mode: "off".into(),
+            ..Default::default()
+        }),
         icmp: Some(IcmpPolicy {
             mode: "enforce".into(),
             limit_pps: 2_000,
             smurf_pps: 500,
+            ..Default::default()
         }),
         ..base.clone()
     };
@@ -650,6 +665,7 @@ fn policies_are_validated_and_reach_every_node() {
                 syn_flood: Some(SynFloodPolicy {
                     mode: "drop".into(),
                     engage_pps: 0,
+                    ..Default::default()
                 }),
                 ..base.clone()
             },
@@ -660,6 +676,7 @@ fn policies_are_validated_and_reach_every_node() {
                 syn_flood: Some(SynFloodPolicy {
                     mode: String::new(),
                     engage_pps: -5,
+                    ..Default::default()
                 }),
                 ..base.clone()
             },
@@ -669,6 +686,7 @@ fn policies_are_validated_and_reach_every_node() {
             Policy {
                 fragments: Some(FragmentPolicy {
                     mode: "strict".into(),
+                    ..Default::default()
                 }),
                 ..base.clone()
             },

@@ -615,6 +615,34 @@ components:
             (see crafted packets in the README). Only what the headers declare may be in it, and at most
             64 bytes of a link''s padding past them, so a capture cut short reads as a packet that lies
             about its length.'
+        length:
+          type: integer
+          minimum: 0
+          description: The IP packet's length, header and all, for rules matching lengths. Read from
+            packet when it is given.
+        ttl:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: Its TTL or hop limit, for rules matching TTLs. Read from packet when it is given.
+        dscp:
+          type: integer
+          minimum: 0
+          maximum: 63
+          description: The DSCP code point it is marked with. Read from packet when it is given.
+        icmp_type:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: For ICMP, its type. Read from packet when it is given.
+        icmp_code:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: For ICMP, its code. Read from packet when it is given.
+        fragment:
+          type: boolean
+          description: Whether it is a fragment. Read from packet when it is given.
     Decision:
       type: object
       properties:

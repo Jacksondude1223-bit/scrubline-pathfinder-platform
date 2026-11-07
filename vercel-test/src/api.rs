@@ -876,10 +876,32 @@ impl Api {
                     .map(value)
                     .ok_or((404, "no counters reported for this node".into()))
             }
+            ("GET", ["settings"]) => {
+                who.operator()?;
+                Ok(crate::tuning::catalog())
+            }
+            ("GET", ["policies", _, "settings"]) if !id.is_empty() => {
+                who.operator()?;
+                let p = self
+                    .store
+                    .data
+                    .policies
+                    .iter()
+                    .find(|p| p.id == id)
+                    .ok_or((404, "unknown policy".into()))?;
+                let mut v = crate::tuning::effective(&crate::tuning::program_of(p));
+                v["policy_id"] = json!(p.id);
+                v["version"] = json!(p.version);
+                Ok(v)
+            }
             ("POST", ["policies"]) => {
                 who.operator()?;
                 self.writable()?;
-                let mut p: Policy = parse(body)?;
+                // A key no setting has is a mistyped name, which the typed policy would pass over
+                // and leave the setting it meant at its default.
+                let raw: Value = parse(body)?;
+                crate::tuning::check_known(&raw).map_err(bad)?;
+                let mut p: Policy = serde_json::from_value(raw).map_err(bad)?;
                 validation::policy(&p).map_err(bad)?;
                 validation::tunnel_tenants(&p, &self.store.data.tenants).map_err(bad)?;
                 if let Some(why) = self.misplaced(&p) {
@@ -1996,6 +2018,12 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         syn_flood,
         fragments,
         icmp,
+        aggregation,
+        pulse,
+        mitigation,
+        sensitivity,
+        profiles,
+        lists,
         tunnels,
         sessions,
         tunnel_src,
@@ -2025,6 +2053,12 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         && *syn_flood == b.syn_flood
         && *fragments == b.fragments
         && *icmp == b.icmp
+        && *aggregation == b.aggregation
+        && *pulse == b.pulse
+        && *mitigation == b.mitigation
+        && *sensitivity == b.sensitivity
+        && *profiles == b.profiles
+        && *lists == b.lists
         && *tunnels == b.tunnels
         && *sessions == b.sessions
         && *tunnel_src == b.tunnel_src
@@ -2151,6 +2185,7 @@ fn route_label(path: &str) -> String {
             format!("nodes/{leaf}")
         }
         ["policies", _, "deploy"] => "policies/deploy".into(),
+        ["policies", _, "settings"] => "policies/settings".into(),
         ["tenants", _, "token"] => "tenants/token".into(),
         ["tenants", _] => "tenants/delete".into(),
         ["nodes", _, "tunnel-endpoint"] => "nodes/tunnel-endpoint".into(),
@@ -2163,6 +2198,7 @@ fn route_label(path: &str) -> String {
         [single]
             if [
                 "state", "promote", "nodes", "policies", "fabric", "tenants", "decide", "tunnels",
+                "settings",
             ]
             .contains(single) =>
         {

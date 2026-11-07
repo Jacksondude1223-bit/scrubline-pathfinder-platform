@@ -37,6 +37,8 @@ pub struct Binding {
     pub l4: bool,
     /// The HTTP rules, judging TCP to the filter's address on their ports.
     pub http: Option<Arc<httpfilter::Policy>>,
+    /// How long a source that cleared the gate stays admitted after its last packet.
+    pub idle: i64,
 }
 #[derive(Default, Debug, Clone)]
 pub struct Inspection {
@@ -59,10 +61,11 @@ pub struct Inspection {
     pub score: f64,
     pub classified: bool,
     pub observed: bool,
-    /// Whether the segment opened a TLS session, and whether it was dropped for a request that
-    /// arrives too slowly.
+    /// Whether the segment opened a TLS session, whether it was dropped for a request that
+    /// arrives too slowly, and whether it would have been but the filter only observes slowness.
     pub handshake: bool,
     pub slow: bool,
+    pub slow_observed: bool,
 }
 fn bytes(v: &[i64], name: &str) -> Result<Vec<u8>> {
     v.iter()
@@ -208,6 +211,7 @@ pub fn compile(filters: &[GameFilter]) -> Result<Vec<Binding>> {
                 profile: p,
                 l4,
                 http: http.map(Arc::new),
+                idle: f.idle_seconds.unwrap_or(120).max(1).saturating_mul(1000),
             })
         })
         .collect()
@@ -369,13 +373,20 @@ impl Engine {
             profile: "http".into(),
             ..Default::default()
         };
-        let key = connection(f);
+        let policy = b.http.clone().expect("an HTTP binding has HTTP rules");
+        let lim = policy.slow;
+        let watch = lim.mode != crate::tuning::Mode::Off;
+        let key = connection(f).filter(|_| watch);
         let flags = crate::packet::tcp_flags(&f.flags);
         // A client is held to the window it advertises in every segment, data or none.
         let starved = match (key, flags, f.window) {
-            (Some(k), Some(flags), Some(window)) => self.slow.window(k, flags, window, now).err(),
+            (Some(k), Some(flags), Some(window)) => {
+                self.slow.window(k, flags, window, now, &lim).err()
+            }
             _ => None,
         };
+        // A filter that only observes slowness counts what it would have dropped for it.
+        let observing = lim.mode == crate::tuning::Mode::Observe;
         if starved.is_none() && f.payload.is_empty() {
             if f.has_payload {
                 // A segment with no data (a handshake, an acknowledgement) carries no request.
@@ -393,13 +404,13 @@ impl Engine {
             r.reason = "no payload supplied, nothing to inspect".into();
             return r;
         }
-        let policy = b.http.as_ref().expect("an HTTP binding has HTTP rules");
         let mut drop;
-        if let Some(why) = starved {
+        if let Some(why) = starved.as_ref().filter(|_| !observing) {
             drop = true;
             r.slow = true;
-            r.reason = why;
+            r.reason = why.clone();
         } else {
+            r.slow_observed = starved.is_some();
             let j = policy.judge(&mut self.windows, &mut self.scratch, f, now, cx);
             r.requests = j.requests;
             r.handshake = j.handshake;
@@ -414,14 +425,18 @@ impl Engine {
             // after this segment, or what this segment carries on.
             if let Some(k) = key.filter(|_| !drop) {
                 let slow = if j.requests > 0 || j.handshake {
-                    self.slow.started(k, j.pending, now)
+                    self.slow.started(k, j.pending, now, &lim)
                 } else {
-                    self.slow.continued(k, &f.payload, now)
+                    self.slow.continued(k, &f.payload, now, &lim)
                 };
                 if let Err(why) = slow {
-                    drop = true;
-                    r.slow = true;
-                    r.reason = why;
+                    if observing {
+                        r.slow_observed = true;
+                    } else {
+                        drop = true;
+                        r.slow = true;
+                        r.reason = why;
+                    }
                 }
             }
             if !drop && !j.flagged.is_empty() {
@@ -445,13 +460,15 @@ impl Engine {
             r.verdict = "pass".into();
             r.limited = false;
             r.budget = false;
+            r.slow_observed |= r.slow;
             r.slow = false;
             r.observed |= r.classified;
             r.classified = false;
         }
         r
     }
-    fn admit(&mut self, key: (String, String), now: i64) -> bool {
+    /// Opens a session for `key` that lasts `idle` milliseconds past its last packet.
+    fn admit(&mut self, key: (String, String), now: i64, idle: i64) -> bool {
         if !self.sessions.contains_key(&key) && self.sessions.len() >= 65536 {
             if now - self.last_sweep < 120000 {
                 return false;
@@ -462,7 +479,7 @@ impl Engine {
                 return false;
             }
         }
-        self.sessions.insert(key, now + 120000);
+        self.sessions.insert(key, now + idle);
         true
     }
     pub fn cookie(&self, f: &Flow, now: i64) -> Vec<u8> {
@@ -518,7 +535,7 @@ impl Engine {
                 let key = (b.id.clone(), f.src_ip.clone());
                 if let Some(until) = self.sessions.get_mut(&key) {
                     if now <= *until {
-                        *until = now + 120000;
+                        *until = now + b.idle;
                     }
                 }
             }
@@ -528,7 +545,7 @@ impl Engine {
             let key = (b.id.clone(), f.src_ip.clone());
             let admitted = self.sessions.get(&key).is_some_and(|until| now <= *until);
             if admitted {
-                self.sessions.insert(key.clone(), now + 120000);
+                self.sessions.insert(key.clone(), now + b.idle);
                 r.verdict = "pass".into();
                 r.reason = format!(
                     "source {} the {} {}",
@@ -557,7 +574,7 @@ impl Engine {
                         );
                     } else if b.profile.complete.contains(&id.unwrap()) {
                         r.verdict = "pass".into();
-                        if self.admit(key, now) {
+                        if self.admit(key, now, b.idle) {
                             r.reason = format!("source completed the {} handshake", b.profile.name);
                             r.cleared = 1;
                         } else {
@@ -597,7 +614,7 @@ impl Engine {
                             && f.payload.get(5..25) == Some(&b"Source Engine Query\0"[..])
                             && f.payload.get(25..29).is_some_and(answers);
                     if valid {
-                        let tracked = self.admit(key, now);
+                        let tracked = self.admit(key, now, b.idle);
                         r.verdict = "pass".into();
                         r.cleared = 3;
                         r.reason = if tracked {

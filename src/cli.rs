@@ -16,6 +16,7 @@ pub enum View {
     Overview,
     Attacks,
     Credential,
+    Settings,
 }
 fn file(path: &str) -> Result<Vec<u8>> {
     let raw = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -29,7 +30,7 @@ pub fn request(args: &[String]) -> Result<Request> {
             .map(String::as_str)
             .ok_or_else(|| usage.to_string())
     };
-    let command=arg(0,"usage: scrubctl [-api URL] [-ca PEM] nodes | policies | apply <file> | deploy <id> | fabric | bgp | decide <node> <flow.json> | ml-load <file> | ml-train [file] | ml-model | analytics [window] | attacks [window] | tenants | tenant-add <file> | tenant-token <id> | tenant-rm <id>")?;
+    let command=arg(0,"usage: scrubctl [-api URL] [-ca PEM] nodes | policies | apply <file> | deploy <id> | settings [policy-id] | fabric | bgp | decide <node> <flow.json> | ml-load <file> | ml-train [file] | ml-model | analytics [window] | attacks [window] | tenants | tenant-add <file> | tenant-token <id> | tenant-rm <id>")?;
     let window = args.get(1).map(String::as_str).unwrap_or("24h");
     let mut r = Request {
         method: "GET",
@@ -93,6 +94,17 @@ pub fn request(args: &[String]) -> Result<Request> {
             });
         }
         "ml-model" => r.path = "/v1/ml/model".into(),
+        // Every setting a policy can tune, or what one policy's resolve to.
+        "settings" => match args.get(1) {
+            Some(id) => {
+                safe_id(id)?;
+                r.path = format!("/v1/policies/{id}/settings");
+            }
+            None => {
+                r.path = "/v1/settings".into();
+                r.view = View::Settings;
+            }
+        },
         "analytics" | "attacks" => {
             // Encode the query value rather than interpreting it as URL syntax.
             let mut url = reqwest::Url::parse("http://localhost/").unwrap();
@@ -209,6 +221,9 @@ pub fn render(raw: &[u8], view: View) -> Result<String> {
         return Ok(format!("{}\n", String::from_utf8_lossy(raw)));
     }
     let v: Value = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
+    if view == View::Settings {
+        return Ok(settings(&v));
+    }
     let key = match view {
         View::Plan => "announcements",
         View::Overview => "prefixes",
@@ -345,6 +360,53 @@ pub fn render(raw: &[u8], view: View) -> Result<String> {
         out += &format!("\nover the last {}\n", text(&v, "window"));
     }
     Ok(out)
+}
+/// The settings catalog as a table: each setting, its default, what it takes, and whether a
+/// profile may set it.
+fn settings(v: &Value) -> String {
+    let empty = Vec::new();
+    let mut rows = vec![header(&["SETTING", "DEFAULT", "TAKES", "PROFILE"])];
+    for s in v["settings"].as_array().unwrap_or(&empty) {
+        let number = |k: &str| {
+            let n = s[k].as_f64().unwrap_or(0.0);
+            if n.fract() == 0.0 {
+                format!("{}", n as i64)
+            } else {
+                n.to_string()
+            }
+        };
+        let default = match &s["default"] {
+            Value::Null => "-".into(),
+            Value::String(w) if w.is_empty() => "-".into(),
+            Value::String(w) => w.clone(),
+            Value::Number(_) => number("default"),
+            other => other.to_string(),
+        };
+        let unit = s["unit"]
+            .as_str()
+            .map(|u| format!(" {u}"))
+            .unwrap_or_default();
+        let takes = match s["type"].as_str().unwrap_or("") {
+            "integer" | "number" => format!("{}..{}{unit}", number("min"), number("max")),
+            "choice" => s["options"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|o| if o.is_empty() { "\"\"" } else { o })
+                .collect::<Vec<_>>()
+                .join(" | "),
+            "flag" => "true | false".into(),
+            _ => text(s, "of"),
+        };
+        rows.push(vec![
+            text(s, "path"),
+            default,
+            takes,
+            if s["profile"] == true { "yes" } else { "-" }.into(),
+        ]);
+    }
+    table(rows)
 }
 pub fn run(args: impl IntoIterator<Item = String>) -> Result<()> {
     let args: Vec<_> = args.into_iter().collect();

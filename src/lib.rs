@@ -24,5 +24,6 @@ pub mod runtime;
 pub mod state;
 pub mod store;
 pub mod telemetry;
+pub mod tuning;
 pub mod validation;
 pub mod wire;

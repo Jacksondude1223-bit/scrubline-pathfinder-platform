@@ -71,8 +71,29 @@ agent=set(re.findall(r'\.route\("(/\w*)"',open('src/node.rs').read()))
 nd=yaml.safe_load(open('api/node-openapi.yaml'))
 for p in sorted(agent-set(nd['paths'])): probs.append(f"agent serves {p} but it is undocumented")
 for p in sorted(set(nd['paths'])-agent): probs.append(f"agent spec documents {p} but it is not served")
+# Every setting the catalog lists is documented where a policy holds it.
+section_schema={'':'Policy','crafted':'CraftedPolicy','reflection':'ReflectionPolicy',
+    'reflection.custom[]':'CustomVector','protocols':'ProtocolPolicy','ack_flood':'AckFloodPolicy',
+    'syn_flood':'SynFloodPolicy','fragments':'FragmentPolicy','icmp':'IcmpPolicy',
+    'aggregation':'AggregationPolicy','reputation':'ReputationPolicy','egress':'EgressPolicy',
+    'pulse':'PulsePolicy','mitigation':'MitigationPolicy','ml':'MlPolicy','games[]':'GameFilter',
+    'games[].http':'GameHttp','games[].http.slow':'GameHttpSlow','rules[]':'Rule',
+    'rules[].match':'Match','profiles[]':'Profile'}
+catalog=open('src/tuning.rs').read()
+catalog=catalog[catalog.index('pub static SETTINGS'):]
+catalog=catalog[:catalog.index('\n];')]
+settings=re.findall(r'\b(?:num|numz|frac|choice|flag|list|map|text)\(\s*"([^"]+)"',catalog)
+if len(settings)<100: probs.append(f"read only {len(settings)} settings from src/tuning.rs")
+schemas=d['components']['schemas']
+for path in settings:
+    section,_,leaf=path.rpartition('.')
+    schema=section_schema.get(section)
+    if schema is None:
+        probs.append(f"setting {path} belongs to no schema spec-check knows"); continue
+    if leaf.removesuffix('[]') not in schemas.get(schema,{}).get('properties',{}):
+        probs.append(f"setting {path} is not documented in {schema}")
 if probs:
     print("\nPROBLEMS:")
     for problem in probs:print('  -',problem)
     sys.exit(1)
-print('both specs resolve, and every route matches the Rust implementation')
+print(f'both specs resolve, every route matches the Rust implementation, and all {len(settings)} settings are documented')
