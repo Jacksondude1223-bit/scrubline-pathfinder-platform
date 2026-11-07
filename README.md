@@ -1509,8 +1509,8 @@ At those bounds, as the allocator counts it:
 
 | Part | Holds at the most | Of which |
 | --- | --- | --- |
-| Node agent | 292 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables, 16384 connections with a request still arriving, and the SYN flood guard's five seconds of SYNs): 94 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
-| Control plane, 128 nodes | 3.5 GiB | programs and the plan 384 MiB, node and tunnel reports 84 MiB, a day of analytics 922 MiB, policies, training set and tenants 188 MiB; writing the state out 568 MiB; metrics scrapes, four at a time, 37 MiB; the largest answer still being sent, the whole fabric, 164 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
+| Node agent | 293 MiB | every table full (65536 sources each in the rate, reputation, return-traffic, reflection, game session and HTTP tables, 16384 connections with a request still arriving, and the SYN flood guard's five seconds of SYNs): 94 MiB; request bodies 64 MiB; 1024 connections at an allowance of 128 KiB each, 128 MiB |
+| Control plane, 128 nodes | 3.5 GiB | programs and the plan 387 MiB, node and tunnel reports 84 MiB, a day of analytics 922 MiB, policies, training set and tenants 189 MiB; writing the state out 568 MiB; metrics scrapes, four at a time, 37 MiB; the largest answer still being sent, the whole fabric, 164 MiB; request bodies 256 MiB; 8192 connections at 128 KiB each, 1 GiB |
 
 Each part grows with what the policy holds multiplied by the nodes: every node
 is compiled the whole policy and reports counters for every prefix, rule,
