@@ -1178,6 +1178,9 @@ pub struct Tunnel {
     pub remote: String,
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
+    pub local: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(deserialize_with = "null_default")]
     pub mtu: i64,
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]

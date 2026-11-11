@@ -1808,8 +1808,9 @@ alongside it.
 "tunnels": [{"id":"northwind","remote":"198.51.100.1","prefixes":["203.0.113.0/24"],"key":42}]
 ```
 
-The local end is each node's own address, because it is per node, not per
-tunnel: the customer's tunnel runs straight to the scrubbing node. An operator
+By default the local end is each node's own shared address. Set a tunnel's
+`local` and `node` for a dedicated customer endpoint instead, as described below.
+For the default shared address, an operator
 assigns it with `PUT /v1/nodes/{id}/tunnel-endpoint`; a node can also supply
 one with `-tunnel-src`, and the operator's assignment wins and survives the
 node re-registering. No two nodes may hold one address, and the address must
@@ -2283,3 +2284,9 @@ cargo run --release --bin scrubctl -- ml-train
 The node agent also takes `-local-as`, `-bgp-next-hop` and `-capacity-pps` for
 steering; see [Steering](#steering).
 
+
+### Dedicated customer tunnel endpoints
+
+A tunnel may set `local` to its own provider IPv4 endpoint together with `node` to pin it to one node. Example: `{"id":"customer-a","remote":"198.51.100.1","local":"192.0.2.10","node":"node-a","prefixes":["203.0.113.0/24"],"key":42}`. Every dedicated endpoint must be unique across the policy, outside protected prefixes, and distinct from node endpoints and customer remote addresses. The operator must already own and route that address to the selected node and configure it on that node. Pathfinder renders it as the actual GRE/IPIP source; it does not allocate or add host addresses. Node endpoints remain in use for inter-node backhaul. Omit `local` for legacy shared-node tunnels.
+
+`GET /v1/tunnels` reports `capabilities.dedicated_tunnel_endpoints: true`. Integrations must require this flag before assigning dedicated endpoints so older servers cannot silently ignore `local`. Tunnel overview location rows report the dedicated endpoint. Deploy the control plane, agents, and provisioners together before enabling this feature in the billing portal.

@@ -143,8 +143,27 @@ pub fn policy(p: &Policy) -> Result<()> {
     unique(p.tunnels.iter().map(|t| t.id.as_str()), "tunnels")?;
     let mut carried = HashSet::new();
     let mut ends = HashMap::new();
+    let mut dedicated = HashSet::new();
     for t in &p.tunnels {
         tunnel::validate(t, Some(&protected))?;
+        if !t.local.is_empty() {
+            if !dedicated.insert(t.local.as_str()) {
+                return Err("dedicated tunnel endpoints must be unique".into());
+            }
+            let addr = t
+                .local
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| "invalid local endpoint")?;
+            if p.protected
+                .iter()
+                .any(|v| v.parse::<IpNet>().is_ok_and(|net| net.contains(&addr)))
+            {
+                return Err("dedicated endpoint must be outside protected prefixes".into());
+            }
+            if p.tunnels.iter().any(|other| other.remote == t.local) {
+                return Err("dedicated endpoint cannot be a customer remote endpoint".into());
+            }
+        }
         // Every tunnel on a node starts from the node's one address, and Linux holds one tunnel
         // per encapsulation, remote and key: the second would fail to build on every node.
         let kind = if t.r#type.is_empty() {

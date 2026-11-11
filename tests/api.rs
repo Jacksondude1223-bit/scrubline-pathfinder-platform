@@ -937,3 +937,59 @@ fn staff_allocate_tunnels_to_customers_with_a_clean_traffic_allowance() {
     assert_eq!(op("DELETE", "/v1/tunnels/northwind", Value::Null).0, 200);
     assert_eq!(op("DELETE", &path, Value::Null).0, 200);
 }
+
+#[test]
+fn dedicated_endpoint_capability_and_customer_configuration_are_reported() {
+    let base = serve(Store::open("").unwrap());
+    let (_, empty) = call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null);
+    assert_eq!(empty["capabilities"]["dedicated_tunnel_endpoints"], true);
+    let (_, registered) = call(
+        &base,
+        "POST",
+        "/v1/nodes/register",
+        Some(ENROLL),
+        json!({"name":"edge-a","region":"iad","tunnel_src":"192.0.2.1"}),
+    );
+    let node = node_id(&registered);
+    let policy = json!({"name":"dedicated","protected":["203.0.113.0/24"],"tunnels":[{"id":"unique","remote":"198.51.100.1","local":"192.0.2.10","node":node,"prefixes":["203.0.113.0/24"]}]});
+    let (status, saved) = call(&base, "POST", "/v1/policies", Some(OP), policy);
+    assert_eq!(status, 200, "{saved}");
+    let deploy = format!("/v1/policies/{}/deploy", saved["id"].as_str().unwrap());
+    let (status, body) = call(&base, "POST", &deploy, Some(OP), Value::Null);
+    assert_eq!(status, 200, "{body}");
+    let (_, fleet) = call(&base, "GET", "/v1/tunnels", Some(OP), Value::Null);
+    assert_eq!(fleet["tunnels"][0]["local"], "192.0.2.10");
+    assert_eq!(fleet["tunnels"][0]["nodes"][0]["endpoint"], "192.0.2.10");
+    let (_, program) = call(
+        &base,
+        "GET",
+        &format!("/v1/nodes/{node}/program"),
+        Some(OP),
+        Value::Null,
+    );
+    assert_eq!(program["tunnels"][0]["local"], "192.0.2.10");
+    assert_eq!(
+        call(
+            &base,
+            "PUT",
+            &format!("/v1/nodes/{node}/tunnel-endpoint"),
+            Some(OP),
+            json!({"address":"192.0.2.10"})
+        )
+        .0,
+        400
+    );
+    assert_eq!(
+        call(
+            &base,
+            "PUT",
+            "/v1/tunnels/unique/location",
+            Some(OP),
+            json!({"node":""})
+        )
+        .0,
+        400
+    );
+    let bad = json!({"name":"shared","protected":["203.0.113.0/24"],"tunnels":[{"id":"shared","remote":"198.51.100.1","local":"192.0.2.1","node":node,"prefixes":["203.0.113.0/24"]}]});
+    assert_eq!(call(&base, "POST", "/v1/policies", Some(OP), bad).0, 400);
+}

@@ -135,6 +135,19 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     if remote.is_unspecified() || remote.is_multicast() || remote.is_loopback() {
         return Err("remote is not a usable endpoint".into());
     }
+    if !t.local.is_empty() {
+        let local = t
+            .local
+            .parse::<Ipv4Addr>()
+            .map_err(|_| "local must be IPv4")?;
+        if local.is_unspecified() || local.is_multicast() || local.is_loopback() || local == remote
+        {
+            return Err("local is not a usable dedicated endpoint".into());
+        }
+        if t.node.is_empty() {
+            return Err("a dedicated local endpoint requires a pinned node".into());
+        }
+    }
     if t.prefixes.is_empty() {
         return Err("tunnel needs at least one prefix".into());
     }
@@ -160,9 +173,18 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     }
     Ok(())
 }
+pub fn local_endpoint<'a>(t: &'a Tunnel, n: &'a Node) -> &'a str {
+    if t.local.is_empty() {
+        &n.tunnel_src
+    } else {
+        &t.local
+    }
+}
 pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel> {
-    let local = n
-        .tunnel_src
+    if !t.local.is_empty() && t.node != n.id {
+        return Err("dedicated endpoint belongs to a different node".into());
+    }
+    let local = local_endpoint(t, n)
         .parse::<Ipv4Addr>()
         .map_err(|_| format!("node {} has no usable IPv4 tunnel_src", n.id))?;
     let mtu = if t.mtu == 0 { default_mtu(t) } else { t.mtu };
