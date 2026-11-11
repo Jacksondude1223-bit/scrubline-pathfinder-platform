@@ -1183,3 +1183,98 @@ fn filters_and_rules_aimed_outside_the_protected_prefixes_are_refused() {
         validation::policy(&policy(vec![], vec![rule(src, dst)])).unwrap();
     }
 }
+
+#[test]
+fn dedicated_endpoints_render_into_real_tunnels_and_remain_pinned() {
+    let t = Tunnel {
+        id: "unique".into(),
+        remote: "198.51.100.1".into(),
+        local: "192.0.2.10".into(),
+        node: "edge-a".into(),
+        prefixes: vec!["203.0.113.0/24".into()],
+        ..Default::default()
+    };
+    tunnel::validate(&t, None).unwrap();
+    let n = Node {
+        id: "edge-a".into(),
+        tunnel_src: "192.0.2.1".into(),
+        ..Default::default()
+    };
+    let built = tunnel::for_node(&t, &n, &t.prefixes).unwrap();
+    assert_eq!(built.local, "192.0.2.10");
+    let lines = tunnel::commands(&[built.clone()]).unwrap();
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("local 192.0.2.10 remote 198.51.100.1")));
+    let pass = provision::plan(
+        &provision::Desired {
+            tunnels: vec![built],
+            lines,
+            ..Default::default()
+        },
+        &provision::Observed::default(),
+    )
+    .unwrap();
+    assert!(pass.steps.iter().any(|step| step
+        .argv
+        .windows(2)
+        .any(|words| words == ["local", "192.0.2.10"])));
+    let other = Node {
+        id: "edge-b".into(),
+        ..n.clone()
+    };
+    assert!(tunnel::for_node(&t, &other, &t.prefixes).is_err());
+    let legacy = Tunnel {
+        local: String::new(),
+        ..t.clone()
+    };
+    assert_eq!(
+        tunnel::for_node(&legacy, &n, &legacy.prefixes)
+            .unwrap()
+            .local,
+        n.tunnel_src
+    );
+}
+
+#[test]
+fn dedicated_addresses_reject_reuse_anycast_and_missing_location() {
+    let t = Tunnel {
+        id: "a".into(),
+        remote: "198.51.100.1".into(),
+        local: "192.0.2.10".into(),
+        node: "edge-a".into(),
+        prefixes: vec!["203.0.113.0/25".into()],
+        ..Default::default()
+    };
+    let mut p = Policy {
+        name: "dedicated".into(),
+        protected: vec!["203.0.113.0/25".into(), "203.0.113.128/25".into()],
+        tunnels: vec![t.clone()],
+        ..Default::default()
+    };
+    validation::policy(&p).unwrap();
+    p.tunnels.push(Tunnel {
+        id: "b".into(),
+        remote: "198.51.100.2".into(),
+        prefixes: vec!["203.0.113.128/25".into()],
+        ..t.clone()
+    });
+    assert!(validation::policy(&p).unwrap_err().contains("unique"));
+    p.tunnels.pop();
+    for local in [
+        "203.0.113.7",
+        "198.51.100.1",
+        "127.0.0.1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "::1",
+    ] {
+        p.tunnels[0].local = local.into();
+        assert!(validation::policy(&p).is_err(), "{local}");
+    }
+    let unpinned = Tunnel {
+        node: String::new(),
+        ..t
+    };
+    assert!(tunnel::validate(&unpinned, None).is_err());
+}

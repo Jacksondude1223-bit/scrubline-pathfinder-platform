@@ -314,6 +314,32 @@ impl Api {
     /// registered node outside the steering regions of one of the tunnel's prefixes, which that
     /// node would never announce and nobody else could deliver.
     fn misplaced(&self, p: &Policy) -> Option<String> {
+        for t in p.tunnels.iter().filter(|t| !t.local.is_empty()) {
+            if !self.store.data.nodes.iter().any(|n| n.id == t.node) {
+                return Some(format!(
+                    "dedicated tunnel {} needs a registered location",
+                    t.id
+                ));
+            }
+            if self
+                .store
+                .data
+                .nodes
+                .iter()
+                .any(|n| n.tunnel_src == t.local)
+                || self
+                    .store
+                    .data
+                    .tunnel_endpoints
+                    .values()
+                    .any(|addr| addr == &t.local)
+            {
+                return Some(format!(
+                    "dedicated tunnel {} cannot use a shared node endpoint",
+                    t.id
+                ));
+            }
+        }
         p.tunnels.iter().find_map(|t| {
             let at = self.store.data.nodes.iter().find(|n| n.id == t.node)?;
             compiler::misplaced(p, at, t)
@@ -379,6 +405,9 @@ impl Api {
         change(&mut p)?;
         validation::policy(&p).map_err(bad)?;
         validation::tunnel_tenants(&p, &self.store.data.tenants).map_err(bad)?;
+        if let Some(why) = self.misplaced(&p) {
+            return Err(bad(why));
+        }
         let saved = self.store.save_policy(p, now).map_err(failed)?;
         for (node, tunnel) in forget {
             self.forget_health(*node, *tunnel);
@@ -439,7 +468,7 @@ impl Api {
     /// only the tunnels allocated to that customer.
     fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self.deployed() else {
-            return json!({"policy_id":null,"version":0,"tunnels":[]});
+            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true}});
         };
         let nodes = self.store.nodes(now);
         let tunnels: Vec<_> = p
@@ -488,7 +517,7 @@ impl Api {
                             "region": n.region,
                             "status": n.status,
                             "role": role,
-                            "endpoint": n.tunnel_src,
+                            "endpoint": if role == "helper" { n.tunnel_src.as_str() } else { crate::tunnel::local_endpoint(t, n) },
                             "endpoint_assigned": self.store.data.tunnel_endpoints.contains_key(&n.id),
                             "enabled": enabled,
                             "state": report.map_or("unreported", |r| r.state.as_str()),
@@ -594,6 +623,7 @@ impl Api {
                     "type": if t.r#type.is_empty() { "gre" } else { t.r#type.as_str() },
                     "direction": if t.direction.is_empty() { "both" } else { t.direction.as_str() },
                     "remote": t.remote,
+                    "local": t.local,
                     "key": t.key,
                     "prefixes": t.prefixes,
                     "required": t.required,
@@ -611,7 +641,7 @@ impl Api {
                 })
             })
             .collect();
-        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels})
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true}})
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
@@ -984,6 +1014,11 @@ impl Api {
                     ));
                 }
                 if let Some(p) = self.deployed() {
+                    if p.tunnels.iter().any(|t| t.local == e.address) {
+                        return Err(bad(
+                            "this address is reserved for a dedicated customer tunnel",
+                        ));
+                    }
                     if let Some(t) = p.tunnels.iter().find(|t| t.remote == e.address) {
                         return Err(bad(format!(
                             "{} is the customer end of tunnel {}; a node's end must be its own address",

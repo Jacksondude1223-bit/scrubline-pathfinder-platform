@@ -329,6 +329,19 @@ fn builds(idx: &Index, n: &Node, t: &Tunnel, health: &TunnelHealth) -> (bool, St
 /// ends where it starts, or an address inside a protected prefix, which the fabric anycasts, so
 /// the customer's packets to it are drawn to whichever scrubber is nearest.
 fn unusable_endpoint(idx: &Index, n: &Node, t: &Tunnel) -> Option<String> {
+    if !t.local.is_empty() {
+        if t.node != n.id || idx.endpoints.contains_key(t.local.as_str()) {
+            return Some(
+                "dedicated endpoint must be on its pinned node and distinct from node endpoints"
+                    .into(),
+            );
+        }
+        let local = Node {
+            tunnel_src: t.local.clone(),
+            ..n.clone()
+        };
+        return endpoint_problem(idx.p, &local);
+    }
     if n.tunnel_src == t.remote {
         return Some(format!(
             "return tunnel {} would end where it starts: the node's tunnel_src is its remote",
