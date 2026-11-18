@@ -1841,6 +1841,9 @@ components:
         prefix:
           type: string
           description: Must be one of the policy's protected prefixes.
+        pre_routed:
+          type: boolean
+          description: Suppress BGP announcements for an existing upstream-routed IPv4 /32 on a dedicated GRE tunnel.
         regions:
           type: array
           items:
@@ -4423,6 +4426,8 @@ components:
           type: object
           properties:
             standalone_gre:
+              type: boolean
+            pre_routed_ipv4:
               type: boolean
             dedicated_tunnel_endpoints:
               type: boolean

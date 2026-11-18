@@ -594,6 +594,8 @@ pub struct EgressPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Steering {
+    #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
+    pub pre_routed: bool,
     #[serde(deserialize_with = "null_default")]
     pub prefix: String,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]

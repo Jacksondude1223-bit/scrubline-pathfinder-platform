@@ -102,6 +102,19 @@ pub fn policy(p: &Policy) -> Result<()> {
         if !protected.contains(&s.prefix) {
             return Err("steering prefix is not protected".into());
         }
+        if s.pre_routed
+            && (!s
+                .prefix
+                .parse::<IpNet>()
+                .is_ok_and(|net| matches!(net, IpNet::V4(v4) if v4.prefix_len() == 32))
+                || !p.tunnels.iter().any(|t| {
+                    !t.node.is_empty() && !t.local.is_empty() && t.prefixes.contains(&s.prefix)
+                }))
+        {
+            return Err(
+                "a pre-routed address must be an IPv4 /32 on a dedicated, pinned tunnel".into(),
+            );
+        }
         if s.regions.iter().any(|r| r.trim().is_empty()) {
             return Err("steering region must not be empty".into());
         }
