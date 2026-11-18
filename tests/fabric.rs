@@ -1278,3 +1278,57 @@ fn dedicated_addresses_reject_reuse_anycast_and_missing_location() {
     };
     assert!(tunnel::validate(&unpinned, None).is_err());
 }
+
+#[test]
+fn standalone_gre_builds_without_routes_or_forwarding() {
+    let t = Tunnel {
+        id: "server".into(),
+        remote: "198.51.100.1".into(),
+        key: 42,
+        standalone: true,
+        ..Default::default()
+    };
+    let mut p = Policy {
+        name: "Edge".into(),
+        tunnels: vec![t.clone()],
+        ..Default::default()
+    };
+    validation::policy(&p).unwrap();
+    let mut edge = node("edge-a", "iad", 100.0, "");
+    edge.tunnel_src = "192.0.2.10".into();
+    let built = compiler::tunnels_for(&p, &edge, &[]);
+    assert_eq!(built.len(), 1);
+    assert!(built[0].prefixes.is_empty());
+    assert!(tunnel::commands(&built)
+        .unwrap()
+        .iter()
+        .all(|line| !line.contains("ip route")));
+    assert_eq!(
+        tunnel::reply_commands(&built).unwrap(),
+        ["nft add rule inet scrubline forward iifname \"scr-server\" drop"]
+    );
+    let program = Program {
+        tunnels: built,
+        ..Default::default()
+    };
+    let lines = tunnel::render(&program).unwrap();
+    assert!(lines
+        .iter()
+        .any(|line| line == "nft add rule inet scrubline input iifname \"scr-server\" drop"));
+    let desired = provision::Desired {
+        tunnels: program.tunnels,
+        lines,
+        ..Default::default()
+    };
+    assert!(provision::plan(&desired, &provision::Observed::default()).is_ok());
+    p.tunnels[0].disabled.push(edge.id.clone());
+    assert!(compiler::tunnels_for(&p, &edge, &[]).is_empty());
+    p.protected.push("203.0.113.0/24".into());
+    p.tunnels[0].prefixes = p.protected.clone();
+    assert!(validation::policy(&p).is_err());
+    p.tunnels[0] = Tunnel {
+        standalone: false,
+        ..t
+    };
+    assert!(validation::policy(&p).is_err());
+}

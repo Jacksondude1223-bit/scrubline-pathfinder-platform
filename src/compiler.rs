@@ -424,7 +424,7 @@ fn tunnels_with(idx: &Index, n: &Node, enforced: &[String]) -> Vec<NodeTunnel> {
                 .filter(|prefix| enforced.contains(prefix.as_str()))
                 .cloned()
                 .collect();
-            if mine.is_empty()
+            if (mine.is_empty() && !t.standalone)
                 || (!t.node.is_empty() && t.node != n.id)
                 || t.disabled.iter().any(|id| id == &n.id)
                 || unusable_endpoint(idx, n, t).is_some()

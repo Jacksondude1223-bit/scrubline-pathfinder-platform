@@ -468,7 +468,7 @@ impl Api {
     /// only the tunnels allocated to that customer.
     fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self.deployed() else {
-            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true}});
+            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true}});
         };
         let nodes = self.store.nodes(now);
         let tunnels: Vec<_> = p
@@ -488,7 +488,7 @@ impl Api {
                             .collect();
                         // The location always has a row, so a tunnel placed where steering keeps
                         // its prefixes away still shows where it is and why.
-                        if mine.is_empty() && t.node != n.id {
+                        if mine.is_empty() && t.node != n.id && (!t.standalone || !t.node.is_empty()) {
                             return None;
                         }
                         let enabled = !t.disabled.iter().any(|id| id == &n.id);
@@ -626,6 +626,7 @@ impl Api {
                     "local": t.local,
                     "key": t.key,
                     "prefixes": t.prefixes,
+                    "standalone": t.standalone,
                     "required": t.required,
                     "disabled": t.disabled,
                     "tenant": t.tenant,
@@ -641,7 +642,7 @@ impl Api {
                 })
             })
             .collect();
-        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true}})
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true}})
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
@@ -1148,6 +1149,7 @@ impl Api {
                         if v.remote == t.remote
                             && v.key == t.key
                             && v.r#type == t.r#type
+                            && v.standalone == t.standalone
                             && v.node == t.node =>
                     {
                         Some(
@@ -1169,7 +1171,7 @@ impl Api {
                 let p = self.change_tunnels(now, &forget, |p| {
                     // Allocating a tunnel to a customer without naming prefixes carries their own
                     // protected prefixes that no other tunnel carries.
-                    if t.prefixes.is_empty() && !t.tenant.is_empty() {
+                    if !t.standalone && t.prefixes.is_empty() && !t.tenant.is_empty() {
                         t.prefixes = tenant_prefixes(p, &tenants, &t.tenant, &t.id)?;
                     }
                     if let Some(why) = location.and_then(|at| compiler::misplaced(p, &at, &t)) {

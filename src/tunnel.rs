@@ -148,8 +148,12 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
             return Err("a dedicated local endpoint requires a pinned node".into());
         }
     }
-    if t.prefixes.is_empty() {
-        return Err("tunnel needs at least one prefix".into());
+    if t.standalone {
+        if !t.prefixes.is_empty() || t.r#type == "ipip" || t.mitigation == "on_demand" {
+            return Err("standalone tunnels require GRE, no prefixes, and always-on mode".into());
+        }
+    } else if t.prefixes.is_empty() {
+        return Err("tunnel needs at least one prefix or standalone GRE mode".into());
     }
     let mut seen = HashSet::new();
     for prefix in &t.prefixes {
@@ -216,7 +220,11 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
         required: t.required,
         interface: interface_name(&t.id)?,
         comment: t.comment.clone(),
-        direction: t.direction.clone(),
+        direction: if t.standalone {
+            "return".into()
+        } else {
+            t.direction.clone()
+        },
         sources: {
             let mut all = t.prefixes.clone();
             all.sort();
@@ -486,6 +494,14 @@ pub fn render(prog: &Program) -> Result<Vec<String>> {
     let mut lines = commands(&prog.tunnels)?;
     lines.extend(backhaul_commands(&prog.backhaul, &prog.pinned)?);
     lines.extend(reply_commands(&prog.tunnels)?);
+    for tunnel in &prog.tunnels {
+        if tunnel.prefixes.is_empty() && tunnel.sources.is_empty() && !carries_replies(tunnel) {
+            let interface = interface_name(&tunnel.id)?;
+            lines.push(format!(
+                "nft add rule inet scrubline input iifname \"{interface}\" drop"
+            ));
+        }
+    }
     // The ends of this node's own tunnels are always peers, whatever the list from the control
     // plane says: one from before the list existed sends none, and that is no reason to cut
     // this node's customers off.

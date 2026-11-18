@@ -118,6 +118,12 @@ fn address(word: &str) -> bool {
 /// our interfaces, or a firewall rule scoped to GRE and IPIP, made of the words they use, with
 /// drop the only verdict.
 fn rule(words: &[&str]) -> bool {
+    if let ["input", "iifname", name, "drop"] = words {
+        return name
+            .strip_prefix('"')
+            .and_then(|name| name.strip_suffix('"'))
+            .is_some_and(|name| name.starts_with("scr-") && interface(name));
+    }
     let quoted = |w: &str| {
         w.strip_prefix('"')
             .and_then(|w| w.strip_suffix('"'))
