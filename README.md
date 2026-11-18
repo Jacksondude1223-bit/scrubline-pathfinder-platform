@@ -2302,3 +2302,14 @@ Attach a protected destination in routed mode to deliver scrubbed traffic.
 The operator must deploy a policy first. A policy and a tunnel's tenant can
 have empty protected-prefix lists for standalone GRE. Integrations can check
 `GET /v1/tunnels` for `capabilities.standalone_gre` before enabling the mode.
+
+### IPv4 host routes delivered by an upstream
+
+Use `"pre_routed": true` on a steering entry to keep an IPv4 /32 out of the
+Pathfinder BGP announcement plan. Add the same address to `protected` and to
+a dedicated tunnel with explicit `local` and `node` settings. Pathfinder
+compiles the address for filtering and forwarding through that tunnel.
+The upstream must deliver the address to the pinned edge. The edge needs a
+discard route covering the address when a tunnel route is unavailable, so
+traffic cannot loop back upstream. Integrations can check
+`GET /v1/tunnels` for `capabilities.pre_routed_ipv4`.

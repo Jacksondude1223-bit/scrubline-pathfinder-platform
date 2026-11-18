@@ -134,6 +134,13 @@ pub fn plan_with(
     let idx = Index::new(p, nodes);
     let mut out = Vec::new();
     for prefix in &p.protected {
+        if idx
+            .steering
+            .get(prefix.as_str())
+            .is_some_and(|s| s.pre_routed)
+        {
+            continue;
+        }
         // Padding is relative to the largest node actually announcing this prefix. A node outside
         // its regions, or one that cannot deliver it, is not competing for its traffic, and
         // counting it would pad every real announcer and spend the shedding budget for nothing.

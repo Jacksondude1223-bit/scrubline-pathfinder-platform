@@ -1332,3 +1332,37 @@ fn standalone_gre_builds_without_routes_or_forwarding() {
     };
     assert!(validation::policy(&p).is_err());
 }
+
+#[test]
+fn pre_routed_host_is_filtered_and_forwarded_without_a_bgp_announcement() {
+    let prefix = "203.0.113.25/32".to_string();
+    let mut edge = node("edge", "buf", 100.0, "");
+    edge.tunnel_src = "192.0.2.1".into();
+    let mut policy = Policy {
+        name: "Game server".into(),
+        protected: vec![prefix.clone()],
+        steering: vec![Steering {
+            prefix: prefix.clone(),
+            pre_routed: true,
+            ..Default::default()
+        }],
+        tunnels: vec![Tunnel {
+            id: "game".into(),
+            remote: "198.51.100.8".into(),
+            local: "192.0.2.2".into(),
+            node: edge.id.clone(),
+            prefixes: vec![prefix.clone()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    validation::policy(&policy).unwrap();
+    let nodes = [edge];
+    let plan = compiler::plan(&policy, &nodes, &HashMap::new(), &HashMap::new());
+    assert!(plan.is_empty());
+    let program = compiler::compile(&policy, &nodes, &plan);
+    assert_eq!(program["edge"].prefixes, [prefix.clone()]);
+    assert_eq!(program["edge"].tunnels[0].prefixes, [prefix]);
+    policy.tunnels[0].local.clear();
+    assert!(validation::policy(&policy).is_err());
+}

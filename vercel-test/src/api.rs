@@ -468,7 +468,7 @@ impl Api {
     /// only the tunnels allocated to that customer.
     fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self.deployed() else {
-            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true}});
+            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true}});
         };
         let nodes = self.store.nodes(now);
         let tunnels: Vec<_> = p
@@ -642,7 +642,7 @@ impl Api {
                 })
             })
             .collect();
-        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true}})
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true}})
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
