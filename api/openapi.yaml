@@ -2100,9 +2100,8 @@ components:
           type: array
           items:
             type: string
-          minItems: 1
           uniqueItems: true
-          description: Network prefixes with no host bits set, each naming a different network. A speaker
+          description: May be empty for a policy without protected routes. Network prefixes with no host bits set, each naming a different network. A speaker
             refuses a route with host bits, so such a prefix would never be announced.
         rules:
           type: array
@@ -4067,10 +4066,14 @@ components:
           type: array
           items:
             type: string
-          description: Which protected prefixes ride this tunnel; at least one, though PUT /v1/tunnels/{id}
-            fills them in from the tenant when it is allocated to one. Each must be one the policy protects,
+          description: Protected prefixes carried by the tunnel. Standalone GRE uses an empty list.
+            For routed tunnels, PUT /v1/tunnels/{id} fills an empty list from the tenant.
+            Each prefix must be one the policy protects,
             and a prefix belongs to at most one tunnel — backup paths are not modelled, so two would leave
             no answer to which return path is authoritative.
+        standalone:
+          type: boolean
+          description: Build GRE without any protected prefixes or forwarded traffic.
         type:
           type: string
           enum:
@@ -4416,6 +4419,13 @@ components:
           nullable: true
         version:
           type: integer
+        capabilities:
+          type: object
+          properties:
+            standalone_gre:
+              type: boolean
+            dedicated_tunnel_endpoints:
+              type: boolean
         tunnels:
           type: array
           items:
@@ -4440,6 +4450,8 @@ components:
           type: string
         key:
           type: integer
+        standalone:
+          type: boolean
         prefixes:
           type: array
           items:
@@ -4662,7 +4674,6 @@ components:
           type: array
           items:
             type: string
-          minItems: 1
           description: 'What this customer may read. An entitlement covers anything inside it, so a customer
             who brings a /22 and has it protected as four /24s is entitled once rather than on every split.
             Must be written masked: host bits are refused, because the entitlement is matched against

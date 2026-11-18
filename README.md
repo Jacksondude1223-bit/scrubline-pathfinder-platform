@@ -2290,3 +2290,15 @@ steering; see [Steering](#steering).
 A tunnel may set `local` to its own provider IPv4 endpoint together with `node` to pin it to one node. Example: `{"id":"customer-a","remote":"198.51.100.1","local":"192.0.2.10","node":"node-a","prefixes":["203.0.113.0/24"],"key":42}`. Every dedicated endpoint must be unique across the policy, outside protected prefixes, and distinct from node endpoints and customer remote addresses. The operator must already own and route that address to the selected node and configure it on that node. Pathfinder renders it as the actual GRE/IPIP source; it does not allocate or add host addresses. Node endpoints remain in use for inter-node backhaul. Omit `local` for legacy shared-node tunnels.
 
 `GET /v1/tunnels` reports `capabilities.dedicated_tunnel_endpoints: true`. Integrations must require this flag before assigning dedicated endpoints so older servers cannot silently ignore `local`. Tunnel overview location rows report the dedicated endpoint. Deploy the control plane, agents, and provisioners together before enabling this feature in the billing portal.
+
+### Standalone GRE for servers
+
+Create or update a tunnel with `"standalone": true` and `"prefixes": []` to
+provision a GRE interface with no protected routes. With no pinned node, the
+interface is compiled on scrubbing nodes with usable tunnel endpoints. A
+standalone tunnel does not announce destinations or forward inner traffic.
+Attach a protected destination in routed mode to deliver scrubbed traffic.
+
+The operator must deploy a policy first. A policy and a tunnel's tenant can
+have empty protected-prefix lists for standalone GRE. Integrations can check
+`GET /v1/tunnels` for `capabilities.standalone_gre` before enabling the mode.

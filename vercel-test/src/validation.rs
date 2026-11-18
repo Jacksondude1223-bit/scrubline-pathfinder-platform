@@ -57,8 +57,8 @@ pub const GAMES_MAX: usize = 256;
 pub const TUNNELS_MAX: usize = 1024;
 pub const SESSIONS_MAX: usize = 256;
 pub fn policy(p: &Policy) -> Result<()> {
-    if p.name.is_empty() || p.protected.is_empty() {
-        return Err("name and protected prefixes required".into());
+    if p.name.is_empty() {
+        return Err("name required".into());
     }
     for (what, n, max) in [
         ("protected prefixes", p.protected.len(), PREFIXES_MAX),
@@ -943,9 +943,6 @@ pub fn tunnel_tenants(p: &Policy, tenants: &[Tenant]) -> Result<()> {
 pub fn tenant(t: &Tenant) -> Result<()> {
     if t.name.is_empty() {
         return Err("name required".into());
-    }
-    if t.prefixes.is_empty() {
-        return Err("at least one prefix required, or the tenant is entitled to nothing".into());
     }
     if t.prefixes.len() > PREFIXES_MAX {
         return Err(format!(

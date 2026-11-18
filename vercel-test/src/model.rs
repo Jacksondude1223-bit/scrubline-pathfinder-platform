@@ -1171,6 +1171,9 @@ pub struct Tunnel {
     pub id: String,
     #[serde(deserialize_with = "null_default")]
     pub prefixes: Vec<String>,
+    /// Bring up GRE without routing or announcing customer address space.
+    #[serde(skip_serializing_if = "is_zero", deserialize_with = "null_default")]
+    pub standalone: bool,
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub r#type: String,

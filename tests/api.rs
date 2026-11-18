@@ -993,3 +993,45 @@ fn dedicated_endpoint_capability_and_customer_configuration_are_reported() {
     let bad = json!({"name":"shared","protected":["203.0.113.0/24"],"tunnels":[{"id":"shared","remote":"198.51.100.1","local":"192.0.2.1","node":node,"prefixes":["203.0.113.0/24"]}]});
     assert_eq!(call(&base, "POST", "/v1/policies", Some(OP), bad).0, 400);
 }
+
+#[test]
+fn standalone_gre_provisions_for_a_tenant_without_prefixes() {
+    let base = serve(Store::open("").unwrap());
+    let op = |method: &str, path: &str, value: Value| call(&base, method, path, Some(OP), value);
+    let (_, registered) = call(
+        &base,
+        "POST",
+        "/v1/nodes/register",
+        Some(ENROLL),
+        json!({"name":"edge-a","region":"iad","tunnel_src":"192.0.2.1"}),
+    );
+    let node = node_id(&registered);
+    let (status, tenant) = op(
+        "POST",
+        "/v1/tenants",
+        json!({"name":"server customer","prefixes":[]}),
+    );
+    assert_eq!(status, 200, "{tenant}");
+    let (status, policy) = op(
+        "POST",
+        "/v1/policies",
+        json!({"name":"Edge","protected":[]}),
+    );
+    assert_eq!(status, 200, "{policy}");
+    let deploy = format!("/v1/policies/{}/deploy", policy["id"].as_str().unwrap());
+    assert_eq!(op("POST", &deploy, Value::Null).0, 200);
+    let (status, body) = op(
+        "PUT",
+        "/v1/tunnels/server",
+        json!({"remote":"198.51.100.1","key":42,"tenant":tenant["id"],"standalone":true,"prefixes":[]}),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, fleet) = op("GET", "/v1/tunnels", Value::Null);
+    assert_eq!(fleet["capabilities"]["standalone_gre"], true);
+    assert_eq!(fleet["tunnels"][0]["standalone"], true);
+    assert_eq!(fleet["tunnels"][0]["nodes"][0]["endpoint"], "192.0.2.1");
+    let (_, program) = op("GET", &format!("/v1/nodes/{node}/program"), Value::Null);
+    assert_eq!(program["tunnels"][0]["prefixes"], json!([]));
+    assert_eq!(program["tunnels"][0]["direction"], "return");
+    assert_eq!(op("DELETE", "/v1/tunnels/server", Value::Null).0, 200);
+}
