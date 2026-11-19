@@ -91,8 +91,14 @@ fn destination(dst: &str) -> Option<String> {
 const TABLE: &str = "table inet scrubline
 delete table inet scrubline
 table inet scrubline {
+\tchain prerouting {
+\t\ttype nat hook prerouting priority dstnat; policy accept;
+\t}
 \tchain forward {
 \t\ttype filter hook forward priority 0; policy accept;
+\t}
+\tchain forwarded_hosts {
+\t\ttype filter hook forward priority 10; policy accept;
 \t}
 \tchain input {
 \t\ttype filter hook input priority 0; policy accept;
@@ -114,6 +120,17 @@ fn number(word: &str) -> bool {
 fn address(word: &str) -> bool {
     word.parse::<std::net::Ipv4Addr>().is_ok()
 }
+fn port_list(ports: &[&str]) -> bool {
+    (1..=16).contains(&ports.len())
+        && ports.iter().enumerate().all(|(i, port)| {
+            let value = if i == ports.len() - 1 {
+                Some(*port)
+            } else {
+                port.strip_suffix(',')
+            };
+            value.is_some_and(|v| number(v) && v.parse::<u16>().is_ok_and(|port| port > 0))
+        })
+}
 /// An nft rule as the renderers write them, and nothing else: a forwarding rule scoped to one of
 /// our interfaces, or a firewall rule scoped to GRE and IPIP, made of the words they use, with
 /// drop the only verdict.
@@ -129,6 +146,41 @@ fn rule(words: &[&str]) -> bool {
             .and_then(|w| w.strip_suffix('"'))
             .is_some_and(|name| interface(name) || name == "sbh-*")
     };
+    if let ["input", "ip", "daddr", addr, "meta", "l4proto", "!=", "47", "drop"] = words {
+        return address(addr);
+    }
+    if let ["forward", direction @ ("iifname" | "oifname"), name, "ct", rest @ ..] = words {
+        return quoted(name)
+            && match (*direction, rest) {
+                (_, ["status", "&", "dnat", "==", "0", "drop"]) => true,
+                ("iifname", ["direction", "!=", "reply", "drop"]) => true,
+                ("oifname", ["original", "ip", "daddr", "!=", addr, "drop"]) => address(addr),
+                _ => false,
+            };
+    }
+    if let ["prerouting", "iifname", "!=", "\"scr-*\"", "iifname", "!=", "\"sbh-*\"", "ip", "daddr", addr, "tcp" | "udp", "dport", "{", ports @ .., "}", "dnat", "ip", "to", backend] =
+        words
+    {
+        return address(addr)
+            && backend.parse::<std::net::Ipv4Addr>().is_ok_and(|addr| {
+                let [a, b, ..] = addr.octets();
+                a == 198 && (18..=19).contains(&b)
+            })
+            && port_list(ports);
+    }
+    if let ["forward", "iifname" | "oifname", name, "tcp" | "udp", "sport" | "dport", "!=", "{", ports @ .., "}", "drop"] =
+        words
+    {
+        return quoted(name) && port_list(ports);
+    }
+    if let ["forwarded_hosts", rest @ ..] = words {
+        return match rest {
+            ["oifname", name, "ip", "daddr", backend, "ct", "status", "dnat", "return"] => {
+                quoted(name) && address(backend)
+            }
+            _ => false,
+        };
+    }
     let rest = match words {
         ["forward", "oifname" | "iifname", name, rest @ ..] if quoted(name) => rest,
         ["input", "meta", "l4proto", "{", "47,", "4", "}", rest @ ..] => rest,
@@ -163,7 +215,7 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
         // Nothing that could end one command and start another reaches nft or a command line.
         if !line
             .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b" .:/,{}!=*\"-_".contains(&c))
+            .all(|c| c.is_ascii_alphanumeric() || b" .:/,{}!=*&\"-_".contains(&c))
         {
             return Err(refuse());
         }
@@ -286,6 +338,9 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
             });
         }
     }
+    nft.push_str(
+        "add rule inet scrubline forwarded_hosts ip daddr 198.18.0.0/15 ct status dnat drop\n",
+    );
     pass.nft = nft;
     Ok(pass)
 }
@@ -538,7 +593,7 @@ mod tests {
         assert!(pass.nft.starts_with(TABLE));
         assert!(pass
             .nft
-            .ends_with("add rule inet scrubline forward oifname \"scr-nw\" tcp flags syn tcp option maxseg size set 1432\n"));
+            .contains("add rule inet scrubline forward oifname \"scr-nw\" tcp flags syn tcp option maxseg size set 1432\n"));
     }
     #[test]
     fn a_box_already_in_step_is_left_alone() {

@@ -78,6 +78,9 @@ impl<'a> Index<'a> {
     }
     fn eligible(&self, n: &Node, prefix: &str) -> bool {
         in_regions(self.steering.get(prefix).copied(), n)
+            && self
+                .tunnel_of(prefix)
+                .is_none_or(|t| t.port_forward.is_none() || t.node == n.id)
     }
     /// The tunnel carrying a prefix, if one does.
     fn tunnel_of(&self, prefix: &str) -> Option<&'a Tunnel> {
@@ -347,6 +350,17 @@ fn unusable_endpoint(idx: &Index, n: &Node, t: &Tunnel) -> Option<String> {
             tunnel_src: t.local.clone(),
             ..n.clone()
         };
+        if t.port_forward.is_some() {
+            let addr = t.local.parse::<IpAddr>().ok()?;
+            let overlaps_other = idx
+                .p
+                .protected
+                .iter()
+                .filter(|prefix| !t.prefixes.contains(prefix))
+                .any(|prefix| prefix.parse::<IpNet>().is_ok_and(|net| net.contains(&addr)));
+            return overlaps_other
+                .then(|| "the forwarding address overlaps another protected prefix".into());
+        }
         return endpoint_problem(idx.p, &local);
     }
     if n.tunnel_src == t.remote {
@@ -690,6 +704,12 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                 tunnels: tunnels_with(&idx, n, &prefixes),
                 backhaul: backhaul_with(&idx, nodes, n, &prefixes),
                 pinned: pinned_at(&idx, n),
+                forwarding_ips: p
+                    .tunnels
+                    .iter()
+                    .filter(|t| t.node == n.id && t.port_forward.is_some())
+                    .map(|t| t.local.clone())
+                    .collect(),
                 sessions: sessions_for(p, n),
                 tunnel_src: n.tunnel_src.clone(),
                 compiled_at: now,

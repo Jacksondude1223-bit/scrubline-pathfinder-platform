@@ -468,7 +468,7 @@ impl Api {
     /// only the tunnels allocated to that customer.
     fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self.deployed() else {
-            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true}});
+            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true}});
         };
         let nodes = self.store.nodes(now);
         let tunnels: Vec<_> = p
@@ -642,7 +642,7 @@ impl Api {
                 })
             })
             .collect();
-        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true}})
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true}})
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
@@ -2067,6 +2067,7 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         backhaul,
         pinned,
         tunnel_peers,
+        forwarding_ips,
         compiled_at: _,
     } = a;
     *node_id == b.node_id
@@ -2102,6 +2103,7 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         && *backhaul == b.backhaul
         && *pinned == b.pinned
         && *tunnel_peers == b.tunnel_peers
+        && *forwarding_ips == b.forwarding_ips
 }
 /// Holds a request for a node's program while the program is still the one the node has, the one
 /// compiled at `since`, or none for a node that has none yet: until the fabric compiles it a new

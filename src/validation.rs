@@ -157,8 +157,32 @@ pub fn policy(p: &Policy) -> Result<()> {
     let mut carried = HashSet::new();
     let mut ends = HashMap::new();
     let mut dedicated = HashSet::new();
+    let mut forwarding_backends = HashSet::new();
     for t in &p.tunnels {
         tunnel::validate(t, Some(&protected))?;
+        if let Some(forward) = &t.port_forward {
+            if !forwarding_backends.insert(forward.backend)
+                || p.protected.iter().any(|prefix| {
+                    prefix
+                        .parse::<IpNet>()
+                        .is_ok_and(|net| net.contains(&std::net::IpAddr::V4(forward.backend)))
+                })
+            {
+                return Err(
+                    "port forwarding backend must be unique and outside protected prefixes".into(),
+                );
+            }
+            if !p
+                .steering
+                .iter()
+                .any(|s| s.prefix == t.prefixes[0] && s.pre_routed && s.regions.is_empty())
+            {
+                return Err(
+                    "the forwarding address requires pre-routed steering with no region override"
+                        .into(),
+                );
+            }
+        }
         if !t.local.is_empty() {
             if !dedicated.insert(t.local.as_str()) {
                 return Err("dedicated tunnel endpoints must be unique".into());
@@ -167,10 +191,10 @@ pub fn policy(p: &Policy) -> Result<()> {
                 .local
                 .parse::<std::net::IpAddr>()
                 .map_err(|_| "invalid local endpoint")?;
-            if p.protected
-                .iter()
-                .any(|v| v.parse::<IpNet>().is_ok_and(|net| net.contains(&addr)))
-            {
+            if p.protected.iter().any(|v| {
+                !(t.port_forward.is_some() && v == &t.prefixes[0])
+                    && v.parse::<IpNet>().is_ok_and(|net| net.contains(&addr))
+            }) {
                 return Err("dedicated endpoint must be outside protected prefixes".into());
             }
             if p.tunnels.iter().any(|other| other.remote == t.local) {
@@ -201,6 +225,13 @@ pub fn policy(p: &Policy) -> Result<()> {
     let mut protocols = HashSet::new();
     for s in &p.sessions {
         bgp::validate_session(s, Some(&protected))?;
+        if s.prefixes.iter().any(|prefix| {
+            p.steering
+                .iter()
+                .any(|steering| steering.pre_routed && steering.prefix == *prefix)
+        }) {
+            return Err("pre-routed addresses cannot be imported over customer BGP".into());
+        }
         // BIRD names each session from its id with dashes folded to underscores, and a duplicate
         // protocol name makes BIRD reject the node's whole session configuration.
         if !protocols.insert(s.id.replace('-', "_")) {

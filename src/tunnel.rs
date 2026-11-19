@@ -148,6 +148,18 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
             return Err("a dedicated local endpoint requires a pinned node".into());
         }
     }
+    if let Some(forward) = &t.port_forward {
+        validate_port_forward(forward)?;
+        if t.local.is_empty()
+            || t.r#type == "ipip"
+            || t.standalone
+            || t.direction == "return"
+            || t.mitigation == "on_demand"
+            || t.prefixes != [format!("{}/32", t.local)]
+        {
+            return Err("port forwarding requires an always-on bidirectional dedicated GRE carrying its local IPv4 /32".into());
+        }
+    }
     if t.standalone {
         if !t.prefixes.is_empty() || t.r#type == "ipip" || t.mitigation == "on_demand" {
             return Err("standalone tunnels require GRE, no prefixes, and always-on mode".into());
@@ -177,6 +189,24 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     }
     Ok(())
 }
+fn validate_port_forward(forward: &crate::model::PortForward) -> Result<()> {
+    let [a, b, ..] = forward.backend.octets();
+    if a != 198 || !(18..=19).contains(&b) {
+        return Err(
+            "port forwarding backend must use the reserved 198.18.0.0/15 tunnel range".into(),
+        );
+    }
+    let ports: HashSet<u16> = forward.ports.iter().copied().collect();
+    if ports.len() != forward.ports.len()
+        || ports.is_empty()
+        || ports.len() > 16
+        || ports.contains(&0)
+    {
+        return Err("port forwarding needs 1 to 16 distinct TCP/UDP ports".into());
+    }
+    Ok(())
+}
+
 pub fn local_endpoint<'a>(t: &'a Tunnel, n: &'a Node) -> &'a str {
     if t.local.is_empty() {
         &n.tunnel_src
@@ -208,6 +238,7 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
             t.r#type.clone()
         },
         local: local.to_string(),
+        port_forward: t.port_forward.clone(),
         remote: t.remote.clone(),
         prefixes,
         mtu,
@@ -320,6 +351,23 @@ pub fn reply_commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
         let name = interface_name(&t.id)?;
         let rule =
             |tail: String| format!("nft add rule inet scrubline forward iifname \"{name}\" {tail}");
+        if let Some(forward) = &t.port_forward {
+            lines.push(rule("meta nfproto ipv6 drop".into()));
+            lines.push(rule(format!("ip saddr != {} drop", forward.backend)));
+            lines.push(rule("ct direction != reply drop".into()));
+            lines.push(rule("ct status & dnat == 0 drop".into()));
+            let ports = format_ports(&forward.ports);
+            for protocol in ["tcp", "udp"] {
+                lines.push(rule(format!("{protocol} sport != {{ {ports} }} drop")));
+            }
+            if t.mss_clamp > 0 {
+                lines.push(rule(format!(
+                    "tcp flags syn tcp option maxseg size set {}",
+                    t.mss_clamp
+                )));
+            }
+            continue;
+        }
         if !carries_replies(t) {
             lines.push(rule("drop".into()));
             continue;
@@ -494,8 +542,16 @@ pub fn render(prog: &Program) -> Result<Vec<String>> {
     let mut lines = commands(&prog.tunnels)?;
     lines.extend(backhaul_commands(&prog.backhaul, &prog.pinned)?);
     lines.extend(reply_commands(&prog.tunnels)?);
+    for addr in &prog.forwarding_ips {
+        let addr = addr.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
+        lines.push(format!(
+            "nft add rule inet scrubline input ip daddr {addr} meta l4proto != 47 drop"
+        ));
+    }
     for tunnel in &prog.tunnels {
-        if tunnel.prefixes.is_empty() && tunnel.sources.is_empty() && !carries_replies(tunnel) {
+        if tunnel.port_forward.is_some()
+            || (tunnel.prefixes.is_empty() && tunnel.sources.is_empty() && !carries_replies(tunnel))
+        {
             let interface = interface_name(&tunnel.id)?;
             lines.push(format!(
                 "nft add rule inet scrubline input iifname \"{interface}\" drop"
@@ -512,6 +568,16 @@ pub fn render(prog: &Program) -> Result<Vec<String>> {
     lines.extend(rate_commands(&prog.tunnels)?);
     Ok(lines)
 }
+fn format_ports(ports: &[u16]) -> String {
+    let mut ports = ports.to_vec();
+    ports.sort_unstable();
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
     let mut rows: Vec<_> = tunnels.iter().collect();
     rows.sort_by_key(|t| &t.id);
@@ -555,6 +621,22 @@ pub fn commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
         ));
         lines.push(format!("ip link set {name} mtu {} up", t.mtu));
         let mut prefixes = t.prefixes.clone();
+        if let Some(forward) = &t.port_forward {
+            validate_port_forward(forward)?;
+            prefixes = vec![format!("{}/32", forward.backend)];
+            lines.push(format!("nft add rule inet scrubline forwarded_hosts oifname \"{name}\" ip daddr {} ct status dnat return", forward.backend));
+            let ports = format_ports(&forward.ports);
+            for protocol in ["tcp", "udp"] {
+                lines.push(format!("nft add rule inet scrubline prerouting iifname != \"scr-*\" iifname != \"sbh-*\" ip daddr {local} {protocol} dport {{ {ports} }} dnat ip to {}", forward.backend));
+            }
+            for protocol in ["tcp", "udp"] {
+                lines.push(format!("nft add rule inet scrubline forward oifname \"{name}\" {protocol} dport != {{ {ports} }} drop"));
+            }
+            lines.push(format!("nft add rule inet scrubline forward oifname \"{name}\" ct original ip daddr != {local} drop"));
+            lines.push(format!(
+                "nft add rule inet scrubline forward oifname \"{name}\" ct status & dnat == 0 drop"
+            ));
+        }
         prefixes.sort();
         for prefix in prefixes {
             let p = prefix.parse::<IpNet>().map_err(|e| e.to_string())?;

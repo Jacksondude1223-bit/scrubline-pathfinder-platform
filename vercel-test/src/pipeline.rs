@@ -1662,6 +1662,27 @@ impl Pipeline {
         self.decisions += 1;
         let pps = f.pps.max(0) as u64;
         let dst = f.dst_ip.parse::<IpAddr>().ok();
+        if f.proto.eq_ignore_ascii_case("gre")
+            && self.program.tunnels.iter().any(|t| {
+                t.port_forward.is_some()
+                    && t.local == f.dst_ip
+                    && t.remote == f.src_ip
+                    && (f.packet.is_empty() || {
+                        let (packet, anomaly) = packet::parse(&f.packet);
+                        anomaly.is_none()
+                            && packet.proto == 47
+                            && packet.dst == dst
+                            && packet.src == f.src_ip.parse().ok()
+                    })
+            })
+        {
+            return decision(
+                "permit",
+                0,
+                "",
+                "GRE transport for this node's dedicated tunnel",
+            );
+        }
         let (profile, g) = self.settings_for(dst);
         self.surge = Surge::default();
         let owner = dst.and_then(|a| {
