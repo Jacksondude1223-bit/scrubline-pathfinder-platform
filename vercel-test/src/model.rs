@@ -891,6 +891,8 @@ pub struct Program {
     /// customer end of each tunnel built here. The firewall drops GRE and IPIP from anywhere else.
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
     pub tunnel_peers: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero", deserialize_with = "null_default")]
+    pub forwarding_ips: Vec<String>,
     #[serde(deserialize_with = "null_time")]
     pub compiled_at: DateTime<Utc>,
 }
@@ -930,6 +932,7 @@ impl Default for Program {
             backhaul: Vec::new(),
             pinned: Vec::new(),
             tunnel_peers: Vec::new(),
+            forwarding_ips: Vec::new(),
             compiled_at: zero_time(),
         }
     }
@@ -943,6 +946,8 @@ pub struct NodeTunnel {
     pub r#type: String,
     #[serde(deserialize_with = "null_default")]
     pub local: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_forward: Option<PortForward>,
     #[serde(deserialize_with = "null_default")]
     pub remote: String,
     #[serde(deserialize_with = "null_default")]
@@ -1166,6 +1171,12 @@ pub struct GameMagic {
     pub hex: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PortForward {
+    pub backend: std::net::Ipv4Addr,
+    pub ports: Vec<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Tunnel {
@@ -1184,6 +1195,8 @@ pub struct Tunnel {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub local: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_forward: Option<PortForward>,
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub mtu: i64,

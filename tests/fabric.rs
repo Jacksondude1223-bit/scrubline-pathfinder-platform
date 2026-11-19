@@ -1366,3 +1366,108 @@ fn pre_routed_host_is_filtered_and_forwarded_without_a_bgp_announcement() {
     policy.tunnels[0].local.clear();
     assert!(validation::policy(&policy).is_err());
 }
+
+#[test]
+fn dedicated_port_forward_is_pinned_filtered_and_only_routes_the_backend() {
+    let mut edge = node("edge", "buf", 100.0, "");
+    edge.tunnel_src = "192.0.2.1".into();
+    let mut helper = node("helper", "nyc", 100.0, "");
+    helper.tunnel_src = "192.0.2.2".into();
+    let nodes = [edge, helper];
+    let prefix = "192.0.2.10/32".to_string();
+    let mut policy = Policy {
+        name: "Single address".into(),
+        protected: vec![prefix.clone()],
+        steering: vec![Steering {
+            prefix: prefix.clone(),
+            pre_routed: true,
+            ..Default::default()
+        }],
+        tunnels: vec![Tunnel {
+            id: "forward".into(),
+            remote: "198.51.100.8".into(),
+            local: "192.0.2.10".into(),
+            node: "edge".into(),
+            prefixes: vec![prefix.clone()],
+            port_forward: Some(PortForward {
+                backend: "198.18.0.19".parse().unwrap(),
+                ports: vec![27016, 27015],
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    validation::policy(&policy).unwrap();
+    let plan = compiler::plan(&policy, &nodes, &HashMap::new(), &HashMap::new());
+    assert!(plan.is_empty());
+    let programs = compiler::compile(&policy, &nodes, &plan);
+    let program = &programs["edge"];
+    assert_eq!(program.prefixes, [prefix]);
+    assert!(programs["helper"].prefixes.is_empty());
+    assert!(programs["helper"].backhaul.is_empty());
+    let mut engine = pathfinder::pipeline::Pipeline::new(program.clone());
+    let gre = Flow {
+        src_ip: "198.51.100.8".into(),
+        dst_ip: "192.0.2.10".into(),
+        proto: "gre".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        engine.decide(&gre, 1).reason,
+        "GRE transport for this node's dedicated tunnel"
+    );
+    assert_ne!(
+        engine
+            .decide(
+                &Flow {
+                    src_ip: "198.51.100.9".into(),
+                    ..gre
+                },
+                2
+            )
+            .reason,
+        "GRE transport for this node's dedicated tunnel"
+    );
+    let lines = pathfinder::tunnel::render(program).unwrap();
+    let pass = pathfinder::provision::plan(
+        &pathfinder::provision::Desired {
+            tunnels: program.tunnels.clone(),
+            lines,
+            ..Default::default()
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(pass
+        .steps
+        .iter()
+        .any(|step| step.argv.join(" ") == "ip route replace 198.18.0.19/32 dev scr-forward"));
+    assert!(!pass.steps.iter().any(|step| step
+        .argv
+        .join(" ")
+        .starts_with("ip route replace 192.0.2.10")));
+    assert!(pass
+        .nft
+        .contains("tcp dport { 27015, 27016 } dnat ip to 198.18.0.19"));
+    assert!(pass
+        .nft
+        .contains("udp dport { 27015, 27016 } dnat ip to 198.18.0.19"));
+    assert!(pass
+        .nft
+        .contains("iifname \"scr-forward\" ct direction != reply drop"));
+    assert!(pass
+        .nft
+        .contains("input ip daddr 192.0.2.10 meta l4proto != 47 drop"));
+
+    policy.tunnels[0].disabled = vec!["edge".into()];
+    let suspended = compiler::compile(&policy, &nodes, &[]);
+    assert!(suspended["edge"].tunnels.is_empty());
+    let lines = pathfinder::tunnel::render(&suspended["edge"])
+        .unwrap()
+        .join("\n");
+    assert!(!lines.contains("dnat ip to"));
+    assert!(lines.contains("input ip daddr 192.0.2.10 meta l4proto != 47 drop"));
+
+    policy.steering[0].pre_routed = false;
+    assert!(validation::policy(&policy).is_err());
+}

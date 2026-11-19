@@ -2415,6 +2415,11 @@ components:
             type: string
           description: Prefixes of the customers pinned to this node, which is all that traffic arriving over
             a node-to-node tunnel may be addressed to.
+        forwarding_ips:
+          type: array
+          items:
+            type: string
+          description: Dedicated IPs reserved for forwarding on this node, including disabled tunnels.
         tunnel_peers:
           type: array
           items:
@@ -4059,6 +4064,8 @@ components:
         fabric is anycast, so it compiles to one tunnel per node carrying the prefixes, all to the same
         remote.'
       properties:
+        port_forward:
+          $ref: '#/components/schemas/PortForward'
         id:
           type: string
           example: northwind
@@ -4254,11 +4261,33 @@ components:
             rarely wanted: a customer peers where they have a path, not with the whole fabric.'
         comment:
           type: string
+    PortForward:
+      type: object
+      required:
+      - backend
+      - ports
+      properties:
+        backend:
+          type: string
+          format: ipv4
+          description: Unique server-side tunnel address within 198.18.0.0/15.
+        ports:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          description: TCP and UDP ports served on the dedicated local IPv4.
     NodeTunnel:
       type: object
       description: One node's instance of a policy Tunnel, with the local end filled in and the derived
         values resolved, so the agent renders configuration rather than recomputing policy.
       properties:
+        port_forward:
+          $ref: '#/components/schemas/PortForward'
         id:
           type: string
         type:
@@ -4428,6 +4457,8 @@ components:
             standalone_gre:
               type: boolean
             pre_routed_ipv4:
+              type: boolean
+            gre_port_forward:
               type: boolean
             dedicated_tunnel_endpoints:
               type: boolean
