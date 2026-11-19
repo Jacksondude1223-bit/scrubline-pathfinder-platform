@@ -827,7 +827,8 @@ impl Api {
                     ));
                 }
                 self.writable()?;
-                let n: Node = parse(body)?;
+                let mut n: Node = parse(body)?;
+                n.routed_ipv4.clear();
                 validation::node(&n).map_err(bad)?;
                 let nid = if n.id.is_empty() {
                     store::id("node", &[&n.name, &n.region])
@@ -1654,10 +1655,16 @@ impl Api {
         self.may_heartbeat(who, id)?;
         let reported = hb.is_some();
         let hb = hb.unwrap_or_default();
+        if hb.routed_ipv4.len() > 1024 {
+            return Err(bad("routed IPv4 inventory exceeds 1024 addresses"));
+        }
         let Some(n) = self.store.data.nodes.iter_mut().find(|n| n.id == id) else {
             return Err((404, "unknown node".into()));
         };
         let fenced = self.fences.get(id);
+        n.routed_ipv4 = hb.routed_ipv4;
+        n.routed_ipv4.sort_unstable();
+        n.routed_ipv4.dedup();
         n.last_seen = now;
         n.status = "ready".into();
         let name = n.name.clone();
@@ -1880,6 +1887,7 @@ async fn health(State(s): State<Shared>) -> Response {
 struct Heartbeat {
     stats: wire::Stats,
     tunnels: Option<Vec<TunnelStatus>>,
+    routed_ipv4: Vec<std::net::Ipv4Addr>,
 }
 /// The node a request heartbeats for, if it is a heartbeat.
 fn heartbeat_for<'a>(method: &Method, path: &'a str) -> Option<&'a str> {
