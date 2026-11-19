@@ -24,6 +24,58 @@ use std::{
     time::Duration,
 };
 use subtle::ConstantTimeEq;
+fn ipv4_inventory(proxies: &[Value], blackholes: &[Value]) -> Vec<std::net::Ipv4Addr> {
+    let forwarded: HashSet<std::net::Ipv4Addr> = proxies
+        .iter()
+        .filter_map(|row| row["dst"].as_str()?.parse().ok())
+        .collect();
+    let mut addresses: Vec<_> = blackholes
+        .iter()
+        .filter(|row| row["metric"] == 42760 && row["type"] == "blackhole")
+        .filter_map(|row| {
+            let raw = row["dst"].as_str()?;
+            raw.strip_suffix("/32").unwrap_or(raw).parse().ok()
+        })
+        .filter(|ip| forwarded.contains(ip))
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(1024);
+    addresses
+}
+
+fn discover_routed_ipv4() -> Vec<std::net::Ipv4Addr> {
+    let ip = |args: &[&str]| -> Option<Vec<Value>> {
+        let output = std::process::Command::new("ip")
+            .args(["-j", "-4"])
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        serde_json::from_slice(&output.stdout).ok()
+    };
+    let (Some(proxy), Some(discard), Some(local)) = (
+        ip(&["neigh", "show", "proxy"]),
+        ip(&["route", "show", "table", "main", "type", "blackhole"]),
+        ip(&["route", "show", "table", "local", "type", "local"]),
+    ) else {
+        return Vec::new();
+    };
+    let local: HashSet<std::net::Ipv4Addr> = local
+        .iter()
+        .filter_map(|row| {
+            let raw = row["dst"].as_str()?;
+            raw.strip_suffix("/32").unwrap_or(raw).parse().ok()
+        })
+        .collect();
+    ipv4_inventory(&proxy, &discard)
+        .into_iter()
+        .filter(|ip| !local.contains(ip))
+        .collect()
+}
+
 pub struct Agent {
     pub node: Node,
     pub pipe: Pipeline,
@@ -625,10 +677,13 @@ pub async fn run() -> Result<()> {
                     a.health.clone(),
                 )
             };
+            let routed_ipv4 = tokio::task::spawn_blocking(discover_routed_ipv4)
+                .await
+                .unwrap_or_default();
             let heartbeat = client
                 .post(format!("{api}/v1/nodes/{id}/heartbeat"))
                 .bearer_auth(&token)
-                .json(&json!({"stats":stats,"tunnels":health}))
+                .json(&json!({"stats":stats,"tunnels":health,"routed_ipv4":routed_ipv4}))
                 .send()
                 .await;
             match heartbeat {
@@ -709,6 +764,22 @@ pub const BODY_BUDGET: usize = 64 << 20;
 pub const CONNECTIONS: usize = 1024;
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn routed_inventory_needs_proxy_arp_and_a_reserved_discard_route() {
+        let ne = json!([{"dst":"133.1.2.3"},{"dst":"133.1.2.5"},{"dst":"133.1.2.6"}]);
+        let rt = json!([
+            {"type":"blackhole","dst":"133.1.2.3","metric":42760},
+            {"type":"blackhole","dst":"133.1.2.4","metric":42760},
+            {"type":"blackhole","dst":"133.1.2.5","metric":100},
+            {"type":"blackhole","dst":"133.1.2.0/24","metric":42760},
+            {"type":"unicast","dst":"133.1.2.6","metric":42760}
+        ]);
+        assert_eq!(
+            super::ipv4_inventory(ne.as_array().unwrap(), rt.as_array().unwrap()),
+            ["133.1.2.3".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
+    }
+
     use super::*;
     fn agent(announcements: Vec<Announcement>) -> Agent {
         Agent {

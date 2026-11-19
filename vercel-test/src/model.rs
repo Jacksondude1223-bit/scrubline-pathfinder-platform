@@ -630,6 +630,8 @@ pub struct Node {
     #[serde(skip_serializing_if = "is_zero")]
     #[serde(deserialize_with = "null_default")]
     pub tunnel_src: String,
+    #[serde(skip_serializing_if = "is_zero", deserialize_with = "null_default")]
+    pub routed_ipv4: Vec<std::net::Ipv4Addr>,
 }
 impl Default for Node {
     fn default() -> Self {
@@ -644,6 +646,7 @@ impl Default for Node {
             status: Default::default(),
             advertise: Default::default(),
             tunnel_src: Default::default(),
+            routed_ipv4: Vec::new(),
         }
     }
 }

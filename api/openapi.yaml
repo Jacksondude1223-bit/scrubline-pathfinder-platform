@@ -387,6 +387,13 @@ paths:
               properties:
                 stats:
                   $ref: '#/components/schemas/Stats'
+                routed_ipv4:
+                  type: array
+                  maxItems: 1024
+                  items:
+                    type: string
+                    format: ipv4
+                  description: IPv4 addresses in the node's routed customer address inventory.
                 tunnels:
                   type: array
                   items:
@@ -2197,6 +2204,13 @@ components:
     Node:
       type: object
       properties:
+        routed_ipv4:
+          type: array
+          maxItems: 1024
+          items:
+            type: string
+            format: ipv4
+          description: IPv4 addresses in the node's routed customer address inventory.
         id:
           type: string
         name:
