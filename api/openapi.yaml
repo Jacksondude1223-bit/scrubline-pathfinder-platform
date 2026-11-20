@@ -4899,6 +4899,18 @@ components:
           type: integer
         dropped_pps:
           type: integer
+        gre_ingress_pps:
+          type: number
+          description: Average packet rate for the protected IPv4 address from non-tunnel ingress at the GRE edge, before forwarding.
+        gre_ingress_bps:
+          type: number
+          description: Average bit rate for the protected IPv4 address from non-tunnel ingress at the GRE edge, before forwarding.
+        gre_forwarded_pps:
+          type: number
+          description: Average packets per second transmitted through the reporting GRE tunnel during this bucket, when available.
+        gre_forwarded_bps:
+          type: number
+          description: Average bits per second transmitted through the reporting GRE tunnel during this bucket, when available.
         pulsing:
           type: boolean
     AnalyticsSummary:

@@ -90,6 +90,27 @@ pub fn validate_id(id: &str) -> Result<()> {
         Ok(())
     }
 }
+pub fn gre_counter_target(tunnel: &NodeTunnel) -> Option<(&str, &str)> {
+    let [prefix] = tunnel.prefixes.as_slice() else {
+        return None;
+    };
+    if tunnel.r#type != "gre"
+        || !matches!(prefix.parse::<ipnet::Ipv4Net>(), Ok(net) if net.prefix_len() == 32)
+        || interface_name(&tunnel.id).ok().as_deref() != Some(&tunnel.interface)
+    {
+        return None;
+    }
+    Some((prefix.as_str(), tunnel.interface.as_str()))
+}
+
+pub fn gre_counter_targets(program: &Program) -> impl Iterator<Item = (&str, &str)> {
+    program
+        .tunnels
+        .iter()
+        .filter_map(gre_counter_target)
+        .filter(|(prefix, _)| program.prefixes.iter().any(|p| p == prefix))
+}
+
 pub fn interface_name(id: &str) -> Result<String> {
     validate_id(id)?;
     Ok(format!("scr-{id}"))

@@ -59,6 +59,7 @@ pub struct Step {
 pub struct Pass {
     pub steps: Vec<Step>,
     pub nft: String,
+    ingress: BTreeMap<String, (String, String)>,
 }
 
 /// Interfaces the provisioner owns: customer tunnels and node-to-node tunnels.
@@ -91,6 +92,9 @@ fn destination(dst: &str) -> Option<String> {
 const TABLE: &str = "table inet scrubline
 delete table inet scrubline
 table inet scrubline {
+\tchain incoming {
+\t\ttype filter hook prerouting priority -450; policy accept;
+\t}
 \tchain prerouting {
 \t\ttype nat hook prerouting priority dstnat; policy accept;
 \t}
@@ -341,6 +345,27 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
     nft.push_str(
         "add rule inet scrubline forwarded_hosts ip daddr 198.18.0.0/15 ct status dnat drop\n",
     );
+    for (prefix, name) in desired
+        .tunnels
+        .iter()
+        .filter_map(crate::tunnel::gre_counter_target)
+    {
+        let Some(address) = prefix
+            .strip_suffix("/32")
+            .and_then(|p| p.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        let counter = format!("gre_in_{:08x}", u32::from(address));
+        if pass.ingress.contains_key(&counter) {
+            continue;
+        }
+        nft.push_str(&format!(
+            "add counter inet scrubline {counter}\nadd rule inet scrubline incoming iifname != \"lo\" iifname != \"scr-*\" iifname != \"sbh-*\" ip daddr {address} ip protocol != {{ 4, 47 }} counter name {counter}\n"
+        ));
+        pass.ingress
+            .insert(counter, (prefix.to_owned(), name.to_owned()));
+    }
     pass.nft = nft;
     Ok(pass)
 }
@@ -459,6 +484,7 @@ pub fn observe(r: &mut impl Runner) -> Result<Observed> {
 #[derive(Debug, Default)]
 pub struct Applied {
     pub failed: BTreeMap<String, String>,
+    pub reloaded: bool,
     pub errors: Vec<String>,
     /// Why the ruleset did not load, when it did not. The pass stops there.
     pub blocked: Option<String>,
@@ -480,7 +506,10 @@ pub fn apply(
     if pass.nft != *last_nft || !observed.table {
         let load = ["nft", "-f", "-"].map(String::from);
         match r.run(&load, Some(&pass.nft)) {
-            Ok(_) => *last_nft = pass.nft.clone(),
+            Ok(_) => {
+                *last_nft = pass.nft.clone();
+                out.reloaded = true;
+            }
             Err(e) => {
                 out.blocked = Some(e);
                 return out;
@@ -498,6 +527,46 @@ pub fn apply(
         }
     }
     out
+}
+
+pub fn read_ingress(
+    runner: &mut impl Runner,
+    pass: &Pass,
+    applied: &Applied,
+    generation: &str,
+) -> Result<Vec<crate::wire::GreCounter>> {
+    if pass.ingress.is_empty() || applied.blocked.is_some() {
+        return Ok(Vec::new());
+    }
+    let raw = runner.run(&argv("nft -j list table inet scrubline"), None)?;
+    let value: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let rows = value["nftables"]
+        .as_array()
+        .ok_or("nft counters were not returned")?;
+    let mut out = Vec::new();
+    for row in rows {
+        let counter = &row["counter"];
+        let Some(name) = counter["name"].as_str() else {
+            continue;
+        };
+        let Some((prefix, interface)) = pass.ingress.get(name) else {
+            continue;
+        };
+        if applied.failed.contains_key(interface) {
+            continue;
+        }
+        if let (Some(packets), Some(bytes)) =
+            (counter["packets"].as_u64(), counter["bytes"].as_u64())
+        {
+            out.push(crate::wire::GreCounter {
+                prefix: prefix.clone(),
+                generation: generation.to_owned(),
+                packets,
+                bytes,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// What to tell the agent about each customer tunnel: built, or why not. Built is all it can
@@ -844,6 +913,41 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn public_gre_ingress_is_counted_once_and_only_for_the_assigned_address() {
+        struct Counters;
+        impl Runner for Counters {
+            fn run(&mut self, argv: &[String], _: Option<&str>) -> Result<String> {
+                assert_eq!(shell(argv), "nft -j list table inet scrubline");
+                Ok(r#"{"nftables":[{"counter":{"name":"gre_in_c0000204","packets":20,"bytes":1600}},
+                    {"counter":{"name":"gre_in_c0000205","packets":99,"bytes":9900}}]}"#.into())
+            }
+        }
+        let mut desired = desired(&[ADD, SET]);
+        let tunnel = &mut desired.tunnels[0];
+        tunnel.r#type = "gre".into();
+        tunnel.prefixes = vec!["192.0.2.4/32".into()];
+        let pass = plan(&desired, &Observed::default()).unwrap();
+        assert!(pass
+            .nft
+            .contains("type filter hook prerouting priority -450"));
+        assert!(pass
+            .nft
+            .contains("ip daddr 192.0.2.4 ip protocol != { 4, 47 } counter name gre_in_c0000204"));
+        let mut applied = Applied::default();
+        let result = read_ingress(&mut Counters, &pass, &applied, "generation").unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].prefix, "192.0.2.4/32");
+        assert_eq!(result[0].packets, 20);
+        assert_eq!(result[0].bytes, 1600);
+        applied
+            .failed
+            .insert("scr-nw".into(), "link is down".into());
+        assert!(read_ingress(&mut Counters, &pass, &applied, "generation")
+            .unwrap()
+            .is_empty());
+    }
+
     struct Fake {
         ran: Vec<String>,
         fail: &'static str,
