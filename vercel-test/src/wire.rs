@@ -72,6 +72,15 @@ pub struct PrefixState {
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct GreCounter {
+    pub prefix: String,
+    pub generation: String,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Stats {
     #[serde(deserialize_with = "null_default")]
     pub decisions: u64,
@@ -85,6 +94,16 @@ pub struct Stats {
     pub games: Vec<GameStats>,
     #[serde(deserialize_with = "null_default")]
     pub prefixes: Vec<PrefixStats>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub gre_counters: Vec<GreCounter>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub ingress_counters: Vec<GreCounter>,
     #[serde(deserialize_with = "null_default")]
     pub ml: MLStats,
     #[serde(deserialize_with = "null_default")]
@@ -156,6 +175,8 @@ impl Stats {
             rules: _,
             games: _,
             prefixes: _,
+            gre_counters: _,
+            ingress_counters: _,
             ml,
             pulsing,
             pulse_peak_pps,
@@ -199,6 +220,8 @@ impl Stats {
             rules: Vec::new(),
             games: Vec::new(),
             prefixes: Vec::new(),
+            gre_counters: Vec::new(),
+            ingress_counters: Vec::new(),
             ml: ml.clone(),
             pulsing: *pulsing,
             pulse_peak_pps: *pulse_peak_pps,

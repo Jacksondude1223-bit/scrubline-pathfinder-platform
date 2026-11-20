@@ -27,8 +27,16 @@ fn run() -> Result<()> {
     let status = f.get("status");
     let mut last_nft = String::new();
     let mut last = String::new();
+    let mut counter_epoch = String::new();
     loop {
-        let outcome = pass(&client, &agent, &token, dry_run, &mut last_nft);
+        let outcome = pass(
+            &client,
+            &agent,
+            &token,
+            dry_run,
+            &mut last_nft,
+            &mut counter_epoch,
+        );
         let line = match &outcome {
             Ok(v) => v.clone(),
             Err(e) => format!("error: {e}"),
@@ -60,6 +68,7 @@ fn pass(
     token: &str,
     dry_run: bool,
     last_nft: &mut String,
+    counter_epoch: &mut String,
 ) -> Result<String> {
     // The box first, so a provisioner that cannot read it says so whether or not there is
     // anything to apply yet.
@@ -93,10 +102,21 @@ fn pass(
         return Ok("ok: dry run".into());
     }
     let applied = provision::apply(&mut system, &plan, &observed, last_nft);
+    if applied.reloaded {
+        *counter_epoch = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_default()
+            .to_string();
+    }
+    let mut report = provision::report(&desired, &applied);
+    let ingress = provision::read_ingress(&mut system, &plan, &applied, counter_epoch);
+    if let Ok(ref rows) = ingress {
+        report["ingress_counters"] = serde_json::json!(rows);
+    }
     let r = client
         .post(format!("{agent}/tunnels"))
         .bearer_auth(token)
-        .json(&provision::report(&desired, &applied))
+        .json(&report)
         .send()
         .map_err(|e| format!("reporting to the agent: {e}"))?;
     if !r.status().is_success() {
@@ -114,6 +134,7 @@ fn pass(
     if !failed.is_empty() {
         return Err(failed.join("; "));
     }
+    ingress.map_err(|e| format!("reading ingress counters: {e}"))?;
     let backhaul = desired
         .lines
         .iter()

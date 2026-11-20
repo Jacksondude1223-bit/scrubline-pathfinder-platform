@@ -81,6 +81,7 @@ pub struct Agent {
     pub pipe: Pipeline,
     local_token: String,
     health: Vec<TunnelStatus>,
+    ingress: (Vec<crate::wire::GreCounter>, i64),
     local_as: i64,
     next_hop: String,
     // Prefixes this node announced that have since left its plan, kept as withdrawals: ExaBGP
@@ -243,6 +244,9 @@ impl Agent {
     /// The datapath's counters, and what this process holds in memory.
     fn stats(&mut self, now: i64) -> Value {
         let mut stats = self.pipe.stats(now);
+        if now - self.ingress.1 <= 15_000 && !self.ingress.0.is_empty() {
+            stats["ingress_counters"] = json!(self.ingress.0);
+        }
         stats["resident_bytes"] = json!(runtime::resident_bytes());
         stats
     }
@@ -320,6 +324,8 @@ impl Agent {
                 #[derive(Deserialize)]
                 struct Body {
                     tunnels: Vec<TunnelStatus>,
+                    #[serde(default)]
+                    ingress_counters: Vec<crate::wire::GreCounter>,
                 }
                 let body: Body = match serde_json::from_slice(body) {
                     Ok(v) => v,
@@ -338,6 +344,7 @@ impl Agent {
                     }
                 }
                 self.health = body.tunnels;
+                self.ingress = (body.ingress_counters, ms);
                 for t in &mut self.health {
                     t.reported_at = chrono::Utc::now();
                 }
@@ -563,6 +570,41 @@ async fn programs(s: Shared, client: reqwest::Client, api: String) {
         }
     }
 }
+fn gre_counters(targets: &[(String, String)]) -> Vec<crate::wire::GreCounter> {
+    use std::{fs, path::Path};
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Ok(boot) = fs::read_to_string("/proc/sys/kernel/random/boot_id") else {
+        return Vec::new();
+    };
+    targets
+        .iter()
+        .filter_map(|(prefix, interface)| {
+            let path = Path::new("/sys/class/net").join(interface);
+            let read = |key| {
+                fs::read_to_string(path.join(key))
+                    .ok()?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            };
+            let index = read("ifindex")?;
+            let packets = read("statistics/tx_packets")?;
+            let bytes = read("statistics/tx_bytes")?;
+            if read("ifindex")? != index {
+                return None;
+            }
+            Some(crate::wire::GreCounter {
+                prefix: prefix.clone(),
+                generation: format!("{}:{interface}:{index}", boot.trim()),
+                packets,
+                bytes,
+            })
+        })
+        .collect()
+}
+
 pub async fn run() -> Result<()> {
     let f = Flags::parse(&[
         ("api", "http://127.0.0.1:8080"),
@@ -650,6 +692,7 @@ pub async fn run() -> Result<()> {
         node: reg.node,
         local_token,
         health: vec![],
+        ingress: Default::default(),
         local_as,
         next_hop,
         retired: BTreeMap::new(),
@@ -665,21 +708,30 @@ pub async fn run() -> Result<()> {
     tokio::spawn(async move {
         let mut surged: Option<tokio::time::Instant> = None;
         loop {
-            let (id, mut token, stats, health) = {
+            let (id, mut token, mut stats, health, targets) = {
                 let mut a = locked(&s);
                 let now = chrono::Utc::now().timestamp_millis();
                 // A surge that has passed lets the next one wake this loop again.
                 a.watch_surge(now);
+                let targets: Vec<(String, String)> = tunnel::gre_counter_targets(&a.pipe.program)
+                    .map(|(prefix, interface)| (prefix.to_owned(), interface.to_owned()))
+                    .collect();
                 (
                     a.node.id.clone(),
                     a.token.clone(),
                     a.stats(now),
                     a.health.clone(),
+                    targets,
                 )
             };
-            let routed_ipv4 = tokio::task::spawn_blocking(discover_routed_ipv4)
-                .await
-                .unwrap_or_default();
+            let (routed_ipv4, counters) = tokio::task::spawn_blocking(move || {
+                (discover_routed_ipv4(), gre_counters(&targets))
+            })
+            .await
+            .unwrap_or_default();
+            if !counters.is_empty() {
+                stats["gre_counters"] = json!(counters);
+            }
             let heartbeat = client
                 .post(format!("{api}/v1/nodes/{id}/heartbeat"))
                 .bearer_auth(&token)
@@ -793,6 +845,7 @@ mod tests {
             }),
             local_token: "local".into(),
             health: vec![],
+            ingress: Default::default(),
             local_as: 0,
             next_hop: String::new(),
             retired: BTreeMap::new(),

@@ -22,6 +22,8 @@ pub fn rows<'a>(v: &'a Value, k: &str) -> &'a [Value] {
 struct Bucket {
     counts: [u64; 5],
     rates: [u64; 3],
+    gre_forwarded: Option<[u64; 2]>,
+    gre_ingress: Option<[u64; 2]>,
     pulse: bool,
 }
 #[derive(Default, Clone)]
@@ -133,10 +135,14 @@ impl Series {
         }
     }
 }
+type GreBaselines = HashMap<String, HashMap<String, (crate::wire::GreCounter, i64)>>;
+
 #[derive(Default)]
 pub struct Collector {
     series: BTreeMap<String, Series>,
     prefix_counters: HashMap<(String, String), [u64; 5]>,
+    gre_baselines: GreBaselines,
+    ingress_baselines: GreBaselines,
     rule_counters: HashMap<(String, String, bool), [u64; 5]>,
     nodes: HashMap<String, i64>,
     /// What the programs nodes last reported under protect, by fingerprint (see Attribution).
@@ -246,6 +252,13 @@ impl Collector {
     pub fn forget(&mut self, live: &HashSet<String>) {
         self.series.retain(|p, _| live.contains(p));
         self.prefix_counters.retain(|(_, p), _| live.contains(p));
+        for baselines in self
+            .gre_baselines
+            .values_mut()
+            .chain(self.ingress_baselines.values_mut())
+        {
+            baselines.retain(|p, _| live.contains(p));
+        }
         self.rule_counters.retain(|(_, id, _), _| {
             ["|crafted|", "|reflection|", "|protocol|", "|ack_flood|"]
                 .into_iter()
@@ -261,6 +274,8 @@ impl Collector {
             s.gauges.remove(node);
         }
         self.prefix_counters.retain(|(n, _), _| n != node);
+        self.gre_baselines.remove(node);
+        self.ingress_baselines.remove(node);
         self.rule_counters.retain(|(n, _, _), _| n != node);
         self.nodes.remove(node);
     }
@@ -272,6 +287,67 @@ impl Collector {
         let stats: crate::wire::Stats = serde_json::from_value(stats.clone()).unwrap_or_default();
         self.observe_stats(node, &stats, program, now);
     }
+    fn observe_gre(
+        &mut self,
+        node: &str,
+        samples: &[crate::wire::GreCounter],
+        program: &Program,
+        now: i64,
+        ingress: bool,
+    ) {
+        let baselines = if ingress {
+            &mut self.ingress_baselines
+        } else {
+            &mut self.gre_baselines
+        };
+        let mut previous = baselines.remove(node).unwrap_or_default();
+        if samples.is_empty() {
+            return;
+        }
+        let eligible: HashSet<_> = crate::tunnel::gre_counter_targets(program)
+            .map(|(prefix, _)| prefix)
+            .collect();
+        let mut current = HashMap::new();
+        for sample in samples {
+            let prefix = &sample.prefix;
+            if !eligible.contains(prefix.as_str())
+                || current.contains_key(prefix)
+                || sample.generation.is_empty()
+                || sample.generation.len() > 128
+                || !self.series.contains_key(prefix) && self.series.len() >= 256
+            {
+                continue;
+            }
+            current.insert(prefix.clone(), (sample.clone(), now));
+            let Some((prior, at)) = previous.remove(prefix) else {
+                continue;
+            };
+            if !(1..=30_000).contains(&(now - at))
+                || prior.generation != sample.generation
+                || prior.packets > sample.packets
+                || prior.bytes > sample.bytes
+            {
+                continue;
+            }
+            let bucket = self
+                .series
+                .entry(prefix.clone())
+                .or_default()
+                .ring
+                .entry(now / 60000)
+                .or_default();
+            let count = if ingress {
+                &mut bucket.gre_ingress
+            } else {
+                &mut bucket.gre_forwarded
+            }
+            .get_or_insert([0, 0]);
+            count[0] = count[0].saturating_add(sample.packets - prior.packets);
+            count[1] = count[1].saturating_add(sample.bytes - prior.bytes);
+        }
+        baselines.insert(node.into(), current);
+    }
+
     pub fn observe_stats(
         &mut self,
         node: &str,
@@ -301,6 +377,7 @@ impl Collector {
         // Only the gauges of a silent node expire. Its baselines stay: the agent keeps counting
         // while it cannot report, and a counter that only counts up survives reports being missed.
         self.nodes.retain(|n, _| !expired.contains(n));
+        self.gre_baselines.retain(|n, _| !expired.contains(n));
         // Every report comes through here, so the day's history is trimmed from its old end
         // rather than walked whole.
         let oldest = now / 60000 - 1439;
@@ -316,6 +393,9 @@ impl Collector {
                 s.ring.pop_first();
             }
         }
+        self.ingress_baselines.retain(|n, _| !expired.contains(n));
+        self.observe_gre(node, &stats.gre_counters, program, now, false);
+        self.observe_gre(node, &stats.ingress_counters, program, now, true);
         let mut touched = HashSet::new();
         let mut crafted = Vec::new();
         let mut guarded = Vec::new();
@@ -565,6 +645,8 @@ impl Collector {
         let mut start = first;
         while start <= last {
             let (mut c, mut r, mut pulse) = ([0u64; 5], [0u64; 3], false);
+            let mut forwarded: Option<[u64; 2]> = None;
+            let mut ingress: Option<[u64; 2]> = None;
             if let Some(s) = self.series.get(p) {
                 for (_, b) in s.ring.range(start..=(start + per - 1).min(last)) {
                     for (i, value) in c.iter_mut().enumerate() {
@@ -574,11 +656,100 @@ impl Collector {
                         *value = (*value).max(b.rates[i]);
                     }
                     pulse |= b.pulse;
+                    for (measurement, counts) in [
+                        (b.gre_forwarded, &mut forwarded),
+                        (b.gre_ingress, &mut ingress),
+                    ] {
+                        if let Some(measurement) = measurement {
+                            for (sum, increment) in
+                                counts.get_or_insert([0, 0]).iter_mut().zip(measurement)
+                            {
+                                *sum = sum.saturating_add(increment);
+                            }
+                        }
+                    }
                 }
             }
-            out.push(json!({"at":stamp(start*60000),"flows":c[0],"flows_dropped":c[1],"offered":c[2],"dropped":c[3],"delivered":c[2].saturating_sub(c[3]),"challenged":c[4],"peak_pps":r[2],"offered_pps":r[0],"dropped_pps":r[1],"pulsing":pulse}));
+            let mut point = json!({"at":stamp(start*60000),"flows":c[0],"flows_dropped":c[1],"offered":c[2],"dropped":c[3],"delivered":c[2].saturating_sub(c[3]),"challenged":c[4],"peak_pps":r[2],"offered_pps":r[0],"dropped_pps":r[1],"pulsing":pulse});
+            let elapsed = (now - start * 60000).clamp(1000, per * 60000) as f64 / 1000.0;
+            for (measurement, pps, bps) in [
+                (forwarded, "gre_forwarded_pps", "gre_forwarded_bps"),
+                (ingress, "gre_ingress_pps", "gre_ingress_bps"),
+            ] {
+                if let Some([packets, bytes]) = measurement {
+                    point[pps] = json!(packets as f64 / elapsed);
+                    point[bps] = json!(bytes as f64 * 8.0 / elapsed);
+                }
+            }
+            out.push(point);
             start += per;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod gre_tests {
+    use super::*;
+    use crate::model::NodeTunnel;
+
+    #[test]
+    fn gre_samples_keep_bursts_separate_from_inspected_traffic_and_reset_at_recreation() {
+        let prefix = "192.0.2.4/32";
+        let other = "192.0.2.5/32";
+        let program = Program {
+            prefixes: vec![prefix.into(), other.into()],
+            tunnels: vec![NodeTunnel {
+                id: "test".into(),
+                interface: "scr-test".into(),
+                r#type: "gre".into(),
+                prefixes: vec![prefix.into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut collector = Collector::default();
+        let sample = |packets: u64, generation: &str| {
+            json!({
+              "ingress_counters": [
+                {"prefix":prefix,"generation":generation,"packets":packets*2,"bytes":packets*180}
+              ],
+              "gre_counters":[
+                {"prefix":prefix,"generation":generation,"packets":packets,"bytes":packets*100},
+                {"prefix":other,"generation":generation,"packets":packets,"bytes":packets*100}
+            ]})
+        };
+        collector.observe("edge", &sample(10_000, "a"), &program, 1000);
+        assert!(collector.points(prefix, 60_000, 60_000, 1000)[0]
+            .get("gre_forwarded_pps")
+            .is_none());
+        collector.observe("edge", &sample(10_120, "a"), &program, 2000);
+        collector.observe("edge", &sample(10_120, "a"), &program, 3000);
+        let row = &collector.points(prefix, 60_000, 60_000, 3000)[0];
+        assert_eq!(row["gre_forwarded_pps"], 40.0);
+        assert_eq!(row["gre_forwarded_bps"], 32_000.0);
+        assert_eq!(row["gre_ingress_pps"], 80.0);
+        assert_eq!(row["gre_ingress_bps"], 57_600.0);
+        assert_eq!(row["offered_pps"], 0);
+        assert_eq!(row["dropped_pps"], 0);
+        assert!(collector.points(other, 60_000, 60_000, 3000)[0]
+            .get("gre_forwarded_pps")
+            .is_none());
+
+        collector.observe("edge", &sample(99_999, "b"), &program, 60_100);
+        assert!(collector.points(prefix, 60_000, 60_000, 60_100)[0]
+            .get("gre_forwarded_pps")
+            .is_none());
+        collector.observe("edge", &sample(100_000, "b"), &program, 61_000);
+        assert_eq!(
+            collector.points(prefix, 60_000, 60_000, 61_000)[0]["gre_forwarded_pps"],
+            1.0
+        );
+        collector.observe("edge", &json!({}), &program, 62_000);
+        collector.observe("edge", &sample(200_000, "b"), &program, 63_000);
+        assert_eq!(
+            collector.points(prefix, 60_000, 60_000, 63_000)[0]["gre_forwarded_pps"].as_f64(),
+            Some(1.0 / 3.0)
+        );
     }
 }
