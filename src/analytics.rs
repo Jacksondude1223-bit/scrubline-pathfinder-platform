@@ -22,6 +22,7 @@ pub fn rows<'a>(v: &'a Value, k: &str) -> &'a [Value] {
 struct Bucket {
     counts: [u64; 5],
     rates: [u64; 3],
+    inspection_reported: bool,
     gre_forwarded: Option<[u64; 2]>,
     gre_ingress: Option<[u64; 2]>,
     gre_drop: Option<[u64; 2]>,
@@ -37,6 +38,7 @@ struct Gauge {
 struct Scope {
     prefixes: Vec<String>,
     stage: String,
+    action: Option<String>,
     shared: bool,
 }
 #[derive(Default, Clone)]
@@ -73,9 +75,7 @@ impl Event {
                         .cmp(b["filter_id"].as_str().unwrap_or(""))
                 })
         });
-        if !vectors.is_empty() {
-            v["vectors"] = json!(vectors);
-        }
+        v["vectors"] = json!(vectors);
         v
     }
 }
@@ -179,23 +179,23 @@ impl Attribution {
         for r in &program.asic {
             scopes.insert(
                 (r.rule_id.clone(), false),
-                scope(&r.r#match.dst_cidr, "asic", &nets),
+                scope(&r.r#match.dst_cidr, "asic", Some(r.action.as_str()), &nets),
             );
         }
         for r in &program.fpga {
             scopes.insert(
                 (r.rule_id.clone(), false),
-                scope(&r.r#match.dst_cidr, "fpga", &nets),
+                scope(&r.r#match.dst_cidr, "fpga", Some(r.action.as_str()), &nets),
             );
         }
         for r in &program.zc {
             scopes.insert(
                 (r.rule_id.clone(), false),
-                scope(&r.r#match.dst_cidr, "zc", &nets),
+                scope(&r.r#match.dst_cidr, "zc", Some(r.action.as_str()), &nets),
             );
         }
         for g in &program.games {
-            scopes.insert((g.id.clone(), true), scope(&g.dst_cidr, "zc", &nets));
+            scopes.insert((g.id.clone(), true), scope(&g.dst_cidr, "zc", None, &nets));
         }
         Self {
             prefixes: program.prefixes.iter().cloned().collect(),
@@ -207,13 +207,13 @@ impl Attribution {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         program.prefixes.hash(&mut h);
         for r in &program.asic {
-            ("asic", &r.rule_id, &r.r#match.dst_cidr).hash(&mut h);
+            ("asic", &r.rule_id, &r.r#match.dst_cidr, r.action.as_str()).hash(&mut h);
         }
         for r in &program.fpga {
-            ("fpga", &r.rule_id, &r.r#match.dst_cidr).hash(&mut h);
+            ("fpga", &r.rule_id, &r.r#match.dst_cidr, r.action.as_str()).hash(&mut h);
         }
         for r in &program.zc {
-            ("zc", &r.rule_id, &r.r#match.dst_cidr).hash(&mut h);
+            ("zc", &r.rule_id, &r.r#match.dst_cidr, r.action.as_str()).hash(&mut h);
         }
         for g in &program.games {
             ("game", &g.id, &g.dst_cidr).hash(&mut h);
@@ -238,7 +238,7 @@ fn delta(a: u64, b: u64) -> u64 {
         b - a
     }
 }
-fn scope(dst: &str, stage: &str, nets: &[(&String, Option<IpNet>)]) -> Scope {
+fn scope(dst: &str, stage: &str, action: Option<&str>, nets: &[(&String, Option<IpNet>)]) -> Scope {
     let target = dst.parse::<IpNet>().ok();
     let prefixes: Vec<_> = nets
         .iter()
@@ -255,6 +255,7 @@ fn scope(dst: &str, stage: &str, nets: &[(&String, Option<IpNet>)]) -> Scope {
         shared: prefixes.len() > 1,
         prefixes,
         stage: stage.into(),
+        action: action.map(str::to_owned),
     }
 }
 impl Collector {
@@ -428,6 +429,7 @@ impl Collector {
             GreMeasurement::Drop,
         );
         let mut touched = HashSet::new();
+        let mut inspected = Vec::new();
         let mut crafted = Vec::new();
         let mut guarded = Vec::new();
         for row in &stats.prefixes {
@@ -515,6 +517,12 @@ impl Collector {
             }
             if let Some(prev) = seen {
                 let b = s.ring.entry(now / 60000).or_default();
+                b.inspection_reported = true;
+                inspected.push((
+                    p.to_string(),
+                    delta(prev[1], cur[1]),
+                    delta(prev[3], cur[3]),
+                ));
                 for i in 0..5 {
                     b.counts[i] = b.counts[i].saturating_add(delta(prev[i], cur[i]));
                 }
@@ -576,6 +584,12 @@ impl Collector {
                 s.judge(now);
             }
         }
+        for (prefix, flows, dropped) in inspected {
+            if let Some(event) = self.series.get_mut(&prefix).and_then(|s| s.open.as_mut()) {
+                event.flows = event.flows.saturating_add(flows);
+                event.dropped = event.dropped.saturating_add(dropped);
+            }
+        }
         let named = crafted
             .into_iter()
             .map(|(p, class, diff)| (p, "crafted", class, diff))
@@ -592,8 +606,6 @@ impl Collector {
                     .or_insert_with(|| json!({kind:name,"flows":0,"dropped":0}));
                 v["flows"] = json!(n(v, "flows").saturating_add(diff[1]));
                 v["dropped"] = json!(n(v, "dropped").saturating_add(diff[3]));
-                e.flows = e.flows.saturating_add(diff[1]);
-                e.dropped = e.dropped.saturating_add(diff[3]);
             }
         }
         for (id, filter, scope, diff) in moved {
@@ -610,6 +622,9 @@ impl Collector {
                     let v = e.vectors.entry(key).or_insert_with(|| {
                         let mut v = json!({"stage":scope.stage,"flows":0,"dropped":0});
                         v[if filter { "filter_id" } else { "rule_id" }] = json!(id);
+                        if let Some(action) = &scope.action {
+                            v["action"] = json!(action);
+                        }
                         if scope.shared {
                             v["shared"] = json!(true);
                         }
@@ -617,8 +632,9 @@ impl Collector {
                     });
                     v["flows"] = json!(n(v, "flows").saturating_add(diff[1]));
                     v["dropped"] = json!(n(v, "dropped").saturating_add(diff[3]));
-                    e.flows = e.flows.saturating_add(diff[1]);
-                    e.dropped = e.dropped.saturating_add(diff[3]);
+                    if filter {
+                        v["challenged"] = json!(n(v, "challenged").saturating_add(diff[4]));
+                    }
                 }
             }
         }
@@ -649,6 +665,9 @@ impl Collector {
         let mut rates = [0; 3];
         let mut nodes = 0;
         let mut under = false;
+        let mut inspection_reported = false;
+        let mut inspection_live = false;
+        let mut gre_dropped: Option<u64> = None;
         if let Some(s) = self.series.get(p) {
             let first = now / 60000 - minutes(span) + 1;
             for (_, b) in s.ring.range(first..=now / 60000) {
@@ -658,14 +677,24 @@ impl Collector {
                 peak = peak.max(b.rates[2]);
                 peak_drop = peak_drop.max(b.rates[1]);
                 pulse |= b.pulse;
+                inspection_reported |= b.inspection_reported;
+                if let Some([packets, _]) = b.gre_drop {
+                    let total = gre_dropped.get_or_insert(0);
+                    *total = total.saturating_add(packets);
+                }
             }
             let (r, _, n) = s.fleet(now);
             rates = r;
             nodes = n;
             under = s.open.is_some();
+            inspection_live = s.gauges.values().any(|g| now - g.at <= 30_000);
         }
         let events = self.events(p, span, now);
-        json!({"prefix":p,"from":stamp((now-span).div_euclid(60000)*60000),"to":stamp(now),"flows":count[0],"flows_dropped":count[1],"offered":count[2],"dropped":count[3],"delivered":count[2].saturating_sub(count[3]),"challenged":count[4],"mitigated_pct":if count[2]>0{100.0*count[3]as f64/count[2]as f64}else{0.0},"peak_pps":peak,"peak_dropped_pps":peak_drop,"offered_pps":rates[0],"dropped_pps":rates[1],"nodes":nodes,"under_attack":under,"pulsing":pulse,"attacks":events.len(),"attack_seconds":events.iter().map(|e|e["seconds"].as_f64().unwrap_or(0.0)).sum::<f64>()})
+        let mut summary = json!({"prefix":p,"from":stamp((now-span).div_euclid(60000)*60000),"to":stamp(now),"flows":count[0],"flows_dropped":count[1],"offered":count[2],"dropped":count[3],"delivered":count[2].saturating_sub(count[3]),"challenged":count[4],"mitigated_pct":if count[2]>0{100.0*count[3]as f64/count[2]as f64}else{0.0},"peak_pps":peak,"peak_dropped_pps":peak_drop,"offered_pps":rates[0],"dropped_pps":rates[1],"nodes":nodes,"inspection_reported":inspection_reported,"inspection_live":inspection_live,"under_attack":under,"pulsing":pulse,"attacks":events.len(),"attack_seconds":events.iter().map(|e|e["seconds"].as_f64().unwrap_or(0.0)).sum::<f64>()});
+        if let Some(packets) = gre_dropped {
+            summary["gre_dropped"] = json!(packets);
+        }
+        summary
     }
     pub fn points(&self, p: &str, span: i64, step: i64, now: i64) -> Vec<Value> {
         let per = resolution(step) / 60000;
@@ -679,6 +708,7 @@ impl Collector {
             let mut forwarded: Option<[u64; 2]> = None;
             let mut ingress: Option<[u64; 2]> = None;
             let mut drops: Option<[u64; 2]> = None;
+            let mut inspection_reported = false;
             if let Some(s) = self.series.get(p) {
                 for (_, b) in s.ring.range(start..=(start + per - 1).min(last)) {
                     for (i, value) in c.iter_mut().enumerate() {
@@ -688,6 +718,7 @@ impl Collector {
                         *value = (*value).max(b.rates[i]);
                     }
                     pulse |= b.pulse;
+                    inspection_reported |= b.inspection_reported;
                     for (measurement, counts) in [
                         (b.gre_forwarded, &mut forwarded),
                         (b.gre_ingress, &mut ingress),
@@ -704,6 +735,7 @@ impl Collector {
                 }
             }
             let mut point = json!({"at":stamp(start*60000),"flows":c[0],"flows_dropped":c[1],"offered":c[2],"dropped":c[3],"delivered":c[2].saturating_sub(c[3]),"challenged":c[4],"peak_pps":r[2],"offered_pps":r[0],"dropped_pps":r[1],"pulsing":pulse});
+            point["inspection_reported"] = json!(inspection_reported);
             let elapsed = (now - start * 60000).clamp(1000, per * 60000) as f64 / 1000.0;
             for (measurement, pps, bps) in [
                 (forwarded, "gre_forwarded_pps", "gre_forwarded_bps"),
@@ -789,6 +821,55 @@ mod gre_tests {
         assert_eq!(
             collector.points(prefix, 60_000, 60_000, 63_000)[0]["gre_forwarded_pps"].as_f64(),
             Some(1.0 / 3.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod mitigation_tests {
+    use super::*;
+
+    #[test]
+    fn measured_mitigation_counts_below_the_detection_threshold() {
+        let prefix = "192.0.2.4/32";
+        let other = "192.0.2.5/32";
+        let program: Program = serde_json::from_value(json!({
+            "prefixes":[prefix,other],
+            "fpga":[{"rule_id":"meter","action":"rate_limit","match":{}}]
+        }))
+        .unwrap();
+        let mut collector = Collector::default();
+        let report = |offered, dropped, offered_pps, dropped_pps, rule_drops| {
+            json!({
+                "prefixes":[{"prefix":prefix,"offered":offered,"dropped":dropped,
+                    "offered_pps":offered_pps,"dropped_pps":dropped_pps}],
+                "rules":[{"rule_id":"meter","pps_dropped":rule_drops}]
+            })
+        };
+        collector.observe("node", &report(0, 0, 0, 0, 0), &program, 1000);
+        collector.observe("node", &report(400, 30, 400, 30, 30), &program, 2000);
+        assert_eq!(collector.summary(prefix, 60_000, 2000)["dropped"], 30);
+        assert!(collector.events(prefix, 60_000, 2000).is_empty());
+
+        collector.observe(
+            "node",
+            &report(20_400, 5_030, 20_000, 5_000, 60_030),
+            &program,
+            3000,
+        );
+        let events = collector.events(prefix, 60_000, 3000);
+        assert_eq!(events[0]["dropped"], 5_000);
+        assert_eq!(events[0]["vectors"][0]["action"], "rate_limit");
+        assert_eq!(events[0]["vectors"][0]["shared"], true);
+        assert!(collector.events(other, 60_000, 3000).is_empty());
+
+        let mut collector = Collector::default();
+        let mut pulse = report(0, 0, 0, 0, 0);
+        pulse["prefixes"][0]["pulsing"] = json!(true);
+        collector.observe("node", &pulse, &program, 1000);
+        assert_eq!(
+            collector.events(prefix, 60_000, 1000)[0]["vectors"],
+            json!([])
         );
     }
 }

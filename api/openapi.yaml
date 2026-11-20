@@ -4755,6 +4755,12 @@ components:
           type: string
         filter_id:
           type: string
+        action:
+          type: string
+          description: Configured firewall rule action.
+        challenged:
+          type: integer
+          description: Filter challenge decisions recorded during the event.
         crafted:
           type: string
           enum:
@@ -4859,10 +4865,8 @@ components:
           type: integer
         dropped:
           type: integer
-          description: 'Volume scrubbed over the whole attack, summed over vectors. Not always the same
-            number as the prefix''s own dropped total: a rule guarding several prefixes has its volume
-            attributed to each of them, and those vectors are marked shared. Read the prefix total when
-            the two disagree.'
+          description: Packets dropped or challenged during the event, measured by the prefix
+            counters. A rule shared across prefixes may report a different total in its vector.
         flows:
           type: integer
         pulse:
@@ -4879,6 +4883,9 @@ components:
         at:
           type: string
           format: date-time
+        inspection_reported:
+          type: boolean
+          description: Whether the interval contains per-prefix inspection counter samples.
         flows:
           type: integer
         flows_dropped:
@@ -4924,6 +4931,15 @@ components:
       properties:
         prefix:
           type: string
+        inspection_reported:
+          type: boolean
+          description: Whether the window contains per-prefix inspection counter samples.
+        inspection_live:
+          type: boolean
+          description: Whether recent per-prefix inspection rates are available.
+        gre_dropped:
+          type: integer
+          description: Packets dropped by the Linux GRE edge firewall during the window, when measured.
         from:
           type: string
           format: date-time

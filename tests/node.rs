@@ -627,6 +627,7 @@ fn the_node_renders_and_reports_everything_it_is_given() {
     }
     let desired = provision::Desired {
         tunnels: program.tunnels.clone(),
+        asic: program.asic.clone(),
         lines: lines.clone(),
         error: String::new(),
     };
