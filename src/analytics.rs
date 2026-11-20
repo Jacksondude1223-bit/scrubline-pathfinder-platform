@@ -24,6 +24,7 @@ struct Bucket {
     rates: [u64; 3],
     gre_forwarded: Option<[u64; 2]>,
     gre_ingress: Option<[u64; 2]>,
+    gre_drop: Option<[u64; 2]>,
     pulse: bool,
 }
 #[derive(Default, Clone)]
@@ -135,6 +136,13 @@ impl Series {
         }
     }
 }
+#[derive(Clone, Copy)]
+enum GreMeasurement {
+    Forwarded,
+    Ingress,
+    Drop,
+}
+
 type GreBaselines = HashMap<String, HashMap<String, (crate::wire::GreCounter, i64)>>;
 
 #[derive(Default)]
@@ -143,6 +151,7 @@ pub struct Collector {
     prefix_counters: HashMap<(String, String), [u64; 5]>,
     gre_baselines: GreBaselines,
     ingress_baselines: GreBaselines,
+    drop_baselines: GreBaselines,
     rule_counters: HashMap<(String, String, bool), [u64; 5]>,
     nodes: HashMap<String, i64>,
     /// What the programs nodes last reported under protect, by fingerprint (see Attribution).
@@ -256,6 +265,7 @@ impl Collector {
             .gre_baselines
             .values_mut()
             .chain(self.ingress_baselines.values_mut())
+            .chain(self.drop_baselines.values_mut())
         {
             baselines.retain(|p, _| live.contains(p));
         }
@@ -276,6 +286,7 @@ impl Collector {
         self.prefix_counters.retain(|(n, _), _| n != node);
         self.gre_baselines.remove(node);
         self.ingress_baselines.remove(node);
+        self.drop_baselines.remove(node);
         self.rule_counters.retain(|(n, _, _), _| n != node);
         self.nodes.remove(node);
     }
@@ -293,12 +304,12 @@ impl Collector {
         samples: &[crate::wire::GreCounter],
         program: &Program,
         now: i64,
-        ingress: bool,
+        kind: GreMeasurement,
     ) {
-        let baselines = if ingress {
-            &mut self.ingress_baselines
-        } else {
-            &mut self.gre_baselines
+        let baselines = match kind {
+            GreMeasurement::Forwarded => &mut self.gre_baselines,
+            GreMeasurement::Ingress => &mut self.ingress_baselines,
+            GreMeasurement::Drop => &mut self.drop_baselines,
         };
         let mut previous = baselines.remove(node).unwrap_or_default();
         if samples.is_empty() {
@@ -336,10 +347,10 @@ impl Collector {
                 .ring
                 .entry(now / 60000)
                 .or_default();
-            let count = if ingress {
-                &mut bucket.gre_ingress
-            } else {
-                &mut bucket.gre_forwarded
+            let count = match kind {
+                GreMeasurement::Forwarded => &mut bucket.gre_forwarded,
+                GreMeasurement::Ingress => &mut bucket.gre_ingress,
+                GreMeasurement::Drop => &mut bucket.gre_drop,
             }
             .get_or_insert([0, 0]);
             count[0] = count[0].saturating_add(sample.packets - prior.packets);
@@ -394,8 +405,28 @@ impl Collector {
             }
         }
         self.ingress_baselines.retain(|n, _| !expired.contains(n));
-        self.observe_gre(node, &stats.gre_counters, program, now, false);
-        self.observe_gre(node, &stats.ingress_counters, program, now, true);
+        self.drop_baselines.retain(|n, _| !expired.contains(n));
+        self.observe_gre(
+            node,
+            &stats.gre_counters,
+            program,
+            now,
+            GreMeasurement::Forwarded,
+        );
+        self.observe_gre(
+            node,
+            &stats.ingress_counters,
+            program,
+            now,
+            GreMeasurement::Ingress,
+        );
+        self.observe_gre(
+            node,
+            &stats.gre_drop_counters,
+            program,
+            now,
+            GreMeasurement::Drop,
+        );
         let mut touched = HashSet::new();
         let mut crafted = Vec::new();
         let mut guarded = Vec::new();
@@ -647,6 +678,7 @@ impl Collector {
             let (mut c, mut r, mut pulse) = ([0u64; 5], [0u64; 3], false);
             let mut forwarded: Option<[u64; 2]> = None;
             let mut ingress: Option<[u64; 2]> = None;
+            let mut drops: Option<[u64; 2]> = None;
             if let Some(s) = self.series.get(p) {
                 for (_, b) in s.ring.range(start..=(start + per - 1).min(last)) {
                     for (i, value) in c.iter_mut().enumerate() {
@@ -659,6 +691,7 @@ impl Collector {
                     for (measurement, counts) in [
                         (b.gre_forwarded, &mut forwarded),
                         (b.gre_ingress, &mut ingress),
+                        (b.gre_drop, &mut drops),
                     ] {
                         if let Some(measurement) = measurement {
                             for (sum, increment) in
@@ -675,6 +708,7 @@ impl Collector {
             for (measurement, pps, bps) in [
                 (forwarded, "gre_forwarded_pps", "gre_forwarded_bps"),
                 (ingress, "gre_ingress_pps", "gre_ingress_bps"),
+                (drops, "gre_drop_pps", "gre_drop_bps"),
             ] {
                 if let Some([packets, bytes]) = measurement {
                     point[pps] = json!(packets as f64 / elapsed);
@@ -714,6 +748,9 @@ mod gre_tests {
               "ingress_counters": [
                 {"prefix":prefix,"generation":generation,"packets":packets*2,"bytes":packets*180}
               ],
+              "gre_drop_counters":[
+                {"prefix":prefix,"generation":generation,"packets":packets/2,"bytes":packets*40}
+              ],
               "gre_counters":[
                 {"prefix":prefix,"generation":generation,"packets":packets,"bytes":packets*100},
                 {"prefix":other,"generation":generation,"packets":packets,"bytes":packets*100}
@@ -730,6 +767,8 @@ mod gre_tests {
         assert_eq!(row["gre_forwarded_bps"], 32_000.0);
         assert_eq!(row["gre_ingress_pps"], 80.0);
         assert_eq!(row["gre_ingress_bps"], 57_600.0);
+        assert_eq!(row["gre_drop_pps"], 20.0);
+        assert_eq!(row["gre_drop_bps"], 12_800.0);
         assert_eq!(row["offered_pps"], 0);
         assert_eq!(row["dropped_pps"], 0);
         assert!(collector.points(other, 60_000, 60_000, 3000)[0]

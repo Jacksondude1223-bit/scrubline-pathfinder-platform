@@ -82,6 +82,7 @@ pub struct Agent {
     local_token: String,
     health: Vec<TunnelStatus>,
     ingress: (Vec<crate::wire::GreCounter>, i64),
+    gre_drops: Vec<crate::wire::GreCounter>,
     local_as: i64,
     next_hop: String,
     // Prefixes this node announced that have since left its plan, kept as withdrawals: ExaBGP
@@ -247,6 +248,9 @@ impl Agent {
         if now - self.ingress.1 <= 15_000 && !self.ingress.0.is_empty() {
             stats["ingress_counters"] = json!(self.ingress.0);
         }
+        if now - self.ingress.1 <= 15_000 && !self.gre_drops.is_empty() {
+            stats["gre_drop_counters"] = json!(self.gre_drops);
+        }
         stats["resident_bytes"] = json!(runtime::resident_bytes());
         stats
     }
@@ -317,7 +321,7 @@ impl Agent {
                 }
                 json_response(
                     200,
-                    json!({"node":self.node.id,"tunnels":prog.tunnels,"backhaul":prog.backhaul,"pinned":prog.pinned,"tunnel_peers":prog.tunnel_peers,"iproute2":commands,"status":self.health,"error":err}),
+                    json!({"node":self.node.id,"tunnels":prog.tunnels,"asic":prog.asic,"backhaul":prog.backhaul,"pinned":prog.pinned,"tunnel_peers":prog.tunnel_peers,"iproute2":commands,"status":self.health,"error":err}),
                 )
             }
             ("POST", "/tunnels") => {
@@ -326,6 +330,8 @@ impl Agent {
                     tunnels: Vec<TunnelStatus>,
                     #[serde(default)]
                     ingress_counters: Vec<crate::wire::GreCounter>,
+                    #[serde(default)]
+                    gre_drop_counters: Vec<crate::wire::GreCounter>,
                 }
                 let body: Body = match serde_json::from_slice(body) {
                     Ok(v) => v,
@@ -345,6 +351,7 @@ impl Agent {
                 }
                 self.health = body.tunnels;
                 self.ingress = (body.ingress_counters, ms);
+                self.gre_drops = body.gre_drop_counters;
                 for t in &mut self.health {
                     t.reported_at = chrono::Utc::now();
                 }
@@ -693,6 +700,7 @@ pub async fn run() -> Result<()> {
         local_token,
         health: vec![],
         ingress: Default::default(),
+        gre_drops: Vec::new(),
         local_as,
         next_hop,
         retired: BTreeMap::new(),
@@ -846,6 +854,7 @@ mod tests {
             local_token: "local".into(),
             health: vec![],
             ingress: Default::default(),
+            gre_drops: Vec::new(),
             local_as: 0,
             next_hop: String::new(),
             retired: BTreeMap::new(),

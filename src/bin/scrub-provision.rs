@@ -109,9 +109,10 @@ fn pass(
             .to_string();
     }
     let mut report = provision::report(&desired, &applied);
-    let ingress = provision::read_ingress(&mut system, &plan, &applied, counter_epoch);
+    let ingress = provision::read_counters(&mut system, &plan, &applied, counter_epoch);
     if let Ok(ref rows) = ingress {
-        report["ingress_counters"] = serde_json::json!(rows);
+        report["ingress_counters"] = serde_json::json!(rows.ingress);
+        report["gre_drop_counters"] = serde_json::json!(rows.drops);
     }
     let r = client
         .post(format!("{agent}/tunnels"))
