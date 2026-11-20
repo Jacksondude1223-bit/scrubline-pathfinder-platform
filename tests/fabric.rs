@@ -564,7 +564,7 @@ fn the_provisioner_takes_every_shaper_the_renderer_gives() {
         let desired = provision::Desired {
             lines: tunnel::rate_commands(std::slice::from_ref(&t)).unwrap(),
             tunnels: vec![t],
-            error: String::new(),
+            ..Default::default()
         };
         let pass = provision::plan(&desired, &provision::Observed::default())
             .unwrap_or_else(|e| panic!("{kbps} kbit/s: {e}"));
@@ -1057,6 +1057,7 @@ fn the_provisioner_accepts_everything_the_agent_renders() {
         let lines = tunnel::render(&prog).unwrap();
         let desired = pathfinder::provision::Desired {
             tunnels: prog.tunnels.clone(),
+            asic: prog.asic.clone(),
             lines: lines.clone(),
             error: String::new(),
         };
