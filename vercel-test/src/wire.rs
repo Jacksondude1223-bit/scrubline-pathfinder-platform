@@ -104,6 +104,11 @@ pub struct Stats {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub ingress_counters: Vec<GreCounter>,
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub gre_drop_counters: Vec<GreCounter>,
     #[serde(deserialize_with = "null_default")]
     pub ml: MLStats,
     #[serde(deserialize_with = "null_default")]
@@ -177,6 +182,7 @@ impl Stats {
             prefixes: _,
             gre_counters: _,
             ingress_counters: _,
+            gre_drop_counters: _,
             ml,
             pulsing,
             pulse_peak_pps,
@@ -222,6 +228,7 @@ impl Stats {
             prefixes: Vec::new(),
             gre_counters: Vec::new(),
             ingress_counters: Vec::new(),
+            gre_drop_counters: Vec::new(),
             ml: ml.clone(),
             pulsing: *pulsing,
             pulse_peak_pps: *pulse_peak_pps,

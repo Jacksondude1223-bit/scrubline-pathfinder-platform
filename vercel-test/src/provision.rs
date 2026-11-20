@@ -6,7 +6,7 @@
 //! rather than replaying it, so it can run every few seconds without piling up duplicates, and
 //! it removes what the agent no longer asks for.
 use crate::{
-    model::NodeTunnel,
+    model::{ACLEntry, Match, NodeTunnel},
     tunnel::{QUEUE_MAX, QUEUE_MIN},
     Result,
 };
@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[serde(default)]
 pub struct Desired {
     pub tunnels: Vec<NodeTunnel>,
+    pub asic: Vec<ACLEntry>,
     #[serde(rename = "iproute2")]
     pub lines: Vec<String>,
     pub error: String,
@@ -60,6 +61,7 @@ pub struct Pass {
     pub steps: Vec<Step>,
     pub nft: String,
     ingress: BTreeMap<String, (String, String)>,
+    drops: BTreeMap<String, (String, String)>,
 }
 
 /// Interfaces the provisioner owns: customer tunnels and node-to-node tunnels.
@@ -95,6 +97,9 @@ table inet scrubline {
 \tchain incoming {
 \t\ttype filter hook prerouting priority -450; policy accept;
 \t}
+\tchain gre_acl {
+\t\ttype filter hook prerouting priority -150; policy accept;
+\t}
 \tchain prerouting {
 \t\ttype nat hook prerouting priority dstnat; policy accept;
 \t}
@@ -109,6 +114,77 @@ table inet scrubline {
 \t}
 }
 ";
+
+fn gre_acl(rules: &[ACLEntry], address: std::net::Ipv4Addr) -> Vec<(String, bool)> {
+    let mut rules: Vec<_> = rules.iter().collect();
+    rules.sort_by_key(|rule| rule.priority);
+    let mut entries = Vec::new();
+    for rule in rules {
+        let m = &rule.r#match;
+        if !m.dst_cidr.is_empty() {
+            match m.dst_cidr.parse::<IpNet>() {
+                Ok(net) if !net.contains(&std::net::IpAddr::V4(address)) => continue,
+                Err(_) => break,
+                _ => {}
+            }
+        }
+        if rule.action == "count" {
+            continue;
+        }
+        if !matches!(rule.action.as_str(), "permit" | "drop")
+            || (Match {
+                src_cidr: String::new(),
+                dst_cidr: String::new(),
+                proto: String::new(),
+                dport: 0,
+                dport_to: 0,
+                sport: 0,
+                sport_to: 0,
+                ..m.clone()
+            }) != Match::default()
+        {
+            break;
+        }
+        let mut terms = Vec::new();
+        if !m.src_cidr.is_empty() {
+            match m.src_cidr.parse::<IpNet>() {
+                Ok(IpNet::V4(net)) => terms.push(format!("ip saddr {}", net.trunc())),
+                Ok(IpNet::V6(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        let ports = m.dport != 0 || m.sport != 0;
+        match m.proto.to_ascii_lowercase().as_str() {
+            "tcp" => terms.push("meta l4proto tcp".into()),
+            "udp" => terms.push("meta l4proto udp".into()),
+            "icmp" if !ports => terms.push("meta l4proto icmp".into()),
+            "" | "any" if ports => terms.push("meta l4proto { tcp, udp }".into()),
+            "" | "any" => {}
+            _ => break,
+        }
+        for (field, from, to) in [
+            ("sport", m.sport, m.sport_to),
+            ("dport", m.dport, m.dport_to),
+        ] {
+            if (1..=65535).contains(&from) && (from..=65535).contains(&to.max(from)) {
+                let port = if to > from {
+                    format!("{from}-{to}")
+                } else {
+                    from.to_string()
+                };
+                terms.push(format!("th {field} {port}"));
+            }
+        }
+        if ![m.sport, m.sport_to, m.dport, m.dport_to]
+            .iter()
+            .all(|p| (0..=65535).contains(p))
+        {
+            break;
+        }
+        entries.push((terms.join(" "), rule.action == "drop"));
+    }
+    entries
+}
 
 /// An interface the provisioner may touch, as the renderers name them.
 fn interface(name: &str) -> bool {
@@ -366,6 +442,41 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
         pass.ingress
             .insert(counter, (prefix.to_owned(), name.to_owned()));
     }
+    for tunnel in &desired.tunnels {
+        let Some((prefix, interface)) = crate::tunnel::gre_counter_target(tunnel) else {
+            continue;
+        };
+        if tunnel.mitigation == "on_demand" {
+            continue;
+        }
+        let Some(address) = prefix
+            .strip_suffix("/32")
+            .and_then(|p| p.parse::<std::net::Ipv4Addr>().ok())
+        else {
+            continue;
+        };
+        let rules = gre_acl(&desired.asic, address);
+        let counter = format!("gre_drop_{:08x}", u32::from(address));
+        if !rules.iter().any(|(_, drop)| *drop) || pass.drops.contains_key(&counter) {
+            continue;
+        }
+        let chain = format!("acl_{:08x}", u32::from(address));
+        nft.push_str(&format!(
+            "add counter inet scrubline {counter}\nadd chain inet scrubline {chain}\nadd rule inet scrubline gre_acl iifname != \"lo\" iifname != \"scr-*\" iifname != \"sbh-*\" ip daddr {address} ip protocol != {{ 4, 47 }} jump {chain}\n"
+        ));
+        for (terms, drop) in rules {
+            let verdict = if drop {
+                format!("counter name {counter} drop")
+            } else {
+                "return".into()
+            };
+            nft.push_str(&format!(
+                "add rule inet scrubline {chain} {terms} {verdict}\n"
+            ));
+        }
+        pass.drops
+            .insert(counter, (prefix.to_owned(), interface.to_owned()));
+    }
     pass.nft = nft;
     Ok(pass)
 }
@@ -529,27 +640,38 @@ pub fn apply(
     out
 }
 
-pub fn read_ingress(
+#[derive(Default)]
+pub struct EdgeCounters {
+    pub ingress: Vec<crate::wire::GreCounter>,
+    pub drops: Vec<crate::wire::GreCounter>,
+}
+
+pub fn read_counters(
     runner: &mut impl Runner,
     pass: &Pass,
     applied: &Applied,
     generation: &str,
-) -> Result<Vec<crate::wire::GreCounter>> {
+) -> Result<EdgeCounters> {
     if pass.ingress.is_empty() || applied.blocked.is_some() {
-        return Ok(Vec::new());
+        return Ok(EdgeCounters::default());
     }
     let raw = runner.run(&argv("nft -j list table inet scrubline"), None)?;
     let value: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let rows = value["nftables"]
         .as_array()
         .ok_or("nft counters were not returned")?;
-    let mut out = Vec::new();
+    let mut out = EdgeCounters::default();
     for row in rows {
         let counter = &row["counter"];
         let Some(name) = counter["name"].as_str() else {
             continue;
         };
-        let Some((prefix, interface)) = pass.ingress.get(name) else {
+        let (matches, samples) = if name.starts_with("gre_drop_") {
+            (&pass.drops, &mut out.drops)
+        } else {
+            (&pass.ingress, &mut out.ingress)
+        };
+        let Some((prefix, interface)) = matches.get(name) else {
             continue;
         };
         if applied.failed.contains_key(interface) {
@@ -558,7 +680,7 @@ pub fn read_ingress(
         if let (Some(packets), Some(bytes)) =
             (counter["packets"].as_u64(), counter["bytes"].as_u64())
         {
-            out.push(crate::wire::GreCounter {
+            samples.push(crate::wire::GreCounter {
                 prefix: prefix.clone(),
                 generation: generation.to_owned(),
                 packets,
@@ -617,6 +739,7 @@ mod tests {
                 interface: "scr-nw".into(),
                 ..Default::default()
             }],
+            asic: Vec::new(),
             lines: lines.iter().map(|l| l.to_string()).collect(),
             error: String::new(),
         }
@@ -935,7 +1058,9 @@ mod tests {
             .nft
             .contains("ip daddr 192.0.2.4 ip protocol != { 4, 47 } counter name gre_in_c0000204"));
         let mut applied = Applied::default();
-        let result = read_ingress(&mut Counters, &pass, &applied, "generation").unwrap();
+        let result = read_counters(&mut Counters, &pass, &applied, "generation")
+            .unwrap()
+            .ingress;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].prefix, "192.0.2.4/32");
         assert_eq!(result[0].packets, 20);
@@ -943,9 +1068,60 @@ mod tests {
         applied
             .failed
             .insert("scr-nw".into(), "link is down".into());
-        assert!(read_ingress(&mut Counters, &pass, &applied, "generation")
+        assert!(read_counters(&mut Counters, &pass, &applied, "generation")
             .unwrap()
+            .ingress
             .is_empty());
+    }
+
+    #[test]
+    fn gre_acl_keeps_asic_priority_and_counts_any_protocol_port_drops() {
+        let mut d = desired(&[ADD, SET]);
+        d.tunnels[0].r#type = "gre".into();
+        d.tunnels[0].prefixes = vec!["192.0.2.4/32".into()];
+        d.asic = vec![
+            ACLEntry {
+                priority: 50,
+                action: "drop".into(),
+                r#match: Match {
+                    dst_cidr: "192.0.2.4/32".into(),
+                    proto: "any".into(),
+                    dport: 80,
+                    dport_to: 80,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ACLEntry {
+                priority: 10,
+                action: "permit".into(),
+                r#match: Match {
+                    src_cidr: "198.51.100.5/32".into(),
+                    proto: "tcp".into(),
+                    dport: 80,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+        let pass = plan(&d, &Observed::default()).unwrap();
+        let permit = pass
+            .nft
+            .find("ip saddr 198.51.100.5/32 meta l4proto tcp th dport 80 return")
+            .unwrap();
+        let drop = pass
+            .nft
+            .find("meta l4proto { tcp, udp } th dport 80 counter name gre_drop_c0000204 drop")
+            .unwrap();
+        assert!(permit < drop);
+        assert_eq!(pass.drops["gre_drop_c0000204"].0, "192.0.2.4/32");
+
+        d.asic[1].r#match.payload_hex = "ff".into();
+        assert!(plan(&d, &Observed::default()).unwrap().drops.is_empty());
+        d.asic[1].r#match.dst_cidr = "192.0.2.5/32".into();
+        assert!(!plan(&d, &Observed::default()).unwrap().drops.is_empty());
+        d.tunnels[0].mitigation = "on_demand".into();
+        assert!(plan(&d, &Observed::default()).unwrap().drops.is_empty());
     }
 
     struct Fake {

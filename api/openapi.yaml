@@ -4905,6 +4905,12 @@ components:
         gre_ingress_bps:
           type: number
           description: Average bit rate for the protected IPv4 address from non-tunnel ingress at the GRE edge, before forwarding.
+        gre_drop_pps:
+          type: number
+          description: Average packets per second dropped by Linux GRE edge ACLs in this bucket, when reported.
+        gre_drop_bps:
+          type: number
+          description: Average bits per second dropped by Linux GRE edge ACLs in this bucket, when reported.
         gre_forwarded_pps:
           type: number
           description: Average packets per second transmitted through the reporting GRE tunnel during this bucket, when available.
