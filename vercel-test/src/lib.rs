@@ -12,6 +12,7 @@ pub mod transport;
 
 pub mod analytics;
 pub mod api;
+pub mod discovery;
 pub mod gamefilter;
 pub mod guards;
 pub mod httpfilter;

@@ -79,9 +79,22 @@ pub struct GreCounter {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredPort {
+    pub destination: String,
+    pub port: u16,
+    pub transport: String,
+    pub protocol: String,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub confirmations: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovered_ports: Option<Vec<DiscoveredPort>>,
     #[serde(deserialize_with = "null_default")]
     pub decisions: u64,
     #[serde(deserialize_with = "null_default")]
@@ -174,6 +187,7 @@ impl Stats {
     /// Stats is not left out of the summary without a decision.
     pub fn summary(&self) -> Self {
         let Self {
+            discovered_ports: _,
             decisions,
             unowned,
             stages,
@@ -220,6 +234,7 @@ impl Stats {
             prefix_states: _,
         } = egress;
         Self {
+            discovered_ports: None,
             decisions: *decisions,
             unowned: *unowned,
             stages: stages.clone(),

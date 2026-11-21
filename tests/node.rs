@@ -1047,3 +1047,58 @@ fn the_control_plane_keeps_everything_the_node_reports() {
         "dropped by the heartbeat contract: {lost:#?}"
     );
 }
+
+#[test]
+fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
+    let fabric = Fabric::new();
+    let mut pipe = fabric.pipeline();
+    let at = chrono::Utc::now().timestamp_millis() - 3000;
+    let request = udp(
+        "192.0.2.31",
+        "203.0.113.10",
+        27016,
+        1,
+        b"\xff\xff\xff\xffTSource Engine Query\0",
+    );
+    let response = Flow {
+        src_ip: request.dst_ip.clone(),
+        dst_ip: request.src_ip.clone(),
+        sport: request.dport,
+        dport: request.sport,
+        payload: b"\xff\xff\xff\xffA1234".to_vec(),
+        ..request.clone()
+    };
+    pipe.observe_return(&response, at);
+    assert_eq!(pipe.stats(at)["discovered_ports"], json!([]));
+    for time in [at + 1, at + 1000] {
+        pipe.decide(&request, time);
+        pipe.observe_return(&response, time + 1);
+    }
+    fabric.heartbeat(pipe.stats(at + 2000), Value::Null);
+    for (index, (_, id)) in fabric.tenants.iter().enumerate() {
+        let (_, issued) = call(
+            &fabric.base,
+            "POST",
+            &format!("/v1/tenants/{id}/token"),
+            OP,
+            Value::Null,
+        );
+        let (status, result) = call(
+            &fabric.base,
+            "GET",
+            "/v1/analytics/discovered-ports",
+            issued["token"].as_str().unwrap(),
+            Value::Null,
+        );
+        assert_eq!(status, 200, "{result}");
+        let rows = result["ports"].as_array().unwrap();
+        if index == 0 {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["destination"], "203.0.113.10/32");
+            assert_eq!(rows[0]["port"], 27016);
+            assert_eq!(rows[0]["protocol"], "a2s");
+        } else {
+            assert!(rows.is_empty(), "{result}");
+        }
+    }
+}

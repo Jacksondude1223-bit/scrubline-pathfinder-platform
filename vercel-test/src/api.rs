@@ -1544,6 +1544,65 @@ impl Api {
                     .map_err(failed)?;
                 Ok(json!({"deleted":id}))
             }
+            ("GET", ["analytics", "discovered-ports"]) => {
+                if !matches!(who.role, "operator" | "tenant") {
+                    return Err((
+                        403,
+                        "reading discoveries requires a tenant or operator credential".into(),
+                    ));
+                }
+                let mut discoveries = BTreeMap::new();
+                for (id, report) in &self.store.reports {
+                    let Some(program) = self.store.programs.get(id) else {
+                        continue;
+                    };
+                    if ms - report.reported_at.timestamp_millis() > 30_000 {
+                        continue;
+                    }
+                    let Some(rows) = &report.stats.discovered_ports else {
+                        continue;
+                    };
+                    let networks: Vec<IpNet> = program
+                        .prefixes
+                        .iter()
+                        .filter_map(|p| p.parse().ok())
+                        .collect();
+                    for row in rows.iter().take(crate::discovery::PORTS_MAX) {
+                        let Ok(host) = row.destination.parse::<IpNet>() else {
+                            continue;
+                        };
+                        if host.prefix_len() != host.max_prefix_len()
+                            || !who.sees(&row.destination)
+                            || !networks.iter().any(|net| net.contains(&host.addr()))
+                            || !(0..=crate::discovery::RETENTION_MS)
+                                .contains(&ms.saturating_sub(row.last_seen_ms))
+                            || row.first_seen_ms < 0
+                            || row.first_seen_ms > row.last_seen_ms
+                            || row.port == 0
+                            || row.confirmations < 2
+                            || !matches!(
+                                (row.transport.as_str(), row.protocol.as_str()),
+                                ("udp", "a2s" | "raknet" | "unknown") | ("tcp", "unknown")
+                            )
+                        {
+                            continue;
+                        }
+                        let key = (host, row.port, row.transport.clone(), row.protocol.clone());
+                        discoveries
+                            .entry(key)
+                            .and_modify(|before: &mut wire::DiscoveredPort| {
+                                before.first_seen_ms = before.first_seen_ms.min(row.first_seen_ms);
+                                before.last_seen_ms = before.last_seen_ms.max(row.last_seen_ms);
+                                before.confirmations = before.confirmations.max(row.confirmations);
+                            })
+                            .or_insert_with(|| row.clone());
+                    }
+                }
+                let mut ports: Vec<_> = discoveries.into_values().collect();
+                ports.sort_by_key(|row| std::cmp::Reverse(row.last_seen_ms));
+                ports.truncate(crate::discovery::PORTS_MAX);
+                Ok(json!({"ports": ports}))
+            }
             ("GET", ["analytics", kind]) if ["overview", "series", "events"].contains(kind) => {
                 if who.role != "operator" && who.role != "tenant" {
                     return Err((
