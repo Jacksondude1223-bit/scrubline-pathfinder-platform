@@ -109,6 +109,7 @@ fn pass(
             .to_string();
     }
     let mut report = provision::report(&desired, &applied);
+    pathfinder::wireguard::report(&mut system, &desired, &mut report);
     let ingress = provision::read_counters(&mut system, &plan, &applied, counter_epoch);
     if let Ok(ref rows) = ingress {
         report["ingress_counters"] = serde_json::json!(rows.ingress);

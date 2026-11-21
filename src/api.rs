@@ -468,7 +468,7 @@ impl Api {
     /// only the tunnels allocated to that customer.
     fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self.deployed() else {
-            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true,"blackwell_blackhole":true}});
+            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true,"blackwell_blackhole":true,"wireguard":true}});
         };
         let nodes = self.store.nodes(now);
         let tunnels: Vec<_> = p
@@ -530,6 +530,7 @@ impl Api {
                         });
                         if let Some(r) = report {
                             row["reported_at"] = json!(r.reported_at);
+                            row["wireguard"] = json!(r.wireguard);
                         }
                         // What the node holding an on-demand tunnel last said about its traffic.
                         if let Some(m) = self.store.reports.get(&n.id).and_then(|r| {
@@ -625,6 +626,7 @@ impl Api {
                     "remote": t.remote,
                     "local": t.local,
                     "key": t.key,
+                    "wireguard": t.wireguard,
                     "prefixes": t.prefixes,
                     "standalone": t.standalone,
                     "required": t.required,
@@ -642,7 +644,7 @@ impl Api {
                 })
             })
             .collect();
-        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true,"blackwell_blackhole":true}})
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true,"blackwell_blackhole":true,"wireguard":true}})
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
@@ -1150,6 +1152,7 @@ impl Api {
                         if v.remote == t.remote
                             && v.key == t.key
                             && v.r#type == t.r#type
+                            && v.wireguard == t.wireguard
                             && v.standalone == t.standalone
                             && v.node == t.node =>
                     {

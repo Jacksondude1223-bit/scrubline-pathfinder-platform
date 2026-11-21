@@ -328,3 +328,14 @@ sudo scripts/install.sh uninstall --purge  # removes those too
 Uninstalling stops the services, removes the tunnels and firewall table the
 provisioner built, and closes what the script opened in firewalld.
 Forwarding settings stay as they are until the next boot.
+
+### WireGuard upgrades
+
+WireGuard requires matching API, node and provisioner versions. Rerun the node
+installer after upgrading: it installs `wireguard-tools`, loads WireGuard at
+boot, and gives the provisioner a persistent private directory at
+`/var/lib/scrubline-wireguard`. Retain that directory when upgrading or restarting.
+Customer keys remain on their own devices; the panel stores only public keys.
+The panel allocates UDP ports in 20000-60000. Permit the allocated ports through
+host and upstream firewalls. The installer handles firewalld. NAT customers
+initiate their connections and use 25-second keepalives.
