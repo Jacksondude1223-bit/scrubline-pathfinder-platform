@@ -1058,6 +1058,7 @@ fn the_provisioner_accepts_everything_the_agent_renders() {
         let desired = pathfinder::provision::Desired {
             tunnels: prog.tunnels.clone(),
             asic: prog.asic.clone(),
+            blackwell: prog.blackwell.clone(),
             lines: lines.clone(),
             error: String::new(),
         };

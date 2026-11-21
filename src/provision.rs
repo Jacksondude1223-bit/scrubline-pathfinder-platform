@@ -6,7 +6,7 @@
 //! rather than replaying it, so it can run every few seconds without piling up duplicates, and
 //! it removes what the agent no longer asks for.
 use crate::{
-    model::{ACLEntry, Match, NodeTunnel},
+    model::{ACLEntry, HostBlackhole, Match, NodeTunnel},
     tunnel::{QUEUE_MAX, QUEUE_MIN},
     Result,
 };
@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Desired {
     pub tunnels: Vec<NodeTunnel>,
     pub asic: Vec<ACLEntry>,
+    pub blackwell: Vec<HostBlackhole>,
     #[serde(rename = "iproute2")]
     pub lines: Vec<String>,
     pub error: String,
@@ -96,6 +97,9 @@ delete table inet scrubline
 table inet scrubline {
 \tchain incoming {
 \t\ttype filter hook prerouting priority -450; policy accept;
+\t}
+\tchain blackwell {
+\t\ttype filter hook prerouting priority -160; policy accept;
 \t}
 \tchain gre_acl {
 \t\ttype filter hook prerouting priority -150; policy accept;
@@ -442,6 +446,8 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
         pass.ingress
             .insert(counter, (prefix.to_owned(), name.to_owned()));
     }
+    render_blackwell(desired, &mut pass, &mut nft);
+    let mut acl_targets = BTreeSet::new();
     for tunnel in &desired.tunnels {
         let Some((prefix, interface)) = crate::tunnel::gre_counter_target(tunnel) else {
             continue;
@@ -455,14 +461,20 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
         else {
             continue;
         };
+        if !acl_targets.insert(address) {
+            continue;
+        }
         let rules = gre_acl(&desired.asic, address);
         let counter = format!("gre_drop_{:08x}", u32::from(address));
-        if !rules.iter().any(|(_, drop)| *drop) || pass.drops.contains_key(&counter) {
+        if !rules.iter().any(|(_, drop)| *drop) {
             continue;
         }
         let chain = format!("acl_{:08x}", u32::from(address));
+        if !pass.drops.contains_key(&counter) {
+            nft.push_str(&format!("add counter inet scrubline {counter}\n"));
+        }
         nft.push_str(&format!(
-            "add counter inet scrubline {counter}\nadd chain inet scrubline {chain}\nadd rule inet scrubline gre_acl iifname != \"lo\" iifname != \"scr-*\" iifname != \"sbh-*\" ip daddr {address} ip protocol != {{ 4, 47 }} jump {chain}\n"
+            "add chain inet scrubline {chain}\nadd rule inet scrubline gre_acl iifname != \"lo\" iifname != \"scr-*\" iifname != \"sbh-*\" ip daddr {address} ip protocol != {{ 4, 47 }} jump {chain}\n"
         ));
         for (terms, drop) in rules {
             let verdict = if drop {
@@ -479,6 +491,83 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
     }
     pass.nft = nft;
     Ok(pass)
+}
+
+fn render_blackwell(desired: &Desired, pass: &mut Pass, nft: &mut String) {
+    let carried: Vec<IpNet> = desired
+        .tunnels
+        .iter()
+        .flat_map(|tunnel| &tunnel.prefixes)
+        .filter_map(|prefix| prefix.parse().ok())
+        .collect();
+    let mut hosts = BTreeMap::new();
+    for host in &desired.blackwell {
+        if (1..=1_000_000_000).contains(&host.max_pps)
+            && carried.iter().any(|net| net.contains(&host.address))
+        {
+            hosts
+                .entry(host.address)
+                .and_modify(|pps: &mut u64| *pps = (*pps).min(host.max_pps))
+                .or_insert(host.max_pps);
+        }
+    }
+    let dedicated: BTreeMap<_, _> = desired
+        .tunnels
+        .iter()
+        .filter_map(crate::tunnel::gre_counter_target)
+        .filter_map(|(prefix, interface)| {
+            prefix
+                .parse::<IpNet>()
+                .ok()
+                .map(|net| (net.addr(), (prefix, interface)))
+        })
+        .collect();
+    for (ipv4, family, field, set) in [
+        (true, "ipv4_addr", "ip", "bw_active4"),
+        (false, "ipv6_addr", "ip6", "bw_active6"),
+    ] {
+        let mut matches = Vec::new();
+        for (index, (host, rate)) in hosts
+            .iter()
+            .filter(|(host, _)| host.is_ipv4() == ipv4)
+            .enumerate()
+        {
+            if index == 0 {
+                nft.push_str(&format!("add set inet scrubline {set} {{ type {family}; flags dynamic,timeout; timeout 2s; size 1024; }}\n"));
+            }
+            let chain = format!("{set}_{index}");
+            nft.push_str(&format!("add chain inet scrubline {chain}\n"));
+            for tunnel in &desired.tunnels {
+                if tunnel.port_forward.is_some()
+                    && tunnel.local.parse::<std::net::IpAddr>().ok() == Some(*host)
+                {
+                    if let Ok(remote) = tunnel.remote.parse::<std::net::Ipv4Addr>() {
+                        nft.push_str(&format!("add rule inet scrubline {chain} ip saddr {remote} meta l4proto gre return\n"));
+                    }
+                }
+            }
+            nft.push_str(&format!("add rule inet scrubline {chain} limit rate over {rate}/second burst {rate} packets update @{set} {{ {field} daddr }}\n"));
+            let counter = if let (std::net::IpAddr::V4(address), Some((prefix, interface))) =
+                (host, dedicated.get(host))
+            {
+                let name = format!("gre_drop_{:08x}", u32::from(*address));
+                nft.push_str(&format!("add counter inet scrubline {name}\n"));
+                pass.drops
+                    .insert(name.clone(), (prefix.to_string(), interface.to_string()));
+                format!("counter name {name}")
+            } else {
+                "counter".into()
+            };
+            nft.push_str(&format!(
+                "add rule inet scrubline {chain} {field} daddr @{set} {counter} drop\n"
+            ));
+            matches.push(format!("{host} : jump {chain}"));
+        }
+        if !matches.is_empty() {
+            let entries = matches.join(", ");
+            nft.push_str(&format!("add rule inet scrubline blackwell iifname != \"lo\" iifname != \"scr-*\" iifname != \"sbh-*\" {field} daddr vmap {{ {entries} }}\n"));
+        }
+    }
 }
 
 /// A shaper as the agent asks for it: the token bucket's rate and line, and the queue's size and
@@ -740,6 +829,7 @@ mod tests {
                 ..Default::default()
             }],
             asic: Vec::new(),
+            blackwell: Vec::new(),
             lines: lines.iter().map(|l| l.to_string()).collect(),
             error: String::new(),
         }

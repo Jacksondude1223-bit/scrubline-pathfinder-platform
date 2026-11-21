@@ -715,7 +715,18 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                 compiled_at: now,
                 ..Default::default()
             };
+            let protected: Vec<IpNet> = prog
+                .prefixes
+                .iter()
+                .filter_map(|net| net.parse().ok())
+                .collect();
             for r in &p.rules {
+                if let Some(host) = r.host_blackhole() {
+                    if protected.iter().any(|net| net.contains(&host.address)) {
+                        prog.blackwell.push(host);
+                    }
+                    continue;
+                }
                 if !has(&r.stage) {
                     continue;
                 }
@@ -746,6 +757,10 @@ pub fn compile(p: &Policy, nodes: &[Node], plan: &[Announcement]) -> HashMap<Str
                     _ => {}
                 }
             }
+            prog.blackwell.sort_by(|a, b| {
+                (a.address, a.max_pps, &a.rule_id).cmp(&(b.address, b.max_pps, &b.rule_id))
+            });
+            prog.blackwell.dedup_by_key(|host| host.address);
             prog.tunnel_peers = tunnel_peers(nodes, n, &prog.tunnels);
             prog.asic.sort_by_key(|r| r.priority);
             prog.fpga.sort_by_key(|r| r.priority);
