@@ -194,6 +194,17 @@ impl Attribution {
                 scope(&r.r#match.dst_cidr, "zc", Some(r.action.as_str()), &nets),
             );
         }
+        for host in &program.blackwell {
+            scopes.insert(
+                (host.rule_id.clone(), false),
+                scope(
+                    &IpNet::from(host.address).to_string(),
+                    "zc",
+                    Some("drop"),
+                    &nets,
+                ),
+            );
+        }
         for g in &program.games {
             scopes.insert((g.id.clone(), true), scope(&g.dst_cidr, "zc", None, &nets));
         }
@@ -214,6 +225,9 @@ impl Attribution {
         }
         for r in &program.zc {
             ("zc", &r.rule_id, &r.r#match.dst_cidr, r.action.as_str()).hash(&mut h);
+        }
+        for host in &program.blackwell {
+            ("blackwell", &host.rule_id, host.address).hash(&mut h);
         }
         for g in &program.games {
             ("game", &g.id, &g.dst_cidr).hash(&mut h);

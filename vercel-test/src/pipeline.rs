@@ -506,10 +506,19 @@ fn bits(f: &Flow) -> u64 {
     };
     (f.pps.max(0) as u64).saturating_mul((ip + l4 + f.payload.len() as u64) * 8)
 }
+const BLACKWELL_HOLD_MS: i64 = 2_000;
+
+struct Blackwell {
+    config: crate::model::HostBlackhole,
+    meter: Meter,
+    until: i64,
+}
+
 pub struct Pipeline {
     pub program: Program,
     pub model: ml::Model,
     rules: [Vec<Entry>; 3],
+    blackwell: HashMap<IpAddr, Blackwell>,
     /// The protected prefixes, most specific first, with the aggregate each one's floods are
     /// judged over.
     prefixes: Vec<(String, IpNet, Key)>,
@@ -616,6 +625,7 @@ impl Pipeline {
             program: Program::default(),
             model: ml::Model::default(),
             rules: Default::default(),
+            blackwell: Default::default(),
             prefixes: vec![],
             buckets: HashMap::new(),
             last_sweep: 0,
@@ -788,6 +798,25 @@ impl Pipeline {
                     .unwrap_or((stage.into(), [0; 4]));
                 stats.entry(r.id.clone()).or_insert(old);
             }
+        }
+        let mut previous = std::mem::take(&mut self.blackwell);
+        for config in &program.blackwell {
+            let state = previous
+                .remove(&config.address)
+                .filter(|state| &state.config == config)
+                .unwrap_or_else(|| Blackwell {
+                    config: config.clone(),
+                    meter: Meter::default(),
+                    until: i64::MIN,
+                });
+            stats.insert(
+                config.rule_id.clone(),
+                self.rule_stats
+                    .get(&config.rule_id)
+                    .cloned()
+                    .unwrap_or(("zc".into(), [0; 4])),
+            );
+            self.blackwell.insert(config.address, state);
         }
         self.rule_stats = stats;
         let bindings = gamefilter::compile(&program.games).unwrap_or_else(|e| {
@@ -1720,6 +1749,26 @@ impl Pipeline {
             meter.observe(now, pps, bits(f));
             let (pps, bps) = meter.rates(now);
             self.surge = Surge { pps, bps };
+        }
+        if let Some(state) = dst.and_then(|addr| self.blackwell.get_mut(&addr)) {
+            state.meter.observe(now, pps, 0);
+            if state.meter.rates(now).0 >= state.config.max_pps {
+                state.until = now.saturating_add(BLACKWELL_HOLD_MS);
+            }
+            if now < state.until {
+                let id = state.config.rule_id.clone();
+                let dropped = decision(
+                    "drop",
+                    2,
+                    &id,
+                    "Blackwell destination packet-rate threshold",
+                );
+                self.seen(&id, f);
+                self.record(&dropped, Some(&id), f);
+                self.load.observe(now, pps, true);
+                self.loads.entry(owner).or_default().observe(now, pps, true);
+                return dropped;
+            }
         }
         // Without a model there is nothing to score, and nothing to look up for it.
         let tighten = self.ml.tightens() && self.model.usable();

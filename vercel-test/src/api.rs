@@ -468,7 +468,7 @@ impl Api {
     /// only the tunnels allocated to that customer.
     fn tunnel_view(&self, now: DateTime<Utc>, tenant: Option<&str>) -> Value {
         let Some(p) = self.deployed() else {
-            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true}});
+            return json!({"policy_id":null,"version":0,"tunnels":[],"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true,"blackwell_blackhole":true}});
         };
         let nodes = self.store.nodes(now);
         let tunnels: Vec<_> = p
@@ -642,7 +642,7 @@ impl Api {
                 })
             })
             .collect();
-        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true}})
+        json!({"policy_id":p.id,"version":p.version,"tunnels":tunnels,"capabilities":{"dedicated_tunnel_endpoints":true,"standalone_gre":true,"pre_routed_ipv4":true,"gre_port_forward":true,"blackwell_blackhole":true}})
     }
     pub fn reconcile(&mut self, now: DateTime<Utc>, force: bool) -> crate::Result<()> {
         if self.store.data.last_policy_id.is_empty() {
@@ -2108,6 +2108,7 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         asic,
         fpga,
         zc,
+        blackwell,
         announcements,
         games,
         challenge_secret,
@@ -2144,6 +2145,7 @@ fn same_but_stamp(a: &Program, b: &Program) -> bool {
         && *asic == b.asic
         && *fpga == b.fpga
         && *zc == b.zc
+        && *blackwell == b.blackwell
         && *announcements == b.announcements
         && *games == b.games
         && *challenge_secret == b.challenge_secret

@@ -628,6 +628,7 @@ fn the_node_renders_and_reports_everything_it_is_given() {
     let desired = provision::Desired {
         tunnels: program.tunnels.clone(),
         asic: program.asic.clone(),
+        blackwell: program.blackwell.clone(),
         lines: lines.clone(),
         error: String::new(),
     };
@@ -1101,4 +1102,70 @@ fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
             assert!(rows.is_empty(), "{result}");
         }
     }
+}
+
+#[test]
+fn blackwell_blocks_only_the_over_limit_host_and_recovers() {
+    let rule = Rule {
+        id: "bw-example".into(),
+        stage: "zc".into(),
+        action: "drop".into(),
+        r#match: Match {
+            dst_cidr: "203.0.113.10/32".into(),
+            attack_pps: 100,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let host = rule.host_blackhole().unwrap();
+    let program = Program {
+        prefixes: vec!["203.0.113.0/24".into()],
+        blackwell: vec![host],
+        ..Default::default()
+    };
+    let mut pipe = Pipeline::new(program.clone());
+    let target = |pps| udp("192.0.2.2", "203.0.113.10", 4321, pps, &[1]);
+    let neighbor = udp("192.0.2.2", "203.0.113.11", 4321, 140, &[1]);
+    assert_eq!(pipe.decide(&neighbor, 10_000).action, "permit");
+    assert_eq!(pipe.decide(&target(60), 10_001).action, "permit");
+    let dropped = pipe.decide(&target(45), 10_100);
+    assert_eq!(dropped.action, "drop");
+    assert_eq!(dropped.rule_id, rule.id);
+    pipe.load(program);
+    assert_eq!(pipe.decide(&target(1), 11_500).action, "drop");
+    assert_eq!(pipe.decide(&neighbor, 11_501).action, "permit");
+    assert_eq!(pipe.decide(&target(1), 12_101).action, "permit");
+    let mut broad = rule.clone();
+    broad.r#match.dst_cidr = "203.0.113.0/24".into();
+    assert!(broad.host_blackhole().is_none());
+    let mut monitor = rule;
+    monitor.action = "count".into();
+    assert!(monitor.host_blackhole().is_none());
+}
+
+#[test]
+fn blackwell_provisioning_routes_only_assigned_hosts_through_the_blackhole() {
+    let mut desired = provision::Desired::default();
+    desired.tunnels.push(NodeTunnel {
+        prefixes: vec!["203.0.113.0/24".into(), "2001:db8:100::/48".into()],
+        ..Default::default()
+    });
+    desired.blackwell = ["203.0.113.10", "198.51.100.3", "2001:db8:100::9"]
+        .into_iter()
+        .map(|ip| HostBlackhole {
+            address: ip.parse().unwrap(),
+            rule_id: "bw-sample".into(),
+            max_pps: 120,
+        })
+        .collect();
+    let plan = provision::plan(&desired, &Default::default()).unwrap();
+    assert!(plan.nft.contains("203.0.113.10 : jump bw_active4_0"));
+    assert!(plan.nft.contains("2001:db8:100::9 : jump bw_active6_0"));
+    assert!(!plan.nft.contains("198.51.100.3"));
+    assert!(!plan.nft.contains("203.0.113.0/24 :"));
+    assert!(plan
+        .nft
+        .contains("limit rate over 120/second burst 120 packets update @bw_active4"));
+    assert!(plan.nft.contains("ip daddr @bw_active4 counter drop"));
+    assert!(plan.nft.contains("timeout 2s; size 1024"));
 }

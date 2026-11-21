@@ -321,7 +321,7 @@ impl Agent {
                 }
                 json_response(
                     200,
-                    json!({"node":self.node.id,"tunnels":prog.tunnels,"asic":prog.asic,"backhaul":prog.backhaul,"pinned":prog.pinned,"tunnel_peers":prog.tunnel_peers,"iproute2":commands,"status":self.health,"error":err}),
+                    json!({"node":self.node.id,"tunnels":prog.tunnels,"asic":prog.asic,"blackwell":prog.blackwell,"backhaul":prog.backhaul,"pinned":prog.pinned,"tunnel_peers":prog.tunnel_peers,"iproute2":commands,"status":self.health,"error":err}),
                 )
             }
             ("POST", "/tunnels") => {

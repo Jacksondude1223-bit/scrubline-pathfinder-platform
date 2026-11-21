@@ -287,6 +287,9 @@ pub fn policy(p: &Policy) -> Result<()> {
     }
     unique(p.rules.iter().map(|r| r.id.as_str()), "rules")?;
     for r in &p.rules {
+        if r.id.starts_with("bw-") && r.action == "drop" && r.host_blackhole().is_none() {
+            return Err("Blackwell blackholes require an exact protected host and a positive packet-rate threshold".into());
+        }
         if !["asic", "fpga", "zc"].contains(&r.stage.as_str()) {
             return Err(format!("unknown stage {:?}", r.stage));
         }

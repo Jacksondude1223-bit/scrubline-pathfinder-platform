@@ -813,6 +813,43 @@ pub struct ZCEntry {
     pub rule_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostBlackhole {
+    pub address: std::net::IpAddr,
+    pub rule_id: String,
+    pub max_pps: u64,
+}
+
+impl Rule {
+    pub fn host_blackhole(&self) -> Option<HostBlackhole> {
+        if !self.id.starts_with("bw-")
+            || self.stage != "zc"
+            || self.action != "drop"
+            || self.pps != 0
+        {
+            return None;
+        }
+        let net = self.r#match.dst_cidr.parse::<ipnet::IpNet>().ok()?;
+        let pps = self.r#match.attack_pps;
+        if net.prefix_len() != net.max_prefix_len()
+            || !(1..=1_000_000_000).contains(&pps)
+            || self.r#match
+                != (Match {
+                    dst_cidr: self.r#match.dst_cidr.clone(),
+                    attack_pps: pps,
+                    ..Default::default()
+                })
+        {
+            return None;
+        }
+        Some(HostBlackhole {
+            address: net.addr(),
+            rule_id: self.id.clone(),
+            max_pps: pps as u64,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Program {
@@ -830,6 +867,8 @@ pub struct Program {
     pub fpga: Vec<FPGAEntry>,
     #[serde(deserialize_with = "null_default")]
     pub zc: Vec<ZCEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blackwell: Vec<HostBlackhole>,
     #[serde(deserialize_with = "null_default")]
     pub announcements: Vec<Announcement>,
     #[serde(deserialize_with = "null_default", skip_serializing_if = "is_zero")]
@@ -909,6 +948,7 @@ impl Default for Program {
             asic: Vec::new(),
             fpga: Vec::new(),
             zc: Vec::new(),
+            blackwell: Vec::new(),
             announcements: Vec::new(),
             games: Vec::new(),
             challenge_secret: Default::default(),

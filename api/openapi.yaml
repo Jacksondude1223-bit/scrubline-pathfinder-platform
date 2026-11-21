@@ -2371,6 +2371,19 @@ components:
           type: integer
         rule_id:
           type: string
+    HostBlackhole:
+      type: object
+      required: [address, rule_id, max_pps]
+      properties:
+        address:
+          type: string
+          description: Exact IPv4 or IPv6 destination.
+        rule_id:
+          type: string
+        max_pps:
+          type: integer
+          minimum: 1
+          maximum: 1000000000
     Program:
       type: object
       description: What one node installs. Compiled from the policy and the live node set.
@@ -2399,6 +2412,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ZCEntry'
+        blackwell:
+          type: array
+          items:
+            $ref: '#/components/schemas/HostBlackhole'
         announcements:
           type: array
           items:
@@ -4504,6 +4521,8 @@ components:
             pre_routed_ipv4:
               type: boolean
             gre_port_forward:
+              type: boolean
+            blackwell_blackhole:
               type: boolean
             dedicated_tunnel_endpoints:
               type: boolean
