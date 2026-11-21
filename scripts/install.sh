@@ -338,7 +338,7 @@ open_firewalld() {
 	local want=() item
 	# The API's port, unless it listens on loopback only.
 	if has_api && [[ $lhost != 127.* && $lhost != '[::1]' ]]; then want+=("port=$PORT/tcp"); fi
-	if has_node; then want+=(protocol=gre protocol=ipencap); fi
+	if has_node; then want+=(protocol=gre protocol=ipencap port=20000-60000/udp); fi
 	for item in ${want[@]+"${want[@]}"}; do
 		# Open already, whether by an earlier run or by someone else, is left as it is.
 		if firewall-cmd --permanent --query-"$item" >/dev/null 2>&1; then continue; fi
@@ -414,7 +414,7 @@ fi
 # The commands this role uses, then the packages they come in, which differ between families.
 needs=(curl ip)
 if has_api; then needs+=(openssl); fi
-if has_node; then needs+=(tc nft); fi
+if has_node; then needs+=(tc nft wg); fi
 packages_for() {
 	case $1:$2 in
 	*:curl) echo curl ca-certificates ;;
@@ -423,6 +423,7 @@ packages_for() {
 	dnf:tc) echo iproute-tc ;;
 	*:ip | *:tc) echo iproute2 ;;
 	*:nft) echo nftables ;;
+	*:wg) echo wireguard-tools ;;
 	*:openssl) echo openssl ;;
 	esac
 }
@@ -759,10 +760,10 @@ ENV
 
 	# The kernel side of tunnels: GRE and IPIP, forwarding, and reverse-path filtering loose
 	# enough for a customer's replies to come up a tunnel for a prefix this node routes elsewhere.
-	printf 'ip_gre\nipip\n' >"$MODULES"
+	printf 'ip_gre\nipip\nwireguard\n' >"$MODULES"
 	chmod 0644 "$MODULES"
-	if ! { modprobe ip_gre && modprobe ipip; } 2>/dev/null; then
-		warn "could not load the ip_gre and ipip modules now; they load at the next boot"
+	if ! { modprobe ip_gre && modprobe ipip && modprobe wireguard; } 2>/dev/null; then
+		warn "could not load the ip_gre, ipip and wireguard modules now; they load at the next boot"
 	fi
 	{
 		printf '%s\n' "# Written by scripts/install.sh for a Scrubline scrubbing node."
@@ -790,7 +791,7 @@ ENV
 fi
 open_firewalld
 if has_node && command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
-	warn "ufw is active: it must let GRE and IPIP (IP protocols 47 and 4) in from the other nodes and the customers' tunnel ends"
+	warn "ufw is active: allow GRE/IPIP (47/4), and inbound UDP 20000:60000 for WireGuard tunnels"
 fi
 
 # ---------------------------------------------------------------- services
@@ -887,6 +888,8 @@ Restart=always
 RestartSec=5
 # How its last pass went, in $STATUS; gone when it stops.
 RuntimeDirectory=scrubline-provision
+StateDirectory=scrubline-wireguard
+StateDirectoryMode=0700
 MemoryMax=512M
 # It changes interfaces, routes, nftables and qdiscs through netlink, and nothing else.
 CapabilityBoundingSet=CAP_NET_ADMIN

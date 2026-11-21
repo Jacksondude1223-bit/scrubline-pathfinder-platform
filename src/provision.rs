@@ -63,6 +63,7 @@ pub struct Pass {
     pub nft: String,
     ingress: BTreeMap<String, (String, String)>,
     drops: BTreeMap<String, (String, String)>,
+    wireguard: BTreeMap<String, NodeTunnel>,
 }
 
 /// Interfaces the provisioner owns: customer tunnels and node-to-node tunnels.
@@ -314,6 +315,9 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
             {
                 adds.insert(name.to_string(), line);
             }
+            ["ip", "link", "add", name, "type", "wireguard"] if interface(name) => {
+                adds.insert(name.to_string(), line);
+            }
             ["ip", "link", "set", name, "mtu", mtu, "up"]
                 if interface(name)
                     && mtu.parse::<u16>().is_ok_and(|m| (576..=9000).contains(&m)) =>
@@ -369,6 +373,21 @@ pub fn plan(desired: &Desired, observed: &Observed) -> Result<Pass> {
         }
     }
     let mut pass = Pass::default();
+    for t in &desired.tunnels {
+        if t.r#type == "wireguard" {
+            crate::wireguard::validate_options(
+                t.wireguard.as_ref().ok_or("missing wireguard options")?,
+            )?;
+            if t.interface != crate::tunnel::interface_name(&t.id)?
+                || adds
+                    .get(&t.interface)
+                    .is_none_or(|line| !line.ends_with("type wireguard"))
+            {
+                return Err("WireGuard interface does not match rendered configuration".into());
+            }
+            pass.wireguard.insert(t.interface.clone(), t.clone());
+        }
+    }
     // Interfaces the agent no longer asks for, or asks for differently, go first: a tunnel that
     // moved to another remote has to be rebuilt, since the kernel will not retarget one in place.
     let mut rebuilt = BTreeSet::new();
@@ -717,6 +736,31 @@ pub fn apply(
         }
     }
     for s in &pass.steps {
+        if s.link
+            .as_ref()
+            .is_some_and(|link| out.failed.contains_key(link) && pass.wireguard.contains_key(link))
+        {
+            continue;
+        }
+        if s.argv.get(1).is_some_and(|v| v == "link")
+            && s.argv.get(2).is_some_and(|v| v == "set")
+            && s.argv.get(4).is_some_and(|v| v == "mtu")
+        {
+            if let Some(t) = s.link.as_ref().and_then(|name| pass.wireguard.get(name)) {
+                if let Err(e) = crate::wireguard::configure(
+                    r,
+                    t,
+                    std::path::Path::new("/var/lib/scrubline-wireguard"),
+                ) {
+                    let _ = r.run(
+                        &argv(&format!("ip link set dev {} down", t.interface)),
+                        None,
+                    );
+                    out.failed.insert(t.interface.clone(), e);
+                    continue;
+                }
+            }
+        }
         if let Err(e) = r.run(&s.argv, None) {
             match &s.link {
                 Some(link) => {

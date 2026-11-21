@@ -6,7 +6,9 @@ use std::{
     net::Ipv4Addr,
 };
 pub fn overhead(t: &Tunnel) -> i64 {
-    if t.r#type == "ipip" {
+    if t.r#type == "wireguard" {
+        60
+    } else if t.r#type == "ipip" {
         20
     } else {
         24 + if t.key == 0 { 0 } else { 4 }
@@ -58,7 +60,11 @@ pub fn backhaul_name(peer: &str) -> String {
     )
 }
 pub fn default_mtu(t: &Tunnel) -> i64 {
-    1500 - overhead(t)
+    if t.r#type == "wireguard" {
+        1420
+    } else {
+        1500 - overhead(t)
+    }
 }
 pub fn mss_for(mtu: i64) -> i64 {
     (mtu - 40).max(0)
@@ -94,7 +100,7 @@ pub fn gre_counter_target(tunnel: &NodeTunnel) -> Option<(&str, &str)> {
     let [prefix] = tunnel.prefixes.as_slice() else {
         return None;
     };
-    if tunnel.r#type != "gre"
+    if !matches!(tunnel.r#type.as_str(), "gre" | "wireguard")
         || !matches!(prefix.parse::<ipnet::Ipv4Net>(), Ok(net) if net.prefix_len() == 32)
         || interface_name(&tunnel.id).ok().as_deref() != Some(&tunnel.interface)
     {
@@ -117,8 +123,12 @@ pub fn interface_name(id: &str) -> Result<String> {
 }
 pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     validate_id(&t.id)?;
+    if t.r#type != "wireguard" && t.wireguard.is_some() {
+        return Err("wireguard options require the wireguard transport".into());
+    }
     match t.r#type.as_str() {
         "" | "gre" => {}
+        "wireguard" => crate::wireguard::validate(t)?,
         "ipip" if t.key == 0 => {}
         "ipip" => return Err("ipip carries no key".into()),
         _ => return Err("unknown tunnel type".into()),
@@ -152,8 +162,15 @@ pub fn validate(t: &Tunnel, protected: Option<&HashSet<String>>) -> Result<()> {
     {
         return Err("disabled must list distinct node ids".into());
     }
-    let remote = t.remote.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
-    if remote.is_unspecified() || remote.is_multicast() || remote.is_loopback() {
+    let remote = if t.r#type == "wireguard" && t.remote.is_empty() {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        t.remote.parse::<Ipv4Addr>().map_err(|e| e.to_string())?
+    };
+    if (remote.is_unspecified() && t.r#type != "wireguard")
+        || remote.is_multicast()
+        || remote.is_loopback()
+    {
         return Err("remote is not a usable endpoint".into());
     }
     if !t.local.is_empty() {
@@ -253,6 +270,7 @@ pub fn for_node(t: &Tunnel, n: &Node, prefixes: &[String]) -> Result<NodeTunnel>
     };
     Ok(NodeTunnel {
         id: t.id.clone(),
+        wireguard: t.wireguard.clone(),
         r#type: if t.r#type.is_empty() {
             "gre".into()
         } else {
@@ -609,11 +627,15 @@ pub fn commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
             return Err("interface does not match the tunnel id".into());
         }
         let local = t.local.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
-        let remote = t.remote.parse::<Ipv4Addr>().map_err(|e| e.to_string())?;
+        let remote = if t.r#type == "wireguard" && t.remote.is_empty() {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            t.remote.parse::<Ipv4Addr>().map_err(|e| e.to_string())?
+        };
         if local == remote {
             return Err("local and remote endpoints are the same".into());
         }
-        if t.r#type != "gre" && t.r#type != "ipip" {
+        if t.r#type != "gre" && t.r#type != "ipip" && t.r#type != "wireguard" {
             return Err("unknown tunnel type".into());
         }
         if t.r#type == "ipip" && t.key != 0 {
@@ -636,10 +658,17 @@ pub fn commands(tunnels: &[NodeTunnel]) -> Result<Vec<String>> {
         } else {
             format!(" key {}", t.key)
         };
-        lines.push(format!(
-            "ip link add {name} type {} local {local} remote {remote}{key}",
-            t.r#type
-        ));
+        if t.r#type == "wireguard" {
+            crate::wireguard::validate_options(
+                t.wireguard.as_ref().ok_or("missing wireguard options")?,
+            )?;
+            lines.push(format!("ip link add {name} type wireguard"));
+        } else {
+            lines.push(format!(
+                "ip link add {name} type {} local {local} remote {remote}{key}",
+                t.r#type
+            ));
+        }
         lines.push(format!("ip link set {name} mtu {} up", t.mtu));
         let mut prefixes = t.prefixes.clone();
         if let Some(forward) = &t.port_forward {

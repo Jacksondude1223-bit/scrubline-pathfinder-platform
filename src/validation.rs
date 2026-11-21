@@ -158,8 +158,14 @@ pub fn policy(p: &Policy) -> Result<()> {
     let mut ends = HashMap::new();
     let mut dedicated = HashSet::new();
     let mut forwarding_backends = HashSet::new();
+    let mut wireguard_ports = HashSet::new();
     for t in &p.tunnels {
         tunnel::validate(t, Some(&protected))?;
+        if let Some(wg) = &t.wireguard {
+            if !wireguard_ports.insert((&t.node, wg.listen_port)) {
+                return Err("WireGuard listen ports must be unique on each node".into());
+            }
+        }
         if let Some(forward) = &t.port_forward {
             if !forwarding_backends.insert(forward.backend)
                 || p.protected.iter().any(|prefix| {
@@ -208,7 +214,18 @@ pub fn policy(p: &Policy) -> Result<()> {
         } else {
             t.r#type.as_str()
         };
-        if let Some(other) = ends.insert((kind, t.remote.as_str(), t.key), t.id.as_str()) {
+        if let Some(other) = ends.insert(
+            (
+                kind,
+                if kind == "wireguard" {
+                    t.id.as_str()
+                } else {
+                    t.remote.as_str()
+                },
+                t.key,
+            ),
+            t.id.as_str(),
+        ) {
             return Err(format!(
                 "tunnels {other} and {} both run {kind} to {} with key {}; give one a distinct key",
                 t.id, t.remote, t.key

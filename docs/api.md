@@ -1603,3 +1603,65 @@ openapi-generator-cli generate -i api/openapi.yaml -g go -o ./client
 `make spec-check` verifies that every `$ref` resolves, every operation declares
 responses and security, and — the part that matters — that the documented routes
 match the dispatch switch in the code exactly, in both directions.
+
+### WireGuard clean traffic delivery
+
+Set a return tunnel's `type` to `wireguard` to use an authenticated UDP transport,
+including when the customer's server is behind NAT. This changes the transport;
+it does not redirect traffic sent to the customer's existing provider IP. Visitors
+connect to an Orbitel-assigned protected address, or an address in the customer's
+BGP prefixes, and clean packets travel down the tunnel. Replies sourced from those
+addresses return through the same tunnel.
+
+Example tunnel inside a policy that protects `203.0.113.10/32`:
+
+```json
+{
+  "id": "wg-client",
+  "type": "wireguard",
+  "node": "buffalo",
+  "local": "192.0.2.20",
+  "remote": "",
+  "prefixes": ["203.0.113.10/32"],
+  "wireguard": {
+    "public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+    "listen_port": 20000
+  },
+  "required": true
+}
+```
+
+Use the customer's actual public key. A WireGuard tunnel requires a pinned node,
+a unique UDP listen port on that node, no GRE key, and bidirectional delivery.
+Port forwarding mode is unavailable for this transport. `remote` can be empty:
+the customer initiates the connection, and WireGuard learns the authenticated
+endpoint, including its NAT mapping. The default MTU is 1420.
+
+The provisioner generates and retains each node-side private key in
+`/var/lib/scrubline-wireguard`, with directory mode 0700 and key mode 0600. It never
+sends private keys to the agent, control plane or panel. Include this directory in
+secure node backups; deleting its keys requires updating customer peer public keys.
+`GET /v1/tunnels` advertises `capabilities.wireguard`. Each tunnel includes public
+peer settings in `wireguard`. Its node reports include
+`wireguard: { public_key, listen_port, latest_handshake }`, exposing the node's
+public key and the latest authenticated handshake's Unix timestamp. A configured
+interface reports down until it has a handshake within the last 180 seconds.
+
+The customer's peer must use the node public key and endpoint, accept public
+source addresses with `AllowedIPs = 0.0.0.0/0, ::/0`, and use
+`PersistentKeepalive = 25`. On Linux, `Table = off` and source routing rules send
+only replies from protected addresses through the tunnel. Keep the ordinary
+provider default route for the outer encrypted connection. On the node,
+`AllowedIPs` is restricted to the customer's carried source prefixes and the
+existing return-path firewall continues to reject other tenants' sources.
+
+Update the API, node agent and provisioner before enabling this transport. Rerun
+`scripts/install.sh` to install `wireguard-tools`, load the kernel module, and
+create the provisioner's writable key directory. The installer opens UDP
+20000-60000 in firewalld for panel allocations. If another host or upstream
+firewall is active, allow the actual allocated UDP ports. Other API-selected
+listen ports need matching firewall rules. Node kernel WireGuard support is
+required.
+
+See the [WireGuard quick start](https://www.wireguard.com/quickstart/) for key
+management and NAT keepalives.

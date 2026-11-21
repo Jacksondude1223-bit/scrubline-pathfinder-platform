@@ -573,7 +573,12 @@ fn tunnel_peers(nodes: &[Node], n: &Node, tunnels: &[NodeTunnel]) -> Vec<String>
         .iter()
         .filter(|v| v.id != n.id && !v.tunnel_src.is_empty() && v.tunnel_src != n.tunnel_src)
         .map(|v| v.tunnel_src.clone())
-        .chain(tunnels.iter().map(|t| t.remote.clone()))
+        .chain(
+            tunnels
+                .iter()
+                .filter(|t| t.r#type != "wireguard")
+                .map(|t| t.remote.clone()),
+        )
         .collect();
     out.sort();
     out.dedup();

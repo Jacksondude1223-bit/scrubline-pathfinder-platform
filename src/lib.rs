@@ -28,3 +28,4 @@ pub mod telemetry;
 pub mod tuning;
 pub mod validation;
 pub mod wire;
+pub mod wireguard;

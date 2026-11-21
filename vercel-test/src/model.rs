@@ -982,7 +982,16 @@ impl Default for Program {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
+pub struct WireGuard {
+    pub public_key: String,
+    pub listen_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct NodeTunnel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wireguard: Option<WireGuard>,
     #[serde(deserialize_with = "null_default")]
     pub id: String,
     #[serde(deserialize_with = "null_default")]
@@ -1223,6 +1232,8 @@ pub struct PortForward {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Tunnel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wireguard: Option<WireGuard>,
     #[serde(deserialize_with = "null_default")]
     pub id: String,
     #[serde(deserialize_with = "null_default")]
@@ -1359,6 +1370,8 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TunnelStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wireguard: Option<WireGuardStatus>,
     #[serde(deserialize_with = "null_default")]
     pub tunnel_id: String,
     #[serde(deserialize_with = "null_default")]
@@ -1370,6 +1383,13 @@ pub struct TunnelStatus {
     #[serde(deserialize_with = "null_time")]
     pub reported_at: DateTime<Utc>,
 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WireGuardStatus {
+    pub public_key: String,
+    pub listen_port: u16,
+    pub latest_handshake: u64,
+}
 impl Default for TunnelStatus {
     fn default() -> Self {
         Self {
@@ -1377,6 +1397,7 @@ impl Default for TunnelStatus {
             state: Default::default(),
             detail: Default::default(),
             reported_at: zero_time(),
+            wireguard: None,
         }
     }
 }
