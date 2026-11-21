@@ -1064,6 +1064,37 @@ paths:
           type: string
         description: Interval per point. Rounded up to the resolution, and defaulted to about 120 points
           across the window. Points are aligned to the step, so two reads of the same dashboard line up.
+  /v1/analytics/discovered-ports:
+    get:
+      summary: Service ports confirmed from recent traffic
+      tags:
+      - Analytics
+      security: *id008
+      responses:
+        '200':
+          description: Confirmed ports within the credential's protected destinations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ports]
+                properties:
+                  ports:
+                    type: array
+                    maxItems: 1024
+                    items:
+                      type: object
+                      required: [destination, port, transport, protocol, first_seen_ms, last_seen_ms, confirmations]
+                      properties:
+                        destination: {type: string, description: Exact IPv4 or IPv6 host CIDR.}
+                        port: {type: integer, minimum: 1, maximum: 65535}
+                        transport: {type: string, enum: [tcp, udp]}
+                        protocol: {type: string, enum: [unknown, a2s, raknet]}
+                        first_seen_ms: {type: integer}
+                        last_seen_ms: {type: integer}
+                        confirmations: {type: integer}
+        '401': *id002
+        '403': *id003
   /v1/analytics/events:
     get:
       summary: The attacks a prefix has been under

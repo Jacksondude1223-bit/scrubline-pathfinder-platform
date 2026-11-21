@@ -2010,6 +2010,17 @@ The policy still decides what the fabric defends — otherwise a peer that
 leaked a supernet would have you announcing address space nobody asked you to
 protect, on the say-so of the peer.
 
+## Automatic port learning
+
+When the same Pathfinder node receives inbound traffic through `/decide` and origin replies through
+`/egress`, it passively learns ports after two matching exchanges. TCP discovery pairs SYN and
+SYN-ACK. UDP discovery recognizes paired Steam A2S and RakNet payloads and lists other responding
+ports as unclassified.
+
+`GET /v1/analytics/discovered-ports` reports the last hour of confirmed entries scoped to the
+tenant's protected addresses. It reports destination addresses, port, protocol, observation times,
+and counts. Deployments using interface counters alone need an inbound and return packet or flow feed.
+
 ## Customer analytics
 
 Observability above is for the people running the fabric. This is for the

@@ -541,6 +541,7 @@ pub struct Pipeline {
     watches: Vec<Watch>,
     watched: HashMap<String, usize>,
     returns: [u64; 3],
+    discovery: crate::discovery::Discovery,
     games: gamefilter::Engine,
     pulses: Pulse,
     pub reputation: Reputation,
@@ -632,6 +633,7 @@ impl Pipeline {
             watches: Vec::new(),
             watched: HashMap::new(),
             returns: [0; 3],
+            discovery: Default::default(),
             games: Default::default(),
             pulses: Default::default(),
             reputation: Reputation::default(),
@@ -709,6 +711,7 @@ impl Pipeline {
         }
         self.pulses.forget(&live);
         self.egress.forget(&live);
+        self.discovery.forget(&self.prefixes);
         self.ack_flood.load(&kept);
         self.syn_flood.load(&kept);
         self.icmp.load(&kept);
@@ -1748,6 +1751,7 @@ impl Pipeline {
             c[1] = c[1].saturating_add(pps);
             return d;
         }
+        self.discovery.request(f, now);
         if let Some(i) = idle {
             let d = self.watch_only(f, now, i);
             self.probed(&owner, now);
@@ -1863,6 +1867,7 @@ impl Pipeline {
                 .map(|(s, _, _)| s.clone())
         });
         if let Some(prefix) = prefix {
+            self.discovery.reply(f, now);
             self.returns[0] += 1;
             // Every confirmation renews trust, not only the first: a client the origin keeps
             // answering would otherwise lose its fast path five minutes into the conversation.
@@ -2022,6 +2027,6 @@ impl Pipeline {
         let base = self.settings[0].clone();
         let crafted = json!({"mode":base.crafted.mode.name(),"dropped":self.crafted.dropped.iter().sum::<u64>(),"observed":self.crafted.observed.iter().sum::<u64>(),"fragments":self.crafted.fragments.len(),"fragments_max":packet::FRAGMENTS_MAX,"fragments_untracked":self.crafted.fragments.untracked,"checks":checks});
         let mitigation:Vec<_>=self.watches.iter().map(|w|{let(pps,bps)=w.meter.rates(now);let active=w.active(now);json!({"tunnel_id":w.tunnel,"active":active,"since":w.since.filter(|_|active).map(crate::analytics::stamp),"pps":pps,"bps":bps,"attack_pps":w.attack_pps,"attack_bps":w.attack_bps,"wave":w.wave,"hold_seconds":w.hold()/1000,"mitigations":w.mitigations,"unfiltered":w.unfiltered})}).collect();
-        json!({"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"game_http_pending":self.games.pending().0,"game_http_pending_max":crate::httpfilter::PENDING_MAX,"game_http_pending_untracked":self.games.pending().1,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(&base.reflection,&self.global.custom,now),"protocols":self.protocols.stats(&base.protocols),"ack_flood":self.ack_flood.stats(&base.ack,now),"syn_flood":self.syn_flood.stats(&base.syn,now),"fragments":self.fragments.stats(&base.fragments),"icmp":self.icmp.stats(&base.icmp,now),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
+        json!({"discovered_ports":self.discovery.report(now),"decisions":self.decisions,"unowned":self.unowned,"stages":stages,"rules":rules,"games":if games.is_empty(){Value::Null}else{json!(games)},"prefixes":if prefixes.is_empty(){Value::Null}else{json!(prefixes)},"ml":{"ready":self.model.ready,"scored":self.ml_counts[0],"drops":self.ml_counts[1],"passes":self.ml_counts[2],"observed":self.ml_counts[3],"http_ready":self.model.http.as_ref().is_some_and(|h|h.ready),"http_scored":self.http_counts[0],"http_drops":self.http_counts[1],"http_observed":self.http_counts[2],"scope":if self.ml.everywhere(){"all"}else{"inspect"},"mode":if self.ml.enforcing(){"enforce"}else{"observe"},"probing":if tighten{"tighten"}else{"ignore"},"near_misses":self.probe_counts[0],"tightened":self.probe_counts[1]},"pulsing":pulsing,"pulse_peak_pps":peak,"game_sessions":self.games.sessions(),"game_sessions_max":65536,"game_http_windows":self.games.windows(),"game_http_windows_max":crate::httpfilter::WINDOWS_MAX,"game_http_pending":self.games.pending().0,"game_http_pending_max":crate::httpfilter::PENDING_MAX,"game_http_pending_untracked":self.games.pending().1,"reputation":self.reputation.stats(now),"egress":egress,"rate_buckets":self.buckets.len(),"rate_buckets_max":65536,"offered_pps":o,"dropped_pps":d,"surge_pps":self.load.surge(now),"load_window_seconds":10,"crafted":crafted,"reflection":self.reflection.stats(&base.reflection,&self.global.custom,now),"protocols":self.protocols.stats(&base.protocols),"ack_flood":self.ack_flood.stats(&base.ack,now),"syn_flood":self.syn_flood.stats(&base.syn,now),"fragments":self.fragments.stats(&base.fragments),"icmp":self.icmp.stats(&base.icmp,now),"mitigation":if mitigation.is_empty(){Value::Null}else{json!(mitigation)}})
     }
 }
