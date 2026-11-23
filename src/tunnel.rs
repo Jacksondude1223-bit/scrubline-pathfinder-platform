@@ -601,7 +601,12 @@ pub fn render(prog: &Program) -> Result<Vec<String>> {
     // plane says: one from before the list existed sends none, and that is no reason to cut
     // this node's customers off.
     let mut peers = prog.tunnel_peers.clone();
-    peers.extend(prog.tunnels.iter().map(|t| t.remote.clone()));
+    peers.extend(
+        prog.tunnels
+            .iter()
+            .filter(|t| t.r#type != "wireguard")
+            .map(|t| t.remote.clone()),
+    );
     peers.extend(prog.backhaul.iter().map(|b| b.remote.clone()));
     lines.extend(firewall_commands(&peers)?);
     lines.extend(rate_commands(&prog.tunnels)?);
