@@ -173,3 +173,44 @@ fn reported_up_requires_a_recent_authenticated_handshake_and_exposes_only_public
     wireguard::report(&mut fake, &d, &mut report);
     assert_eq!(report["tunnels"][0]["state"], "down");
 }
+
+#[test]
+fn full_node_renderer_accepts_wireguard_before_first_handshake() {
+    let t = node_tunnel();
+    assert!(t.remote.is_empty());
+    let program = Program {
+        tunnels: vec![t.clone()],
+        ..Default::default()
+    };
+    let lines = tunnel::render(&program).unwrap();
+    assert!(lines
+        .iter()
+        .any(|line| line == "ip link add scr-wg1 type wireguard"));
+    assert!(lines
+        .iter()
+        .any(|line| line == "nft add rule inet scrubline input meta l4proto { 47, 4 } drop"));
+    let desired = Desired {
+        lines,
+        tunnels: vec![t],
+        ..Default::default()
+    };
+    assert!(provision::plan(&desired, &Observed::default()).is_ok());
+}
+
+#[test]
+fn wireguard_endpoints_do_not_become_gre_firewall_peers() {
+    let mut t = node_tunnel();
+    t.remote = "198.51.100.99".into();
+    let program = Program {
+        tunnels: vec![t],
+        tunnel_peers: vec!["198.51.100.10".into()],
+        ..Default::default()
+    };
+    let lines = tunnel::render(&program).unwrap();
+    let firewall = lines
+        .iter()
+        .find(|line| line.contains("meta l4proto { 47, 4 } ip saddr"))
+        .unwrap();
+    assert!(firewall.contains("198.51.100.10"));
+    assert!(!firewall.contains("198.51.100.99"));
+}
