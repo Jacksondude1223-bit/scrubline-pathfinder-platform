@@ -2013,7 +2013,7 @@ protect, on the say-so of the peer.
 ## Automatic port learning
 
 When the same Pathfinder node receives inbound traffic through `/decide` and origin replies through
-`/egress`, it passively learns ports after two matching exchanges. TCP discovery pairs SYN and
+`/egress`, it passively learns ports after the first matching request and reply. TCP discovery pairs SYN and
 SYN-ACK. UDP discovery recognizes paired Steam A2S and RakNet payloads and lists other responding
 ports as unclassified.
 

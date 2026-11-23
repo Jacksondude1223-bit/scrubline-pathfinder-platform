@@ -1071,10 +1071,8 @@ fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
     };
     pipe.observe_return(&response, at);
     assert_eq!(pipe.stats(at)["discovered_ports"], json!([]));
-    for time in [at + 1, at + 1000] {
-        pipe.decide(&request, time);
-        pipe.observe_return(&response, time + 1);
-    }
+    pipe.decide(&request, at + 1);
+    pipe.observe_return(&response, at + 2);
     fabric.heartbeat(pipe.stats(at + 2000), Value::Null);
     for (index, (_, id)) in fabric.tenants.iter().enumerate() {
         let (_, issued) = call(
@@ -1098,6 +1096,7 @@ fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
             assert_eq!(rows[0]["destination"], "203.0.113.10/32");
             assert_eq!(rows[0]["port"], 27016);
             assert_eq!(rows[0]["protocol"], "a2s");
+            assert_eq!(rows[0]["confirmations"], 1);
         } else {
             assert!(rows.is_empty(), "{result}");
         }
