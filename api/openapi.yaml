@@ -3394,6 +3394,22 @@ components:
       description: A node's datapath counters. Most are monotonic totals; the fields documented as rates
         are moving averages.
       properties:
+        discovery_capture:
+          type: object
+          description: Passive discovery capture status by configured tunnel interface. Absent for older nodes, empty when disabled. This does not assert inline enforcement.
+          maxProperties: 16
+          additionalProperties:
+            type: object
+            properties:
+              active: {type: boolean}
+              packets: {type: integer, minimum: 0}
+              observed: {type: integer, minimum: 0}
+              invalid: {type: integer, minimum: 0}
+              ignored: {type: integer, minimum: 0}
+              busy: {type: integer, minimum: 0}
+              kernel_dropped: {type: integer, minimum: 0}
+              last_packet_ms: {type: integer, nullable: true}
+              error: {type: string, nullable: true}
         decisions:
           type: integer
         unowned:

@@ -99,6 +99,7 @@ pub struct Agent {
     surge: Arc<tokio::sync::Notify>,
     surging: bool,
     mitigations: u64,
+    discovery_capture: BTreeMap<String, crate::discovery_capture::Status>,
 }
 type Shared = Arc<Mutex<Agent>>;
 /// The agent, even after a request panicked while holding it. The control plane's state is
@@ -245,6 +246,7 @@ impl Agent {
     /// The datapath's counters, and what this process holds in memory.
     fn stats(&mut self, now: i64) -> Value {
         let mut stats = self.pipe.stats(now);
+        stats["discovery_capture"] = json!(self.discovery_capture);
         if now - self.ingress.1 <= 15_000 && !self.ingress.0.is_empty() {
             stats["ingress_counters"] = json!(self.ingress.0);
         }
@@ -612,6 +614,99 @@ fn gre_counters(targets: &[(String, String)]) -> Vec<crate::wire::GreCounter> {
         .collect()
 }
 
+fn idle_agent(state: &Shared) -> Option<MutexGuard<'_, Agent>> {
+    match state.try_lock() {
+        Ok(agent) => Some(agent),
+        Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+async fn capture_discovery(state: Shared, interface: String) {
+    use crate::discovery_capture::{Socket, Status, BATCH, PACKET_MAX};
+    let mut status = Status::default();
+    let mut bytes = vec![0u8; PACKET_MAX];
+    let mut socket: Option<Socket> = None;
+    let mut refresh_in = 0u8;
+    let mut timer = tokio::time::interval(Duration::from_millis(100));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { _ = timer.tick() => {}, _ = runtime::stopping() => return }
+        if refresh_in == 0 {
+            refresh_in = 20;
+            if socket.as_ref().is_some_and(|s| !s.current(&interface)) {
+                socket = None;
+            }
+            if socket.is_none() {
+                match Socket::open(&interface) {
+                    Ok(opened) => {
+                        socket = Some(opened);
+                        status.error = None;
+                    }
+                    Err(error) => {
+                        status.error = Some(error.to_string());
+                    }
+                }
+            }
+            status.active = socket.is_some();
+            if let Some(s) = &socket {
+                match s.dropped() {
+                    Ok(dropped) => {
+                        status.kernel_dropped = status.kernel_dropped.saturating_add(dropped)
+                    }
+                    Err(error) => status.error = Some(error.to_string()),
+                }
+            }
+        }
+        refresh_in -= 1;
+        if let Some(s) = &socket {
+            for _ in 0..BATCH {
+                match s.receive(&mut bytes) {
+                    Ok(Some((length, direction))) => {
+                        status.packets = status.packets.saturating_add(1);
+                        let now = chrono::Utc::now().timestamp_millis();
+                        status.last_packet_ms = Some(now);
+                        if length > bytes.len() {
+                            status.invalid = status.invalid.saturating_add(1);
+                            continue;
+                        }
+                        let Some(direction) = direction else {
+                            status.ignored = status.ignored.saturating_add(1);
+                            continue;
+                        };
+                        if let Some(mut agent) = idle_agent(&state) {
+                            match agent.pipe.observe_discovery_packet(
+                                &interface,
+                                direction,
+                                &bytes[..length],
+                                now,
+                            ) {
+                                Some(true) => status.observed = status.observed.saturating_add(1),
+                                Some(false) => status.ignored = status.ignored.saturating_add(1),
+                                None => status.invalid = status.invalid.saturating_add(1),
+                            }
+                        } else {
+                            status.busy = status.busy.saturating_add(1);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        status.active = false;
+                        status.error = Some(error.to_string());
+                        socket = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(mut agent) = idle_agent(&state) {
+            agent
+                .discovery_capture
+                .insert(interface.clone(), status.clone());
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     let f = Flags::parse(&[
         ("api", "http://127.0.0.1:8080"),
@@ -628,7 +723,12 @@ pub async fn run() -> Result<()> {
         ("tls-key", ""),
         ("ca", ""),
         ("insecure", "false"),
+        ("discovery-interfaces", ""),
     ])?;
+    let discovery_interfaces = crate::discovery_capture::interfaces(f.get("discovery-interfaces"))?;
+    if !cfg!(target_os = "linux") && !discovery_interfaces.is_empty() {
+        return Err("discovery capture requires Linux".into());
+    }
     let enroll_token = runtime::required_env("SCRUBLINE_ENROLL_TOKEN")?;
     let local_token = runtime::required_env("SCRUBLINE_NODE_API_TOKEN")?;
     let api = f.get("api").trim_end_matches('/').to_owned();
@@ -709,7 +809,14 @@ pub async fn run() -> Result<()> {
         surge: surge.clone(),
         surging: false,
         mitigations: 0,
+        discovery_capture: discovery_interfaces
+            .iter()
+            .map(|name| (name.clone(), Default::default()))
+            .collect(),
     }));
+    for interface in discovery_interfaces {
+        tokio::spawn(capture_discovery(state.clone(), interface));
+    }
     let waiting = runtime::client(f.get("ca"), PROGRAM_WAIT + Duration::from_secs(10))?;
     tokio::spawn(programs(state.clone(), waiting, api.clone()));
     let s = state.clone();
@@ -863,6 +970,7 @@ mod tests {
             surge: Arc::new(tokio::sync::Notify::new()),
             surging: false,
             mitigations: 0,
+            discovery_capture: BTreeMap::new(),
         }
     }
     fn row(prefix: &str, prepends: i64) -> Announcement {
@@ -1105,5 +1213,69 @@ mod tests {
                 "tc qdisc replace dev scr-northwind parent 1:1 handle 10: fq_codel memory_limit 10416662",
             ]
         );
+    }
+    #[tokio::test]
+    async fn missing_capture_interfaces_are_reported_without_stopping_the_agent() {
+        let state = Arc::new(Mutex::new(agent(Vec::new())));
+        let task = tokio::spawn(capture_discovery(state.clone(), "scr-absent-test".into()));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let agent = locked(&state);
+            let status = agent.discovery_capture.get("scr-absent-test").unwrap();
+            assert!(!status.active);
+            assert!(status.error.is_some());
+            assert_eq!(status.observed, 0);
+        }
+        task.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires an isolated network namespace with documentation addresses on lo"]
+    async fn capture_task_feeds_real_packets_and_reports_status() {
+        use crate::model::NodeTunnel;
+        use std::net::UdpSocket;
+        let mut fixture = agent(Vec::new());
+        fixture.pipe = Pipeline::new(Program {
+            prefixes: vec!["203.0.113.10/32".into()],
+            tunnels: vec![NodeTunnel {
+                interface: "lo".into(),
+                prefixes: vec!["203.0.113.10/32".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let state = Arc::new(Mutex::new(fixture));
+        let task = tokio::spawn(capture_discovery(state.clone(), "lo".into()));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(locked(&state).discovery_capture["lo"].active);
+        let client = UdpSocket::bind("192.0.2.10:0").unwrap();
+        let server = UdpSocket::bind("203.0.113.10:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut buffer = [0u8; 128];
+        for _ in 0..2 {
+            client
+                .send_to(
+                    b"\xff\xff\xff\xffTSource Engine Query\0",
+                    server.local_addr().unwrap(),
+                )
+                .unwrap();
+            let (_, from) = server.recv_from(&mut buffer).unwrap();
+            server.send_to(b"\xff\xff\xff\xffA1234", from).unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let stats = locked(&state).stats(chrono::Utc::now().timestamp_millis());
+        assert_eq!(stats["discovered_ports"][0]["protocol"], "a2s");
+        assert_eq!(stats["discovered_ports"][0]["confirmations"], 2);
+        assert!(
+            stats["discovery_capture"]["lo"]["observed"]
+                .as_u64()
+                .unwrap()
+                >= 4
+        );
+        assert_eq!(stats["decisions"], 0);
+        task.abort();
     }
 }

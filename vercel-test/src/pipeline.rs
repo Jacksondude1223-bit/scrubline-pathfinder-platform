@@ -1908,6 +1908,41 @@ impl Pipeline {
                 u64::from(p.observe(now, self.scoring.near, tighten, hold, min));
         }
     }
+    pub fn observe_discovery_packet(
+        &mut self,
+        interface: &str,
+        direction: crate::discovery_capture::Direction,
+        bytes: &[u8],
+        now: i64,
+    ) -> Option<bool> {
+        let flow = crate::discovery_capture::flow(bytes)?;
+        let address = match direction {
+            crate::discovery_capture::Direction::ToOrigin => &flow.dst_ip,
+            crate::discovery_capture::Direction::FromOrigin => &flow.src_ip,
+        }
+        .parse::<std::net::IpAddr>()
+        .ok()?;
+        let owned = self
+            .prefixes
+            .iter()
+            .any(|(_, prefix, _)| prefix.contains(&address));
+        let assigned = self.program.tunnels.iter().any(|tunnel| {
+            tunnel.interface == interface
+                && tunnel.prefixes.iter().any(|prefix| {
+                    prefix
+                        .parse::<ipnet::IpNet>()
+                        .is_ok_and(|net| net.contains(&address))
+                })
+        });
+        if !owned || !assigned {
+            return Some(false);
+        }
+        match direction {
+            crate::discovery_capture::Direction::ToOrigin => self.discovery.request(&flow, now),
+            crate::discovery_capture::Direction::FromOrigin => self.discovery.reply(&flow, now),
+        }
+        Some(true)
+    }
     pub fn observe_return(&mut self, f: &Flow, now: i64) {
         let prefix = f.src_ip.parse::<IpAddr>().ok().and_then(|a| {
             self.prefixes

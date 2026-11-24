@@ -94,6 +94,9 @@ pub struct DiscoveredPort {
 #[serde(default)]
 pub struct Stats {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_capture:
+        Option<std::collections::BTreeMap<String, crate::discovery_capture::Status>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub discovered_ports: Option<Vec<DiscoveredPort>>,
     #[serde(deserialize_with = "null_default")]
     pub decisions: u64,
@@ -187,6 +190,7 @@ impl Stats {
     /// Stats is not left out of the summary without a decision.
     pub fn summary(&self) -> Self {
         let Self {
+            discovery_capture: _,
             discovered_ports: _,
             decisions,
             unowned,
@@ -234,6 +238,7 @@ impl Stats {
             prefix_states: _,
         } = egress;
         Self {
+            discovery_capture: None,
             discovered_ports: None,
             decisions: *decisions,
             unowned: *unowned,

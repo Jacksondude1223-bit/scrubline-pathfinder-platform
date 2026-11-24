@@ -13,6 +13,7 @@ pub mod transport;
 pub mod analytics;
 pub mod api;
 pub mod discovery;
+pub mod discovery_capture;
 pub mod gamefilter;
 pub mod guards;
 pub mod httpfilter;
