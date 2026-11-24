@@ -865,8 +865,11 @@ LimitNOFILE=65536
 MemoryHigh=1536M
 MemoryMax=2G
 OOMScoreAdjust=-500
-CapabilityBoundingSet=
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Live protocol discovery (-discovery-interfaces) reads tunnel packets from an AF_PACKET socket,
+# which needs CAP_NET_RAW; without both the socket is refused and discovery never sees a packet.
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
 MemoryDenyWriteExecute=yes
 $HARDENING
 

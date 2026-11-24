@@ -4,7 +4,7 @@ The node can observe packets actually crossing configured Linux tunnel interface
 
 ## Configuration
 
-Start scrub-node with `-discovery-interfaces scr-example`. Multiple exact interface names can be separated by commas, up to 16. Capture is disabled when the flag is absent. The observer needs Linux and CAP_NET_RAW, normally supplied by the existing root-run node service. No promiscuous mode, firewall rule, route or packet queue is installed.
+Start scrub-node with `-discovery-interfaces scr-example`. Multiple exact interface names can be separated by commas, up to 16. Capture is disabled when the flag is absent. The observer needs Linux, CAP_NET_RAW and the AF_PACKET address family. The scrubline-node unit written by scripts/install.sh grants both; a node installed before that change must rerun the installer (or add `AmbientCapabilities=CAP_NET_RAW`, `CapabilityBoundingSet=CAP_NET_RAW` and `AF_PACKET` to `RestrictAddressFamilies` in a drop-in), otherwise capture status shows `active: false` with an "Address family not supported" or permission error. No promiscuous mode, firewall rule, route or packet queue is installed.
 
 Use only the interfaces rendered for this node's current protected tunnels. The pipeline accepts a packet only when its protected source or destination belongs both to the compiled node prefixes and to the specified interface's tunnel assignment. Unknown interfaces, removed assignments and other addresses do not contribute discoveries. Interface deletion/recreation is checked every two seconds and opens a new socket for the new interface index. A missing interface or permission failure remains visible in status while the node retries; forwarding is unaffected.
 
