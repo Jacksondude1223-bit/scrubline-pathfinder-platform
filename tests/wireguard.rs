@@ -55,11 +55,13 @@ fn nat_peers_compile_with_safe_mtu_and_source_bound_return_rules() {
         .iter()
         .any(|s| s.argv == ["ip", "link", "add", "scr-wg1", "type", "wireguard"]));
     assert!(pass.nft.contains("ip saddr != { 203.0.113.10/32 } drop"));
-    let mut observed = Observed::default();
-    observed.links = BTreeMap::from([(
-        "scr-wg1".into(),
-        "ip link add scr-wg1 type wireguard".into(),
-    )]);
+    let observed = Observed {
+        links: BTreeMap::from([(
+            "scr-wg1".into(),
+            "ip link add scr-wg1 type wireguard".into(),
+        )]),
+        ..Default::default()
+    };
     let second = provision::plan(&d, &observed).unwrap();
     assert!(!second.steps.iter().any(|s| s.argv.starts_with(&[
         "ip".into(),
