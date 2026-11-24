@@ -100,6 +100,10 @@ pub struct Agent {
     surging: bool,
     mitigations: u64,
     discovery_capture: BTreeMap<String, crate::discovery_capture::Status>,
+    // The NFQUEUE this agent judges forwarded game traffic on, when enforcing inline, and what it
+    // has done there.
+    inline_queue: Option<u16>,
+    inline_games: Option<crate::inline::Status>,
 }
 type Shared = Arc<Mutex<Agent>>;
 /// The agent, even after a request panicked while holding it. The control plane's state is
@@ -247,6 +251,9 @@ impl Agent {
     fn stats(&mut self, now: i64) -> Value {
         let mut stats = self.pipe.stats(now);
         stats["discovery_capture"] = json!(self.discovery_capture);
+        if let Some(inline) = &self.inline_games {
+            stats["inline_games"] = json!(inline);
+        }
         if now - self.ingress.1 <= 15_000 && !self.ingress.0.is_empty() {
             stats["ingress_counters"] = json!(self.ingress.0);
         }
@@ -314,7 +321,13 @@ impl Agent {
                     return error(503, "no program from the control plane yet");
                 }
                 let prog = &self.pipe.program;
-                let (commands, err) = match tunnel::render(prog) {
+                let built = tunnel::render(prog).and_then(|mut lines| {
+                    if let Some(queue) = self.inline_queue {
+                        lines.extend(tunnel::inline_commands(prog, queue)?);
+                    }
+                    Ok(lines)
+                });
+                let (commands, err) = match built {
                     Ok(v) => (v, String::new()),
                     Err(e) => (vec![], e),
                 };
@@ -622,6 +635,36 @@ fn idle_agent(state: &Shared) -> Option<MutexGuard<'_, Agent>> {
     }
 }
 
+/// Verdicts for a batch of queued packets, judged under one hold of the agent's lock. A packet
+/// that could not be read, or that is not the agent's to judge until a program is installed,
+/// is accepted.
+fn judge_inline(
+    state: &Shared,
+    flows: &[Option<crate::model::Flow>],
+    now: i64,
+) -> Vec<crate::inline::Verdict> {
+    use crate::inline::Verdict;
+    let mut agent = locked(state);
+    if !agent.installed {
+        return vec![Verdict::Accept; flows.len()];
+    }
+    flows
+        .iter()
+        .map(|f| {
+            let Some(f) = f else {
+                return Verdict::Accept;
+            };
+            let d = agent.pipe.inline_game(f, now);
+            match d.action.as_str() {
+                "drop" => Verdict::Drop,
+                "challenge" if !d.reply.is_empty() => Verdict::Challenge(d.reply),
+                "challenge" => Verdict::Drop,
+                _ => Verdict::Accept,
+            }
+        })
+        .collect()
+}
+
 async fn capture_discovery(state: Shared, interface: String) {
     use crate::discovery_capture::{Socket, Status, BATCH, PACKET_MAX};
     let mut status = Status::default();
@@ -724,7 +767,12 @@ pub async fn run() -> Result<()> {
         ("ca", ""),
         ("insecure", "false"),
         ("discovery-interfaces", ""),
+        ("inline-queue", ""),
     ])?;
+    let inline_queue = crate::inline::queue_number(f.get("inline-queue"))?;
+    if !cfg!(target_os = "linux") && inline_queue.is_some() {
+        return Err("inline game-filter enforcement requires Linux".into());
+    }
     let discovery_interfaces = crate::discovery_capture::interfaces(f.get("discovery-interfaces"))?;
     if !cfg!(target_os = "linux") && !discovery_interfaces.is_empty() {
         return Err("discovery capture requires Linux".into());
@@ -813,7 +861,27 @@ pub async fn run() -> Result<()> {
             .iter()
             .map(|name| (name.clone(), Default::default()))
             .collect(),
+        inline_queue,
+        inline_games: inline_queue.map(|queue| crate::inline::Status {
+            queue,
+            ..Default::default()
+        }),
     }));
+    #[cfg(target_os = "linux")]
+    if let Some(queue) = inline_queue {
+        let judging = state.clone();
+        let reporting = state.clone();
+        std::thread::Builder::new()
+            .name(format!("inline-queue-{queue}"))
+            .spawn(move || {
+                crate::inline::run(
+                    queue,
+                    |flows, now| judge_inline(&judging, flows, now),
+                    |status| locked(&reporting).inline_games = Some(status.clone()),
+                )
+            })
+            .map_err(|e| format!("starting the inline queue reader: {e}"))?;
+    }
     for interface in discovery_interfaces {
         tokio::spawn(capture_discovery(state.clone(), interface));
     }
@@ -971,6 +1039,8 @@ mod tests {
             surging: false,
             mitigations: 0,
             discovery_capture: BTreeMap::new(),
+            inline_queue: None,
+            inline_games: None,
         }
     }
     fn row(prefix: &str, prepends: i64) -> Announcement {

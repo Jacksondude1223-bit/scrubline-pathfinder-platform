@@ -114,6 +114,9 @@ table inet scrubline {
 \tchain forwarded_hosts {
 \t\ttype filter hook forward priority 10; policy accept;
 \t}
+\tchain game_inline {
+\t\ttype filter hook forward priority 20; policy accept;
+\t}
 \tchain input {
 \t\ttype filter hook input priority 0; policy accept;
 \t}
@@ -257,6 +260,21 @@ fn rule(words: &[&str]) -> bool {
         words
     {
         return quoted(name) && port_list(ports);
+    }
+    // UDP to an enforcing game filter's port, handed to the agent; bypass forwards it unjudged
+    // while no agent listens.
+    if let ["game_inline", "oifname", name, family @ ("ip" | "ip6"), "daddr", net, "udp", "dport", port, "queue", "num", queue, "bypass"] =
+        words
+    {
+        return quoted(name)
+            && name.starts_with("\"scr-")
+            && net
+                .parse::<IpNet>()
+                .is_ok_and(|n| n.trunc() == n && n.addr().is_ipv4() == (*family == "ip"))
+            && number(port)
+            && port.parse::<u16>().is_ok_and(|p| p > 0)
+            && number(queue)
+            && queue.parse::<u16>().is_ok();
     }
     if let ["forwarded_hosts", rest @ ..] = words {
         return match rest {

@@ -1943,6 +1943,43 @@ impl Pipeline {
         }
         Some(true)
     }
+    /// Judges a packet being forwarded down a tunnel that the provisioner queued to the agent
+    /// because an enforcing game filter is bound to its UDP port. Only the game-filter stage
+    /// judges it, with the source's standing: a source in the penalty box is dropped, a trusted
+    /// one skips the gate but is still held to the protocol's framing. An on-demand tunnel under
+    /// its thresholds only watches, as `decide` does. Whatever no filter is bound to passes.
+    pub fn inline_game(&mut self, f: &Flow, now: i64) -> Decision {
+        let pps = f.pps.max(0) as u64;
+        let owner = f.dst_ip.parse::<IpAddr>().ok().and_then(|a| {
+            self.prefixes
+                .iter()
+                .find(|(_, p, _)| p.contains(&a))
+                .map(|(s, _, _)| s.clone())
+        });
+        let Some(owner) = owner else {
+            return decision("permit", 0, "", "prefix not assigned to this node");
+        };
+        self.surge = Surge::default();
+        self.scoring = Scoring::default();
+        if let Some(i) = self.watched.get(&owner).copied() {
+            if !self.watches[i].mitigating(now, pps, bits(f)) {
+                return self.watch_only(f, now, i);
+            }
+        }
+        let rules = &self.rules;
+        let surge = self.surge;
+        let state = self
+            .reputation
+            .check_sparing(&f.src_ip, now, || allowed(rules, f, &surge));
+        let d = if state == 2 {
+            decision("drop", 2, "", "source is in the penalty box")
+        } else {
+            self.inspect_game(f, now, state == 1)
+                .unwrap_or_else(|| decision("permit", 2, "", "game filter passed the packet"))
+        };
+        self.record(&d, None, f);
+        d
+    }
     pub fn observe_return(&mut self, f: &Flow, now: i64) {
         let prefix = f.src_ip.parse::<IpAddr>().ok().and_then(|a| {
             self.prefixes

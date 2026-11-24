@@ -17,6 +17,7 @@ pub mod discovery_capture;
 pub mod gamefilter;
 pub mod guards;
 pub mod httpfilter;
+pub mod inline;
 pub mod node;
 pub mod packet;
 pub mod pipeline;
