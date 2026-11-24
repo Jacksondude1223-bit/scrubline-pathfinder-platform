@@ -3410,6 +3410,23 @@ components:
               kernel_dropped: {type: integer, minimum: 0}
               last_packet_ms: {type: integer, nullable: true}
               error: {type: string, nullable: true}
+        inline_games:
+          type: object
+          description: Inline game-filter enforcement on NFQUEUE, present only on nodes started with -inline-queue. Counts forwarded UDP packets for enforcing game filters that the agent accepted, dropped or answered with a challenge. The queue fails open, so queue_dropped and user_dropped are packets forwarded unjudged.
+          properties:
+            active: {type: boolean}
+            queue: {type: integer, minimum: 0, maximum: 65535}
+            packets: {type: integer, minimum: 0}
+            accepted: {type: integer, minimum: 0}
+            dropped: {type: integer, minimum: 0}
+            challenged: {type: integer, minimum: 0}
+            replies_failed: {type: integer, minimum: 0}
+            unreadable: {type: integer, minimum: 0}
+            overruns: {type: integer, minimum: 0}
+            queue_dropped: {type: integer, minimum: 0}
+            user_dropped: {type: integer, minimum: 0}
+            last_packet_ms: {type: integer, nullable: true}
+            error: {type: string, nullable: true}
         decisions:
           type: integer
         unowned:

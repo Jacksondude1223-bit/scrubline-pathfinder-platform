@@ -845,6 +845,14 @@ fi
 if has_node; then
 	after=network-online.target
 	if [[ $ROLE == all ]]; then after+=" scrubline-api.service"; fi
+	# Inline game-filter enforcement (-inline-queue) reads NFQUEUE, which needs CAP_NET_ADMIN. That
+	# also lets a process reconfigure the box's networking, the provisioner's job, so the agent
+	# holds it only when its extra options ask for inline enforcement; adding the flag later means
+	# running this again.
+	node_caps=CAP_NET_RAW
+	if [[ $(read_env "$ETC/node.env" SCRUBLINE_NODE_EXTRA_OPTS) == *inline-queue* ]]; then
+		node_caps+=" CAP_NET_ADMIN"
+	fi
 	cat >"$UNITS/scrubline-node.service" <<UNIT
 [Unit]
 Description=Scrubline scrubbing node agent
@@ -867,8 +875,9 @@ MemoryMax=2G
 OOMScoreAdjust=-500
 # Live protocol discovery (-discovery-interfaces) reads tunnel packets from an AF_PACKET socket,
 # which needs CAP_NET_RAW; without both the socket is refused and discovery never sees a packet.
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
+# Inline enforcement sends game challenges from a raw socket, which needs it too.
+CapabilityBoundingSet=$node_caps
+AmbientCapabilities=$node_caps
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
 MemoryDenyWriteExecute=yes
 $HARDENING

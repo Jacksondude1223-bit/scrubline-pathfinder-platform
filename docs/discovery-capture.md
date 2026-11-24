@@ -20,6 +20,6 @@ Each node report includes discovery_capture keyed by interface, with active stat
 
 ## Scope of the fix
 
-This observer supplies passive discovery evidence. It does not call the live decision tester, change inspection counters or trust/session/rate state, or claim that a sampled decision was enforced against a forwarded packet. Existing kernel forwarding and ACL behavior continue to apply. Enforcing stateful userspace game-filter decisions on live forwarded traffic requires an inline datapath adapter; installing a discovered filter alone is not proof of inline enforcement.
+This observer supplies passive discovery evidence. It does not call the live decision tester, change inspection counters or trust/session/rate state, or claim that a sampled decision was enforced against a forwarded packet. Existing kernel forwarding and ACL behavior continue to apply. Enforcing stateful userspace game-filter decisions on live forwarded traffic requires the inline datapath adapter described in [inline-game-filters.md](inline-game-filters.md) (`-inline-queue`); installing a discovered filter alone, without it, is not proof of inline enforcement.
 
 Deploy and enable this independently from the panel. Existing panel discovery settings remain authoritative for observe/enforce installation, including the warning that A2S belongs only on a dedicated query port. Configure the affected service's protocols according to what that server actually runs.

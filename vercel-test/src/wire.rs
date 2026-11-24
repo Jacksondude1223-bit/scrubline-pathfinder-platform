@@ -97,6 +97,8 @@ pub struct Stats {
     pub discovery_capture:
         Option<std::collections::BTreeMap<String, crate::discovery_capture::Status>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_games: Option<crate::inline::Status>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub discovered_ports: Option<Vec<DiscoveredPort>>,
     #[serde(deserialize_with = "null_default")]
     pub decisions: u64,
@@ -191,6 +193,7 @@ impl Stats {
     pub fn summary(&self) -> Self {
         let Self {
             discovery_capture: _,
+            inline_games: _,
             discovered_ports: _,
             decisions,
             unowned,
@@ -239,6 +242,7 @@ impl Stats {
         } = egress;
         Self {
             discovery_capture: None,
+            inline_games: None,
             discovered_ports: None,
             decisions: *decisions,
             unowned: *unowned,

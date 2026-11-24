@@ -601,10 +601,77 @@ pub fn render(prog: &Program) -> Result<Vec<String>> {
     // plane says: one from before the list existed sends none, and that is no reason to cut
     // this node's customers off.
     let mut peers = prog.tunnel_peers.clone();
-    peers.extend(prog.tunnels.iter().map(|t| t.remote.clone()));
+    peers.extend(
+        prog.tunnels
+            .iter()
+            .filter(|t| t.r#type != "wireguard")
+            .map(|t| t.remote.clone()),
+    );
     peers.extend(prog.backhaul.iter().map(|b| b.remote.clone()));
     lines.extend(firewall_commands(&peers)?);
     lines.extend(rate_commands(&prog.tunnels)?);
+    Ok(lines)
+}
+/// The game filters a node enforces inline: enforcing (not observe-only) layer-4 profiles bound to
+/// one UDP port. TCP stays on the kernel path: a handshake segment carries no payload for a
+/// profile to judge, and HTTP rules need the connection's context.
+pub fn inline_filters(games: &[GameFilter]) -> Vec<&GameFilter> {
+    games
+        .iter()
+        .filter(|g| {
+            !g.observe
+                && (g.custom.is_some() || !g.profile.is_empty())
+                && matches!(g.proto.to_ascii_lowercase().as_str(), "udp" | "" | "any")
+                && (1..=65535).contains(&g.dport)
+        })
+        .collect()
+}
+/// The rules that hand forwarded UDP going down a tunnel to an enforcing game filter's port to the
+/// agent on NFQUEUE `queue`, one rule per protected network and port. They sit in their own chain,
+/// after the forwarding rules, so a packet those drop never reaches the agent, and a verdict of
+/// accept ends only this chain. `bypass` forwards the packets unjudged while no agent listens, so
+/// a stopped or restarting agent costs filtering, not the customers' traffic.
+pub fn inline_commands(prog: &Program, queue: u16) -> Result<Vec<String>> {
+    let filters = inline_filters(&prog.games);
+    let mut rows: Vec<_> = prog
+        .tunnels
+        .iter()
+        .filter(|t| t.port_forward.is_none() && carries_replies(t))
+        .collect();
+    rows.sort_by_key(|t| &t.id);
+    let mut lines = Vec::new();
+    for t in rows {
+        let name = interface_name(&t.id)?;
+        for net in nets(&t.prefixes)? {
+            for g in &filters {
+                let target = if g.dst_cidr.is_empty() {
+                    Some(net)
+                } else {
+                    let dst = g
+                        .dst_cidr
+                        .parse::<IpNet>()
+                        .map_err(|e| format!("game filter {}: {e}", g.id))?
+                        .trunc();
+                    if dst.contains(&net) {
+                        Some(net)
+                    } else if net.contains(&dst) {
+                        Some(dst)
+                    } else {
+                        None
+                    }
+                };
+                let Some(target) = target else { continue };
+                let family = if target.addr().is_ipv4() { "ip" } else { "ip6" };
+                let line = format!(
+                    "nft add rule inet scrubline game_inline oifname \"{name}\" {family} daddr {target} udp dport {} queue num {queue} bypass",
+                    g.dport
+                );
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
+        }
+    }
     Ok(lines)
 }
 fn format_ports(ports: &[u16]) -> String {
