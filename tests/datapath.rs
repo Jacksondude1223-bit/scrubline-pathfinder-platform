@@ -43,6 +43,7 @@ fn equal(a: &Value, b: &Value, path: &str) {
 /// which it had, are left out of the comparison.
 fn go_shape(mut stats: Value) -> Value {
     let top = stats.as_object_mut().unwrap();
+    top.remove("discovered_ports");
     top.remove("game_http_windows");
     top.remove("game_http_windows_max");
     top.remove("game_http_pending");
