@@ -1943,6 +1943,13 @@ impl Pipeline {
         }
         Some(true)
     }
+    pub fn origin_prefix(&self, destination: &str) -> Option<String> {
+        let address = destination.parse::<IpAddr>().ok()?;
+        self.prefixes
+            .iter()
+            .find(|(_, net, _)| net.contains(&address))
+            .map(|(prefix, _, _)| prefix.clone())
+    }
     /// Judges a packet being forwarded down a tunnel that the provisioner queued to the agent
     /// because an enforcing game filter is bound to its UDP port. Only the game-filter stage
     /// judges it, with the source's standing: a source in the penalty box is dropped, a trusted
@@ -1959,11 +1966,19 @@ impl Pipeline {
         let Some(owner) = owner else {
             return decision("permit", 0, "", "prefix not assigned to this node");
         };
+        self.decisions += 1;
+        self.pulses.observe(&owner, pps, now);
         self.surge = Surge::default();
         self.scoring = Scoring::default();
         if let Some(i) = self.watched.get(&owner).copied() {
             if !self.watches[i].mitigating(now, pps, bits(f)) {
-                return self.watch_only(f, now, i);
+                let decision = self.watch_only(f, now, i);
+                self.load.observe(now, pps, false);
+                self.loads
+                    .entry(owner)
+                    .or_default()
+                    .observe(now, pps, false);
+                return decision;
             }
         }
         let rules = &self.rules;
@@ -1978,6 +1993,12 @@ impl Pipeline {
                 .unwrap_or_else(|| decision("permit", 2, "", "game filter passed the packet"))
         };
         self.record(&d, None, f);
+        let mitigated = d.action == "drop" || d.action == "challenge";
+        self.load.observe(now, pps, mitigated);
+        self.loads
+            .entry(owner)
+            .or_default()
+            .observe(now, pps, mitigated);
         d
     }
     pub fn observe_return(&mut self, f: &Flow, now: i64) {

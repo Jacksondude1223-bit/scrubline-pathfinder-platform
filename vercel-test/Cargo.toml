@@ -31,6 +31,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower-http = { version = "0.6", features = ["timeout"] }
+maxminddb = "0.26"
 
 vercel_runtime = { version = "2.4", features = ["axum"] }
 tower = "0.5"
