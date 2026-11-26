@@ -19,6 +19,7 @@ pub mod guards;
 pub mod httpfilter;
 pub mod inline;
 pub mod node;
+pub mod origins;
 pub mod packet;
 pub mod pipeline;
 pub mod provision;

@@ -1582,7 +1582,7 @@ impl Api {
                             || row.first_seen_ms < 0
                             || row.first_seen_ms > row.last_seen_ms
                             || row.port == 0
-                            || row.confirmations < 2
+                            || row.confirmations < 1
                             || !matches!(
                                 (row.transport.as_str(), row.protocol.as_str()),
                                 ("udp", "a2s" | "raknet" | "unknown") | ("tcp", "unknown")

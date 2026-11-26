@@ -104,6 +104,7 @@ pub struct Agent {
     // has done there.
     inline_queue: Option<u16>,
     inline_games: Option<crate::inline::Status>,
+    origins: Option<crate::origins::Sampler>,
 }
 type Shared = Arc<Mutex<Agent>>;
 /// The agent, even after a request panicked while holding it. The control plane's state is
@@ -187,6 +188,9 @@ impl Agent {
                     })
             })
         });
+        if let Some(origins) = &mut self.origins {
+            origins.retain(&prog);
+        }
         self.pipe.load(prog);
         self.installed = true;
     }
@@ -250,6 +254,9 @@ impl Agent {
     /// The datapath's counters, and what this process holds in memory.
     fn stats(&mut self, now: i64) -> Value {
         let mut stats = self.pipe.stats(now);
+        if let Some(origins) = &self.origins {
+            stats["origin_samples"] = json!(origins.report());
+        }
         stats["discovery_capture"] = json!(self.discovery_capture);
         if let Some(inline) = &self.inline_games {
             stats["inline_games"] = json!(inline);
@@ -655,6 +662,18 @@ fn judge_inline(
                 return Verdict::Accept;
             };
             let d = agent.pipe.inline_game(f, now);
+            if d.action == "drop"
+                && agent
+                    .origins
+                    .as_mut()
+                    .is_some_and(|origins| origins.select(now))
+            {
+                if let Some(prefix) = agent.pipe.origin_prefix(&f.dst_ip) {
+                    if let Some(origins) = &mut agent.origins {
+                        origins.observe_drop(&prefix, &f.src_ip);
+                    }
+                }
+            }
             match d.action.as_str() {
                 "drop" => Verdict::Drop,
                 "challenge" if !d.reply.is_empty() => Verdict::Challenge(d.reply),
@@ -768,11 +787,36 @@ pub async fn run() -> Result<()> {
         ("insecure", "false"),
         ("discovery-interfaces", ""),
         ("inline-queue", ""),
+        ("origin-country-db", ""),
+        ("origin-country-provider", "custom"),
+        ("origin-longitude", ""),
+        ("origin-latitude", ""),
+        ("origin-label", ""),
     ])?;
     let inline_queue = crate::inline::queue_number(f.get("inline-queue"))?;
     if !cfg!(target_os = "linux") && inline_queue.is_some() {
         return Err("inline game-filter enforcement requires Linux".into());
     }
+    let location = crate::origins::Location::parse(
+        f.get("origin-longitude"),
+        f.get("origin-latitude"),
+        f.get("origin-label"),
+    )?;
+    let origins = if f.get("origin-country-db").is_empty() {
+        if location.is_some() {
+            return Err("origin location requires an origin-country-db".into());
+        }
+        None
+    } else {
+        if inline_queue.is_none() {
+            return Err("origin country sampling requires inline-queue".into());
+        }
+        Some(crate::origins::Sampler::open(
+            f.get("origin-country-db"),
+            f.get("origin-country-provider"),
+            location,
+        )?)
+    };
     let discovery_interfaces = crate::discovery_capture::interfaces(f.get("discovery-interfaces"))?;
     if !cfg!(target_os = "linux") && !discovery_interfaces.is_empty() {
         return Err("discovery capture requires Linux".into());
@@ -862,6 +906,7 @@ pub async fn run() -> Result<()> {
             .map(|name| (name.clone(), Default::default()))
             .collect(),
         inline_queue,
+        origins,
         inline_games: inline_queue.map(|queue| crate::inline::Status {
             queue,
             ..Default::default()
@@ -1041,6 +1086,7 @@ mod tests {
             discovery_capture: BTreeMap::new(),
             inline_queue: None,
             inline_games: None,
+            origins: None,
         }
     }
     fn row(prefix: &str, prepends: i64) -> Announcement {
@@ -1347,5 +1393,98 @@ mod tests {
         );
         assert_eq!(stats["decisions"], 0);
         task.abort();
+    }
+    #[test]
+    fn simulated_decisions_never_enter_the_country_sampler() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = root.join("tests/data/GeoIP2-Country-Test.mmdb");
+        let path = if path.exists() {
+            path
+        } else {
+            root.join("../tests/data/GeoIP2-Country-Test.mmdb")
+        };
+        let mut a = agent(vec![]);
+        a.origins =
+            Some(crate::origins::Sampler::open(path.to_str().unwrap(), "maxmind", None).unwrap());
+        a.install(Program {
+            prefixes: vec!["203.0.113.0/24".into()],
+            ..Default::default()
+        });
+        let body = br#"{"src_ip":"81.2.69.160","dst_ip":"203.0.113.10","proto":"udp","dport":19132,"pps":1000000}"#;
+        for _ in 0..200 {
+            assert_eq!(call(&mut a, "POST", "/decide", body), 200);
+        }
+        assert!(a.origins.as_ref().unwrap().report().prefixes.is_empty());
+    }
+    #[test]
+    fn inline_callback_samples_only_real_parsed_drop_decisions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = root.join("tests/data/GeoIP2-Country-Test.mmdb");
+        let path = if path.exists() {
+            path
+        } else {
+            root.join("../tests/data/GeoIP2-Country-Test.mmdb")
+        };
+        let mut a = agent(vec![]);
+        let mut sampler =
+            crate::origins::Sampler::open(path.to_str().unwrap(), "maxmind", None).unwrap();
+        sampler.test_seed(71);
+        a.origins = Some(sampler);
+        a.install(Program {
+            prefixes: vec!["203.0.113.20/32".into()],
+            games: vec![GameFilter {
+                id: "game".into(),
+                profile: "raknet".into(),
+                proto: "udp".into(),
+                dst_cidr: "203.0.113.20/32".into(),
+                dport: 19132,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut packet = vec![0u8; 29];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&29u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[81, 2, 69, 160]);
+        packet[16..20].copy_from_slice(&[203, 0, 113, 20]);
+        packet[20..22].copy_from_slice(&45000u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&19132u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&9u16.to_be_bytes());
+        packet[28] = 0xff;
+        let mut sum: u32 = packet[..20]
+            .chunks_exact(2)
+            .map(|bytes| u32::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+            .sum();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        packet[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        let flow = crate::inline::flow(&packet).unwrap();
+        let mut outside = flow.clone();
+        outside.dst_ip = "198.51.100.1".into();
+        let state = Arc::new(Mutex::new(a));
+        assert_eq!(
+            judge_inline(&state, &[None, Some(outside)], 1000),
+            vec![crate::inline::Verdict::Accept; 2]
+        );
+        assert!(locked(&state)
+            .origins
+            .as_ref()
+            .unwrap()
+            .report()
+            .prefixes
+            .is_empty());
+        let verdicts = judge_inline(&state, &vec![Some(flow); 1024], 1000);
+        assert!(verdicts
+            .iter()
+            .all(|verdict| *verdict == crate::inline::Verdict::Drop));
+        let report = locked(&state).origins.as_ref().unwrap().report();
+        assert!(report.prefixes[0].countries["GB"] > 0);
+        assert!(report.prefixes[0].countries["GB"] < 1024);
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("81.2.69.160"));
     }
 }

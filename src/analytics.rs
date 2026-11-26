@@ -51,6 +51,8 @@ struct Event {
     dropped: u64,
     pulse: bool,
     vectors: BTreeMap<(String, String), Value>,
+    origins: crate::origins::EventOrigins,
+    origin_since: i64,
 }
 impl Event {
     fn render(&self, p: &str, now: i64) -> Value {
@@ -76,6 +78,9 @@ impl Event {
                 })
         });
         v["vectors"] = json!(vectors);
+        if let Some(origins) = self.origins.render() {
+            v["origin_samples"] = origins;
+        }
         v
     }
 }
@@ -112,11 +117,16 @@ impl Series {
         b.pulse |= pulse;
         let under = pulse || r[1] >= 5000 && r[1] as f64 >= 0.25 * r[0] as f64;
         if under {
+            let recovering = self.clear != 0;
             self.clear = 0;
             let e = self.open.get_or_insert_with(|| Event {
                 start: now,
+                origin_since: now,
                 ..Default::default()
             });
+            if recovering {
+                e.origin_since = now;
+            }
             e.peak = e.peak.max(peak);
             e.peak_drop = e.peak_drop.max(r[1]);
             e.pulse |= pulse;
@@ -154,6 +164,7 @@ pub struct Collector {
     drop_baselines: GreBaselines,
     rule_counters: HashMap<(String, String, bool), [u64; 5]>,
     nodes: HashMap<String, i64>,
+    origin_baselines: crate::origins::Baselines,
     /// What the programs nodes last reported under protect, by fingerprint (see Attribution).
     attributions: HashMap<u64, Arc<Attribution>>,
 }
@@ -275,6 +286,7 @@ fn scope(dst: &str, stage: &str, action: Option<&str>, nets: &[(&String, Option<
 impl Collector {
     pub fn forget(&mut self, live: &HashSet<String>) {
         self.series.retain(|p, _| live.contains(p));
+        self.origin_baselines.forget(live);
         self.prefix_counters.retain(|(_, p), _| live.contains(p));
         for baselines in self
             .gre_baselines
@@ -304,6 +316,7 @@ impl Collector {
         self.drop_baselines.remove(node);
         self.rule_counters.retain(|(n, _, _), _| n != node);
         self.nodes.remove(node);
+        self.origin_baselines.forget_node(node);
     }
     pub fn prefixes(&self) -> Vec<String> {
         self.series.keys().cloned().collect()
@@ -403,6 +416,9 @@ impl Collector {
         // Only the gauges of a silent node expire. Its baselines stay: the agent keeps counting
         // while it cannot report, and a counter that only counts up survives reports being missed.
         self.nodes.retain(|n, _| !expired.contains(n));
+        for node in &expired {
+            self.origin_baselines.forget_node(node);
+        }
         self.gre_baselines.retain(|n, _| !expired.contains(n));
         // Every report comes through here, so the day's history is trimmed from its old end
         // rather than walked whole.
@@ -596,6 +612,20 @@ impl Collector {
         for (p, s) in self.series.iter_mut() {
             if touched.contains(p) || s.open.is_some() {
                 s.judge(now);
+            }
+        }
+        for delta in
+            self.origin_baselines
+                .observe(node, stats.origin_samples.as_ref(), &attr.prefixes, now)
+        {
+            if let Some(series) = self.series.get_mut(&delta.prefix) {
+                if series.clear == 0 {
+                    if let Some(event) = series.open.as_mut().filter(|event| {
+                        delta.since >= event.start && delta.since >= event.origin_since
+                    }) {
+                        event.origins.merge(delta);
+                    }
+                }
             }
         }
         for (prefix, flows, dropped) in inspected {

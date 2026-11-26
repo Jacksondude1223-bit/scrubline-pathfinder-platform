@@ -181,7 +181,7 @@ impl Discovery {
         self.sweep(now);
         self.ports
             .values()
-            .filter(|row| row.confirmations >= 2 && now - row.last_seen_ms <= RETENTION_MS)
+            .filter(|row| row.confirmations >= 1 && now - row.last_seen_ms <= RETENTION_MS)
             .cloned()
             .collect()
     }
