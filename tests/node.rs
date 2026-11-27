@@ -1049,6 +1049,27 @@ fn the_control_plane_keeps_everything_the_node_reports() {
     );
 }
 
+/// The first tenant's discovered ports, as the control plane serves them.
+fn discovered(fabric: &Fabric) -> Vec<Value> {
+    let (_, id) = &fabric.tenants[0];
+    let (_, issued) = call(
+        &fabric.base,
+        "POST",
+        &format!("/v1/tenants/{id}/token"),
+        OP,
+        Value::Null,
+    );
+    let (status, result) = call(
+        &fabric.base,
+        "GET",
+        "/v1/analytics/discovered-ports",
+        issued["token"].as_str().unwrap(),
+        Value::Null,
+    );
+    assert_eq!(status, 200, "{result}");
+    result["ports"].as_array().unwrap().clone()
+}
+
 #[test]
 fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
     let fabric = Fabric::new();
@@ -1074,6 +1095,27 @@ fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
     pipe.decide(&request, at + 1);
     pipe.observe_return(&response, at + 2);
     fabric.heartbeat(pipe.stats(at + 2000), Value::Null);
+    let rows = discovered(&fabric);
+    // A challenge alone names no game and no game port.
+    assert_eq!(rows[0]["auto_filter"]["eligible"], false, "{rows:?}");
+    assert_eq!(rows[0]["auto_filter"]["profile"], "a2s");
+    assert!(rows[0].get("metadata").is_none(), "{rows:?}");
+    // The client answers the challenge, and the server describes itself: its game traffic is on
+    // 27015, so 27016 is a dedicated query port.
+    let mut answered = request.clone();
+    answered.payload = b"\xff\xff\xff\xffTSource Engine Query\0\x01\x02\x03\x04".to_vec();
+    let mut described = response.clone();
+    described.payload = b"\xff\xff\xff\xffI\x11Server\0map\0cstrike\0Counter-Strike: Source\0\xf0\x00\x01\x10\x00d\x6c\x00\x01\x31\x00\x80\x87\x69".to_vec();
+    pipe.decide(&answered, at + 3);
+    pipe.observe_return(&described, at + 4);
+    fabric.heartbeat(pipe.stats(at + 2000), Value::Null);
+    let rows = discovered(&fabric);
+    assert_eq!(
+        rows[0]["metadata"]["game"], "Counter-Strike: Source",
+        "{rows:?}"
+    );
+    assert_eq!(rows[0]["metadata"]["game_port"], 27015);
+    assert_eq!(rows[0]["auto_filter"]["eligible"], true, "{rows:?}");
     for (index, (_, id)) in fabric.tenants.iter().enumerate() {
         let (_, issued) = call(
             &fabric.base,
@@ -1096,7 +1138,7 @@ fn learns_the_query_port_and_scopes_it_to_the_owning_service() {
             assert_eq!(rows[0]["destination"], "203.0.113.10/32");
             assert_eq!(rows[0]["port"], 27016);
             assert_eq!(rows[0]["protocol"], "a2s");
-            assert_eq!(rows[0]["confirmations"], 1);
+            assert_eq!(rows[0]["confirmations"], 2);
         } else {
             assert!(rows.is_empty(), "{result}");
         }
