@@ -123,7 +123,8 @@ pub fn a2s_info(payload: &[u8]) -> Option<GameMetadata> {
             self.take(2).map(|b| u16::from_le_bytes([b[0], b[1]]))
         }
         fn long(&mut self) -> Option<u64> {
-            self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            self.take(8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
         }
         fn string(&mut self) -> Option<&'a [u8]> {
             let end = self.0.iter().position(|b| *b == 0)?;
@@ -192,7 +193,11 @@ pub fn raknet_pong(payload: &[u8]) -> Option<GameMetadata> {
     let advertised = payload.get(35..)?;
     let fields: Vec<&[u8]> = advertised.split(|b| *b == b';').collect();
     let number = |i: usize| -> Option<u32> {
-        std::str::from_utf8(fields.get(i)?).ok()?.trim().parse().ok()
+        std::str::from_utf8(fields.get(i)?)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     };
     match fields.first().copied() {
         Some(edition @ (b"MCPE" | b"MCEE")) => Some(GameMetadata {
@@ -209,7 +214,9 @@ pub fn raknet_pong(payload: &[u8]) -> Option<GameMetadata> {
             version: fields.get(3).and_then(|f| text(f)),
             players: number(4),
             max_players: number(5),
-            game_port: number(10).and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0),
+            game_port: number(10)
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0),
             ..Default::default()
         }),
         Some(first) => Some(GameMetadata {
