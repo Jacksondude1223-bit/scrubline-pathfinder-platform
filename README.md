@@ -2021,6 +2021,21 @@ ports as unclassified.
 tenant's protected addresses. It reports destination addresses, port, protocol, observation times,
 and counts. Deployments using interface counters alone need an inbound and return packet or flow feed.
 
+Each entry also carries what the server said about itself, `metadata`, and an `auto_filter`
+decision based on it. The packet signature only says a port speaks A2S or RakNet. The metadata
+says which game it is and where its game traffic goes:
+
+- **A2S** is eligible only when the server's A2S_INFO answer names a game port other than the
+  one queried. The a2s profile drops everything that does not start with the query header, so on
+  a port that also carries the game's own traffic it would drop players. A port that has only
+  answered with a challenge, or whose answer names no game port, is not eligible.
+- **RakNet** is eligible only when the server's pong identifies Minecraft: Bedrock (or
+  Education) Edition and advertises this port or none.
+- Unclassified ports and TCP are never eligible.
+
+Each decision comes with a reason. Freshness, confirmation counts, the customer's protocol opt-in
+and conflicts with existing filters stay with the installer.
+
 ## Customer analytics
 
 Observability above is for the people running the fabric. This is for the

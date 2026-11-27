@@ -1084,7 +1084,7 @@ paths:
                     maxItems: 1024
                     items:
                       type: object
-                      required: [destination, port, transport, protocol, first_seen_ms, last_seen_ms, confirmations]
+                      required: [destination, port, transport, protocol, first_seen_ms, last_seen_ms, confirmations, auto_filter]
                       properties:
                         destination: {type: string, description: Exact IPv4 or IPv6 host CIDR.}
                         port: {type: integer, minimum: 1, maximum: 65535}
@@ -1093,6 +1093,28 @@ paths:
                         first_seen_ms: {type: integer}
                         last_seen_ms: {type: integer}
                         confirmations: {type: integer}
+                        metadata:
+                          type: object
+                          description: What the server said about itself in its latest reply (an A2S_INFO answer or a RakNet pong). Absent for unclassified ports and for A2S ports that have only answered with a challenge. Strings are printable and at most 64 characters.
+                          properties:
+                            game: {type: string}
+                            folder: {type: string}
+                            app_id: {type: integer, minimum: 1}
+                            edition: {type: string, enum: [MCPE, MCEE]}
+                            name: {type: string}
+                            version: {type: string}
+                            players: {type: integer, minimum: 0}
+                            max_players: {type: integer, minimum: 0}
+                            game_port: {type: integer, minimum: 1, maximum: 65535, description: The port the server says its game traffic uses.}
+                            dedicated: {type: boolean}
+                        auto_filter:
+                          type: object
+                          description: Whether automatic filtering may install the protocol's game filter on this port, decided from the metadata. A2S qualifies only on a dedicated query port whose A2S_INFO answer names a different game port; RakNet only for a pong identifying Minecraft Bedrock or Education Edition on this port. Freshness, confirmations, protocol opt-in and conflicts remain the installer's to check.
+                          required: [eligible, reason]
+                          properties:
+                            eligible: {type: boolean}
+                            profile: {type: string, enum: [a2s, raknet]}
+                            reason: {type: string}
         '401': *id002
         '403': *id003
   /v1/analytics/events:

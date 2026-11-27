@@ -1594,6 +1594,13 @@ impl Api {
                         discoveries
                             .entry(key)
                             .and_modify(|before: &mut wire::DiscoveredPort| {
+                                // The newest description of the server across nodes wins.
+                                if row.metadata.is_some()
+                                    && (before.metadata.is_none()
+                                        || row.last_seen_ms > before.last_seen_ms)
+                                {
+                                    before.metadata = row.metadata.clone();
+                                }
                                 before.first_seen_ms = before.first_seen_ms.min(row.first_seen_ms);
                                 before.last_seen_ms = before.last_seen_ms.max(row.last_seen_ms);
                                 before.confirmations = before.confirmations.max(row.confirmations);
@@ -1601,7 +1608,14 @@ impl Api {
                             .or_insert_with(|| row.clone());
                     }
                 }
-                let mut ports: Vec<_> = discoveries.into_values().collect();
+                let mut ports: Vec<_> = discoveries
+                    .into_values()
+                    .map(|mut row| {
+                        // A node does not decide this; only what it observed is taken from it.
+                        row.auto_filter = Some(crate::discovery::auto_filter(&row));
+                        row
+                    })
+                    .collect();
                 ports.sort_by_key(|row| std::cmp::Reverse(row.last_seen_ms));
                 ports.truncate(crate::discovery::PORTS_MAX);
                 Ok(json!({"ports": ports}))

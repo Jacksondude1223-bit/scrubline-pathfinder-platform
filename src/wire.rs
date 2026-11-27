@@ -88,6 +88,62 @@ pub struct DiscoveredPort {
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
     pub confirmations: u64,
+    /// What the server said about itself in its latest reply, when the protocol carries it: an
+    /// A2S_INFO answer or a RakNet unconnected pong. Absent from older nodes, for unclassified
+    /// ports, and for A2S ports that have only answered with a challenge so far.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<GameMetadata>,
+    /// Whether automatic filtering may install the protocol's game filter here, decided from the
+    /// metadata. Set by the control plane when it serves discoveries, never by nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_filter: Option<AutoFilter>,
+}
+
+/// A game server's description of itself, bounded and sanitised: every string is printable and
+/// at most `METADATA_TEXT_MAX` characters.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameMetadata {
+    /// The game: A2S's game description, or "Minecraft: Bedrock Edition".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
+    /// A2S's game directory, such as cstrike or rust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    /// The Steam AppID, from the extended game id when the server sends one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<u64>,
+    /// A RakNet pong's edition: MCPE (Bedrock) or MCEE (Education Edition).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub players: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_players: Option<u32>,
+    /// The port the server says its game traffic uses: A2S's extra data port, or a Bedrock
+    /// pong's IPv4 port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_port: Option<u16>,
+    /// A2S's server type: true for a dedicated server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedicated: Option<bool>,
+}
+
+pub const METADATA_TEXT_MAX: usize = 64;
+
+/// The decision for automatic filtering on a discovered port.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoFilter {
+    pub eligible: bool,
+    /// The game filter profile it would install: a2s or raknet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
